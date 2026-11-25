@@ -12,6 +12,28 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Background Bash jobs can get a time limit and a stuck-prompt notice**
+  (preview feature `background_watchdog`, off by default). With
+  `--preview=background_watchdog`, a `run_in_background` job stops when it
+  reaches its `timeout` (default 30 minutes, at most 2 hours; a command moved
+  to the background after 15s gets the default), and its notification says it
+  was stopped at its time limit. A background job whose output has not grown
+  for 45s and ends in a prompt such as `[y/N]` or `Password:` produces one
+  `running` notification that suggests KillShell and a non-interactive re-run;
+  like every job notification it carries no output bytes. With the feature
+  off, the Bash tool and its jobs behave as before.
+- **`monitor_events` preview: Monitor pushes events instead of being
+  polled.** With `--preview=monitor_events`, each batch of the monitored
+  command's stdout lines reaches the model as a `<task-notification>` event at
+  the next turn boundary, or wakes the end-of-turn wait, so the model keeps
+  working instead of polling `BashOutput`. Events are rate-limited (a bucket
+  of 10, one more every 2 s, with a suppressed-count line; 30 s over the limit
+  stops the monitor), lines are cut at 500 bytes and events at 3000. The
+  schema gains `timeout_ms` (default 5 minutes, at most 1 hour), after which
+  the monitor is killed with one re-arm notice; its exit gives a final
+  notice. Event text is XML-escaped and labelled as command output, not
+  instructions. Off by default; with it off Monitor is unchanged
+  ([API.md](doc/API.md#preview-features)).
 - **Bench has a 监控 page for the execution machine.** It shows the machine's
   CPU, load, memory, disks and network rate, whether Docker Hub, ghcr.io,
   GitHub, PyPI, Hugging Face, astral.sh and every configured mirror answer

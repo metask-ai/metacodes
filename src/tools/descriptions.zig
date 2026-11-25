@@ -102,6 +102,11 @@ const BASH_GIT_SECTION =
     \\4. Return the PR URL and its verification state. A successful local commit or push alone does not establish that a PR exists.
 ;
 
+const BASH_BACKGROUND_LIMIT_NOTE =
+    \\
+    \\- A background job is stopped when it reaches its background time limit. With `run_in_background`, `timeout` sets that limit (default 1800000 ms = 30 minutes, maximum 7200000 ms = 2 hours); a command moved to the background after 15s gets the default. If a background job seems to be waiting for interactive input, you are told once: kill it with KillShell and re-run it non-interactively.
+;
+
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
     const windows = @import("builtin").os.tag == .windows;
     const readonly = ctx.isReadonlyAgent();
@@ -145,6 +150,7 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\# Long-running commands and results
         \\The foreground timeout is in milliseconds. Set it to suit the work. For background work on a host with job support, set `run_in_background` and use the returned `job_id`. A long foreground call can also return a job ID while work continues. Starting a job does not mean it succeeded.
     );
+    if (ctx.preview.background_watchdog) try out.writeAll(BASH_BACKGROUND_LIMIT_NOTE);
     if (ctx.hasTool("BashOutput")) try out.writeAll(" Use BashOutput with that ID when you need the result: it waits for exit up to `wait_ms` by default. The CLI also delivers a completion notification. Avoid sleep loops and repeated empty polls.");
     try out.writeAll("\nFor a completed command, inspect `exit_code`, `stdout` and `stderr`. A search exit code of 1 from rg means no match; check diagnostics for other failures. A channel marked truncated contains only a preview.");
     if (ctx.hasTool("ReadArtifact")) try out.writeAll(" Pass the returned channel artifact ID to ReadArtifact and continue at `next_offset` to recover the omitted output.");

@@ -149,6 +149,13 @@ const SESSION_TASK_UPDATE_PROPS: []const json.PropSpec = &.{
     json.PropSpec{ .name = "addBlockedBy", .type = "array", .description = "Task ids that block this task", .items_type = "string" },
 };
 
+const MONITOR_EVENTS_PROP_SPECS: []const json.PropSpec = &.{
+    .{ .name = "command", .type = "string", .description = "Shell command to run; each stdout line becomes an event" },
+    .{ .name = "description", .type = "string", .description = "Short description of what is being monitored, shown in every event notification" },
+    .{ .name = "timeout_ms", .type = "integer", .description = "Kill the monitor after this many milliseconds (default 300000, minimum 1000, maximum 3600000)" },
+    .{ .name = "persistent", .type = "boolean", .description = "If true, run with no timeout for the session lifetime" },
+};
+
 pub const registry: []const ToolEntry = &.{
     .{
         .name = "Read",
@@ -777,10 +784,12 @@ pub fn toToolDefinitionsFull(
         if (tool.tinykg_gated and !tinykg_on) continue;
         if (!tool.previewAllowed(preview)) continue;
         if (std.mem.eql(u8, tool.name, "ToolSearch") and !has_deferred) continue;
+        const monitor_events = preview.monitor_events and std.mem.eql(u8, tool.name, "Monitor");
         const desc: []const u8 = blk: {
             // env override(slot "TOOL_DESC_<UPPER_NAME>")优先于 describe_fn / 静态描述。
             // 用于提示词 A/B 实验:同一二进制按 env 切换工具描述,无需重编译。
             if (overrideToolDesc(allocator, tool.name)) |ov| break :blk ov;
+            if (monitor_events) break :blk monitor_tool.EVENTS_DESCRIPTION;
             if (prompt_ctx) |pc| {
                 if (tool.describe_fn) |df| break :blk try df(allocator, pc);
             }
@@ -788,6 +797,8 @@ pub fn toToolDefinitionsFull(
         };
         const prop_specs = if (!tinykg_on and std.mem.eql(u8, tool.name, "TaskUpdate"))
             SESSION_TASK_UPDATE_PROPS
+        else if (monitor_events)
+            MONITOR_EVENTS_PROP_SPECS
         else
             tool.input_schema.prop_specs;
         try defs.append(allocator, .{
@@ -844,6 +855,10 @@ pub fn redescribeForContext(
                     t.input_schema.prop_specs
                 else
                     SESSION_TASK_UPDATE_PROPS;
+            }
+            if (prompt_ctx.preview.monitor_events and std.mem.eql(u8, d.name, "Monitor")) {
+                d.description = monitor_tool.EVENTS_DESCRIPTION;
+                d.input_schema.prop_specs = MONITOR_EVENTS_PROP_SPECS;
             }
             if (t.describe_fn) |df| {
                 d.description = try df(allocator, prompt_ctx);
@@ -1361,6 +1376,48 @@ test "toToolDefinitions includes ToolSearch when native formal audit is deferred
     }
     try std.testing.expect(found_ws);
     try std.testing.expect(found_tool_search);
+}
+
+fn monitorDefinition(defs: []const json.ToolDefinition) !json.ToolDefinition {
+    for (defs) |d| if (std.mem.eql(u8, d.name, "Monitor")) return d;
+    return error.MonitorNotAdvertised;
+}
+
+test "Monitor schema and description stay byte-identical unless monitor_events is enabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const legacy_description = "Start a background monitor that runs a command and streams stdout line-by-line. Its exit is announced to you automatically. Use to watch logs, poll status, or react to file changes mid-conversation. Each stdout line is collected into a ring buffer readable via BashOutput(job_id, until=\"output\") as lines arrive; a plain BashOutput waits up to wait_ms for the monitor to exit. Stop with KillShell(job_id). Args: command (required), description (required, e.g. 'errors in /var/log/app.log'). Optional: persistent (default false; if true, no timeout).";
+    const legacy_props = [_][3][]const u8{
+        .{ "command", "string", "Shell command to run; each stdout line becomes an event" },
+        .{ "description", "string", "Short description of what is being monitored" },
+        .{ "persistent", "boolean", "If true, run with no timeout for the session lifetime" },
+    };
+    const others = @import("preview.zig").Features.all.with(.monitor_events, false);
+    for ([_]@import("preview.zig").Features{ .none, others }) |preview| {
+        const pc = PromptContext{ .preview = preview };
+        const defs = try toToolDefinitionsFull(a, null, &pc);
+        const monitor = try monitorDefinition(defs);
+        try std.testing.expectEqualStrings(legacy_description, monitor.description);
+        const props = monitor.input_schema.prop_specs.?;
+        try std.testing.expectEqual(legacy_props.len, props.len);
+        for (legacy_props, props) |expected, actual| {
+            try std.testing.expectEqualStrings(expected[0], actual.name);
+            try std.testing.expectEqualStrings(expected[1], actual.type);
+            try std.testing.expectEqualStrings(expected[2], actual.description);
+        }
+        try std.testing.expectEqualDeep(@as(?[]const []const u8, &.{ "command", "description" }), monitor.input_schema.required);
+    }
+
+    const pc = PromptContext{ .preview = .{ .monitor_events = true } };
+    const defs = try toToolDefinitionsFull(a, null, &pc);
+    const monitor = try monitorDefinition(defs);
+    try std.testing.expectEqualStrings(monitor_tool.EVENTS_DESCRIPTION, monitor.description);
+    var has_timeout = false;
+    for (monitor.input_schema.prop_specs.?) |prop| {
+        if (std.mem.eql(u8, prop.name, "timeout_ms")) has_timeout = true;
+    }
+    try std.testing.expect(has_timeout);
 }
 
 test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-tool web_search)" {

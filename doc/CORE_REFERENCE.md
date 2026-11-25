@@ -62,7 +62,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 |----|------------------------------------|------------------|
 | `base` | `util/` · `platform/` · `symbols/` · `highlight/` · `code/` · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
 | `ai` | `api/`(`model_name` 除外) · `provider/` · `client` · `types` · `json` · `preview` · `core/` 里的 `auth` · `recorder` · `context_pressure` | base |
-| `kernel` | `core/` 里的 `conversation` · `message` · `session_id` · `result_budget` | base、ai |
+| `kernel` | `core/` 里的 `conversation` · `message` · `session_id` · `result_budget`,以及最小内核 `kernel/`(入口 `core/kernel.zig`:循环、钩子、工具接口、顺序/并行执行器,还没有调用方) | base、ai |
 | `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `protocol/` 里 `PermissionContext` 的字段用到的 `ui_event` · `ui_request` · `permission_choice`,以及 `ui_event` 载荷用到的 `goal` · `output_semantics` · `core/` 里 `CoreEvent` 载荷的类型 `file_change` · `tools/` 里的 `common` · `observation`(含 `FileReference`、`Locator` 等纯数据类型) · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
 | `coding` | `core/` 其余文件(含 `agent_loop` · `tool_exec` · `protocol/` 其余文件) · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `sandbox/filesystem` · `formal/task_audit` · `api/model_name_consumers_test` | 以上各包 |
 | `session` | `core/agent_session` · `core/session_host` | 以上各包 |
@@ -147,6 +147,15 @@ coding;kernel 只留按位置改写工具结果的 `clearToolResultLocked`(换�
 `tool_exec`(`tool_exec.Collector`),`file_change` 其余部分改归 `guard`。纯类型不另开新文件,因为新文件的 import 会算作新增的深层
 import;放进 `file_reference` 原本就 import 的 `tools/observation`,用的都是基线里已有的边。越层 import 3 → 0,包间环 1 → 0,
 深层 import 1815(新增的 11 条都是基线代码里同一个包内已有的 import),kernel 2775 行,依赖 base、ai。
+
+迁移 3.2a 在 kernel 里新增最小内核 `core/kernel/`,入口是 `core/kernel.zig`,对应 pi 的 `packages/agent/src/{agent-loop,types}.ts`。
+`kernel.run` 流式请求 → 收集 tool call → 按批执行 → 把结果写回 `Conversation` → 继续,直到模型不再调用工具(`completed`)、
+`max_turns`、中止(`aborted`)、钩子要求停止(`stopped`)或出错(`failed`)。模型调用只经 `ai.Provider.sendStream`(调用方注入,
+对应 pi 的 `StreamFn`)。钩子(`prepare_request` 改请求、`before_tool` 放行/改写/拒绝、`after_tool` 改结果、`finish_turn`
+继续/停止、`event`)按调用方给的顺序执行,`event` 之外都在循环线程上执行,`event` 加锁串行。工具带名字、schema、
+`execute` 和执行方式:连续的 `parallel` 工具成一批并发执行,`sequential` 工具单独一批;每次执行有自己的 arena,
+结果先复制进对话,再释放 arena;中止后还没执行的调用记为错误结果,对话里每个 tool_use 都有对应结果。还没有调用方,
+3.2b 起 `agent_loop` 按能力逐项改为调用它。base 和 ai 经各自的 root(`src/base.zig`、`src/ai.zig`)访问,不新增深层 import。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。

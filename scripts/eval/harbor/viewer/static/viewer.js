@@ -22,8 +22,8 @@ function timeTitle(r) {
 const REFRESH_S = 10;
 
 const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, live: false,
-  jobFilter: 'all', jobSearch: '', suite: null, category: 'all', sort: { key: 'task', dir: 1 }, selected: new Set(),
-  scope: null, suitePick: null, profileSuite: 'all', taskFilter: 'all', taskSearch: '', boardModel: {}, boardExpanded: {} };
+  jobFilter: 'all', jobSearch: '', suite: null, comparisons: new Map(), sort: { key: 'task', dir: 1 }, selected: new Set(),
+  suitePick: null, profileSuite: 'all', taskFilter: 'all', taskSearch: '', boardModel: {}, boardExpanded: {} };
 
 // ------------------------------------------------------------ DOM helpers
 function h(tag, props, ...children) {
@@ -134,11 +134,12 @@ function setConnection(ok, message) {
 function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   if (parts[0] === 'new') return { view: 'new' };
-  if (parts[0] === 'settings') return { view: 'settings' };
-  if (parts[0] === 'providers') return { view: 'providers' };
+  if (parts[0] === 'settings') return { view: 'settings', tab: parts[1] || 'database' };
+  if (parts[0] === 'providers') return { view: 'settings', tab: 'providers' };
   if (parts[0] === 'monitor') return { view: 'monitor', executor: parts[1] || null };
   if (parts[0] === 'run' && parts[1]) return { view: 'run', name: parts[1] };
   if (parts[0] === 'profile' && parts[1] && parts[2] === 'task' && parts[3] && parts[4]) return { view: 'task', profile: parts[1], job: parts[3], task: parts[4], trial: parts[5] || null };
+  if (parts[0] === 'profile' && parts[2] === 'compare' && parts[3]) return { view: 'compare', profile: parts[1], jobs: parts[3].split(',') };
   if (parts[0] === 'profile' && parts[1]) return { view: 'profile', profile: parts[1] };
   if (parts[0] === 'job' && parts[1] && parts[2]) return { view: 'trial', job: parts[1], trial: parts[2] };
   if (parts[0] === 'job' && parts[1]) return { view: 'job', job: parts[1] };
@@ -159,12 +160,13 @@ async function render() {
   if (state.busy) return;
   state.busy = true;
   state.editing = false;
+  const hash = location.hash;
   const r = route();
   try {
+    $('.header-actions a.primary').hidden = true;
     let node;
     if (r.view === 'new') node = await renderNewRun();
-    else if (r.view === 'settings') node = await renderSettings();
-    else if (r.view === 'providers') node = await renderProviders();
+    else if (r.view === 'settings') node = await renderSettings(r.tab);
     else if (r.view === 'monitor') node = await renderMonitor(r.executor);
     else if (r.view === 'run') node = await renderRun(r.name);
     else if (r.view === 'overview') node = await renderOverview();
@@ -173,7 +175,7 @@ async function render() {
     else if (r.view === 'job') node = await renderJob(r.job);
     else if (r.view === 'trial') node = await renderTrial(r.job, r.trial);
     else if (r.view === 'leaderboard') node = await renderLeaderboard(r.suite);
-    else node = await renderCompare(r.jobs);
+    else node = await renderCompare(r.jobs, r.profile);
     // Keep open <details> and scroll position across a live refresh.
     const open = new Set([...document.querySelectorAll('#app details[open]')].map((d) => d.dataset.key));
     $('#app').replaceChildren(node);
@@ -184,6 +186,7 @@ async function render() {
     setConnection(false, '读取失败：' + e.message + '（保留上一次的数据）');
   } finally {
     state.busy = false;
+    if (hash !== location.hash) render();
   }
 }
 
@@ -240,23 +243,22 @@ function runAgain(b, onlyInvalid) {
   location.hash = '#/new';
 }
 async function deleteProfile(b, button) {
-  if (!confirm(`删除评测配置 ${profileName(b)}？它的所有运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
+  if (!confirm(`删除Profile ${profileName(b)}？它的所有运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
   button.disabled = true;
   try { await api('/api/profile/delete', { id: b.id }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return false; }
-  if (state.scope === b.id) state.scope = null;
+  state.selected.delete(b.id);
   return true;
 }
 async function deleteJob(j, button) {
-  if (!confirm(`删除作业 ${j.name}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
+  if (!confirm(`删除评测结果 ${j.name}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
   button.disabled = true;
   try { await api('/api/job/delete', { name: j.name }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return; }
-  state.selected.delete(j.name);
   render();
 }
 async function stopProfile(b, button) {
-  if (!confirm(`停止评测配置 ${profileName(b)} 的队列？正在运行的评测集会被取消，还没开始的评测集不再运行。`)) return;
+  if (!confirm(`停止Profile ${profileName(b)} 的队列？正在运行的评测集会被取消，还没开始的评测集不再运行。`)) return;
   button.disabled = true;
   try { await api('/api/profile/cancel', { id: b.id }); state.countdown = 1; }
   catch (error) { button.disabled = false; setConnection(false, error.message); }
@@ -278,117 +280,123 @@ function itemActions(b, index) {
       const button = event.currentTarget;
       if (ITEM_ACTIONS[name].ask && !confirm(ITEM_ACTIONS[name].ask)) return;
       button.disabled = true;
-      try { await api('/api/profile/item', { id: b.id, index, action: name }); state.countdown = 1; }
+      try { await api('/api/profile/item', { id: b.id, index, action: name }); await render(); }
       catch (error) { button.disabled = false; setConnection(false, error.message); }
     } }, ITEM_ACTIONS[name].label));
 }
-function profileActions(b, compact) {
+function profileActions(b) {
   const keep = (handler) => (event) => { event.stopPropagation(); handler(event.currentTarget); };
   return [
-    h('button', { type: 'button', class: 'button', title: '在这个评测配置上再运行，题目和参数按上次填好', onclick: keep(() => runAgain(b, false)) }, compact ? '运行' : '再次运行'),
     b.tasks && b.tasks.some((t) => t.model === runModel(b) && hasInvalid(t))
       ? h('button', { type: 'button', class: 'button', title: '只选最新结果里有无效尝试的题（网络波动、环境故障等导致）', onclick: keep(() => runAgain(b, true)) }, '重跑无效的题') : null,
     profileActive(b)
-      ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, compact ? '停止' : '停止队列')
+      ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, '停止队列')
       : h('button', { type: 'button', class: 'button', onclick: keep(async (button) => {
         if (!await deleteProfile(b, button)) return;
         if (route().view === 'overview') render(); else location.hash = '#/';
-      }) }, compact ? '删除' : '删除评测配置'),
+      }) }, '删除 Profile'),
   ];
 }
 function progressText(b) {
   return b.progress ? `${b.progress.done} / ${b.progress.planned} trial` : '—';
 }
 
+function groupedItems(b) {
+  const groups = new Map();
+  b.items.forEach((item, index) => {
+    if (!groups.has(item.submission)) groups.set(item.submission, []);
+    groups.get(item.submission).push({ item, index });
+  });
+  return [...groups].map(([id, entries], index) => ({ id, entries, label: '作业 ' + (index + 1) })).reverse();
+}
+
+function comparisonPicker(profiles, crossProfile) {
+  const bySuite = new Map();
+  for (const profile of profiles) {
+    for (const group of groupedItems(profile)) {
+      for (const { item } of group.entries) {
+        if (!item.job) continue;
+        if (!bySuite.has(item.suite)) bySuite.set(item.suite, []);
+        bySuite.get(item.suite).push({ run: item.job.name, suite: item.suite_name || item.suite,
+          owner: crossProfile ? profile.id : group.id,
+          label: [crossProfile ? profileName(profile) : null, group.label, item.model, item.run].filter(Boolean).join(' · ') });
+      }
+    }
+  }
+  const choices = [...bySuite].filter(([, entries]) => new Set(entries.map((e) => e.owner)).size > 1);
+  if (!choices.length) return h('p', { class: 'muted', text: '需要两个' + (crossProfile ? ' Profile' : '作业') + '都有同一评测集的结果。' });
+  const key = profiles.map((p) => p.id).join(',');
+  const picked = state.comparisons.get(key) || {};
+  const suite = h('select', { 'aria-label': '对比评测集' }, choices.map(([id, entries]) =>
+    h('option', { value: id, selected: id === picked.suite }, entries[0].suite)));
+  const left = h('select', { 'aria-label': '第一份结果' });
+  const right = h('select', { 'aria-label': '第二份结果' });
+  const compare = h('a', { class: 'button', text: '逐题对比' });
+  const options = (entries, selected) => entries.map((e) => h('option', { value: e.run, selected: e.run === selected }, e.label));
+  function selectPair() {
+    const entries = bySuite.get(suite.value);
+    const first = entries.find((e) => e.run === left.value);
+    right.replaceChildren(...options(entries.filter((e) => e.owner !== first.owner), picked.right));
+    updateLink();
+  }
+  function updateLink() {
+    Object.assign(picked, { suite: suite.value, left: left.value, right: right.value });
+    state.comparisons.set(key, picked);
+    const prefix = crossProfile ? '#/compare/' : profileHref(profiles[0]) + '/compare/';
+    compare.href = prefix + [left.value, right.value].map(encodeURIComponent).join(',');
+  }
+  function selectSuite() {
+    left.replaceChildren(...options(bySuite.get(suite.value), picked.left));
+    selectPair();
+  }
+  suite.onchange = selectSuite;
+  left.onchange = selectPair;
+  right.onchange = updateLink;
+  selectSuite();
+  return h('div', { class: 'compare-picker' },
+    h('label', { class: 'field' }, '评测集', suite), h('label', { class: 'field' }, '第一份结果', left),
+    h('label', { class: 'field' }, '第二份结果', right), compare);
+}
+
 async function renderOverview() {
   navCurrent('overview');
-  $('#title').textContent = 'Bench 看板';
-  let body = await api('/api/jobs?profile=' + encodeURIComponent(state.scope || 'all'));
-  if (!state.scope) {
-    state.scope = body.profiles.length ? body.profiles[0].id : 'all';
-    if (state.scope !== 'all') body = await api('/api/jobs?profile=' + encodeURIComponent(state.scope));
-  }
-  const { jobs, runs = [], summary, profiles = [] } = body;
-  if (state.scope !== 'all' && !profiles.some((b) => b.id === state.scope)) {
-    state.scope = 'all';
-    return renderOverview();
-  }
-  const current = profiles.find((b) => b.id === state.scope);
-  crumbs([{ text: current ? '评测配置 ' + profileName(current) : '所有作业' }]);
-  state.live = jobs.some((j) => j.running) || profiles.some(profileActive) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
-
-  const select = h('select', { 'aria-label': '按评测配置查看', onchange: () => { state.scope = select.value; state.selected.clear(); render(); } },
-    profiles.map((b) => h('option', { value: b.id, selected: b.id === state.scope }, `${profileName(b)} · ${b.metacodes?.label || '—'} · ${PROFILE_STATUS[b.status] || b.status}`)),
-    h('option', { value: 'all', selected: state.scope === 'all' }, `全部作业（${body.job_total}）`));
-  const scopeBar = h('div', { class: 'scope' }, h('b', { text: '数据范围' }), select,
-    current ? h('span', { class: 'meta', text: `metacodes ${current.metacodes?.label || '—'} · 高级功能 ${featuresText(current)} · ${current.suites.length} 个评测集 · ${PROFILE_STATUS[current.status] || current.status}` }) : null,
-    current ? link(profileHref(current), '查看评测配置 →') : null);
-
-  const all = { trials: 0, running: 0, invalid: 0 };
-  for (const j of jobs) { all.trials += j.summary.trials; all.running += j.summary.counts.running; all.invalid += j.summary.counts.invalid; }
-  const metrics = h('section', { class: 'metrics' }, measurementCards(summary),
-    metric('作业', String(jobs.length), jobs.filter((j) => j.running).length + ' 个运行中'),
-    metric('trial', String(all.trials), all.running + ' 个运行中'),
-    metric('无效', String(all.invalid)));
-
-  const profileRows = profiles.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = profileHref(b); } },
-    h('td', {}, h('a', { href: profileHref(b), onclick: (e) => e.stopPropagation(), text: profileName(b) }), h('span', { class: 'sub mono', text: b.name ? b.id : when(b.created_at) })),
-    h('td', {}, h('span', { class: 'mono', text: b.metacodes?.label || '—' }), h('span', { class: 'sub mono', text: [b.metacodes?.digest ? '冻结 ' + b.metacodes.digest : null, '高级功能 ' + featuresText(b)].filter(Boolean).join(' · ') })),
-    h('td', { text: b.models.join('、') || '—' }),
-    h('td', {}, h('span', { text: [...new Map(b.items.map((i) => [i.suite, i.suite_name || i.suite])).values()].join('、') }), h('span', { class: 'sub', text: `${b.items.length} 次运行` })),
-    h('td', {}, h('span', { text: PROFILE_STATUS[b.status] || b.status }), h('span', { class: 'sub', text: progressText(b) })),
-    h('td', {}, outcomeBar(b.summary.counts, b.summary.trials || 0)),
-    h('td', { class: 'num', text: pct(b.summary.first_pass_rate) }),
-    h('td', { class: 'num', text: compact(b.summary.total_tokens) }),
-    h('td', { class: 'num', text: when(b.last_run_at) }),
-    body.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, profileActions(b, true))) : null));
-  const profileHeads = ['评测配置', 'metacodes 版本', '模型', '评测集', '状态', '结局分布（最新结果）', '首次满分率', '总 Token', '最近运行', ...(body.can_run ? ['操作'] : [])];
-  const profilePanel = panel('评测配置', `${profiles.length} 个`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, profileHeads.map((t, i) => h('th', { class: i >= 6 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
-    h('tbody', {}, profileRows.length ? profileRows : h('tr', {}, h('td', { colspan: profileHeads.length, class: 'empty' }, '还没有评测配置 · ', link('#/new', '发起评测')))))),
-  h('a', { class: 'button', href: '#/new', text: '发起评测' }));
-
-  const compareBtn = h('button', { class: 'button primary', type: 'button', disabled: state.selected.size < 2 || null,
-    onclick: () => { location.hash = '#/compare/' + [...state.selected].map(encodeURIComponent).join(','); } }, `对比所选 (${state.selected.size})`);
-  const present = new Map();
-  for (const j of jobs) present.set(j.category || 'none', j.category_name || '未分类');
-  if (state.category !== 'all' && !present.has(state.category)) state.category = 'all';
-  const filter = present.size > 1 || state.category !== 'all' ? h('div', { class: 'chips', role: 'group', 'aria-label': '按类别筛选' },
-    [['all', '全部类别'], ...present].map(([id, name]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String(state.category === id),
-      onclick: () => { state.category = id; render(); } }, name))) : null;
-  const visible = state.category === 'all' ? jobs : jobs.filter((j) => (j.category || 'none') === state.category);
-  const rows = visible.map((j) => {
-    const s = j.summary;
-    const done = s.trials - s.counts.running;
-    const box = h('input', { type: 'checkbox', 'aria-label': '选择 ' + j.name, onclick: (e) => e.stopPropagation(),
-      onchange: (e) => { e.target.checked ? state.selected.add(j.name) : state.selected.delete(j.name); compareBtn.disabled = state.selected.size < 2; compareBtn.textContent = `对比所选 (${state.selected.size})`; } });
-    box.checked = state.selected.has(j.name);
-    return h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
-      h('td', {}, box),
-      h('td', { class: 'wrap' }, h('span', { class: 'name', text: j.name }), h('span', { class: 'model', text: j.model || '—' }), h('span', { class: 'sub', text: [j.category_name, j.suite_name || j.dataset, j.metacodes?.label ? 'metacodes ' + j.metacodes.label : null].filter(Boolean).join(' · ') + (j.running ? ' · 运行中' : '') })),
-      h('td', {}, h('span', { class: 'num', text: `${done} / ${j.planned}` }), h('div', { class: 'track' }, h('span', { width: (j.planned ? 100 * done / j.planned : 0) + '%' }))),
-      h('td', {}, outcomeBar(s.counts, s.trials)),
-      h('td', { class: 'num', text: pct(s.first_pass_rate) }, h('span', { class: 'sub', text: `${s.first_passed}/${s.first_valid} 首次有效 · 无效 ${s.counts.invalid}` })),
-      h('td', { class: 'num', text: compact(s.total_tokens) }, h('span', { class: 'sub', text: `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)} · 初始 ${compact(s.initial_input_tokens_mean)}` })),
-      h('td', { class: 'num', text: tps(s.tps) }, h('span', { class: 'sub', text: 'TTFT ' + ttft(s.ttft_ms) })),
-      h('td', { class: 'num', text: usd(s.cost_usd) }),
-      h('td', { class: 'num', text: when(j.started_at) }, h('span', { class: 'sub', text: '用时 ' + dur(j.wall_s) })),
-      body.can_run ? h('td', { class: 'pinned' }, j.running ? null : h('button', { type: 'button', class: 'button',
-        onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除')) : null);
-  });
-  const jobHeads = ['', '作业 / 模型', '进度', '结局分布', '首次满分率', '任务总 Token', 'TPS', '估算成本', '开始', ...(body.can_run ? ['操作'] : [])];
-  const table = h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, jobHeads.map((t, i) => h('th', { class: i >= 4 && i <= 8 ? 'num' : i === 9 ? 'pinned' : null, text: t })))),
-    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: jobHeads.length, class: 'empty', text: jobs.length ? '该类别下没有作业' : '这个范围内还没有作业' })))));
-  const loose = runs.filter((r) => !r.profile && !r.batch);
-  const launches = state.scope !== 'all' || !loose.length ? null : panel('早期单独发起的评测', `${loose.length} 次`,
-    h('div', { class: 'launches' }, loose.map((r) => h('a', { class: 'launch', href: '#/run/' + r.name },
-      h('b', { text: r.name }), h('span', { class: 'muted', text: [r.suite_name, r.model].filter(Boolean).join(' · ') }),
-      h('span', { text: RUN_STATUS[r.status] || r.status })))));
-  const jobsTitle = current ? '这个评测配置的作业（每次运行的每个评测集一个）' : '作业';
-  return h('div', {}, profilePanel, scopeBar, metrics,
-    panel(jobsTitle, state.category === 'all' ? `${jobs.length} 个` : `${visible.length} / ${jobs.length} 个`, h('div', {}, filter, table), compareBtn),
-    compositionPanel(summary, current ? '本评测配置所有作业均值' : '均值'), launches);
+  $('#title').textContent = 'Profiles';
+  crumbs([]);
+  const { profiles, jobs, runs, can_run: canRun } = await api('/api/jobs');
+  state.live = profiles.some(profileActive) || jobs.some((j) => j.running) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
+  $('.header-actions a.primary').hidden = !canRun;
+  const chosen = profiles.filter((p) => state.selected.has(p.id));
+  const rows = profiles.map((p) => h('tr', {},
+    h('td', {}, h('input', { type: 'checkbox', checked: state.selected.has(p.id), 'aria-label': '对比 ' + profileName(p),
+      onchange: (e) => { if (e.target.checked) state.selected.add(p.id); else state.selected.delete(p.id); render(); } })),
+    h('td', {}, link(profileHref(p), profileName(p)), h('small', { class: 'sub', text: p.models.join('、') })),
+    h('td', { class: 'mono', text: p.metacodes?.label || '—' }),
+    h('td', { text: groupedItems(p).length }), h('td', { text: PROFILE_STATUS[p.status] || p.status }),
+    h('td', { class: 'num', text: pct(p.summary.first_pass_rate) }),
+    h('td', { class: 'num', text: when(p.last_run_at) })));
+  const table = (heads, rows) => h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, heads.map((head) => h('th', { text: head })))), h('tbody', {}, rows)));
+  const listing = panel('Profile 列表', profiles.length + ' 个', profiles.length
+    ? table(['对比', 'Profile / 模型', 'MetaCodes 版本', '作业数', '状态', '首轮满分率', '最近运行'], rows)
+    : h('div', { class: 'empty' }, '还没有 Profile。', canRun ? link('#/new', '创建首个作业') : null));
+  const comparison = chosen.length < 2 ? null : panel('Profile 对比', '各 Profile 的最新结果', h('div', {},
+    table(['Profile', '一次性完成率', '首轮满分率', '至少通过一次', '初始 Token', '每题平均成本', '每次通过成本', '通过 trial', '缓存命中率'],
+      chosen.map((p) => h('tr', {}, [profileName(p), pct(p.summary.one_shot_pass_rate), pct(p.summary.first_pass_rate),
+        pct(p.summary.solved_rate), compact(p.summary.initial_input_tokens_mean), usd(p.summary.cost_per_task),
+        usd(p.summary.cost_per_pass), int(p.summary.counts.pass), pct(p.summary.cache_hit_rate)].map((v) => h('td', { text: v }))))),
+    h('div', { class: 'panel-body' }, comparisonPicker(chosen, true))));
+  const owned = new Set(profiles.flatMap((p) => p.items.map((i) => i.run)));
+  const localRuns = new Set(runs.map((r) => r.name));
+  const loose = jobs.filter((j) => !owned.has(j.name));
+  const receipts = runs.filter((r) => !owned.has(r.name) && !jobs.some((j) => j.name === r.name));
+  const legacy = loose.length || receipts.length ? panel('独立评测记录', null, table(['评测', '模型', '评测集', ''], [
+    ...loose.map((j) => h('tr', {}, h('td', {}, link((localRuns.has(j.name) ? '#/run/' : '#/job/') + encodeURIComponent(j.name), j.name)),
+      h('td', { text: j.model }), h('td', { text: j.suite_name || j.dataset }), h('td', {}, canRun && !j.running ?
+        h('button', { class: 'button', onclick: (e) => deleteJob(j, e.currentTarget) }, '删除') : null))),
+    ...receipts.map((r) => h('tr', {}, h('td', {}, link('#/run/' + encodeURIComponent(r.name), r.name)),
+      h('td', { text: r.model }), h('td', { text: r.suite_name }), h('td', { text: RUN_STATUS[r.status] || r.status }))),
+  ])) : null;
+  return h('div', {}, listing, comparison, legacy);
 }
 
 // ------------------------------------------------------------ profile
@@ -397,15 +405,21 @@ async function renderProfile(id) {
   const b = await api('/api/profile?id=' + encodeURIComponent(id));
   state.live = profileActive(b);
   $('#title').textContent = profileName(b);
-  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + profileName(b) }]);
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: 'MetaCodes ' + (b.metacodes?.label || '—') }]);
   const s = b.summary;
-  const metrics = h('section', { class: 'metrics' }, measurementCards(s),
-    metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
-    metric('运行', String(b.items.length), b.items.filter((i) => i.status === 'finished').length + ' 个完成'),
-    metric('无效', String(s.counts.invalid)),
-    s.budget_exhausted ? metric('预算用完', String(s.budget_exhausted), 'teamwork 用完上限后停下的尝试，按判分结果计入') : null);
+  const metrics = h('section', { class: 'profile-metrics', 'aria-label': '各题最新结果' },
+    metric('一次性完成率', pct(s.one_shot_pass_rate), int(s.counts.pass) + ' 通过 / ' + int(s.valid) + ' 有效', true),
+    metric('首轮满分率', pct(s.first_pass_rate), int(s.first_passed) + ' / ' + int(s.first_valid) + ' 道首次有效'),
+    metric('至少通过一次', pct(s.solved_rate), int(s.tasks_solved) + ' / ' + int(s.tasks_attempted) + ' 道'),
+    metric('通过 trial', int(s.counts.pass), int(s.trials) + ' 次尝试'),
+    metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), int(s.initial_token_trials) + ' 次有记录'),
+    metric('每题平均成本', usd(s.cost_per_task), int(s.task_cost_tasks) + ' 道有价格'),
+    metric('每次通过成本', usd(s.cost_per_pass)), metric('缓存命中率', pct(s.cache_hit_rate)));
+  const diagnostics = h('details', { class: 'panel', 'data-key': 'profile-metrics' }, h('summary', { text: '完整指标' }),
+    h('div', { class: 'metrics' }, measurementCards(s), metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
+      metric('无效', int(s.counts.invalid)), s.budget_exhausted ? metric('预算用完', int(s.budget_exhausted)) : null));
 
-  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.default_name || b.id, 'aria-label': '评测配置名称' });
+  const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.default_name || b.id, 'aria-label': 'Profile名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
   const closeRename = () => { state.editing = false; renameForm.hidden = true; nameRow.hidden = false; };
   const renameForm = h('form', { class: 'rename', hidden: true },
@@ -440,36 +454,45 @@ async function renderProfile(id) {
 
   const itemRow = (item, index) => {
     const j = item.job; const js = j?.summary;
-    return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
-      h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
+    const href = item.local_run ? '#/run/' + encodeURIComponent(item.run) : j ? '#/job/' + encodeURIComponent(j.name) : null;
+    return h('tr', { class: href ? 'link' : null, onclick: href ? () => { location.hash = href; } : null },
+      h('td', {}, href ? link(href, item.suite_name || item.suite) : h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
         item.concurrency ? `并发 ${item.concurrency}` : null,
         item.auto_rerun ? `自动重跑无效的题 第 ${item.auto_rerun} 轮` : null,
         skippedFeatures(b, item).length ? `本次未开启 ${skippedFeatures(b, item).join(', ')}` : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
-      h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null,
+      h('td', {}, h('span', { text: item.status === 'running' && item.cancel_requested ? '正在停止' : ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null,
         item.auto_rerun_error ? h('span', { class: 'sub flag', text: item.auto_rerun_error }) : null),
       h('td', { class: 'num', text: js ? `${js.trials - js.counts.running} / ${j.planned}` : `0 / ${item.tasks.length * (item.attempts || 1)}` }),
       h('td', {}, js ? outcomeBar(js.counts, js.trials) : dash()),
       h('td', { class: 'num', text: js ? pct(js.first_pass_rate) : '—' }),
       h('td', { class: 'num', text: js ? compact(js.total_tokens) : '—' }),
       h('td', { class: 'num', text: j ? dur(j.wall_s) : '—' }),
-      h('td', { class: 'num', text: when(item.queued_at) }),
-      h('td', { class: 'mono', text: item.run || '—' }),
-      b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index))) : null);
-  };
-  const itemHeads = ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', '排队', '作业', ...(b.can_run ? ['操作'] : [])];
-  const itemTable = (rows, empty) => h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, itemHeads.map((t, i) => h('th', { class: [3, 5, 6, 7, 8].includes(i) ? 'num' : i === 10 ? 'pinned' : null, text: t })))),
-    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: itemHeads.length, class: 'empty', text: empty })))));
-  const indexed = b.items.map((item, index) => [item, index]).reverse();
-  const live = indexed.filter(([item]) => ['pending', 'running'].includes(item.status));
-  const ended = indexed.filter(([item]) => !['pending', 'running'].includes(item.status));
-  const running = live.filter(([item]) => item.status === 'running').length;
-  const items = panel('正在运行的任务', `${running} 个运行中 · ${live.length - running} 个等待`,
-    itemTable(live.reverse().map(([item, index]) => itemRow(item, index)), '没有正在运行或等待的评测集'));
-  const endedItems = ended.length ? panel('已结束的任务', `${ended.length} 个`,
-    itemTable(ended.map(([item, index]) => itemRow(item, index)), '')) : null;
 
+      b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index), j && !j.running && item.status !== 'running' ? h('button', { class: 'button', onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除结果') : null)) : null);
+  };
+  const itemHeads = ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', ...(b.can_run ? ['操作'] : [])];
+  const itemTable = (rows, empty) => h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, itemHeads.map((t, i) => h('th', { class: [3, 5, 6, 7].includes(i) ? 'num' : i === 8 ? 'pinned' : null, text: t })))),
+    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: itemHeads.length, class: 'empty', text: empty })))));
+  const groups = groupedItems(b);
+  const submissions = panel('作业', groups.length + ' 个', h('div', {}, groups.map((group) => {
+    const active = group.entries.some(({ item }) => ['pending', 'running'].includes(item.status));
+    const action = active ? 'cancel' : 'run';
+    const button = b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
+      if (active && !confirm('取消' + group.label + '里的所有等待中和运行中评测？')) return;
+      const control = event.currentTarget;
+      control.disabled = true;
+      try {
+        await api('/api/profile/submission', { id: b.id, submission: group.id, action });
+        await render();
+      } catch (error) { control.disabled = false; setConnection(false, error.message); }
+    } }, active ? '取消作业' : '重新运行作业') : null;
+    const first = group.entries[0].item;
+    return h('article', { class: 'submission' }, h('div', { class: 'panel-heading' },
+      h('h3', {}, group.label, h('small', { class: 'muted', text: [when(first.queued_at), first.executor, group.entries.length + ' 项评测'].filter(Boolean).join(' · ') })),
+      button), itemTable(group.entries.map(({ item, index }) => itemRow(item, index)), ''));
+  })), b.can_run ? h('button', { class: 'button primary', onclick: () => runAgain(b, false) }, '创建作业') : null);
   // Per task: each (suite, model, task)'s latest attempts in order.
   const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
   if (state.profileSuite && !suitesPresent.some(([id]) => id === state.profileSuite)) state.profileSuite = 'all';
@@ -513,7 +536,11 @@ async function renderProfile(id) {
   const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, endedItems, tasks, compositionPanel(s, '最新结果均值'));
+  const settings = h('details', { class: 'panel', 'data-key': 'profile-settings-' + b.id },
+    h('summary', {}, 'Profile 设置', h('span', { class: 'muted', text: '并发 ' + b.concurrency })), info,
+    b.can_run ? h('div', { class: 'panel-body row-actions' }, profileActions(b)) : null);
+  return h('div', {}, metrics, settings, submissions, panel('作业对比', '同一评测集', h('div', { class: 'panel-body' }, comparisonPicker([b], false))),
+    modelsPanel(b), diagnostics, tasks, compositionPanel(s, '最新结果均值'));
 }
 
 // The profile's concurrency, the only place it is set: every dataset
@@ -525,7 +552,7 @@ function concurrencyControl(b) {
     onblur: () => { if (input.value === String(b.concurrency ?? '')) state.editing = false; } });
   const feedback = h('span', { class: 'muted', role: 'status', text: profileActive(b)
     ? '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中和之后运行的评测集也按新值运行'
-    : '之后在这个评测配置上运行的评测集都按这个并发运行' });
+    : '之后在这个Profile上运行的评测集都按这个并发运行' });
   const form = h('form', { class: 'rename' }, input, h('button', { type: 'submit', class: 'button primary' }, '应用'), feedback);
   form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { state.editing = false; render(); } });
   form.addEventListener('submit', async (event) => {
@@ -590,10 +617,10 @@ async function renderProfileTask(profileId, jobName, taskName, trialName) {
   const ordered = b.tasks.filter((t) => t.job);
   const index = ordered.findIndex((t) => t.job === jobName && t.task === taskName);
   const group = ordered[index] || await historyGroup(b, jobName, taskName);
-  if (!group) throw new Error('评测配置中没有这个任务');
+  if (!group) throw new Error('Profile中没有这个任务');
   const chosen = group.attempts.find((a) => a.trial === trialName) || group.attempts[0];
   $('#title').textContent = taskName;
-  crumbs([{ text: '看板', href: '#/' }, { text: '评测配置 ' + profileName(b), href: profileHref(b) },
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: 'Profile ' + profileName(b), href: profileHref(b) },
     { text: group.suite_name || group.suite }, { text: taskName }]);
   const taskHref = (t) => `#/profile/${encodeURIComponent(b.id)}/task/${encodeURIComponent(t.job)}/${encodeURIComponent(t.task)}`;
   const prev = index >= 0 ? ordered[index - 1] : null; const next = index >= 0 ? ordered[index + 1] : null;
@@ -651,9 +678,9 @@ const judgeText = (j) => '评委 ' + j.model + (j.via === 'metask' ? '（Metask 
 
 async function renderNewRun() {
   state.live = false;
-  navCurrent('new');
-  $('#title').textContent = '发起评测';
-  crumbs([{ text: '看板', href: '#/' }, { text: '选择 metacodes 版本和高级功能（即评测配置），再选评测集' }]);
+  navCurrent('overview');
+  $('#title').textContent = '创建作业';
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: '选择 metacodes 版本和高级功能（即Profile），再选评测集' }]);
   const c = await api('/api/workbench');
   const suites = c.suites || [];
   const byId = new Map(suites.map((s) => [s.id, s]));
@@ -684,7 +711,7 @@ async function renderNewRun() {
   const fixed = Boolean(draft.profile);
   const picked = bundles.some((b) => b.id === state.pickBundle) ? state.pickBundle : null;
   const bundle = fixed
-    ? h('select', { name: 'bundle', disabled: true }, h('option', { text: `${draft.label || '—'}（评测配置已冻结）` }))
+    ? h('select', { name: 'bundle', disabled: true }, h('option', { text: `${draft.label || '—'}（Profile已冻结）` }))
     : h('select', { name: 'bundle', onchange: () => { state.pickBundle = bundle.value; } }, bundles.map((b) => h('option', { value: b.id, selected: picked ? b.id === picked : b.current },
       `${b.label}${b.current ? '（当前配置）' : ''}`)));
   const commitBox = h('div', { class: 'commit-builder', hidden: !state.commitsOpen });
@@ -713,8 +740,8 @@ async function renderNewRun() {
   });
   const model = h('div', { class: 'task-options', role: 'group', 'aria-label': '模型' }, modelChecks);
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
-  const concurrencyNote = fixed ? `并发数 ${draft.concurrency ?? '—'}，在评测配置页面修改`
-    : `并发数按评测配置设置（新配置默认 ${runDefaults.concurrency}），开始评测后可在评测配置页面修改`;
+  const concurrencyNote = fixed ? `并发数 ${draft.concurrency ?? '—'}，在Profile页面修改`
+    : `并发数按Profile设置（新配置默认 ${runDefaults.concurrency}），开始评测后可在Profile页面修改`;
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
     oninput: () => { draft.attempts = attempts.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
@@ -730,10 +757,10 @@ async function renderNewRun() {
     return boxes.length ? h('div', { class: 'stack' }, h('small', { class: 'muted', text: title }),
       ...boxes.map((f) => h('label', { class: 'check' }, f.input, h('span', { text: f.label }), h('small', { class: 'mono muted', text: f.id })))) : null;
   };
-  const features = featureBoxes.length ? h('fieldset', {}, h('legend', { text: fixed ? '高级功能（评测配置已固定）' : '高级功能（形式化门控默认开启，Preview 默认关闭）' }),
+  const features = featureBoxes.length ? h('fieldset', {}, h('legend', { text: fixed ? '高级功能（Profile已固定）' : '高级功能（形式化门控默认开启，Preview 默认关闭）' }),
     featureGroup('formal', 'Lean 形式化门控'), featureGroup('preview', 'Preview 特性')) : '';
   const feedback = h('div', { role: 'status', class: 'form-feedback' });
-  const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '开始评测');
+  const submit = h('button', { type: 'submit', class: 'button primary', disabled: true }, '创建作业');
   const blocked = h('small', { class: 'muted', role: 'status' });
 
   function setupReasons() {
@@ -760,7 +787,7 @@ async function renderNewRun() {
     submit.disabled = reasons.length > 0;
     blocked.textContent = reasons.length ? '无法开始：' + reasons.join('；') : '';
     const modelText = chosenModels.size > 1 ? ` · ${chosenModels.size} 个模型` : '';
-    submit.textContent = picked.length ? `开始评测（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '开始评测';
+    submit.textContent = picked.length ? `创建作业（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '创建作业';
   }
   function drawPicker() {
     picker.replaceChildren(...(c.categories || []).map((cat) => {
@@ -854,25 +881,25 @@ async function renderNewRun() {
     form.append(h('label', { class: 'field' }, h('span', { text: '执行机器' }), executor));
   }
   if (draft.from) {
-    const notes = [`在评测配置「${draft.from}」上运行`];
+    const notes = [`在Profile「${draft.from}」上运行`];
     if (modelMissing) notes.push(`上次的模型 ${modelMissing} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
         state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; render();
-      } }, '改为新的评测配置')));
+      } }, '改为新的Profile')));
   }
   form.append(
     h('div', { class: 'form-row' },
       h('div', { class: 'field' }, h('label', { class: 'field' }, h('span', { text: 'metacodes 版本' }), bundle),
         fixed || bundles.length ? null : h('small', { text: '还没有可用的 Linux 发行包，请先运行一键配置。' }),
         c.can_run && !fixed ? h('div', {}, commitToggle) : null),
-      fixed ? null : h('label', { class: 'field' }, h('span', { text: '评测配置名称（可选）' }), name)),
+      fixed ? null : h('label', { class: 'field' }, h('span', { text: 'Profile名称（可选）' }), name)),
     fixed ? null : commitBox,
     features,
     h('div', { class: 'field' }, h('span', { text: '模型（可多选，每个评测集按每个模型各跑一次）' }), model,
       h('small', { text: c.authentication?.label || '使用执行服务上配置的 Provider 和凭证' }),
       h('small', {}, c.providers?.models ? `另有 ${c.providers.count} 个导入的 Provider · ${c.providers.models} 个模型 · ` : '',
-        link('#/providers', '用 URL + API Key 导入 Provider')),
+        link('#/settings/providers', '配置模型 Provider')),
       c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
@@ -898,7 +925,6 @@ async function renderNewRun() {
       state.suitePick = null;
       state.runDraft = null;
       state.taskWanted = null;
-      state.scope = record.id;
       location.hash = profileHref(record);
     } catch (error) {
       feedback.textContent = error.message;
@@ -918,7 +944,7 @@ async function renderNewRun() {
         h('button', { type: 'button', class: 'button', onclick: () => startSetup(true) }, '预演（不修改）'));
     }
     if (c.can_run && c.login?.available && !c.login?.signed_in) {
-      actions.push(h('button', { type: 'button', class: 'button', onclick: startLogin }, '登录 Metask'));
+      actions.push(link('#/settings/login', '前往系统配置登录 Metask'));
     }
     callout.hidden = !notes.length && !actions.length;
     callout.replaceChildren(...notes.map((text) => h('p', { text })),
@@ -931,26 +957,11 @@ async function renderNewRun() {
       await drawSetup();
     } catch (error) { setupBox.replaceChildren(h('div', { class: 'callout', text: error.message })); }
   }
-  async function startLogin() {
-    try { await api('/api/login', {}); state.setupWatch = true; await drawSetup(); }
-    catch (error) { setupBox.replaceChildren(h('div', { class: 'callout', text: error.message })); }
-  }
   async function drawSetup() {
     if (!c.can_run) return;
     let latest = null;
     try { latest = (await api('/api/setup')).setup; } catch (_) { return; }
-    let login = null;
-    if (c.login?.available) { try { login = await api('/api/login'); } catch (_) { login = null; } }
     const parts = [];
-    // The device code matters only while the sign-in waits for approval, or
-    // when it ended without signing in; once signed in it is stale.
-    if (login && (login.running || (login.verification_uri && !login.signed_in && !c.login?.signed_in))) {
-      parts.push(panel('Metask 登录', login.running ? '等待确认' : '未完成，请重新登录',
-        h('div', { class: 'panel-body run-state' },
-          login.verification_uri ? h('p', {}, '在自己的浏览器打开 ',
-            h('a', { href: login.verification_uri, target: '_blank', rel: 'noopener noreferrer', text: login.verification_uri }),
-            ' 并输入代码 ', h('b', { class: 'mono', text: login.user_code || '' })) : h('p', { class: 'muted', text: '正在获取设备码…' }))));
-    }
     if (latest) {
       const rows = (latest.steps || []).map((step) => h('details', { class: 'setup-step', 'data-key': 'setup-' + step.id },
         h('summary', {}, h('span', { class: 'setup-status s-' + step.status, text: SETUP_STATUS[step.status] || step.status }),
@@ -964,7 +975,7 @@ async function renderNewRun() {
     const open = new Set([...setupBox.querySelectorAll('details[open]')].map((d) => d.dataset.key));
     setupBox.replaceChildren(...parts);
     for (const d of setupBox.querySelectorAll('details')) if (open.has(d.dataset.key)) d.open = true;
-    const active = (latest && latest.status === 'running') || (login && login.running);
+    const active = latest && latest.status === 'running';
     if (active && route().view === 'new') { state.setupWatch = true; setTimeout(drawSetup, 2000); }
     else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(render, 500); }
   }
@@ -1038,17 +1049,17 @@ async function renderNewRun() {
     h('div', { class: 'panel-body' },
       groupTable)) : null;
   return h('div', {}, callout, setupBox,
-    panel('发起评测', null, form), groups);
+    panel('作业配置', null, form), groups);
 }
 
 async function renderRun(name) {
   const run = await api('/api/run?name=' + encodeURIComponent(name));
   let results;
-  try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建作业' }); }
+  try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建评测记录' }); }
   state.live = ['queued', 'starting', 'running', 'cancelling'].includes(run.status);
   navCurrent('overview');
   $('#title').textContent = RUN_STATUS[run.status] || run.status;
-  crumbs([{ text: '看板', href: '#/' }, { text: name }]);
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: name }]);
   const url = location.origin + '/#/run/' + encodeURIComponent(name);
   const stop = state.live ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
     event.currentTarget.disabled = true;
@@ -1092,7 +1103,7 @@ async function renderJob(name) {
   const job = await api('/api/job?name=' + encodeURIComponent(name));
   state.live = job.running;
   $('#title').textContent = job.name;
-  crumbs([{ text: '看板', href: '#/' }, job.profile ? { text: '评测配置 ' + job.profile, href: '#/profile/' + encodeURIComponent(job.profile) } : null, { text: job.name }].filter(Boolean));
+  crumbs([{ text: 'Profiles', href: '#/' }, job.profile ? { text: 'Profile ' + job.profile, href: '#/profile/' + encodeURIComponent(job.profile) } : null, { text: job.name }].filter(Boolean));
   const s = job.summary;
   const causes = Object.entries(s.invalid_causes).map(([k, v]) => `${k} ${v}`).join(' · ');
   const metrics = h('section', { class: 'metrics' }, measurementCards(s),
@@ -1103,7 +1114,7 @@ async function renderJob(name) {
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
-    h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（评测配置冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
+    h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（Profile冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
   const filters = h('div', { class: 'filters' }, ['all', ...ORDER].map((key) => h('button', {
@@ -1344,18 +1355,18 @@ async function renderTrial(jobName, trialName) {
   const r = t.row;
   state.live = r.status === 'running';
   $('#title').textContent = r.task;
-  crumbs([{ text: '看板', href: '#/' }, { text: jobName, href: '#/job/' + encodeURIComponent(jobName) }, { text: r.trial }]);
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: jobName, href: '#/job/' + encodeURIComponent(jobName) }, { text: r.trial }]);
   return h('div', {}, trialBody(t));
 }
 
 // ------------------------------------------------------------ compare
-async function renderCompare(names) {
-  navCurrent('compare');
+async function renderCompare(names, profileId) {
+  navCurrent('overview');
   $('#title').textContent = '对比';
-  crumbs([{ text: '看板', href: '#/' }, { text: '对比' }]);
+  crumbs([{ text: 'Profiles', href: '#/' }, ...(profileId ? [{ text: 'Profile 作业', href: profileHref({ id: profileId }) }] : []), { text: '逐题对比' }]);
   if (names.length < 2) {
     state.live = false;
-    return panel('对比', null, h('div', { class: 'empty', text: '在看板勾选两个以上的作业' }));
+    return panel('对比', null, h('div', { class: 'empty', text: '从 Profile 进入作业对比，或在首页勾选要对比的 Profile。' }));
   }
   const jobs = await Promise.all(names.map((n) => api('/api/job?name=' + encodeURIComponent(n))));
   state.live = jobs.some((j) => j.running);
@@ -1419,7 +1430,7 @@ function costPassPanel(jobs, common) {
       h('td', { class: 'num', text: point ? pct(point.pass) : '—' }, h('span', { class: 'sub', text: point ? usd(point.cost) + ' / 题' : '' })),
       h('td', { text: frontier ? '是' : point ? '' : '—' }));
   });
-  const heads = ['作业', '通过率（95% 区间）', '至少通过一次', '每题平均成本', '每次通过成本', '未通过成本占比', '缓存命中率', '通过平均轮数', '共同题通过率 / 成本', '成本-通过率前沿'];
+  const heads = ['评测', '通过率（95% 区间）', '至少通过一次', '每题平均成本', '每次通过成本', '未通过成本占比', '缓存命中率', '通过平均轮数', '共同题通过率 / 成本', '成本-通过率前沿'];
   return panel('成本与通过率', `${common.length} 道共同题`,
     h('div', { class: 'table-scroll' }, h('table', {},
       h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 0 || i === heads.length - 1 ? null : 'num', text: t })))),
@@ -1601,7 +1612,7 @@ function scoreBars(rows, focus, lookOf) {
     err(r) ? h('i', { class: 'bar-err', style: `left:${at(r.score - err(r))}%;width:${at(r.score + err(r)) - at(r.score - err(r))}%` }) : null),
   h('span', { class: 'bar-value num', text: score(r.score) + (err(r) ? ` ±${err(r).toFixed(1)}` : '') }))]));
   focus.on((active) => { for (const [r, el] of items) el.toggleAttribute('data-current', r === active); });
-  const note = rows.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 名${shown.some((r) => r.ours) ? '及我们的作业' : ''} · 共 ${rows.length} 条，完整列表见下表` }) : null;
+  const note = rows.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 名${shown.some((r) => r.ours) ? '及我们的评测' : ''} · 共 ${rows.length} 条，完整列表见下表` }) : null;
   return h('div', { class: 'scatter-box bars-box' }, h('div', { class: 'bars' }, lines, ...items.values(), axis), note);
 }
 function modelDots(rows, focus, lookOf) {
@@ -1647,7 +1658,7 @@ function modelDots(rows, focus, lookOf) {
   };
   const legend = h('div', { class: 'scatter-legend pair-legend' }, [...new Set([...dots.keys()].map(lookOf))].map((look) =>
     h('span', { class: 'key', onmouseenter: () => group(look), onmouseleave: () => group(null) }, glyph(look), look.name)));
-  const note = all.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 个模型${shown.some((g) => g.rows.some((r) => r.ours)) ? '及我们的作业' : ''} · 共 ${all.length} 个模型、${rows.length} 条，完整列表见下表` }) : null;
+  const note = all.length > shown.length ? h('div', { class: 'bars-note', text: `前 ${BARS_TOP} 个模型${shown.some((g) => g.rows.some((r) => r.ours)) ? '及我们的评测' : ''} · 共 ${all.length} 个模型、${rows.length} 条，完整列表见下表` }) : null;
   return h('div', { class: 'scatter-box bars-box' }, legend, box, note);
 }
 function focusHub() {
@@ -1707,13 +1718,13 @@ async function renderLeaderboard(suiteId) {
   navCurrent('leaderboard');
   $('#title').textContent = '公开榜单';
   const d = await api('/api/leaderboard' + (suiteId ? '?suite=' + encodeURIComponent(suiteId) : ''));
-  crumbs([{ text: '看板', href: '#/' }, { text: '公开榜单' }]);
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: '公开榜单' }]);
   const suitePicker = h('label', { class: 'scope' }, '评测集',
     h('select', { onchange: (e) => { location.hash = '#/leaderboard/' + encodeURIComponent(e.target.value); } },
       d.suites.map((s) => h('option', { value: s.suite, selected: s.suite === d.suite, text: s.suite_name }))));
   const partial = d.unranked;
-  const rest = partial.length ? panel('未参与排名的作业', null, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['作业', '模型', '题数', '分数'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
+  const rest = partial.length ? panel('未参与排名的评测', null, h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, ['评测', '模型', '题数', '分数'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
     h('tbody', {}, partial.map((j) => h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
       h('td', { text: j.name }), h('td', { text: j.model || '—' }),
       h('td', { class: 'num', text: `${j.tasks} / ${d.task_count}` }), h('td', { class: 'num', text: pct(j.score, 1) }))))))) : null;
@@ -1722,11 +1733,39 @@ async function renderLeaderboard(suiteId) {
 }
 
 // ------------------------------------------------------------ settings (database)
-async function renderSettings() {
+async function renderSettings(tab) {
   state.live = false;
   navCurrent('settings');
-  $('#title').textContent = '数据库';
-  crumbs([{ text: '看板', href: '#/' }, { text: '评测数据库' }]);
+  $('#title').textContent = '系统配置';
+  const tabs = [['database', '数据库'], ['providers', '模型 Provider'], ['login', '账号登录']];
+  const selected = tabs.find(([key]) => key === tab) || tabs[0];
+  crumbs([{ text: '系统配置' }, { text: selected[1] }]);
+  const nav = h('nav', { class: 'settings-tabs', 'aria-label': '系统配置' }, tabs.map(([key, label]) =>
+    h('a', { href: '#/settings/' + key, 'aria-current': key === selected[0] ? 'page' : null }, label)));
+  const page = selected[0] === 'login' ? await renderLogin() : selected[0] === 'providers' ? await renderProviders() : await renderDatabase();
+  return h('div', {}, nav, page);
+}
+
+async function renderLogin() {
+  const catalog = await api('/api/workbench');
+  if (!catalog.can_run || !catalog.login?.available) return panel('Metask 登录', null, h('div', { class: 'panel-body' },
+    catalog.can_run ? '当前工作台未启用 Metask 账号登录。' : '只读模式'));
+  const login = await api('/api/login');
+  state.live = login.running;
+  const signedIn = catalog.login.signed_in || login.signed_in;
+  const button = h('button', { class: 'button', disabled: login.running, onclick: async () => {
+    button.disabled = true;
+    try { await api('/api/login', {}); await render(); }
+    catch (error) { button.disabled = false; setConnection(false, error.message); }
+  } }, signedIn ? '重新登录' : '登录 Metask');
+  return panel('Metask 登录', login.running ? '等待确认' : signedIn ? '已登录' : '未登录', h('div', { class: 'panel-body' },
+    login.running && login.verification_uri ? h('p', {}, '打开 ', h('a', { href: login.verification_uri,
+      target: '_blank', rel: 'noopener noreferrer', text: login.verification_uri }), ' 并输入代码 ', h('b', { text: login.user_code })) : null,
+    login.running && !login.verification_uri ? '正在获取设备码…' : null, button));
+}
+
+async function renderDatabase() {
+  state.live = false;
   const st = await api('/api/store');
   const db = st.database;
   const counts = st.counts || {};
@@ -1734,7 +1773,7 @@ async function renderSettings() {
     h('dt', { text: '类型' }), h('dd', { text: `${db.format}（schema v${db.schema_version}）` }),
     h('dt', { text: '位置' }), h('dd', { class: 'mono', text: db.location }),
     db.password_env ? h('dt', { text: '密码环境变量' }) : null, db.password_env ? h('dd', { class: 'mono', text: db.password_env }) : null,
-    h('dt', { text: '内容' }), h('dd', { text: `评测配置 ${counts.profiles ?? 0} · 作业 ${counts.jobs ?? 0} · trial ${counts.trials ?? 0} · 请求 ${counts.requests ?? 0} · 文件 ${counts.files ?? 0} · 启动记录 ${counts.runs ?? 0}` }),
+    h('dt', { text: '内容' }), h('dd', { text: `Profile ${counts.profiles ?? 0} · 评测 ${counts.jobs ?? 0} · trial ${counts.trials ?? 0} · 请求 ${counts.requests ?? 0} · 文件 ${counts.files ?? 0} · 启动记录 ${counts.runs ?? 0}` }),
     h('dt', { text: '最近导入' }), h('dd', { text: st.last_ingested_at ? when(st.last_ingested_at) : '—' }),
     h('dt', { text: '待重算投影' }), h('dd', { text: String(st.stale_projections) }),
     h('dt', { text: '同步的作业目录' }), h('dd', { class: 'mono', text: (st.jobs_dirs || []).join('\n') || '—' }),
@@ -1774,7 +1813,7 @@ async function renderSettings() {
       const body = await api('/api/store', { action, store: target(), ...(action === 'apply' ? { migrate: migrate.checked } : {}) });
       result.className = 'result ok';
       if (action === 'test') {
-        result.textContent = body.exists ? `连接成功：${body.database.format} ${body.database.location}（schema v${body.database.schema_version}）${body.same ? ' · 就是当前数据库' : ''}\n已有：作业 ${body.counts.jobs} · trial ${body.counts.trials} · 评测配置 ${body.counts.profiles ?? 0}` : `可用：${body.message}`;
+        result.textContent = body.exists ? `连接成功：${body.database.format} ${body.database.location}（schema v${body.database.schema_version}）${body.same ? ' · 就是当前数据库' : ''}\n已有：评测 ${body.counts.jobs} · trial ${body.counts.trials} · Profile ${body.counts.profiles ?? 0}` : `可用：${body.message}`;
       } else if (body.unchanged) {
         result.textContent = '目标就是当前数据库，未作改动。';
       } else {
@@ -1809,9 +1848,6 @@ function probeText(p) {
 
 async function renderProviders() {
   state.live = false;
-  navCurrent('providers');
-  $('#title').textContent = '模型 Provider';
-  crumbs([{ text: '看板', href: '#/' }, { text: '用 URL + API Key 导入评测用的模型' }]);
   let list;
   try { list = await api('/api/providers'); } catch (e) {
     return h('div', { class: 'empty', text: e.message || '只读模式' });
@@ -2150,7 +2186,7 @@ async function renderMonitor(name) {
   state.live = true;
   navCurrent('monitor');
   $('#title').textContent = '监控';
-  crumbs([{ text: '看板', href: '#/' }, { text: '执行机器的负载、网络、镜像源、Docker 和缓存' }]);
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: '执行机器的负载、网络、镜像源、Docker 和缓存' }]);
   let m;
   try { m = await api('/api/monitor' + (name ? '?executor=' + encodeURIComponent(name) : '')); } catch (e) {
     return h('div', { class: 'empty', text: e.message || '只读模式' });

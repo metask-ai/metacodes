@@ -59,8 +59,13 @@ Preview features are set by the root `preview` field in the state root's
 every preview feature, `false` (the default) disables them all, and an object
 enables only the features set to `true`, for example
 `{"preview": {"execute_code": true, "teamwork": true}}`. The features are
-`execute_code`, `teamwork` and `comment_guard` (the instruction to avoid adding
-code comments and the matching check in the built-in file editors).
+`execute_code`, `teamwork`, `comment_guard` (the instruction to avoid adding
+code comments and the matching check in the built-in file editors),
+`background_watchdog` (background Bash jobs stop at a time limit, 30 minutes
+unless `timeout` sets another up to 2 hours, and the model is told once when a
+background job seems to wait for interactive input) and `monitor_events`
+(`Monitor` pushes its stdout lines to the model as events instead of being
+polled).
 
 Use `--preview` or `--no-preview` to override every feature for one
 invocation, or `--preview=<list>` / `--no-preview=<list>` to override only the

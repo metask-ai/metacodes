@@ -97,6 +97,7 @@ pub const core = struct {
     pub const host_injection_meter = @import("core/host_injection_meter.zig");
     pub const isolated_verifier = @import("core/isolated_verifier.zig");
     pub const job_registry = @import("core/job_registry.zig");
+    pub const kernel = @import("core/kernel.zig");
     pub const learning_end_of_run = @import("core/learning_end_of_run.zig");
     pub const learning_turn = @import("core/learning_turn.zig");
     pub const mcp_session = @import("core/mcp_session.zig");

@@ -24,7 +24,7 @@ import threading
 import time
 
 from scripts.eval.harbor.profiling import StaticCredential
-from scripts.eval.harbor.bench.account import Account, AccountHTTPError
+from scripts.eval.harbor.bench.account import Account, AccountHTTPError, SessionGatewayChanged
 
 # Refresh once an access token has less than this left (~45 minutes into a
 # one-hour token). METACODES_BENCH_REFRESH_MARGIN overrides it (tests).
@@ -83,8 +83,7 @@ class SessionCredential:
         return self.update(None)
 
     def refresh(self, stale):
-        """After the gateway rejected `stale`: a newer token, or `stale`."""
-        return self.update(stale) or stale
+        return self.update(stale)
 
     def update(self, stale):
         with self.lock:
@@ -96,6 +95,8 @@ class SessionCredential:
                 return self.token
             try:
                 token, expires_at = self.account.session_access(stale=stale, margin=self.margin)
+            except SessionGatewayChanged as exc:
+                return self.fail(str(exc))
             except AccountHTTPError as exc:
                 if 400 <= exc.status < 500 and exc.status not in (408, 429):
                     return self.fail(EXPIRED_MESSAGE)
@@ -186,7 +187,8 @@ def for_judge(spec, source):
     the fixed key of the account group that lists the judge model. Raises
     a user-facing ValueError when no group of the account lists it."""
     model = spec["judge"]["model"]
-    account = Account(spec.get("account_state_dir"), spec.get("account_gateway"))
+    account = (source.account if isinstance(source, SessionCredential)
+               else Account(spec.get("account_state_dir"), spec.get("account_gateway")))
     try:
         secret = account.credential(model, any_endpoint=True)
     except ValueError as exc:

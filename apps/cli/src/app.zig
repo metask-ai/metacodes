@@ -801,6 +801,7 @@ pub const App = struct {
 
     /// What a host settles before `App.init` instead of leaving it to init.
     pub const InitOptions = struct {
+        metask_session: ?*?provider_oauth_mod.Session = null,
         /// The TUI theme, already resolved (`resolveThemeVariant`). The CLI
         /// resolves it first so the startup splash can play while init runs;
         /// init must not query the terminal (OSC 11) while the splash owns it.
@@ -840,7 +841,7 @@ pub const App = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         config: types.Config,
-        api_key: []const u8,
+        initial_key: []const u8,
         options: InitOptions,
     ) !*App {
         const app = try allocator.create(App);
@@ -848,12 +849,45 @@ pub const App = struct {
         var active_config = config;
         active_config.preview = try @import("metacodes-internal").core.file_config.resolvePreview(allocator, config.state_root, config.preview);
 
+        const state_root_default = if (active_config.state_root.len == 0)
+            if (platform_paths.homeDir()) |home| try @import("metacodes-internal").util.state_root.legacyDefault(allocator, home) else null
+        else
+            null;
+        errdefer if (state_root_default) |root| allocator.free(root);
+        if (state_root_default) |root| active_config.state_root = root;
+
+        var login: ?provider_oauth_mod.Session = null;
+        errdefer if (login) |*session| session.deinit();
+        var owned_key: ?[]u8 = null;
+        errdefer if (owned_key) |key| provider_oauth_mod.secureFree(allocator, key);
+        if (config.metask_oauth_selected and std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask")) {
+            if (options.metask_session) |slot| {
+                login = slot.* orelse return error.NoTokens;
+                slot.* = null;
+            } else {
+                login = try provider_oauth_mod.Session.initHome(allocator, active_config.state_root, provider_ids_mod.Slug.lit("metask"));
+                if (!try login.?.load()) return error.NoTokens;
+            }
+            const tokens = login.?.tokens orelse return error.NoTokens;
+            if (config.metask_session_gateway) |expected| {
+                if (!std.mem.eql(u8, expected, tokens.gateway_url orelse "")) return error.GatewayChanged;
+            }
+            if (options.metask_session != null or config.metask_session_gateway == null) {
+                if (!std.mem.eql(u8, initial_key, tokens.access_token)) return error.GatewayChanged;
+            }
+            if (options.metask_session == null)
+                owned_key = try oauth_exchange_mod.metaskAccessToken(&login.?, io, @import("metacodes-internal").util.time.nowUnix());
+        }
+        const api_key = owned_key orelse initial_key;
         // 顺序：先把 conversation/skills/jobs/tasks/abort 等"空壳"放好,
         // 然后注册动态工具（Skill 需要 &app.skills 指针）,
         // 最后 toToolDefinitionsWithDyn 一次性构造给 API 的 tool 清单。
         app.* = .{
             .allocator = allocator,
             .config = active_config,
+            .state_root_default = state_root_default,
+            .oauth_session = login,
+            .oauth_session_provider = if (login != null) provider_ids_mod.Slug.lit("metask") else null,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .model_picker = model_picker_mod.Picker.init(allocator),
@@ -895,13 +929,11 @@ pub const App = struct {
             .cron_registry = CronRegistry.init(allocator),
             .model_context = @import("metacodes-internal").api.model_context.ModelContext.init(allocator),
         };
-        // The CLI resolves the state root (apps/cli/src/main.zig) and passes it in. An App
-        // built without one keeps the historical `$HOME/.metacodes`.
-        if (app.config.state_root.len == 0) if (platform_paths.homeDir()) |home| {
-            app.state_root_default = try @import("metacodes-internal").util.state_root.legacyDefault(allocator, home);
-            app.config.state_root = app.state_root_default.?;
-        };
-        errdefer if (app.state_root_default) |owned| allocator.free(owned);
+        login = null;
+        errdefer if (app.oauth_session) |*session| session.deinit();
+        if (owned_key) |key| app.route_strings.installSecret(key);
+        owned_key = null;
+        errdefer app.route_strings.deinit();
         errdefer app.tool_defs_arena.deinit();
 
         if (app.config.rsi) {
@@ -935,21 +967,7 @@ pub const App = struct {
         // A Metask login is process-scoped: retain the same Session object
         // used by turn-boundary refresh so a gateway 401 can force-refresh the
         // rotating token without opening a second single-flight domain.
-        if (config.metask_oauth_selected) if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) {
-            if (provider_ids_mod.Slug.parse("metask")) |provider_id| {
-                app.oauth_session = provider_oauth_mod.Session.initHome(allocator, app.stateRoot(), provider_id) catch null;
-                if (app.oauth_session) |*loaded| {
-                    if (loaded.load() catch false) {
-                        app.oauth_session_provider = provider_id;
-                        app.api_client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
-                        if (app.openai_client) |*client| client.setRefreshCallback(@ptrCast(app), refreshMetaskToken);
-                    } else {
-                        loaded.deinit();
-                        app.oauth_session = null;
-                    }
-                }
-            } else |_| {}
-        };
+        if (app.oauth_session != null) app.armMetaskRefresh(true);
 
         // 启动时先事务化解析 CLI data packages，再由 canonical Runtime 一次性解析
         // enterprise / personal / project / plugin Skill sources。插件失败不降级：用户
@@ -1121,14 +1139,10 @@ pub const App = struct {
         // inheriting the historical static inventory.
         if (config.metask_oauth_selected) if (config.provider_profile) |profile_name| if (std.ascii.eqlIgnoreCase(profile_name, "metask")) metask_catalog: {
             if (app.oauth_session) |*session| if (session.tokens) |tokens| {
-                const gateway = if (std.c.getenv("METASK_GATEWAY_URL")) |raw|
-                    std.mem.trimEnd(u8, std.mem.span(raw), "/")
-                else
-                    std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/");
-                if (gateway.len == 0 or !metask_oauth_mod.isGatewayOrigin(gateway)) {
+                const gateway = (metask_oauth_mod.modelGateway(tokens.gateway_url) catch null) orelse {
                     @import("metacodes-internal").util.log.warn("catalog", "Metask gateway origin unavailable; keeping the compiled route", .{});
                     break :metask_catalog;
-                }
+                };
                 const models_url = std.fmt.allocPrint(app.allocator, "{s}/v1/models", .{gateway}) catch {
                     @import("metacodes-internal").util.log.warn("catalog", "Metask catalog URL allocation failed", .{});
                     break :metask_catalog;
@@ -1136,7 +1150,7 @@ pub const App = struct {
                 defer app.allocator.free(models_url);
                 const fetched = @import("metacodes-internal").api.catalog_fetch.fetchModelPages(app.allocator, io, .{
                     .url = models_url,
-                    .bearer = app.api_key,
+                    .bearer = tokens.access_token,
                     .timeout_ms = models_cache_mod.STARTUP_WAIT_MS,
                 }) catch |err| {
                     @import("metacodes-internal").util.log.warn("catalog", "Metask /v1/models fetch failed: {s}", .{@errorName(err)});
@@ -3155,17 +3169,9 @@ pub const App = struct {
         // generic form-encoded RFC 6749 request. Keep this branch here (rather
         // than relying only on main's startup path) because the picker/turn
         // boundary can also refresh the process-scoped session.
-        const token = if (built.id.eqlText("metask")) blk: {
-            var site_buf: [1024]u8 = undefined;
-            const metask_token_url = metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf) catch
-                return error.RefreshFailed;
-            var exchange = oauth_exchange_mod.MetaskHttpExchange{
-                .allocator = app.allocator,
-                .io = app.api_client.http_client.io,
-                .token_url = metask_token_url,
-            };
-            break :blk try session.accessToken(now_seconds, exchange.exchange());
-        } else blk: {
+        const token = if (built.id.eqlText("metask"))
+            try oauth_exchange_mod.metaskAccessToken(session, app.api_client.http_client.io, now_seconds)
+        else blk: {
             var exchange = oauth_exchange_mod.HttpExchange{
                 .allocator = app.allocator,
                 .io = app.api_client.http_client.io,

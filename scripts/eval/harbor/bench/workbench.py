@@ -98,7 +98,7 @@ def model_comparison(latest):
     models ran different tasks, over the tasks all of them ran."""
     by_model = {}
     for (suite, model, task), (_, _, rows) in latest.items():
-        by_model.setdefault(model, {})[(suite, task)] = rows
+        by_model.setdefault(model, {})[(suite, task)] = [{**row, "task": (suite, task)} for row in rows]
 
     def summary(rows):
         return {k: v for k, v in data.summarize(rows).items() if k != "ttft_samples_ms"}
@@ -239,7 +239,7 @@ class Workbench:
                                                         "finished_at", "dataset", "execution_status")}
                 item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
         latest, _ = latest_results(record, views)
-        value["summary"] = data.summarize([row for _, _, rows in latest.values() for row in rows])
+        value["summary"] = data.summarize({**row, "task": key} for key, (_, _, rows) in latest.items() for row in rows)
         value["by_model"], value["common_tasks"] = model_comparison(latest)
         value["progress"] = {"done": done, "planned": planned} if planned else None
         value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
@@ -329,9 +329,11 @@ class Workbench:
         record = next((r for r in self.profile_records() if r["id"] == profile), None)
         if record is None:
             return None
+        runs = self.runs()
+        local_names = {r["name"] for r in runs}
         full = {}
         for item in record["items"]:
-            view = self.job_view(item["run"]) if item.get("run") else None
+            view = self.job_view(item["run"], runs=runs) if item.get("run") else None
             if view is not None:
                 full[view["name"]] = view
         value = self.profile_summary(record, full)
@@ -339,6 +341,7 @@ class Workbench:
         tasks = [{**task_group(task, rows, item, job), "history": history.get(key, [])}
                  for key, (item, job, rows) in latest.items() for task in [key[2]]]
         for item in value["items"]:
+            item["local_run"] = item.get("run") in local_names
             if item["status"] in ("pending", "running") and item.get("run") not in full:
                 tasks += [{"task": t, "job": None, "suite": item["suite"], "suite_name": item.get("suite_name"),
                            "model": item.get("model"), "attempts": [], "first_status": None, "passed": 0,
@@ -372,6 +375,11 @@ class Workbench:
         if not self.manager:
             raise ValueError(READ_ONLY)
         return self.profiles.cancel(profile)
+
+    def submission_action(self, profile, submission, action):
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return self.profiles.submission_action(profile, submission, action)
 
     def profile_item(self, profile, index, action) -> Dict[str, Any]:
         """Act on one queued dataset: `cancel` a waiting one, `stop` the running

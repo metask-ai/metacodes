@@ -9,6 +9,8 @@ pub const PreviewFeature = enum {
     execute_code,
     teamwork,
     comment_guard,
+    background_watchdog,
+    monitor_events,
 
     pub fn parse(name: []const u8) ?PreviewFeature {
         return std.meta.stringToEnum(PreviewFeature, name);
@@ -19,7 +21,9 @@ pub const PreviewFeatures = packed struct(u8) {
     execute_code: bool = false,
     teamwork: bool = false,
     comment_guard: bool = false,
-    _unused: u5 = 0,
+    background_watchdog: bool = false,
+    monitor_events: bool = false,
+    _unused: u3 = 0,
 
     comptime {
         for (@typeInfo(PreviewFeatures).@"struct".fields) |field| {
@@ -428,6 +432,7 @@ pub const Config = struct {
     /// True only when startup resolved the bearer from the Metask OAuth session;
     /// explicit legacy API-key mode must not load that session or hydrate it.
     metask_oauth_selected: bool = false,
+    metask_session_gateway: ?[]const u8 = null,
     /// The host's layer below the process environment for the variables
     /// credentials are read from (#486): the CLI's `<state root>/.env`, as
     /// `apps/cli/src/app/state_env.zig` accepted it at startup. A name the process
