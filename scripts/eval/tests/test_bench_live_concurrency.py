@@ -161,7 +161,7 @@ def instant(log=None, seconds=0.0, status="pulled"):
 class LifecycleTest(LifecycleCase):
     def test_slots_go_to_the_oldest_waiting_trial(self):
         for concurrency in (1, 3):
-            queue = self.queue(concurrency, instant())
+            queue = self.queue(concurrency, instant(), seconds=0.1)
             names = [f"task{n}__{concurrency}" for n in range(12)]
 
             async def main():
@@ -190,13 +190,24 @@ class LifecycleTest(LifecycleCase):
 
         queue._execute_trial_with_retries = held
 
+        async def settled(started, prepared):
+            deadline = time.monotonic() + 20
+            await asyncio.sleep(0)
+            while True:
+                records = [self.record(name) for name in names]
+                if (sum(bool(r["started_at"]) for r in records) >= started
+                        and sum(bool(r["prepare_finished_at"]) for r in records) >= prepared):
+                    await asyncio.sleep(0.1)
+                    return [self.record(name) for name in names]
+                if time.monotonic() > deadline:
+                    return records
+                await asyncio.sleep(0.01)
+
         async def main():
             tasks = [asyncio.ensure_future(queue._run_trial(trial)) for trial in trials]
-            await asyncio.sleep(0.2)
-            first = [self.record(name) for name in names]
+            first = await settled(2, 4)
             live_concurrency.write(self.limit, 3)
-            await asyncio.sleep(0.2)
-            raised = [self.record(name) for name in names]
+            raised = await settled(3, 6)
             release.set()
             await asyncio.gather(*tasks)
             return first, raised
@@ -227,11 +238,17 @@ class LifecycleTest(LifecycleCase):
         lock = threading.Lock()
         active, peak = [0], [0]
 
+        full = threading.Event()
+        self.addCleanup(full.set)
+
         def operations(task_dir):
             def run():
                 with lock:
                     active[0] += 1
                     peak[0] = max(peak[0], active[0])
+                    if active[0] >= trial_lifecycle.PREPARE_PARALLEL:
+                        full.set()
+                full.wait(20)
                 time.sleep(0.05)
                 with lock:
                     active[0] -= 1
@@ -377,6 +394,30 @@ class LifecycleTest(LifecycleCase):
         results = asyncio.run(main())
         self.assertLess(time.monotonic() - started, 5)
         self.assertTrue(all(isinstance(result, asyncio.CancelledError) for result in results))
+        self.assertEqual(queue.started, [])
+        self.assertEqual((queue.lifecycle.running, len(queue.lifecycle.waiting)), (0, 0))
+
+    def test_cancelling_every_task_stops_a_trial_that_prepares_in_its_slot(self):
+        stuck = threading.Event()
+        self.addCleanup(stuck.set)
+
+        def operations(task_dir):
+            return [trial_lifecycle.Operation("pull:" + task_dir.name, "pull", task_dir.name,
+                                              lambda: stuck.wait(60) and {"status": "pulled"})]
+
+        queue = self.queue(2, operations, seconds=30)
+
+        async def main():
+            tasks = [asyncio.ensure_future(queue._run_trial(self.trial(f"task{n}__x"))) for n in range(4)]
+            await asyncio.sleep(0)
+            for task in asyncio.all_tasks() - {asyncio.current_task()}:
+                task.cancel()
+            done, pending = await asyncio.wait(tasks, timeout=5)
+            for task in pending:
+                task.cancel()
+            return len(done), len(pending)
+
+        self.assertEqual(asyncio.run(main()), (4, 0))
         self.assertEqual(queue.started, [])
         self.assertEqual((queue.lifecycle.running, len(queue.lifecycle.waiting)), (0, 0))
 

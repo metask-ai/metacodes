@@ -5,6 +5,7 @@ import collections
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -54,7 +55,7 @@ def task_name(trial_config, task_dir):
         return task_dir.name
     task = getattr(trial_config, "task", None)
     named = getattr(task, "name", None) or getattr(task, "path", None)
-    return str(named).rstrip("/").rsplit("/", 1)[-1] if named else ""
+    return re.split(r"[\\/]", str(named).rstrip("\\/"))[-1] if named else ""
 
 
 class Operation:
@@ -175,6 +176,7 @@ class Scheduler:
         while self.waiting and self.running < limit:
             ticket = self.waiting.popleft()
             self.running += 1
+            ticket.mark("started_at")
             ticket.slot.set_result(None)
         for position, ticket in enumerate(self.waiting):
             if position >= limit:
@@ -265,7 +267,6 @@ class Scheduler:
             self.abandon(ticket)
             raise
         try:
-            ticket.mark("started_at")
             self.prepare(ticket)
             await self.settled(ticket.preparation)
             return await execute(trial_config)
@@ -275,13 +276,7 @@ class Scheduler:
             self.release()
 
     async def settled(self, preparation):
-        try:
-            await asyncio.shield(preparation)
-        except asyncio.CancelledError:
-            if not preparation.cancelled():
-                raise
-        except Exception:
-            pass
+        await asyncio.wait({preparation})
 
     def abandon(self, ticket):
         if ticket.preparation is not None and not ticket.preparation.done():
