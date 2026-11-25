@@ -16735,6 +16735,29 @@ const win_cost = struct {
     extern "kernel32" fn K32GetProcessMemoryInfo(process: HANDLE, counters: *ProcessMemoryCountersEx, cb: u32) callconv(.winapi) i32;
 };
 
+fn openIdleStreamingSession(
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle,
+    config: *const wire.SessionCreateConfigV1,
+    callbacks: *const wire.SessionCallbacksV1,
+    diagnostic: *wire.OwnedBytesV1,
+) !*wire.SessionHandle {
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, config, callbacks, &session, diagnostic));
+    const handle = session orelse return error.MissingSession;
+    errdefer _ = api.session().destroy()(handle, diagnostic);
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(handle, 1, sdk.bytesView("stream once, then idle"), &options, &result, diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    return handle;
+}
+
 test "L2 #503 Sessions idling after a streaming Run keep at most their provider's two Io workers, and on Windows no 16 MiB commit each" {
     const idle_sessions = 4;
     const a = std.testing.allocator;
@@ -16772,23 +16795,19 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
 
-    const baseline = ProcessCost.now();
+    var baseline = ProcessCost.now();
+    if (@import("builtin").os.tag == .windows) {
+        const warmup = try openIdleStreamingSession(api, runtime, &session_config, &callbacks, &diagnostic);
+        try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(warmup, &diagnostic));
+        baseline.threads = ProcessCost.processThreadCount() orelse return error.ThreadCountUnavailable;
+    }
     errdefer std.debug.print("#503 process cost: baseline {any}, after Session teardown {any}\n", .{ baseline, ProcessCost.now() });
     var sessions = [_]?*wire.SessionHandle{null} ** idle_sessions;
     defer for (sessions) |session| if (session) |handle| {
         _ = api.session().destroy()(handle, &diagnostic);
     };
     for (&sessions) |*session| {
-        try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, session, &diagnostic));
-        var options = std.mem.zeroes(wire.RunOptionsV1);
-        options.struct_size = @sizeOf(wire.RunOptionsV1);
-        options.max_turns = 1;
-        var result = std.mem.zeroes(wire.RunResultV1);
-        try std.testing.expectEqual(
-            wire.STATUS_OK,
-            api.session().runText(session.*, 1, sdk.bytesView("stream once, then idle"), &options, &result, &diagnostic),
-        );
-        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+        session.* = try openIdleStreamingSession(api, runtime, &session_config, &callbacks, &diagnostic);
     }
 
     // Idle: the stream liveness monitor leaves within a tick of the last

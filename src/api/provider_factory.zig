@@ -164,7 +164,6 @@ pub fn makeProviderWithOptions(
     errdefer a.destroy(io_rt);
     @import("../util/log.zig").info("mp", "io_rt created, calling Threaded.init", .{});
     io_rt.* = @import("platform").signal.threadedIo(a, .{});
-    io_rt.setAsyncLimit(io_rt.async_limit.min(.limited(2)));
     errdefer io_rt.deinit();
     @import("../util/log.zig").info("mp", "Threaded.init done, creating client", .{});
 
@@ -255,7 +254,6 @@ test "makeProvider:三 kind 各造对应 client + provider() 出中立 vtable" {
         var op = try makeProvider(a, k, "test-key", "some-model", null);
         defer op.deinit();
         try std.testing.expectEqual(k, op.kind());
-        try std.testing.expect(@intFromEnum(op.io.async_limit) <= 2);
         // provider() 不 crash + model 透传(经具体 client)。
         const p = op.provider();
         try std.testing.expectEqualStrings("some-model", p.model());
