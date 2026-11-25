@@ -98,7 +98,7 @@ def model_comparison(latest):
     models ran different tasks, over the tasks all of them ran."""
     by_model = {}
     for (suite, model, task), (_, _, rows) in latest.items():
-        by_model.setdefault(model, {})[(suite, task)] = rows
+        by_model.setdefault(model, {})[(suite, task)] = [{**row, "task": (suite, task)} for row in rows]
 
     def summary(rows):
         return {k: v for k, v in data.summarize(rows).items() if k != "ttft_samples_ms"}
@@ -238,7 +238,7 @@ class Workbench:
                                                         "finished_at", "dataset", "execution_status")}
                 item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
         latest, _ = latest_results(record, views)
-        value["summary"] = data.summarize([row for _, _, rows in latest.values() for row in rows])
+        value["summary"] = data.summarize({**row, "task": key} for key, (_, _, rows) in latest.items() for row in rows)
         value["by_model"], value["common_tasks"] = model_comparison(latest)
         value["progress"] = {"done": done, "planned": planned} if planned else None
         value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
@@ -371,6 +371,11 @@ class Workbench:
         if not self.manager:
             raise ValueError(READ_ONLY)
         return self.profiles.cancel(profile)
+
+    def submission_action(self, profile, submission, action):
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return self.profiles.submission_action(profile, submission, action)
 
     def profile_item(self, profile, index, action) -> Dict[str, Any]:
         """Act on one queued dataset: `cancel` a waiting one, `stop` the running

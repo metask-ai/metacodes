@@ -248,3 +248,17 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .row-actions{display:flex;gap:6px}.row-actions .button{height:26px;padding:0 8px}
 .rename{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.rename input{min-width:220px;height:32px;padding:0 10px;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;font:inherit}
 .form-submit{position:sticky;bottom:0;z-index:2;display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:14px 0;background:var(--surface);border-top:1px solid var(--border)}
+.profile-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--border);border-radius:var(--radius);margin:20px 0 var(--gap);overflow:hidden;background:var(--surface)}
+.profile-metrics>.metric{border:0;padding:14px 20px;min-width:0}
+.profile-metrics>.metric:nth-child(-n+4){border-bottom:1px solid var(--border)}
+.profile-metrics>.metric.lead strong{color:var(--positive);font-size:26px}
+.submission{border-top:1px solid var(--border)}
+.submission h3{font-size:14px}.submission h3 small,.panel summary>span{margin-left:12px;font-size:12px;font-weight:400}
+.compare-picker{display:flex;gap:12px;align-items:end;flex-wrap:wrap}
+.compare-picker .field{min-width:0;flex:1 1 190px}
+.compare-picker select{min-width:0}
+.settings-tabs{display:flex;gap:20px;border-bottom:1px solid var(--border);margin:20px 0}
+.settings-tabs a{padding:8px 2px;color:var(--muted)}
+.settings-tabs a[aria-current=page]{border-bottom:2px solid var(--accent);color:var(--text)}
+@media (min-width:641px){.rail{width:74px}.canvas{margin-left:74px}.rail nav a{height:54px;gap:3px;flex-direction:column}.rail nav a span{display:block;font-size:11px}}
+@media (max-width:640px){.profile-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-metrics>.metric{padding:12px}.compare-picker .field{flex-basis:100%}}

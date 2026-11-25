@@ -142,6 +142,9 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.queue_profile(payload), 202)
                 elif path == "/api/profile/cancel" and isinstance(payload, dict):
                     self.send_json(workbench.cancel_profile(payload.get("id")))
+                elif path == "/api/profile/submission" and isinstance(payload, dict):
+                    self.send_json(workbench.submission_action(payload.get("id"), payload.get("submission"),
+                                                               payload.get("action")))
                 elif path == "/api/profile/item" and isinstance(payload, dict):
                     self.send_json(workbench.profile_item(payload.get("id"), payload.get("index"), payload.get("action")))
                 elif path == "/api/profile/concurrency" and isinstance(payload, dict):
