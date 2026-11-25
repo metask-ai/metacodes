@@ -18,21 +18,13 @@ status, compatibility boundaries, and entry points are defined by
   ones the model failed. Turning on 自动重跑无效的题 on a profile queues a
   finished dataset's invalid tasks again, at most two rounds per dataset.
 
-- **Dragging over text in the TUI can copy it** (preview `copy_on_select`).
-  With `--preview=copy_on_select` or `{"preview": {"copy_on_select": true}}`
-  the interactive TUI reports the mouse; releasing a left-button drag copies
-  the text under it through OSC 52 (and `pbcopy` in a local macOS session)
-  and the prompt shows `Copied to clipboard`, like Claude Code's fullscreen
-  mode. While it is on, the wheel no longer scrolls the scrollback and the
-  terminal's own selection needs its modifier key. macOS and Linux only.
-- **File references in replies open with Cmd/Ctrl+click.** The TUI renders a
-  Markdown link (`[notes.txt](/abs/notes.txt)`, `[x](src/a.zig:42)`,
-  `[docs](https://…)`) as an underlined OSC 8 hyperlink showing only its
-  label, and an inline code span that reads as a file reference
-  (`src/repl/render.zig:42`, `/etc/hosts`) keeps its look but becomes
-  clickable. Relative paths resolve against the working directory and the
-  `:line[:col]` suffix is dropped from the `file://` URL. Terminals without
-  OSC 8 show the same text.
+- **Dragging over text in the TUI copies it.** On macOS and Linux the
+  interactive TUI reports the mouse; releasing a left-button drag copies the
+  text under it through OSC 52 (and `pbcopy` in a local macOS session) and
+  the prompt shows `Copied to clipboard`, like Claude Code's fullscreen
+  mode. The wheel no longer scrolls the scrollback while the TUI waits for
+  input, and the terminal's own selection needs its modifier key (Shift, or
+  Option in iTerm2).
 
 - **WorkBuddy suites run with the profile's run gates.** A bench profile's
   Lean-modelled run gates now reach the WorkBuddy suites too: the workbench

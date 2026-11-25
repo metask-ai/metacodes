@@ -59,10 +59,8 @@ Preview features are set by the root `preview` field in the state root's
 every preview feature, `false` (the default) disables them all, and an object
 enables only the features set to `true`, for example
 `{"preview": {"execute_code": true, "teamwork": true}}`. The features are
-`execute_code`, `teamwork`, `comment_guard` (the instruction to avoid adding
-code comments and the matching check in the built-in file editors) and
-`copy_on_select` (copying text dragged over with the mouse in the
-interactive TUI).
+`execute_code`, `teamwork` and `comment_guard` (the instruction to avoid adding
+code comments and the matching check in the built-in file editors).
 
 Use `--preview` or `--no-preview` to override every feature for one
 invocation, or `--preview=<list>` / `--no-preview=<list>` to override only the

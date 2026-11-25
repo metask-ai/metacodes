@@ -8898,14 +8898,12 @@ metacodes-core.types.PreviewFeature: enum
 metacodes-core.types.PreviewFeature.execute_code
 metacodes-core.types.PreviewFeature.teamwork
 metacodes-core.types.PreviewFeature.comment_guard
-metacodes-core.types.PreviewFeature.copy_on_select
 metacodes-core.types.PreviewFeature.parse: fn parse(name: []const u8) ?PreviewFeature
 metacodes-core.types.PreviewFeatures: struct(u8)
 metacodes-core.types.PreviewFeatures.execute_code: bool = false
 metacodes-core.types.PreviewFeatures.teamwork: bool = false
 metacodes-core.types.PreviewFeatures.comment_guard: bool = false
-metacodes-core.types.PreviewFeatures.copy_on_select: bool = false
-metacodes-core.types.PreviewFeatures._unused: u4 = 0
+metacodes-core.types.PreviewFeatures._unused: u5 = 0
 metacodes-core.types.PreviewFeatures.none: const PreviewFeatures = .{}
 metacodes-core.types.PreviewFeatures.all: const PreviewFeatures = blk: { var features: PreviewFeatures = .{}; for (std.enums.values(PreviewFeature)) |feature| @field(features, @tagName(feature)) = true; break :blk features; }
 metacodes-core.types.PreviewFeatures.has: fn has(self: PreviewFeatures, feature: PreviewFeature) bool
