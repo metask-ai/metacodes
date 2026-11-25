@@ -4166,6 +4166,7 @@ pub const App = struct {
         // still current. Background jobs retain their own policy-frame
         // reference, so this cannot invalidate a child worker.
         app.clearActiveSkill();
+        app.resetSessionToolState();
         app.session_id = transcript.genSessionId();
         app.permission_ctx.session = app.session_id;
         app.swarm.session = app.session_id;
@@ -4251,6 +4252,7 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
         app.publishSessionDir();
+        app.resetSessionToolState();
         app.session_id = session;
         app.permission_ctx.session = session;
         app.swarm.session = session;
@@ -5126,6 +5128,13 @@ pub const App = struct {
     ) anyerror!void {
         const app: *App = @ptrCast(@alignCast(state));
         return app.activateSkill(skill_name, allowed, disallowed);
+    }
+
+    pub fn resetSessionToolState(app: *App) void {
+        _ = app.cron_registry.clear();
+        var names = app.activated_tools.keyIterator();
+        while (names.next()) |name| app.allocator.free(name.*);
+        app.activated_tools.clearRetainingCapacity();
     }
 
     /// 激活一个 deferred 工具(ToolSearch 调):记入 activated_tools 集(dupe name,只增)。

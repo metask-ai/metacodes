@@ -1706,7 +1706,7 @@ leaving every Host to rebuild them:
   Run, queued behind any work already there and journaled like a submission
   without a `trace_id`. The bundled daemon does the same for its `App` lead.
 - A Session that selected the cron tools (`CronCreate`, `CronDelete`,
-  `CronList`; admitted only with `RuntimeConfig.enable_cron`) has its
+  `CronList`, or `ScheduleWakeup`, admitted with `RuntimeConfig.enable_cron`) has its
   scheduled prompts fired by its driver, as the CLI fires them once it is
   back at the prompt: while its queue is empty and it has cron jobs, the
   driver calls `AgentSession.takeDueCronPrompts` at most every

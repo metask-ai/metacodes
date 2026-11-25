@@ -649,6 +649,7 @@ pub fn buildOptions(
         .goal_meter = if (app.goal_meter) |*meter| meter else null,
         .synthetic_user_input = scoped_recall,
         .dyn_registry = &app.dyn_registry,
+        .activated_tools = &app.activated_tools,
         .host_services = app.hostServices(),
         .project_dir = app.project_dir_or_empty(),
         .sandbox = app.sandboxPtr(),

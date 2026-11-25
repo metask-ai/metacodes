@@ -377,8 +377,10 @@ team 成员由 Host 在 create/restore 时提供，不进 checkpoint。AgentCore
 
 ### 定时 prompt（cron，issue #445）
 
-`RuntimeConfig.enable_cron` 打开后，cron 工具（`CronCreate`/`CronDelete`/`CronList`）
+`RuntimeConfig.enable_cron` 打开后，cron 工具（`CronCreate`/`CronDelete`/`CronList`/`ScheduleWakeup`）
 进入目录（不能经显式 `builtin_tools` 列表进入）；选了其中任一工具的 `AgentSession`
+可用 `ScheduleWakeup` 安排一次 60–3600 秒后的回访。重复安排会替换上一次回访，
+`stop:true` 取消待执行的回访，独立的 cron 计划继续运行。Session
 自带一个 `CronRegistry`，随 Session 生灭、不落盘、不进 checkpoint。工具只负责登记：
 到期的 prompt 由 Host 在 Session 空闲时用 `takeDueCronPrompts(allocator, limit)` 取走
 （运行中 `error.SessionBusy`；至多 `limit` 条，超出的仍保持到期、原样留待下次），

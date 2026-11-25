@@ -281,10 +281,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             echoUserSubmission(app, q, if (tui_region) |*r| r else null);
             break :blk q; // q owned,与 readLine 返回所有权一致
         } else if (tty)
-            readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?, &unsent_draft) catch |err| switch (err) {
+            readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?, &unsent_draft, true) catch |err| switch (err) {
                 // The double-press exits leave quietly, as Claude Code does;
                 // only `/exit` says goodbye.
                 error.Eof, error.ExitRequested, error.TerminateRequested => break,
+                error.ScheduledPromptDue => continue,
                 else => return err,
             }
         else
@@ -1863,7 +1864,7 @@ const TeamworkReader = struct {
     fn read(ctx: *anyopaque) ?[]u8 {
         const self: *TeamworkReader = @ptrCast(@alignCast(ctx));
         const host = self.host;
-        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region, host.unsent_draft) catch null;
+        if (host.region) |region| return readLineRaw(host.stdin_fd, host.allocator, host.history, host.app, region, host.unsent_draft, false) catch null;
         return readLineBuffered(host.allocator, host.stdin_fd) catch null;
     }
 };
@@ -1881,6 +1882,7 @@ fn readLineRaw(
     app: *app_mod.App,
     region: *render_region_mod.RenderRegion,
     unsent_draft: *?input.LineEditor,
+    wake_for_timers: bool,
 ) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
@@ -1991,7 +1993,12 @@ fn readLineRaw(
             }
             const rc = platform_term.waitReadable(fd, 200); // 可移植:200ms 超时等可读
             // 一个周期没有输入 = 输入静默过:此后的 Ctrl+O 不再算上一串的连发(Ctrl+O 去抖)。
-            if (rc == 0) region.noteInputIdle();
+            if (rc == 0) {
+                region.noteInputIdle();
+                if (wake_for_timers and app.cron_registry.count() != 0 and app.unbound() == null and
+                    !parser.pendingEsc() and editor.view().len == 0 and !region.escapeClosesOverlay() and
+                    app.cron_registry.dueCount() != 0) return error.ScheduledPromptDue;
+            }
             // A double-press window that ran out takes its hint with it.
             if (rc <= 0 and region.expirePress(util_time.nowMs())) redraw(region, &editor, app);
             if (rc <= 0) {
@@ -4733,6 +4740,7 @@ fn handleLoop(app: *app_mod.App, rest: []const u8) void {
         .off => {
             app.loop_enabled = false;
             app.loop_remaining = 0;
+            _ = app.cron_registry.stopWakeup();
             cmd_output.print("Loop continuation stopped.\n", .{});
             return;
         },
@@ -4758,6 +4766,7 @@ fn handleLoop(app: *app_mod.App, rest: []const u8) void {
 fn printLoopStatus(app: *const app_mod.App) void {
     cmd_output.print("Loop continuation: {s}", .{if (app.loop_enabled) "on" else "off"});
     if (app.loop_enabled) cmd_output.print(" ({d} remaining)", .{app.loop_remaining});
+    if (app.cron_registry.pendingWakeup()) |job| cmd_output.print(" (next wakeup at unix {d})", .{job.next_fire_unix});
     cmd_output.print("\n", .{});
     if (app.goal_state.current) |g| {
         cmd_output.print("Goal status: {s}\n", .{@tagName(g.status)});
@@ -4767,6 +4776,7 @@ fn printLoopStatus(app: *const app_mod.App) void {
 }
 
 fn shouldRunLoopContinuation(app: *const app_mod.App, queued_count: usize) bool {
+    if (app.cron_registry.pendingWakeup() != null) return false;
     const goal_status = if (app.goal_state.current) |g| g.status else null;
     return shouldRunLoopContinuationInput(.{
         .loop_enabled = app.loop_enabled,
@@ -6143,8 +6153,9 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     // A team is live process state, not part of the transcript. Drop
     // the old roster before changing identity so `/resume` cannot
     // leave an old worker, inbox, or worktree visible to the new run.
-    if (!std.mem.eql(u8, app.session_id.asSlice(), target_sid.asSlice()) and app.swarm.hasTeam()) {
-        app.swarm.detachTeam();
+    if (!std.mem.eql(u8, app.session_id.asSlice(), target_sid.asSlice())) {
+        app.resetSessionToolState();
+        if (app.swarm.hasTeam()) app.swarm.detachTeam();
     }
     app.session_id = target_sid;
     app.permission_ctx.session = target_sid; // 权限对话框路由到本会话视图(M5/M6)

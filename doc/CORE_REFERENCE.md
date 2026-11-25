@@ -1060,7 +1060,7 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
 提供,不进 checkpoint。设计见 `SWARM_DESIGN.md` §7b,C ABI 封装见 `AGENTCORE_BINARY_ABI.md`
 "Teams"。
 
-`RuntimeConfig.enable_cron`(issue #445)把 cron 工具(`CronCreate`/`CronDelete`/`CronList`)
+`RuntimeConfig.enable_cron`(issue #445)把 cron 工具(`CronCreate`/`CronDelete`/`CronList`/`ScheduleWakeup`)
 放进目录;选了它们的 Session 自带 `CronRegistry`(不落盘)。到期 prompt 由 Host 在空闲时经
 `AgentSession.takeDueCronPrompts` 取走;`SessionHost` 的 driver 把每条变成一个
 `cron_fired` Run,只取队列 `max_queued` 容得下的条数,其余仍到期留待下次;Host 经

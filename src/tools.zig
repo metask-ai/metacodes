@@ -247,6 +247,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "BashOutput",
+        .deferred = true,
         .description = "A backgrounded job's exit is announced to you automatically; you do not need to call this in a loop. Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks plus status (running|exited|killed). On a running job the call waits (default 30 seconds, maximum 600 seconds) until the job exits, or returns at once when unread output already fills the result (returned_on \"backlog\": page on with the cursors). until=\"output\" returns on the first unread byte instead (to stream a Monitor), until=\"quiet\" once output pauses for quiet_ms, until=\"pattern\" once output past the cursor contains pattern (pattern_match gives the channel and byte offset; pass it as *_since_byte to read from there; if the search could not reach the end in time, pattern_searched_to says where to resume it). Set wait_ms to 0 for a snapshot. returned_on names what ended the call. Back-to-back waiting polls that keep returning only a few bytes of a still-running job (a progress ticker) engage poll_guard: later waits ignore progress output and may run up to poll_guard.min_wait_ms even when wait_ms is shorter, and a page smaller than 256 bytes (a tiny max_bytes) no longer counts as full; page through a backlog with wait_ms 0. A pattern match ends any wait, guarded or not, and clears the guard's count. Omit stdout_since_byte/stderr_since_byte to continue from the last read, or pass an explicit offset to override it. Do not re-poll in a loop or sleep between polls: one BashOutput call waits for it. max_bytes caps a single read; omit it to get as much as the context budget allows (maximum 262144, and a large explicit value may still be reduced to fit that budget). To follow a long job, pass the previous stdout_next_offset/stderr_next_offset as the next stdout_since_byte/stderr_since_byte — those are the resume cursors. stdout_total_bytes/stderr_total_bytes report the file's current size, NOT a cursor: using them as one skips everything between what was shown and the end of the file. NOTE: if the command used shell redirection (>/>>/2>), the redirected output went to the file you named and BashOutput will not show it — Read that file directly.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to read" },
@@ -276,6 +277,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KillShell",
+        .deferred = true,
         .description = "Terminate a running backgrounded Bash job by job_id",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to terminate" },
@@ -284,6 +286,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Monitor",
+        .deferred = true,
         .description = "Start a background monitor that runs a command and streams stdout line-by-line. Its exit is announced to you automatically. Use to watch logs, poll status, or react to file changes mid-conversation. Each stdout line is collected into a ring buffer readable via BashOutput(job_id, until=\"output\") as lines arrive; a plain BashOutput waits up to wait_ms for the monitor to exit. Stop with KillShell(job_id). Args: command (required), description (required, e.g. 'errors in /var/log/app.log'). Optional: persistent (default false; if true, no timeout).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "command", .type = "string", .description = "Shell command to run; each stdout line becomes an event" },
@@ -352,7 +355,20 @@ pub const registry: []const ToolEntry = &.{
         .execute = .{ .legacy_inline = push_notification_tool.execute },
     },
     .{
+        .name = "ScheduleWakeup",
+        .description = "Schedule the next one-shot check-in for a requested task in this live session. Choose a delay from 60 to 3600 seconds, explain it, and pass the prompt to resume. A new call replaces the pending wakeup. Set stop to cancel it. Fixed schedules are managed separately with CronCreate, CronList and CronDelete via ToolSearch.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "delaySeconds", .type = "integer", .description = "Delay in seconds, clamped to 60..3600. Required unless stopping." },
+            .{ .name = "prompt", .type = "string", .description = "Instructions for the next check-in. Required unless stopping." },
+            .{ .name = "reason", .type = "string", .description = "Short reason for the chosen delay. Required unless stopping." },
+            .{ .name = "noop", .type = "boolean", .description = "Whether this iteration found no change. Required unless stopping." },
+            .{ .name = "stop", .type = "boolean", .description = "Cancel the pending dynamic wakeup in this session." },
+        } },
+        .execute = .{ .legacy_inline = cron_tool.wakeupExecute },
+    },
+    .{
         .name = "CronCreate",
+        .deferred = true,
         .description = "Schedule a prompt to fire at a future time. Recurring (cron) or one-shot (delaySeconds). Args: cron (5-field 'M H DoM Mon DoW') OR delaySeconds; prompt (required); recurring (default true). Session-scoped, fires when you return to the prompt. Returns job id.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "prompt", .type = "string", .description = "The prompt to enqueue at each fire time" },
@@ -364,6 +380,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CronDelete",
+        .deferred = true,
         .description = "Cancel a scheduled cron job by id.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "id", .type = "string", .description = "The id of the cron job to cancel" },
@@ -372,6 +389,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CronList",
+        .deferred = true,
         .description = "List all scheduled cron jobs in this session.",
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
         .execute = .{ .legacy_inline = cron_tool.listExecute },
@@ -485,6 +503,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskCreate",
+        .deferred = true,
         .description = "Create a task in the in-session task list. Returns the new task id. Use for multi-step work you want to track across turns.",
         .describe_fn = descriptions.describeTaskCreate,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -496,6 +515,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskGet",
+        .deferred = true,
         .description = "Fetch a task by id. For persistent kg-* tasks this also returns a bounded TinyKG task_packet with parent objective, dependencies, evidence, truncation diagnostics and continuations. Call it after restart/compaction or whenever claim could not return a packet; do not work from the title alone.",
         .describe_fn = descriptions.describeTaskGet,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -505,6 +525,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskList",
+        .deferred = true,
         .description = "List the live task frontier. For kg-* tasks select only an open, ready, unclaimed leaf; then claim it with TaskUpdate status=in_progress before work. This is a summary/projection, so use TaskGet/task_packet for full recovery context.",
         .describe_fn = descriptions.describeTaskList,
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
@@ -512,6 +533,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskUpdate",
+        .deferred = true,
         .description = "Update a task's status (pending/in_progress/completed/failed/deleted) and/or fields. For persistent kg-* tasks: claim with in_progress before work (the successful response contains the bounded task_packet); completed/failed are terminal while preserving the stable id; deleted is only a compatibility alias for failed. Close every claimed task with a verified conclusion and actual acts_on/uses/produces when known, then inspect the returned frontier.",
         .describe_fn = descriptions.describeTaskUpdate,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -532,6 +554,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskStop",
+        .deferred = true,
         .description = "Stop a task by id. For a backgrounded agent job (agent_* id, or agent_job_id arg), requests termination of the running subagent. For a todo task id, marks it completed (shortcut for TaskUpdate status=completed).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The task id (todo id or agent_* job id) to stop" },
@@ -541,6 +564,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskOutput",
+        .deferred = true,
         .description = "Read a backgrounded Task subagent by agent_job_id. Omit since_byte to start at offset 0 and wait up to 30 seconds for the first output or terminal status; pass since_byte = previous output_next_offset to wait for incremental output. output_total_bytes is retained as the next cursor for compatibility; output_size_bytes reports the current total. When done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "agent_job_id", .type = "string", .description = "The backgrounded agent job id to read" },
@@ -762,8 +786,6 @@ pub fn toToolDefinitionsFull(
     const tinykg_on = if (prompt_ctx) |pc| pc.tinykg_enabled else true;
     // ToolSearch 是 deferred 工具的发现/激活入口。没有任何 deferred 工具时仍广告它，
     // 会诱导模型对已经带完整 schema 的常驻工具做 select:Write/KgRecall，徒增一轮。
-    // 静态内置当前全常驻；MCP 动态工具 deferred=true。未来若静态工具重新 deferred，
-    // 此门会自动把 ToolSearch 放回。
     var has_deferred = false;
     for (registry) |tool| {
         if (tool.embedding_only or (tool.swarm_gated and !teams_on)) continue;

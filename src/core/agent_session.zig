@@ -83,7 +83,7 @@ pub const TEAM_BUILTIN_TOOLS = [_][]const u8{ "TeamCreate", "TeamDelete", "SendM
 /// (as the CLI's `App` keeps it). The tools only schedule: a prompt fires when
 /// the Session's Host takes it with `takeDueCronPrompts` while the Session is
 /// idle, as `SessionHost` does, so the C ABI does not offer them.
-pub const CRON_BUILTIN_TOOLS = [_][]const u8{ "CronCreate", "CronDelete", "CronList" };
+pub const CRON_BUILTIN_TOOLS = [_][]const u8{ "CronCreate", "CronDelete", "CronList", "ScheduleWakeup" };
 
 pub fn isCronBuiltin(name: []const u8) bool {
     return containsToolName(&CRON_BUILTIN_TOOLS, name);

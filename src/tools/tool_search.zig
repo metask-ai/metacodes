@@ -45,6 +45,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 }
             }
         }
+    } else if (ctx.request_tools) |request| {
+        for (request.catalog) |definition| {
+            if (matched.items.len >= max_results) break;
+            if (!definition.deferred or !request.offersDeferred(definition.name)) continue;
+            if (matchesKeywords(query, definition.name, definition.description)) try matched.append(allocator, definition.name);
+        }
     } else {
         // 关键字匹配:扫 deferred 工具(静态 deferred + dyn/MCP deferred)的 name/description。
         for (tools.registry) |*t| {
@@ -74,30 +80,39 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer out.deinit();
     try out.writer.writeAll("<functions>\n");
     for (matched.items) |name| {
-        // 激活失败安全吞:下一轮该工具没进 tools 数组,模型最多重试一次,无正确性损失
-        // (区别于 skill 激活——那个 catch 记 log,因激活态影响权限判定)。
-        if (ctx.host_services) |hs| hs.activateTool(name) catch {};
-        // 静态工具用 toolSchemaJson;dyn(MCP)工具从 DynRegistry 条目建 schema。
-        const schema: []u8 = tools.toolSchemaJson(allocator, name) catch blk: {
-            const dr = ctx.dyn_registry orelse return error.UnknownTool;
-            const e = dr.find(name) orelse return error.UnknownTool;
-            // 有借用的完整 schema(MCP inputSchema / 插件定义)就给模型完整参数;
-            // 只有 required 名单的旧式注册才退化成空 properties。
-            const def = json_mod.ToolDefinition{
-                .name = e.name,
-                .description = e.description,
-                .input_schema = e.borrowed_input_schema orelse .{ .type = "object", .properties = null, .required = e.required_fields },
-            };
-            var b: std.ArrayList(u8) = .empty;
-            errdefer b.deinit(allocator);
-            try @import("../api/request.zig").serializeOneTool(def, &b, allocator);
-            break :blk try b.toOwnedSlice(allocator);
-        };
+        const schema = try schemaForTool(ctx, name);
         defer allocator.free(schema);
         try out.writer.print("<function>{s}</function>\n", .{schema});
+        if (ctx.host_services) |hs| {
+            if (hs.activateToolFn != null) try hs.activateTool(name);
+        }
     }
     try out.writer.writeAll("</functions>");
     return try out.toOwnedSlice();
+}
+
+fn schemaForTool(ctx: *const ToolContext, name: []const u8) ![]u8 {
+    const allocator = ctx.allocator;
+    const definition: json_mod.ToolDefinition = blk: {
+        if (ctx.request_tools) |request| {
+            for (request.catalog) |definition| {
+                if (std.mem.eql(u8, definition.name, name)) break :blk definition;
+            }
+            return error.UnknownTool;
+        }
+        if (tools.getTool(name) != null) return tools.toolSchemaJson(allocator, name);
+        const registry = ctx.dyn_registry orelse return error.UnknownTool;
+        const entry = registry.find(name) orelse return error.UnknownTool;
+        break :blk .{
+            .name = entry.name,
+            .description = entry.description,
+            .input_schema = entry.borrowed_input_schema orelse .{ .type = "object", .required = entry.required_fields },
+        };
+    };
+    var schema: std.ArrayList(u8) = .empty;
+    errdefer schema.deinit(allocator);
+    try @import("../api/request.zig").serializeOneTool(definition, &schema, allocator);
+    return schema.toOwnedSlice(allocator);
 }
 
 /// Whether this turn's request showed the model `name`: in its tools array for

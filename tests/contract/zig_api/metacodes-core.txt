@@ -514,7 +514,7 @@ metacodes-core.agent_session.CronAccessError: const = error{ OutOfMemory, Sessio
 metacodes-core.agent_session.DEFAULT_BUILTIN_TOOLS: const = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS
 metacodes-core.agent_session.SESSION_BUILTIN_TOOLS: const = DEFAULT_BUILTIN_TOOLS ++ first_party_plugins.PREVIEW_TOOLS ++ [_][]const u8{"AskUserQuestion"}
 metacodes-core.agent_session.TEAM_BUILTIN_TOOLS: const = [_][]const u8{ "TeamCreate", "TeamDelete", "SendMessage", "SpawnTeammate" }
-metacodes-core.agent_session.CRON_BUILTIN_TOOLS: const = [_][]const u8{ "CronCreate", "CronDelete", "CronList" }
+metacodes-core.agent_session.CRON_BUILTIN_TOOLS: const = [_][]const u8{ "CronCreate", "CronDelete", "CronList", "ScheduleWakeup" }
 metacodes-core.agent_session.isCronBuiltin: fn isCronBuiltin(name: []const u8) bool
 metacodes-core.agent_session.isTeamBuiltin: fn isTeamBuiltin(name: []const u8) bool
 metacodes-core.agent_session.isSessionBuiltin: fn isSessionBuiltin(name: []const u8) bool
@@ -4124,6 +4124,7 @@ metacodes-core.cron_registry.freeViews: fn freeViews(allocator: std.mem.Allocato
 metacodes-core.cron_registry.dupeViews: fn dupeViews(allocator: std.mem.Allocator, views: []const JobView) error{OutOfMemory}![]JobView
 metacodes-core.cron_registry.CronJob: struct
 metacodes-core.cron_registry.CronJob.id: JobId
+metacodes-core.cron_registry.CronJob.dynamic_wakeup: bool = false
 metacodes-core.cron_registry.CronJob.cron_expr: []const u8
 metacodes-core.cron_registry.CronJob.prompt: []const u8
 metacodes-core.cron_registry.CronJob.recurring: bool
@@ -4135,6 +4136,9 @@ metacodes-core.cron_registry.CronRegistry.jobs: std.ArrayList(CronJob)
 metacodes-core.cron_registry.CronRegistry.init: fn init(allocator: std.mem.Allocator) CronRegistry
 metacodes-core.cron_registry.CronRegistry.deinit: fn deinit(self: *CronRegistry) void
 metacodes-core.cron_registry.CronRegistry.create: fn create( self: *CronRegistry, cron_expr: []const u8, delay_seconds: ?i64, prompt: []const u8, recurring: bool, ) !JobId
+metacodes-core.cron_registry.CronRegistry.pendingWakeup: fn pendingWakeup(self: *const CronRegistry) ?CronJob
+metacodes-core.cron_registry.CronRegistry.stopWakeup: fn stopWakeup(self: *CronRegistry) bool
+metacodes-core.cron_registry.CronRegistry.scheduleWakeup: fn scheduleWakeup(self: *CronRegistry, delay_seconds: i64, prompt: []const u8) !i64
 metacodes-core.cron_registry.CronRegistry.delete: fn delete(self: *CronRegistry, id: []const u8) bool
 metacodes-core.cron_registry.CronRegistry.remove: fn remove(self: *CronRegistry, id: JobId) bool
 metacodes-core.cron_registry.CronRegistry.clear: fn clear(self: *CronRegistry) usize
@@ -9645,7 +9649,7 @@ metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
 metacodes-core.tools.ToolEntry.embedding_only: bool = false
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <41615 bytes, sha256 b0be58688a4c>
+metacodes-core.tools.registry: const []const ToolEntry = <42925 bytes, sha256 b41bbc655382>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8

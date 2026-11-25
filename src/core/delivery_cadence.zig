@@ -154,10 +154,10 @@ const EXPLORATION_TOOLS = [_][]const u8{
 };
 
 const NEUTRAL_TOOLS = [_][]const u8{
-    "TaskCreate", "TaskUpdate",       "TaskList",        "TaskGet",    "KgRemember",
-    "ToolSearch", "BashOutput",       "KillShell",       "TaskOutput", "TaskStop",
-    "Monitor",    "PushNotification", "AskUserQuestion", "CronCreate", "CronDelete",
-    "CronList",   "SendMessage",      "FormalAuditTask", "Skill",
+    "TaskCreate", "TaskUpdate",       "TaskList",        "TaskGet",         "KgRemember",
+    "ToolSearch", "BashOutput",       "KillShell",       "TaskOutput",      "TaskStop",
+    "Monitor",    "PushNotification", "AskUserQuestion", "CronCreate",      "CronDelete",
+    "CronList",   "ScheduleWakeup",   "SendMessage",     "FormalAuditTask", "Skill",
 };
 
 /// Classify one executed tool call. Unknown names (MCP, plugins) are

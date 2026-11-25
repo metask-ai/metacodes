@@ -233,7 +233,7 @@ def test_T36_edit_diff_live_inline(bin_path):
 
 
 
-def _run_cassette(steps_files, key_events, term_size=(30, 90), env=None):
+def _run_cassette(steps_files, key_events, term_size=(30, 90), env=None, bin_path="zig-out/bin/metacodes-debug"):
     """通用:写 cassette(steps_files=[(name,sse_text)...]),起 replay(带瞬态重试),跑,返回 raw。"""
     if not os.path.isfile(REPLAY_BIN):
         raise SkipTest("无 replay_server(先 zig build test:harness)")
@@ -243,7 +243,7 @@ def _run_cassette(steps_files, key_events, term_size=(30, 90), env=None):
     for i, (_, txt) in enumerate(steps_files, start=1):
         with open(os.path.join(cdir, f"sse-{i:03d}.txt"), "w") as f:
             f.write(txt)
-    return replay_run(cdir, key_events, term_size=term_size, env=env)
+    return replay_run(cdir, key_events, term_size=term_size, env=env, bin_path=bin_path)
 
 
 
@@ -277,13 +277,15 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
     恰好一直处于 degraded——HOME 隔离修好后(2026-07-18)假设崩塌,故显式钉死。
     """
     raw = _run_cassette(
-        [("a", _sse_tool("tu1", "TaskCreate", {"subject": "build the widget", "description": "d", "activeForm": "Building the widget"})),
+        [("discover", _sse_tool("search1", "ToolSearch", {"query": "select:TaskCreate,TaskUpdate"})),
+         ("a", _sse_tool("tu1", "TaskCreate", {"subject": "build the widget", "description": "d", "activeForm": "Building the widget"})),
          ("b", _sse_tool("tu2", "TaskUpdate", {"taskId": "1", "status": "in_progress"})),
          ("c", _sse_text("started"))],
         # 断言看的是空闲态布局(清单行紧贴输入框上边框),等空闲输入框。
         [READY, "type:make a task", "key:enter", wait_for("◼"), IDLE],
         term_size=(40, 100),
         env={"METACODES_KG_BIN": "/nonexistent/kg-disabled-for-test"},
+        bin_path=bin_path,
     )
     a = TTYAssert(raw)
     top = a.box_top_row()
@@ -293,6 +295,18 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
     # B3 多行 Task 清单:in_progress 用 ◼(对齐 cc TaskListV2),label 用 activeForm。
     if "◼" not in tab or "Building the widget" not in tab:
         a._fail(f"TaskCreate/Update 后 TaskTab 未显示 activeForm:row={top-1!r} '{tab}'")
+
+
+def test_due_timer_starts_a_turn_while_the_terminal_is_idle(bin_path):
+    raw = _run_cassette(
+        [("discover", _sse_tool("s", "ToolSearch", {"query": "select:CronCreate"})),
+         ("schedule", _sse_tool("c", "CronCreate", {"delaySeconds": 2, "recurring": False, "prompt": "check timer"})),
+         ("scheduled", _sse_text("timer started")),
+         ("fired", _sse_text("idle timer delivered"))],
+        [READY, "type:start timer", "key:enter", wait_for("idle timer delivered", 12)],
+        bin_path=bin_path,
+    )
+    assert b"idle timer delivered" in raw
 
 
 def test_T40_assistant_markdown_render(bin_path):

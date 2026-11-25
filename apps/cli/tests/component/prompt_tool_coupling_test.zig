@@ -160,21 +160,18 @@ test "L2: ToolSearch enters the API tool set only when a deferred tool exists" {
     const definitions_allocator = definitions_arena.allocator();
     var no_tinykg = cc.tools.PromptContext{ .tinykg_enabled = false };
 
-    // TinyKG 治理核未启用、无动态工具：ToolSearch 没有工作可做，必须不广告。
     const core_only = try cc.tools.toToolDefinitionsFull(definitions_allocator, null, &no_tinykg);
     try std.testing.expect(findDef(core_only, "KgRecall") == null);
     try std.testing.expect(findDef(core_only, "Write") != null);
-    try std.testing.expect(findDef(core_only, "ToolSearch") == null);
+    try std.testing.expect(findDef(core_only, "ToolSearch") != null);
 
     var dyn = cc.tools_dynamic.DynRegistry.init(a);
     defer dyn.deinit();
-    // 常驻 Skill 类动态工具不需要激活，仍不应引入 ToolSearch。
     try dyn.register("always_visible", "always visible helper", &.{}, deferredProbe, null, false);
     const visible_dyn = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
     try std.testing.expect(findDef(visible_dyn, "always_visible") != null);
-    try std.testing.expect(findDef(visible_dyn, "ToolSearch") == null);
+    try std.testing.expect(findDef(visible_dyn, "ToolSearch") != null);
 
-    // MCP 工具 deferred=true：此时 ToolSearch 才是必要能力并随工具表进入请求。
     try dyn.registerMcp("demo__lookup", "deferred MCP lookup", &.{}, deferredProbe, null, "demo");
     const with_deferred = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
     try std.testing.expect(findDef(with_deferred, "ToolSearch") != null);
@@ -212,7 +209,7 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     try std.testing.expect(findDef(baseline_defs, "KgRecall") == null);
     try std.testing.expect(findDef(baseline_defs, "KgContext") == null);
     try std.testing.expect(findDef(baseline_defs, "FormalAuditTask") == null);
-    try std.testing.expect(findDef(baseline_defs, "ToolSearch") == null);
+    try std.testing.expect(findDef(baseline_defs, "ToolSearch") != null);
     const baseline_create = findDef(baseline_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "in-session task list") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "TinyKG") == null);
@@ -531,7 +528,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
 
     var defs_arena = std.heap.ArenaAllocator.init(a);
     defer defs_arena.deinit();
-    var pc = cc.tools.PromptContext{};
+    var pc = cc.tools.PromptContext{ .tinykg_enabled = false };
     const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), &dyn, &pc);
     const names = try defs_arena.allocator().alloc([]const u8, defs.len);
     for (defs, 0..) |d, i| names[i] = d.name;
@@ -543,7 +540,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__search — Search a KnowForge knowledge base by keyword. Returns fragments") != null);
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__overview — Knowledge base overview.") != null);
 
-    const search_sse = try toolSearchSse(a, "select:knowforge__search");
+    const search_sse = try toolSearchSse(a, "select:knowforge__search,TaskCreate,TaskUpdate,TaskOutput,CronList,BashOutput");
     defer a.free(search_sse);
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
     defer srv.stop();
@@ -585,6 +582,17 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__search") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__overview") != null);
 
+    const deferred_names = [_][]const u8{ "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop", "BashOutput", "Monitor", "KillShell", "CronCreate", "CronList", "CronDelete" };
+    try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"ScheduleWakeup\"") != null);
+    for (deferred_names) |name| {
+        const field = try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name});
+        defer a.free(field);
+        try std.testing.expect(std.mem.indexOf(u8, first_tools, field) == null);
+        const catalog_entry = try std.fmt.allocPrint(a, "- {s} —", .{name});
+        defer a.free(catalog_entry);
+        try std.testing.expect(std.mem.indexOf(u8, first_system, catalog_entry) != null);
+    }
+
     // ToolSearch 的结果把 schema 给了模型,激活集记下了名字。
     try std.testing.expect(activated.contains("knowforge__search"));
     try std.testing.expect(!activated.contains("knowforge__overview"));
@@ -592,12 +600,22 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(tool_result_msg.blocks[0] == .tool_result);
     try std.testing.expect(std.mem.indexOf(u8, tool_result_msg.blocks[0].tool_result.content, "\"name\":\"knowforge__search\"") != null);
 
+    try std.testing.expect(std.mem.indexOf(u8, tool_result_msg.blocks[0].tool_result.content, "acts_on") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "- TaskUpdate — Update an in-session task") != null);
+
     // 第二请求:被激活的 MCP 工具进 tools 数组;未激活的同伴仍只在 Deferred 段。
     const second = srv.requestAt(1) orelse return error.NoRequestCaptured;
     const second_tools = second.jsonField("tools") orelse return error.ToolsFieldMissing;
     const second_system = second.jsonField("system") orelse return error.SystemFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, second_tools, "\"name\":\"knowforge__search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, second_tools, "knowforge__overview") == null);
+    for (deferred_names) |name| {
+        const selected = activated.contains(name);
+        const field = try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name});
+        defer a.free(field);
+        try std.testing.expectEqual(selected, std.mem.indexOf(u8, second_tools, field) != null);
+    }
+    for ([_][]const u8{ "TaskCreate", "TaskUpdate", "TaskOutput", "CronList", "BashOutput" }) |name| try std.testing.expect(activated.contains(name));
     try std.testing.expect(std.mem.indexOf(u8, second_system, "- knowforge__overview") != null);
 }
 

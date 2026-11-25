@@ -855,7 +855,6 @@ fn kernelSection(which: KernelSection, text: []const u8) prompt_sections.Section
 /// 列出 deferred 工具(name + 短描述),说明调 ToolSearch 取 schema 才能用(对齐 cc
 /// <available-deferred-tools>)。只列当前 runtime treatment 实际启用的 deferred 工具；
 /// 否则 TinyKG-only schema 名会泄漏到 codex/claude 对照臂并破坏实验隔离。
-/// MCP 动态工具在 DynRegistry(此函数看不到),其 prompt 列名待 MCP 启动接线后补。
 fn buildDeferredToolsSection(
     allocator: std.mem.Allocator,
     enabled_tool_names: ?[]const []const u8,
@@ -866,22 +865,20 @@ fn buildDeferredToolsSection(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var any = false;
-    for (tools.registry) |*t| {
-        if (!t.deferred) continue;
-        if (t.tinykg_gated and !kg_ready) continue;
-        if (!toolNameEnabled(enabled_tool_names, t.name)) continue;
-        try appendDeferredLine(allocator, &buf, &any, t.name, t.description);
-    }
-    // 动态 deferred 工具(MCP/插件):不在静态注册表里,按运行时定义列名。描述压成单行
-    // 并截短——MCP server 的描述常常是整段文档,提示词只需要"这是什么"够模型选。
     if (tool_defs) |defs| {
         for (defs) |def| {
-            if (!def.deferred or def.retired) continue;
-            if (tools.getTool(def.name) != null) continue; // 静态条目上面已列
-            if (!toolNameEnabled(enabled_tool_names, def.name)) continue;
+            if (!def.deferred or def.retired or !toolNameEnabled(enabled_tool_names, def.name)) continue;
+            if (tools.getTool(def.name)) |tool| if (tool.tinykg_gated and !kg_ready) continue;
             const summary = try deferredDescriptionSummary(allocator, def.description);
             defer allocator.free(summary);
             try appendDeferredLine(allocator, &buf, &any, def.name, summary);
+        }
+    } else {
+        for (tools.registry) |tool| {
+            if (!tool.deferred or (tool.tinykg_gated and !kg_ready) or !toolNameEnabled(enabled_tool_names, tool.name)) continue;
+            const summary = try deferredDescriptionSummary(allocator, tool.description);
+            defer allocator.free(summary);
+            try appendDeferredLine(allocator, &buf, &any, tool.name, summary);
         }
     }
     if (!any) return try allocator.dupe(u8, "");
@@ -1595,8 +1592,6 @@ test "deferred section lists dynamic (MCP) deferred tools with a single-line sum
         .{ .name = "knowforge__search", .description = "Search the knowledge base.\n\nSecond paragraph that goes on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on.", .input_schema = .{}, .deferred = true, .mcp_server = "knowforge" },
         .{ .name = "knowforge__overview", .description = "  库概览——中文描述也要在 UTF-8 边界上截断,不能切出半个字。这里放足够长的文字保证超过一百二十字节的上限以触发截断逻辑。", .input_schema = .{}, .deferred = true, .mcp_server = "knowforge" },
         .{ .name = "skill__helper", .description = "resident skill tool", .input_schema = .{}, .deferred = false },
-        // 与静态注册表同名的动态定义(唯一的静态 deferred 是 TinyKG 门控的 FormalAuditTask):
-        // 静态循环已列,动态循环必须跳过,否则重复。
         .{ .name = "FormalAuditTask", .description = "static deferred already listed by the registry", .input_schema = .{}, .deferred = true },
     };
     const names = [_][]const u8{ "Read", "ToolSearch", "FormalAuditTask", "knowforge__search", "knowforge__overview", "skill__helper" };

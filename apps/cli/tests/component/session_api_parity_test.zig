@@ -279,7 +279,11 @@ test "R3-1回归: Ctrl+B 身份轮换 —— 新 session_id + 新 transcript 目
         break :blk old_dir_buf[0..w.dir.len];
     } else null;
 
+    try app.activateTool("TaskList");
+    _ = try app.cron_registry.scheduleWakeup(60, "original session");
     app.rotateSessionIdentity();
+    try std.testing.expect(!app.activated_tools.contains("TaskList"));
+    try std.testing.expect(app.cron_registry.pendingWakeup() == null);
 
     try std.testing.expect(!std.meta.eql(old_id, app.session_id));
     try std.testing.expect(std.meta.eql(app.permission_ctx.session, app.session_id));
@@ -347,6 +351,8 @@ test "L2 goal (issue #277): every CLI Run charges the App's goal and goal.json f
     // headless builds its own. Both carry the App's Meter and date announcer.
     const canonical = session_service.buildRunOptions(app, null);
     const headless = cc.repl_headless.buildOptions(app, null, null, null, false, null, null, null);
+    try std.testing.expect(canonical.activated_tools == &app.activated_tools);
+    try std.testing.expect(headless.activated_tools == &app.activated_tools);
     try std.testing.expect(canonical.goal_meter == meter);
     try std.testing.expect(headless.goal_meter == meter);
     try std.testing.expect(canonical.time_announcer != null and canonical.time_announcer == headless.time_announcer);
