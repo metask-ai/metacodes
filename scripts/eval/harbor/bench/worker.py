@@ -186,14 +186,6 @@ def adjusted_concurrency(spec_path, record):
 
 
 def supervise_remote(remote, spec, env, spec_path, record_path, record, source=None):
-    """Run Harbor on an SSH executor: heartbeat, cancel, background sync.
-
-    The receipt is rewritten every two seconds whatever the copy-back is
-    doing (RunManager shows a receipt older than 30 seconds as interrupted),
-    and the run is `finished` only when the final copy was verified
-    complete; otherwise the receipt says where the results still are. A
-    channel that drops or goes silent is reattached (RemoteRun.reconnect):
-    Harbor keeps running on the executor meanwhile."""
     secret_env = {}
     if spec.get("runner") != "workbuddy":
         # The run's key plus the suite's execution-host variables (a judge
@@ -248,6 +240,8 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         if now_s - last_write > 2:
             if remote.reconnects:
                 record["reconnects"] = remote.reconnects
+            if remote.summary is not None:
+                record["worker_summary"] = remote.summary
             stamp_credential(record, source)
             atomic_json(record_path, record)
             last_write = time.monotonic()
@@ -255,9 +249,6 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     remote.hang_up()
     remote.close()  # the session (and its ssh -R) is over: stop the egress proxy
     stamp_credential(record, source)
-    # Copy what is left beside the heartbeat; a cancel now stops the copy
-    # (the results stay on the executor and the receipt says so). A lost
-    # channel (no exit event) tries briefly: the host is likely unreachable.
     stop = threading.Event()
     timeout = None if remote.exit_code() is not None else min(remote.final_timeout, 120)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -274,6 +265,8 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
     except Exception as exc:  # never lose the run's outcome to the copy
         remote.log(f"同步远程作业目录失败：{type(exc).__name__}: {exc}")
         complete = False
+    if remote.summary is not None:
+        record["worker_summary"] = remote.summary
     code = remote.exit_code()
     if code is None:
         lost = remote.error_message() or remote.lost_message() or "SSH 连接中断"
@@ -292,7 +285,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         record["status"] = "failed"
     if not complete:
         note = remote.results_note()
-        message = (f"结果未能完整同步回本机，仍在执行机器 {note['executor']} 的 {note['path']}；"
+        message = (f"作业汇总未能同步，仍在执行机器 {note['executor']} 的 {note['path']}；"
                    f"同步后再查看：{note['retry']}")
         if record["status"] == "finished":
             record["status"] = "failed"

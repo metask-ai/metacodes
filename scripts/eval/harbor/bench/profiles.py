@@ -567,6 +567,10 @@ class ProfileManager:
         return public(record)
 
     def invalid_tasks(self, run: str) -> List[str]:
+        receipt = data.read_json(self.runs.records / (run + ".json")) or {}
+        if receipt.get("result_owner"):
+            groups = (receipt.get("worker_summary") or {}).get("tasks") or {}
+            return sorted(task for task, summary in groups.items() if summary["counts"]["invalid"])
         job_dir = self.runs.jobs_dir / run
         if not job_dir.is_dir():
             return []

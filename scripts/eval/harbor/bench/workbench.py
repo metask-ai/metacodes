@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.suites import leaderboards
-from scripts.eval.harbor.bench import builds, data, executors, monitor
+from scripts.eval.harbor.bench import builds, data, executors, monitor, results
 from scripts.eval.harbor.bench.profiles import PROFILE_ACTIVE, ProfileManager, public as public_profile, runs_of
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
@@ -22,7 +22,7 @@ from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.store import migrate as migration
 from scripts.eval.harbor.store.backend import Store, open_ephemeral
-from scripts.eval.harbor.store.library import StoreLibrary
+from scripts.eval.harbor.store.library import HIDDEN_WORKER_JOBS, StoreLibrary
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[4]
 READ_ONLY = "当前服务为只读模式"
@@ -66,9 +66,12 @@ def latest_results(record, views):
         by_task = {}
         for row in view.get("rows") or []:
             by_task.setdefault(row["task"], []).append(row)
+        by_task.update(view.get("task_summaries") or {})
         for task, rows in by_task.items():
             key = (item["suite"], item.get("model"), task)
-            if key in latest and stopped and all(row["status"] == "invalid" for row in rows):
+            invalid = rows["counts"]["invalid"] == rows["trials"] if isinstance(rows, dict) else all(
+                row["status"] == "invalid" for row in rows)
+            if key in latest and stopped and invalid:
                 continue
             if key in latest:
                 history.setdefault(key, []).append(latest[key][1])
@@ -80,6 +83,16 @@ def board_job(view, tasks):
     """A finished job on a published board's tasks (None: all of them): the
     mean reward of its finished trials, an invalid trial counting 0, and the
     mean over tasks of each task's mean priced cost."""
+    if "task_summaries" in view:
+        groups = [group for task, group in view["task_summaries"].items() if (tasks is None or task in tasks)
+                  and group["trials"] > group["counts"]["running"]]
+        finished = sum(g["trials"] - g["counts"]["running"] for g in groups)
+        if not finished:
+            return None
+        return {"name": view["name"], "model": view.get("model"), "profile": view.get("profile"),
+                "started_at": view.get("started_at"), "trials": finished, "tasks": len(groups),
+                "score": sum(g["reward_sum"] for g in groups) / finished,
+                "cost_per_task": _mean([g["finished_cost_mean"] for g in groups])}
     rows = [r for r in view["rows"] if r["status"] != "running" and (tasks is None or r["task"] in tasks)]
     if not rows:
         return None
@@ -93,23 +106,37 @@ def board_job(view, tasks):
             "cost_per_task": _mean([sum(c) / len(c) for c in costs.values()])}
 
 
+def group_summary(groups):
+    if not any(isinstance(group, dict) for group in groups.values()):
+        return data.summarize([{**row, "task": key} for key, group in groups.items() for row in group])
+    summaries = [group if isinstance(group, dict) else results.aggregate(group) for group in groups.values()]
+    summary = data.merge_summaries(summaries)
+    causes = {}
+    for group in summaries:
+        for cause, n in group["invalid_causes"].items():
+            causes[cause] = causes.get(cause, 0) + n
+    rewards = sum(s["reward_count"] for s in summaries)
+    summary.update(invalid_causes=causes, mean_reward=sum(s["reward_sum"] for s in summaries) / rewards if rewards else None)
+    return summary
+
+
 def model_comparison(latest):
     """Each model's latest results: over every task it ran, and, when the
     models ran different tasks, over the tasks all of them ran."""
     by_model = {}
     for (suite, model, task), (_, _, rows) in latest.items():
-        by_model.setdefault(model, {})[(suite, task)] = [{**row, "task": (suite, task)} for row in rows]
+        by_model.setdefault(model, {})[(suite, task)] = rows
 
     def summary(rows):
-        return {k: v for k, v in data.summarize(rows).items() if k != "ttft_samples_ms"}
+        return {k: v for k, v in group_summary(rows).items() if k not in ("ttft_samples_ms", "ttft_histogram")}
 
     task_sets = [set(tasks) for tasks in by_model.values()]
     common = set.intersection(*task_sets) if len(task_sets) > 1 and len({frozenset(t) for t in task_sets}) > 1 else None
     result = []
     for model, tasks in sorted(by_model.items(), key=lambda pair: pair[0] or ""):
-        entry = {"model": model, "tasks": len(tasks), "summary": summary([r for rows in tasks.values() for r in rows])}
+        entry = {"model": model, "tasks": len(tasks), "summary": summary(tasks)}
         if common is not None:
-            entry["common_summary"] = summary([r for key in common for r in tasks[key]])
+            entry["common_summary"] = summary({key: tasks[key] for key in common})
         result.append(entry)
     return result, (len(common) if common is not None else None)
 
@@ -184,13 +211,61 @@ class Workbench:
             raise ValueError(READ_ONLY)
         return self.manager.suite_tasks(suite_id, executor)
 
-    def job_view(self, name, with_rows=True, runs=None) -> Optional[Dict[str, Any]]:
-        """A stored job, labelled by its launch and corrected by its durable worker outcome."""
-        view = self.library.job_view(name)
+    def result_records(self):
+        records = {r["name"]: r for r in self.library.run_records()}
+        records.update((r["name"], r) for r in self.runs())
+        return records
+
+    def worker_read(self, run, operation, trial=None):
+        snapshot = run.get("worker_summary") or {}
+        name = run["name"]
+        if not snapshot and operation != "log":
+            return None
+        store = self.library.store
+        if snapshot and snapshot["store_id"] == store.identity():
+            with store.read() as tx:
+                source = tx.one("SELECT source_dir FROM jobs WHERE name = ?", (name,))
+            if source and source[0] == snapshot["source"]:
+                if operation == "log":
+                    return results.stored_log(store, name)
+                value = self.library.job_view(name) if operation == "job" else self.library.trial_view(name, trial)
+                return {**value, "detail_source": "database"} if value else None
+        if not self.manager:
+            raise results.WorkerUnavailable(f"请通过作业所属的工作台访问 worker {run['result_owner']}")
+        spec = settings(self.manager.records / (name + ".spec"))
+        entry = spec.get("executor") or {}
+        if entry.get("kind") != "ssh" or entry.get("name") != run["result_owner"] or spec.get("name") != name:
+            raise results.WorkerUnavailable(f"找不到作业 {name} 所属的 worker {run['result_owner']}")
+        executor = executors.parse({k: v for k, v in entry.items() if v is not None})
+        value = results.request(executor, name, operation, trial)
+        if operation == "log" or value is None:
+            return value
+        return {**value, "detail_source": "worker"}
+
+    def job_view(self, name, with_rows=True, runs=None, *, aggregate=False) -> Optional[Dict[str, Any]]:
+        if not isinstance(name, str) or not data.NAME.fullmatch(name):
+            return None
+        if isinstance(runs, dict):
+            run = runs.get(name)
+        else:
+            run = next((r for r in (self.runs() if runs is None else runs) if r["name"] == name), None)
+            run = run or self.library.run_record(name)
+        if run and run.get("result_owner"):
+            if aggregate:
+                snapshot = run.get("worker_summary") or {}
+                if not snapshot.get("view"):
+                    return None
+                view = {**snapshot["view"], "task_summaries": snapshot["tasks"]}
+            else:
+                view = self.worker_read(run, "job")
+            if view is not None:
+                view["result_owner"] = run["result_owner"]
+        elif not run and self.library.worker_only(name):
+            return None
+        else:
+            view = self.library.job_view(name)
         if view is None:
             return None
-        run = next((r for r in (self.runs() if runs is None else runs) if r["name"] == name), None)
-        run = run or self.library.run_record(name)
         # Suite/category: the launch record, else inferred from Harbor's dataset.
         view.update(suites.label((run or {}).get("suite")) or suites.label(suites.infer(view.get("dataset"))))
         judge = (run or {}).get("judge")
@@ -202,10 +277,14 @@ class Workbench:
             # Preserve those files, and display the durable worker outcome.
             view["running"] = False
             view["execution_status"] = run["status"]
-            for row in view["rows"]:
+            for row in view.get("rows", []):
                 if row["status"] == "running":
                     row.update(status="invalid", cause="execution: " + run["status"])
-            view["summary"] = data.summarize(view["rows"])
+            if "rows" in view:
+                view["summary"] = data.summarize(view["rows"])
+            else:
+                view["summary"] = results.stopped_summary(view["summary"])
+                view["task_summaries"] = {t: results.stopped_summary(g) for t, g in view["task_summaries"].items()}
             started, finished = data.parse_time(view.get("started_at")), data.parse_time(run.get("finished_at"))
             if finished:
                 view["finished_at"] = finished.isoformat()
@@ -239,7 +318,7 @@ class Workbench:
                                                         "finished_at", "dataset", "execution_status")}
                 item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
         latest, _ = latest_results(record, views)
-        value["summary"] = data.summarize({**row, "task": key} for key, (_, _, rows) in latest.items() for row in rows)
+        value["summary"] = group_summary({key: group for key, (_, _, group) in latest.items()})
         value["by_model"], value["common_tasks"] = model_comparison(latest)
         value["progress"] = {"done": done, "planned": planned} if planned else None
         value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
@@ -250,14 +329,18 @@ class Workbench:
     def jobs(self, scope="all") -> Dict[str, Any]:
         """Every job, newest first; `scope` is a profile id or "all"."""
         self.library.maybe_sync()
-        runs = self.runs()  # one scan of the run records for every job
-        jobs = [view for view in (self.job_view(name, True, runs) for name in self.library.job_names()) if view]
+        runs = self.runs()
+        receipts = {r["name"]: r for r in self.library.run_records()}
+        receipts.update((r["name"], r) for r in runs)
+        names = set(self.library.job_names()).union(n for n, r in receipts.items() if r.get("worker_summary"))
+        jobs = [view for view in (self.job_view(name, True, receipts, aggregate=True) for name in sorted(names)) if view]
         jobs.sort(key=lambda view: view["started_at"] or "", reverse=True)
         views = {view["name"]: view for view in jobs}
         records = self.profile_records()
         profiles = [self.profile_summary(record, views) for record in records]
         for view in jobs:
             view.pop("rows", None)
+            view.pop("task_summaries", None)
         if scope != "all":
             record = next((r for r in records if r["id"] == scope), None)
             owned = set(runs_of(record, runs)) if record else set()
@@ -274,7 +357,15 @@ class Workbench:
     def overview(self):
         """Every stored job, newest first, as Harbor wrote it."""
         self.library.maybe_sync()
-        return self.library.overview()
+        records = self.result_records()
+        hidden = self.library.worker_only()
+        summaries = {name: r["worker_summary"]["view"] for name, r in records.items() if r.get("worker_summary")}
+        views = []
+        for name in sorted(set(self.library.job_names()).union(summaries) - hidden):
+            view = summaries.get(name) or self.library.job_view(name, with_rows=False)
+            if view:
+                views.append(view)
+        return sorted(views, key=lambda view: view["started_at"] or "", reverse=True)
 
     def leaderboard(self, suite_id=None) -> Optional[Dict[str, Any]]:
         """Published boards of one suite (default: the first that has any) and
@@ -289,8 +380,9 @@ class Workbench:
         suite = suites.resolved(suites.BY_ID[suite_id])
         task_count = len(suite.tasks) if suite.tasks else suite.max_tasks
         self.library.maybe_sync()
-        runs = self.runs()
-        views = [view for view in (self.job_view(name, True, runs) for name in self.library.job_names())
+        runs = self.result_records()
+        names = set(self.library.job_names()).union(n for n, r in runs.items() if r.get("worker_summary"))
+        views = [view for view in (self.job_view(name, True, runs, aggregate=True) for name in sorted(names))
                  if view and view.get("suite") == suite_id and not view["running"]]
         boards, ranked_anywhere = [], set()
         for board in (b for b in published if suite_id in b["suites"]):
@@ -313,6 +405,16 @@ class Workbench:
 
     def trial(self, job, trial) -> Optional[Dict[str, Any]]:
         self.library.maybe_sync()
+        if not all(isinstance(n, str) and data.NAME.fullmatch(n) for n in (job, trial)):
+            return None
+        run = self.result_records().get(job)
+        if run and run.get("result_owner"):
+            detail = self.worker_read(run, "trial", trial)
+            if detail and detail["row"]["status"] == "running" and run["status"] in {"failed", "cancelled", "interrupted"}:
+                detail["row"].update(status="invalid", cause="execution: " + run["status"])
+            return {**detail, "result_owner": run["result_owner"]} if detail else None
+        if not run and self.library.worker_only(job):
+            return None
         detail = self.library.trial_detail(job, trial)
         if detail is None:
             return None
@@ -350,11 +452,17 @@ class Workbench:
         value["tasks"] = sorted(tasks, key=lambda t: (t["suite"], t["model"] or "", t["task"]))
         return value
 
-    def run(self, name) -> Optional[Dict[str, Any]]:
+    def run(self, name, *, worker_log=False) -> Optional[Dict[str, Any]]:
         record = next((r for r in self.runs() if r["name"] == name), None)
         if not record:
             return None
-        return {**record, "log": data.tail(self.manager.records / (record["name"] + ".log"))}
+        log = data.tail(self.manager.records / (record["name"] + ".log"))
+        if worker_log and record.get("result_owner"):
+            try:
+                log += "\n" + (self.worker_read(record, "log") or "")
+            except results.WorkerUnavailable as exc:
+                return {**record, "log": log, "log_error": str(exc)}
+        return {**record, "log": log}
 
     def launch(self, request) -> Dict[str, Any]:
         if not self.manager:
@@ -437,8 +545,9 @@ class Workbench:
             running = {r["name"] for r in receipts if r.get("status") in ACTIVE}
             if record["status"] in PROFILE_ACTIVE or running.intersection(runs):
                 raise ValueError("评测配置还在运行，请先停止，结束后再删除")
+            worker_jobs = {r["name"] for r in receipts + self.library.run_records() if r.get("result_owner")}
             self.library.delete_profile(profile, runs, manager.jobs_dir, self.profiles.path(profile),
-                                        lambda: self._remove_run_files(runs))
+                                        lambda protected: self._remove_run_files(runs, protected), worker_jobs)
         return {"id": profile, "deleted": True, "runs": runs}
 
     def delete_job(self, name) -> Dict[str, Any]:
@@ -450,22 +559,24 @@ class Workbench:
         self.profiles.advance()
         with self.profiles.lock, manager.lock:
             receipts = manager.runs()
-            view = self.job_view(name, True, receipts)
+            view = self.job_view(name, True, receipts, aggregate=True)
             if (view and view["running"]) or any(r["name"] == name and r.get("status") in ACTIVE for r in receipts):
                 raise ValueError("作业还在运行，请先停止，结束后再删除")
-            self.library.delete_job(name, manager.jobs_dir, lambda: self._forget_run(name))
+            record = next((r for r in receipts if r["name"] == name), None) or self.library.run_record(name)
+            worker_jobs = {name} if (record or {}).get("result_owner") else set()
+            self.library.delete_job(name, manager.jobs_dir, lambda protected: self._forget_run(name, protected), worker_jobs)
         return {"name": name, "deleted": True}
 
-    def _forget_run(self, name) -> None:
+    def _forget_run(self, name, worker_jobs) -> None:
         for record in self.profiles.records():
             items = [item for item in record["items"] if item.get("run") == name]
             for item in items:
                 item["run"] = None
             if items:
                 self.profiles.save(record)
-        self._remove_run_files([name])
+        self._remove_run_files([name], worker_jobs)
 
-    def _remove_run_files(self, runs) -> None:
+    def _remove_run_files(self, runs, worker_jobs=()) -> None:
         manager = self.manager
         try:
             try:
@@ -474,6 +585,11 @@ class Workbench:
             except FileNotFoundError:
                 receipts = []
             for run in runs:
+                if run in worker_jobs:
+                    hidden = manager.records / HIDDEN_WORKER_JOBS
+                    hidden.mkdir(parents=True, exist_ok=True)
+                    (hidden / run).touch()
+                    continue
                 try:
                     shutil.rmtree(manager.jobs_dir / run)
                 except FileNotFoundError:

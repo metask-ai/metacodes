@@ -255,16 +255,16 @@ class Store:
         with self.read() as tx:
             return {table: int(tx.one(f"SELECT COUNT(*) FROM {table}")[0]) for table, _ in schema.TABLES}
 
+    def identity(self) -> str:
+        with self.read() as tx:
+            return tx.one("SELECT value FROM store_meta WHERE key = 'store_id'")[0]
+
     def same_database(self, other: "Store") -> bool:
         if self.dialect != other.dialect:
             return False
         if self.dialect == "sqlite":
             return self.config.path == other.config.path
-        with self.read() as tx:
-            mine = tx.one("SELECT value FROM store_meta WHERE key = 'store_id'")
-        with other.read() as tx:
-            theirs = tx.one("SELECT value FROM store_meta WHERE key = 'store_id'")
-        return mine == theirs
+        return self.identity() == other.identity()
 
 
 def open_store(config: StoreConfig) -> Store:
