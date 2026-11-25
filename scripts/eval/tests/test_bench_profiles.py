@@ -1003,6 +1003,30 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn(left['submission'], {group, ended['items'][2]['submission']})
         self.assertEqual([i['suite'] for i in replay['items'][-2:]], [i['suite'] for i in first['items']])
 
+    def test_old_queued_auto_retry_is_cancelled_and_its_original_replayed_once(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        manager = self.manager.profiles
+        record = manager.queue(self.request())
+        first, waiting = record['items']
+        for item in record['items']:
+            del item['submission']
+        first.update(status='finished', finished_at='2026-01-01T10:05:00Z')
+        first['queued_at'] = waiting['queued_at'] = '2026-01-01T10:00:00Z'
+        separate = {**first, 'status': 'pending', 'finished_at': None, 'queued_at': '2026-01-01T10:03:00Z'}
+        retry = {**separate, 'auto_rerun': 1, 'queued_at': '2026-01-01T10:05:01Z'}
+        record['items'].extend([separate, retry])
+        manager.save(record)
+        visible = self.workbench.profile(record['id'])['items']
+        group = visible[0]['submission']
+        self.assertEqual(visible[-1]['submission'], group)
+        self.assertTrue(visible[-1]['retry'])
+        command = {'id': record['id'], 'submission': group}
+        stopped = self.client.request('api/profile/submission', {**command, 'action': 'cancel'})
+        self.assertEqual([i['status'] for i in stopped['items']], ['finished', 'skipped', 'pending', 'skipped'])
+        replay = self.client.request('api/profile/submission', {**command, 'action': 'run'})
+        self.assertEqual([i['suite'] for i in replay['items'][4:]], [first['suite'], waiting['suite']])
+
     def test_models_that_ran_different_tasks_are_also_compared_on_the_common_ones(self):
         def entry(status):
             return (None, 'job', [{'task': 't', 'status': status}])

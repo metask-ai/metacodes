@@ -24,6 +24,7 @@ from scripts.eval.harbor.viewer import server  # noqa: E402
 from scripts.eval.harbor.bench.runner import RunManager  # noqa: E402
 from scripts.eval.harbor.adapters import gaia2_cli  # noqa: E402
 from scripts.eval.tests.test_bench_workbench import fixture, wait_run  # noqa: E402
+from scripts.eval.tests.test_harbor_viewer import _job  # noqa: E402
 
 
 def main():
@@ -85,6 +86,22 @@ def main():
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/job/{name}/fix-git__fake')
                     page.get_by_text('920', exact=True).first.wait_for()
                     page.get_by_text('2,020', exact=True).first.wait_for()
+                    manager.profiles.advance()
+                    with patch.dict(os.environ, {'FAKE_BENCH_RELEASE_FILE': str(root / 'hold-standalone')}):
+                        loose = manager.launch({'model': 'tokenjoy/test-model', 'tasks': ['fix-git']})['name']
+                    imported = _job(manager.jobs_dir, 'imported', 'test-model', 1)
+                    try:
+                        page.wait_for_function("name => fetch('/api/job?name=' + name).then(r => r.ok)", arg=loose)
+                        http.workbench.library.sync()
+                        page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/')
+                        assert page.get_by_role('link', name=imported.name, exact=True).get_attribute('href') == '#/job/imported'
+                        page.get_by_role('link', name=loose, exact=True).click()
+                        page.get_by_text('执行日志', exact=True).wait_for()
+                        page.get_by_role('button', name='停止评测', exact=True).click()
+                        assert wait_run(manager, loose)['status'] == 'cancelled'
+                    finally:
+                        manager.cancel(loose)
+                        wait_run(manager, loose)
                     page.set_viewport_size({'width': 390, 'height': 844})
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
                     page.locator('.form-submit button').wait_for()

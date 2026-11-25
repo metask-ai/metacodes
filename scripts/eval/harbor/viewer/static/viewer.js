@@ -384,10 +384,11 @@ async function renderOverview() {
         usd(p.summary.cost_per_pass), int(p.summary.counts.pass), pct(p.summary.cache_hit_rate)].map((v) => h('td', { text: v }))))),
     h('div', { class: 'panel-body' }, comparisonPicker(chosen, true))));
   const owned = new Set(profiles.flatMap((p) => p.items.map((i) => i.run)));
+  const localRuns = new Set(runs.map((r) => r.name));
   const loose = jobs.filter((j) => !owned.has(j.name));
   const receipts = runs.filter((r) => !owned.has(r.name) && !jobs.some((j) => j.name === r.name));
   const legacy = loose.length || receipts.length ? panel('独立评测记录', null, table(['评测', '模型', '评测集', ''], [
-    ...loose.map((j) => h('tr', {}, h('td', {}, link('#/job/' + encodeURIComponent(j.name), j.name)),
+    ...loose.map((j) => h('tr', {}, h('td', {}, link((localRuns.has(j.name) ? '#/run/' : '#/job/') + encodeURIComponent(j.name), j.name)),
       h('td', { text: j.model }), h('td', { text: j.suite_name || j.dataset }), h('td', {}, canRun && !j.running ?
         h('button', { class: 'button', onclick: (e) => deleteJob(j, e.currentTarget) }, '删除') : null))),
     ...receipts.map((r) => h('tr', {}, h('td', {}, link('#/run/' + encodeURIComponent(r.name), r.name)),
@@ -451,7 +452,7 @@ async function renderProfile(id) {
 
   const itemRow = (item, index) => {
     const j = item.job; const js = j?.summary;
-    const href = j ? '#/job/' + encodeURIComponent(j.name) : item.run ? '#/run/' + encodeURIComponent(item.run) : null;
+    const href = item.local_run ? '#/run/' + encodeURIComponent(item.run) : j ? '#/job/' + encodeURIComponent(j.name) : null;
     return h('tr', { class: href ? 'link' : null, onclick: href ? () => { location.hash = href; } : null },
       h('td', {}, href ? link(href, item.suite_name || item.suite) : h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
         item.concurrency ? `并发 ${item.concurrency}` : null,

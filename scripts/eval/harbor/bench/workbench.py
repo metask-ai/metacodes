@@ -328,9 +328,11 @@ class Workbench:
         record = next((r for r in self.profile_records() if r["id"] == profile), None)
         if record is None:
             return None
+        runs = self.runs()
+        local_names = {r["name"] for r in runs}
         full = {}
         for item in record["items"]:
-            view = self.job_view(item["run"]) if item.get("run") else None
+            view = self.job_view(item["run"], runs=runs) if item.get("run") else None
             if view is not None:
                 full[view["name"]] = view
         value = self.profile_summary(record, full)
@@ -338,6 +340,7 @@ class Workbench:
         tasks = [{**task_group(task, rows, item, job), "history": history.get(key, [])}
                  for key, (item, job, rows) in latest.items() for task in [key[2]]]
         for item in value["items"]:
+            item["local_run"] = item.get("run") in local_names
             if item["status"] in ("pending", "running") and item.get("run") not in full:
                 tasks += [{"task": t, "job": None, "suite": item["suite"], "suite_name": item.get("suite_name"),
                            "model": item.get("model"), "attempts": [], "first_status": None, "passed": 0,

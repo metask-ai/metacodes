@@ -267,14 +267,14 @@ class ProfileManager:
         for path in paths:
             value = data.read_json(path)
             if isinstance(value, dict) and value.get("id") == path.stem and data.NAME.fullmatch(path.stem):
-                found.append(value)
+                found.append(restore_submissions(value))
         return sorted(found, key=lambda r: r.get("created_at", ""), reverse=True)
 
     def get(self, profile: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(profile, str) or not data.NAME.fullmatch(profile):
             return None
         value = data.read_json(self.path(profile))
-        return value if isinstance(value, dict) and value.get("id") == profile else None
+        return restore_submissions(value) if isinstance(value, dict) and value.get("id") == profile else None
 
     def active_id(self) -> Optional[str]:
         """The profile that owns the executor now (reads files only, no lock:
@@ -503,7 +503,7 @@ class ProfileManager:
             record = self.get(profile)
             if record is None:
                 raise ValueError("Profile 不存在")
-            items = [item for index, item in enumerate(record["items"]) if submission_id(item, index) == submission]
+            items = [item for item in record["items"] if item["submission"] == submission]
             if not items:
                 raise ValueError("作业不存在")
             if action == "cancel":
@@ -561,7 +561,7 @@ class ProfileManager:
                 raise ValueError("这个评测集没有要运行的题")
             again = rerun(item, tasks, 0, profile_concurrency(record))
             record = self._append({"id": record["id"]}, None, [{**again, "retry": True}],
-                                  submission=submission_id(item, index))
+                                  submission=item["submission"])
         self.wake()
         return public(record)
 
@@ -588,7 +588,7 @@ class ProfileManager:
         if tasks:
             again = rerun(item, tasks, next_round, pin_concurrency(record))
             record["items"].append({**again, "queued_at": now(), "retry": True,
-                                    "submission": submission_id(item, record["items"].index(item))})
+                                    "submission": item["submission"]})
 
     # -------------------------------------------------------------- scheduler
 
@@ -743,8 +743,33 @@ def queued_since(record: Dict[str, Any]) -> str:
     return min(waiting, default=record.get("created_at") or "")
 
 
-def submission_id(item, index):
-    return item.get("submission") or "legacy-" + str(item.get("queued_at") or index)
+def restore_submissions(record):
+    items = record.get("items") or []
+    for index, item in enumerate(items):
+        if item.get("submission"):
+            continue
+        item["submission"] = "legacy-" + str(item.get("queued_at") or index)
+        if not item.get("auto_rerun"):
+            continue
+        queued = data.parse_time(item.get("queued_at"))
+        sources = []
+        for previous in items[:index]:
+            if previous.get("status") != "finished" or previous.get("auto_rerun", 0) + 1 != item["auto_rerun"]:
+                continue
+            if any(previous.get(k) != item.get(k) for k in ("suite", "model", "executor", "attempts", "route")):
+                continue
+            finished = data.parse_time(previous.get("finished_at"))
+            if finished and queued and finished > queued:
+                continue
+            if set(item.get("tasks") or []).issubset(previous.get("tasks") or []):
+                sources.append((finished, previous["submission"]))
+        if sources and queued and all(time for time, _ in sources):
+            latest = max(time for time, _ in sources)
+            sources = [source for source in sources if source[0] == latest]
+        owners = {owner for _, owner in sources}
+        if len(owners) == 1:
+            item.update(submission=owners.pop(), retry=True)
+    return record
 
 
 def runs_of(record: Dict[str, Any], receipts: List[Dict[str, Any]]) -> List[str]:
@@ -781,11 +806,10 @@ def profile_concurrency(record: Dict[str, Any]) -> int:
 
 def public(record: Dict[str, Any]) -> Dict[str, Any]:
     """A profile record without the internal per-item launch requests."""
-    value = json.loads(json.dumps(record))
+    value = restore_submissions(json.loads(json.dumps(record)))
     value["default_name"] = default_name(record)
     value["concurrency"] = profile_concurrency(record)
-    for index, item in enumerate(value.get("items") or []):
-        item["submission"] = submission_id(item, index)
+    for item in value.get("items") or []:
         item.pop("request", None)
         item.pop("route", None)
     return value

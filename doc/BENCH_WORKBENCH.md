@@ -1431,8 +1431,9 @@ carry the same `submission` ID. The profile page can cancel one job or rerun
 its original evaluations together (`POST /api/profile/submission` with `id`,
 `submission` and `action` of `cancel` or `run`). Rerunning a whole job
 creates a new job on its recorded executor. A single evaluation retry and an
-automatic retry stay in the original job. Historical items use their shared
-queue timestamp when their submission was recorded before IDs were introduced.
+automatic retry stay in the original job. For older records, the workbench
+groups evaluations by their original queue timestamp and assigns automatic
+retries to their source submission when the recorded history identifies it.
 
 The queued datasets run one after another, each as an ordinary workbench run
 (one Harbor job) whose record names the profile. The durable state is
