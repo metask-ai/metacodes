@@ -675,7 +675,6 @@ class ProfileManager:
                     for item in batch.get("items") or []:
                         record["items"].append({**item, "model": batch.get("model"), "attempts": batch.get("attempts"),
                                                 "executor": batch.get("executor"), "queued_at": batch.get("created_at")})
-                    pin_concurrency(record)
                     record["started_at"] = record.get("started_at") or batch.get("started_at")
                     record["finished_at"] = max(filter(None, (record.get("finished_at"), batch.get("finished_at"))),
                                                 default=None)

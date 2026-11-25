@@ -1020,13 +1020,15 @@ class ProfileTest(unittest.TestCase):
         old_run = created['items'][0]['run']
         legacy = self.manager.jobs_dir / '.bench-batches'
         item = {k: v for k, v in created['items'][0].items() if k not in ('model', 'attempts', 'executor', 'queued_at')}
-        for batch_id, at, features in (('batch-1', '2026-01-01T00:00:00Z', []), ('batch-2', '2026-01-02T00:00:00Z', []),
-                                       ('batch-3', '2026-01-03T00:00:00Z', ['execute_code'])):
+        for batch_id, at, features, concurrency in (
+                ('batch-1', '2026-01-01T00:00:00Z', [], 10), ('batch-2', '2026-01-02T00:00:00Z', [], 10),
+                ('batch-3', '2026-01-03T00:00:00Z', ['execute_code'], 20),
+                ('batch-4', '2026-01-04T00:00:00Z', ['execute_code'], 2)):
             atomic_json(legacy / (batch_id + '.json'), {
                 'id': batch_id, 'name': batch_id + ' 名称', 'status': 'finished', 'created_at': at,
                 'started_at': at, 'finished_at': at, 'model': 'tokenjoy/test-model', 'executor': 'local',
                 'attempts': 1, 'concurrency': 1, 'features': features, 'metacodes': created['metacodes'],
-                'items': [item], 'cancel_requested': False})
+                'items': [{**item, 'concurrency': concurrency}], 'cancel_requested': False})
         atomic_json(self.manager.records / 'launch-failed.json', {'name': 'launch-failed', 'status': 'failed',
                                                                   'batch': 'batch-2', 'error': 'OSError'})
         manager = profiles.ProfileManager(self.manager)
@@ -1036,7 +1038,8 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([i['run'] for i in merged['items']], [old_run] * 3)
         self.assertEqual(merged['items'][1]['model'], 'tokenjoy/test-model')
         other = manager.get(profiles.profile_id(created['metacodes']['digest'], ['execute_code']))
-        self.assertEqual((other['name'], other['batches']), ('batch-3 名称', ['batch-3']))
+        self.assertEqual((other['name'], other['batches']), ('batch-3 名称', ['batch-3', 'batch-4']))
+        self.assertEqual(profiles.profile_concurrency(other), 2)
         self.assertEqual(profiles.runs_of(merged, self.manager.runs()), sorted([old_run, 'launch-failed']))
         again = profiles.ProfileManager(self.manager)
         self.assertEqual(len(again.get(created['id'])['items']), 3)
