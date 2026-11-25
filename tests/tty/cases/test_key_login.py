@@ -8,7 +8,7 @@ provider does not bill, and store it in that provider's own key file. The
 
 The check is pointed at a local mock with METACODES_KEY_CHECK_URL; the page a
 key is created on is "opened" through a $BROWSER recorder. The kernel flow and
-the credential scoping are covered by tests/component/provider_key_login_test.zig.
+the credential scoping are covered by apps/cli/tests/component/provider_key_login_test.zig.
 """
 import http.server
 import json

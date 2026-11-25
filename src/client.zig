@@ -121,7 +121,7 @@ pub fn connectErrorDetail(err: anyerror) []const u8 {
 }
 
 /// 给定错误是否值得重试(瞬态网络错误 + 可重试 HTTP 状态)。对齐 CC shouldRetry:
-/// 连接错误、429、5xx(ServerError/BadGateway/ServiceUnavailable)、overloaded(ApiError 由上层判)。
+/// 连接错误、429、5xx(ServerError/BadGateway/ServiceUnavailable,529 overloaded 也归 ServiceUnavailable)。
 pub fn isRetriableError(err: anyerror) bool {
     if (isTransientNetworkError(err)) return true;
     return switch (err) {
@@ -180,7 +180,7 @@ fn backOffBeforeRetry(
 /// One attempt covers DNS/TCP/TLS, the request and the response head, so
 /// nothing has reached the caller yet and the very same request bytes, to the
 /// same endpoint and model, can go again. A retriable failure
-/// (`isRetriableError`: transient network, 429, 500/502/503, a head stall)
+/// (`isRetriableError`: transient network, 429, 500/502/503/529, a head stall)
 /// backs off - the server's Retry-After when it sent one, else `retryDelayMs` -
 /// with the caller's reporter told, as in the Messages client since it was
 /// added; anything else, and the last allowed attempt, ends the request with
@@ -210,6 +210,7 @@ pub fn ConnectRetryFor(comptime module: []const u8) type {
                 .base_ms = if (retry_base_ms > 0) retry_base_ms else RETRY_BASE_MS,
                 .reporter = reporter,
                 .abort = abort,
+                .failed = if (reporter) |rep| rep.attempts_before else 0,
             };
         }
 
@@ -545,17 +546,19 @@ pub fn noteConnectFailure(err: anyerror) void {
 
 /// 服务端在流里**主动声明**的失败(OpenAI chat 兼容端 / Gemini 的顶层 `error` 对象、Responses 的
 /// `response.failed` / `error` 事件)的统一交代:日志 + last_error 现场,与 Anthropic 错误帧
-/// (stream.zig `.error_event`)同一个名字。调用方随后返回 `error.ApiError`——它是服务端的答复,
-/// 不是断连(`RequestFailed`),agent_loop 不会为它兜底重发。
+/// (stream.zig `.error_event`)同一个名字。返回调用方要上抛的错误:过载是
+/// `error.ServiceUnavailable`,与 HTTP 503/529 同名,agent_loop 按 provider 的重试上限和退避重发;
+/// 其余是 `error.ApiError`——它是服务端的答复,不是断连(`RequestFailed`),agent_loop 不会为它兜底重发。
 ///
 /// `credential` is what the stream's request carried: a server that echoes it in
 /// the frame does not get it into the log or onto the screen.
-pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8, credential: ?model_error.SecretPrint) void {
+pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8, credential: ?model_error.SecretPrint) error{ ApiError, ServiceUnavailable } {
     var masked: model_error.MaskedFailure = .{};
     const shown = model_error.maskFailure(&masked, err_obj, credential);
     log.warnId(module, rid, "API error in stream: {s}", .{shown});
     last_error.recordNamed("API 错误帧", shown);
     model_error.noteStreamError(err_obj);
+    return if (model_error.isOverloaded(err_obj)) error.ServiceUnavailable else error.ApiError;
 }
 
 /// What lies beneath a stream read that failed (#573). std folds every
@@ -1769,7 +1772,7 @@ fn classifyHttpStatus(status_code: u16) HttpDisposition {
         429 => .{ .failure = .rate_limited },
         500 => .{ .failure = .server_error },
         502 => .{ .failure = .bad_gateway },
-        503 => .{ .failure = .service_unavailable },
+        503, 529 => .{ .failure = .service_unavailable },
         else => .{ .failure = .generic },
     };
 }
@@ -1868,7 +1871,7 @@ test "HTTP status classification is total and preserves provider semantics" {
         .{ .code = 500, .failure = .server_error },
         .{ .code = 502, .failure = .bad_gateway },
         .{ .code = 503, .failure = .service_unavailable },
-        .{ .code = 529, .failure = .generic },
+        .{ .code = 529, .failure = .service_unavailable },
         .{ .code = 599, .failure = .generic },
     };
     for (cases) |case| {
@@ -2083,6 +2086,10 @@ pub const StreamResponse = struct {
                 // 上抛**区分性** error,不塌缩成 RequestFailed,让 agent_loop/测试能识别。
                 log.warnId("stream", self.id, "API error event surfaced", .{});
                 return error.ApiError;
+            },
+            error.OverloadedEvent => {
+                log.warnId("stream", self.id, "overloaded error event surfaced", .{});
+                return error.ServiceUnavailable;
             },
             error.ContextWindowExceededEvent => {
                 self.context_window_numbers = self.event_iter.context_window_numbers;

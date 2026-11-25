@@ -294,7 +294,7 @@ path unchanged.
 ## Session command surface (UI-neutral)
 
 All three interactive hosts (terminal REPL, `--web`, `serve`/`serve --sessions N`)
-share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
+share one input pipeline (`apps/cli/src/session_intent.zig` + `apps/cli/src/session_service.zig`):
 
     raw input → session_intent.parse → InputIntent
       → SessionService.dispatch (validate → mutate → optional RunPlan)
@@ -315,7 +315,7 @@ share one input pipeline (`src/session_intent.zig` + `src/session_service.zig`):
 - **Run assembly.** `session_service.buildRunOptions` is the only place App
   state is projected into `agent_loop.Options`; hosts add only host-specific
   fields (UI requester, run-control observers, budgets).
-- Equivalence is locked by `tests/component/session_api_parity_test.zig`.
+- Equivalence is locked by `apps/cli/tests/component/session_api_parity_test.zig`.
 
 ### Edit and rerun
 
@@ -379,7 +379,7 @@ the same root `"preview"` in `<state root>/config.json` and the same
 `--preview`, `--no-preview`, `--preview=teamwork` and `--no-preview=teamwork`
 flags as the other preview features. Flags may precede `teamwork` or follow
 the action; the last flag naming the feature wins and overrides the saved value. CLI dispatch
-before App initialization and App initialization share `app/config.zig`'s
+before App initialization and App initialization share `core/file_config.zig`'s
 `resolvePreview` (`FileConfig` loading plus `Setting.resolve`). `--preview`
 selects the feature; it does not approve a task or authorize spend.
 
@@ -602,6 +602,17 @@ an unpinned kernel or daemon may be absent. `metacodes terminal-setup
 or a VS Code build's `keybindings.json` after a backup, and `--restore` undoes
 it; it exits 0 when the terminal is set up or needs nothing, 1 when it left the
 terminal alone or the change failed ([TERMINAL_SETUP.md](TERMINAL_SETUP.md)).
+On macOS and Linux the interactive TUI reports the mouse (`ESC[?1002h`,
+`ESC[?1006h`) while it reads keys, so dragging with the left button copies
+the text under the drag when the button is released: the TUI sends it as OSC
+52 and, in a local session on macOS, also to `pbcopy`, and the prompt shows
+`Copied to clipboard`. The TUI keeps a copy of the text it printed and asks
+the terminal for the cursor position (`ESC[6n`) to place it on the screen.
+Text that other programs printed may not match what the drag covered. While
+the mouse is reported, the wheel no longer scrolls the terminal's scrollback
+and the terminal's own selection needs its modifier key (Shift in most
+terminals, Option in iTerm2). Linux needs a terminal that accepts OSC 52.
+Windows keeps the terminal's own selection.
 `metacodes mcp add <name> <url> [--type http|sse] [--header <name>=<value>]... [--force] [--no-check]`,
 `metacodes mcp add <name> [--env <name>=<value>]... [--force] [--no-check] -- <command> [<arg>...]`
 and `metacodes mcp add-json <name> '<json>'` write a server into `mcpServers`
@@ -680,7 +691,7 @@ the executable belongs to up to date from the source its install record names
 the working directory (an id or id prefix, the rule `/resume <id>` uses) with
 its conversation, goal and model route restored, and appends to the same
 transcript. Under the banner, the REPL writes the conversation back as its
-turns were shown live (`src/repl/replay.zig`: prompts, replies and tool cards
+turns were shown live (`apps/cli/src/repl/replay.zig`: prompts, replies and tool cards
 through the live rendering paths; at most the last 200 messages, opening at a
 typed prompt, after a dim count of the rest; Ctrl+O shows all of it). What the
 live view never showed stays out: messages the runtime wrote itself
@@ -1128,7 +1139,7 @@ serializes byte-identically to before.
 `metacodes serve [port]` (one session) and `metacodes serve --sessions N
 [--max-sessions M] [--uds <path>] [port]` (the multi-session daemon: N
 sessions at startup, N ≥ 0, then created and destroyed over HTTP, at most M
-live) serve one HTTP/1.1 surface (`src/web/server.zig`). Port 0 lets the
+live) serve one HTTP/1.1 surface (`apps/cli/src/web/server.zig`). Port 0 lets the
 kernel pick; the startup line prints the address actually bound,
 `<label>: http://<address>:<port>  (Ctrl+C to quit)`.
 
@@ -1526,7 +1537,7 @@ connecting or reconnecting:
 
 It also carries `session_id`, `additional_dirs`, token usage and cost, the
 agent roster, tasks and `plugin_inventory`.
-`tests/component/web_message_config_test.zig` holds both drivers (`--web` and
+`apps/cli/tests/component/web_message_config_test.zig` holds both drivers (`--web` and
 `serve`, over HTTP and UDS) to this section.
 
 ### SessionHost: a multi-session service for network Hosts

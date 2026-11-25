@@ -670,6 +670,33 @@ class MaterializedCheckoutTest(unittest.TestCase):
         with self.assertRaisesRegex(PluginGateError, "link"):
             _materialize_head(repo, head, self._scratch() / "tree")
 
+    @requires_symlinks
+    def test_materialize_head_writes_the_root_instruction_alias_as_a_regular_copy(self) -> None:
+        repo = self._repo()
+        (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+        (repo / "CLAUDE.md").symlink_to("AGENTS.md")
+        head = self._commit(repo, "alias")
+
+        tree = _materialize_head(repo, head, self._scratch() / "tree")
+
+        self.assertFalse((tree / "CLAUDE.md").is_symlink())
+        self.assertEqual("rules\n", (tree / "CLAUDE.md").read_text(encoding="utf-8"))
+        self.assertEqual("rules\n", (tree / "AGENTS.md").read_text(encoding="utf-8"))
+
+    @requires_symlinks
+    def test_materialize_head_refuses_every_other_instruction_link(self) -> None:
+        for name, target in (("CLAUDE.md", "README.md"), ("dir/CLAUDE.md", "AGENTS.md"), ("CLAUDE.md", "missing.md")):
+            with self.subTest(name=name, target=target):
+                repo = self._repo()
+                (repo / "AGENTS.md").write_text("rules\n", encoding="utf-8")
+                (repo / "README.md").write_text("readme\n", encoding="utf-8")
+                (repo / "dir").mkdir()
+                (repo / "dir/AGENTS.md").write_text("rules\n", encoding="utf-8")
+                (repo / name).symlink_to(target)
+                head = self._commit(repo, "link")
+                with self.assertRaisesRegex(PluginGateError, "unsafe archive member type"):
+                    _materialize_head(repo, head, self._scratch() / "tree")
+
     def _synthetic(self) -> tuple[Path, Path, Path, dict, str]:
         """A committed synthetic repository whose protocol pins point into it.
 

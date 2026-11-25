@@ -56,11 +56,93 @@ inputs; moving into a code/input tree takes the wider scope.
 |---|---|---|
 | `docs` | `doc/**`, top-level `*.md`, release-document sources, plus protocol edits limited to documentation paths; additions, edits and deletions | Documentation links/facts, their tests, gate manifest, version state and whitespace; independently selected protocol references and release-document checks |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
+| `tests` | one of the above or a test: `scripts/tests/test_*.py`, `tests/tty/**`, or another file of the `tests` package in `layers.zon` | The gates' checks. A changed `tests/**` file outside `tests/tty/` (a fixture may feed both) or harness file runs the unit, integration, product and TTY suites; a changed `tests/tty/**` file runs TTY; a changed script suite that `build.zig` runs keeps `test:units` (Windows included), the others run by name |
+| `packages` | one of the above or a file of a product package in `layers.zon`, when every affected package is trusted (below) | The gates with the affected packages' `test:<package>` steps in place of `test:units`, and without the other whole-package unit runs (the ReleaseSafe core gate, the native platform modules); integration, product, release, contract snapshots, TTY and SDK as in `full` |
 | `full` | anything else | Everything |
 
-Manual and scheduled runs are always `full`, and so are an empty diff and
-any error. Neither CI workflow runs on ordinary pushes to main; their nightly
-run on main is a full run that saves the caches (§5).
+Manual and scheduled runs are always `full`, and so are a pull request
+labelled `migration` (the labels come from the event, so labelling reruns
+CI), an empty diff and any error. Neither CI workflow runs on ordinary pushes to main; their nightly
+run on main is a full run on all three platforms that saves the caches (§5).
+
+### Affected packages
+
+`layers.zon` assigns every path under `src/`, `apps/`, `packages/` and
+`tests/` to a package and
+lists what each may import (`allowed_dependencies`); `layer:check` holds the
+imports to it, except for what `layer_baseline.zon` still lists. A change to
+a product package affects that package and every package that depends on it,
+directly or not. The scope job writes that set as `packages=`.
+
+The set is narrower than everything only if the declared dependencies are the
+real ones, so a package is **trusted** when no baseline entry involves it: no
+upward or deep import from or into one of its files, no package cycle it is
+part of, no module wiring or wide module root it owns. A change takes the
+`packages` scope only when every package in its affected set is trusted and
+has a `test:<package>` build step; otherwise it is `full`, and the reason
+names the packages and their entry counts. The rules are read from the
+candidate tree, so the pull request that empties a package's entries is the
+first one narrowed for it. There is no global switch: the scope opens up
+package by package as the migration empties the baseline, upper packages
+first, because a package's affected set includes everything above it. On
+the tree of 0b (#792) every product package but `agentcore` has entries, and
+`agentcore`'s set includes `cli`, so every product change is still `full`.
+Since migration step 1.3c `cli` is the first package narrowed: it has no
+entries, nothing depends on it, and `test:cli` runs its tests (the inline
+tests of `apps/cli/src`, the picker root, the component suite in
+`apps/cli/tests/` and the termios spike). A change confined to `apps/cli/`
+runs `test:cli` in place of `test:units`. Its tests live in the `tests`
+package (`apps/cli/tests/` is listed there, so they may use the harness),
+but a test inside a product package's directory counts as a change to that
+package. `agentcore` has no entries either, but no `test:agentcore` step
+yet, so its changes are still `full`.
+
+`build.zig`, `build.zig.zon`, `layers.zon`, `layer_baseline.zon`, the
+`testing` package (`tests/_harness/`, `tests/helpers/`), `.github/`,
+`scripts/` outside `scripts/eval/` and the test modules, `vendor/`, the
+toolchain and release manifests, and anything unowned take the full scope.
+So does a release, which changes `build.zig.zon`.
+
+### Running the selection
+
+The legs keep their names and report success for a step they skip: the
+unit step reads `UNITS` and `PACKAGE_TESTS`, the product step `PRODUCT`, the
+checks leg's **Changed script unit suites** step `SCRIPT_TESTS`. Every
+output fails open: empty runs `test:units`, integration and product. The
+source-level guards (`gate:static`, which includes `layer:check`), lint and
+`test:contract` run on every scope but `docs`.
+
+Only a run of every Zig and script suite (`complete=true`: `full`, `eval`,
+and `tests` when the suites ran) records and uploads its executed test IDs.
+A narrowed run's IDs are a subset that `scripts/test_ids.py` would report as
+missing tests, so the **Test IDs (Linux)** job neither compares nor keeps
+them. A `migration` PR always takes the full scope, so its comparison runs;
+on a narrowed run it would fail there. Bases come from complete runs and
+main's nightly run. **Changed script unit suites** runs only on runs that
+are not complete, so no test is recorded twice.
+
+`zig build test:affected` applies the same decision to the working tree,
+untracked files included, against its merge base with `origin/main`
+(`-Daffected-base=<rev>`), and runs the selected suites offline
+(`TTY_SKIP_MODEL=1`; `zig build test` for `full` and `eval`, `windows:tty`
+for TTY on Windows), plus every changed script suite, as CI's checks leg
+does; the AGENTS.md checklist uses it in place of `zig build test`.
+
+### The nightly backstop
+
+main's nightly run (`schedule`, or `gh workflow run ci.yml --ref main`) is
+`full` on Linux, macOS and Windows. Every scope job records its decision,
+with the release fast path's, as the `change-scope` artifact (90 days). The
+nightly **Scopes of the day's merges** job (`scripts/ci_scope.py merged`)
+finds the pull request of every first-parent commit of the last 24 hours,
+reads the record of its newest CI run only (an older run may have had other
+labels) and writes commit, PR, scope, packages and reason to the job
+summary. Without a record the row is `unknown`; a fast-path run, which
+reused the base's suite results, is `fast-path`. When the nightly run
+fails, the `packages`, `tests`, `fast-path` and `unknown` rows are the pull
+requests that may not have run the failing suite. Recomputing the decision measures the rules
+instead: `python3 scripts/ci_scope.py replay --max-count 300 --rules HEAD`,
+with `--assume-cleared` for the end state of the migration.
 
 The scope step writes a **CI change attribution** job summary: the base,
 event, effective scope, reason, planned checks and a status/path/scope table.
@@ -111,7 +193,9 @@ The remaining boundaries are deliberately narrow:
 ## 3. PR-only validation and merge policy
 
 Run full primary-platform CI on `pull_request`, then merge the exact reviewed
-head. Ordinary pushes to `main` do not repeat that run. The four required
+head. A label change runs it again (the `labeled` and `unlabeled` events),
+because the test ID comparison and the version state gate judge the
+labels the PR has when they run. Ordinary pushes to `main` do not repeat that run. The four required
 check names and their GitHub Actions source stay unchanged. `Protect main`
 must require branches to be up to date and must not require a merge queue.
 If main advances, merge main into the PR branch and repeat review and CI.
@@ -216,10 +300,10 @@ The gate flags (Windows has no `checks` leg; its version state gate runs on
 | `checks` | The linters (`scripts/lint.py`, Linux), the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the contract snapshots (`zig build test:contract`, Linux; `tests/README.md`), the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
 Before any of these, every leg on every platform runs `zig build
-gate:static`: `zig fmt --check`, the scans of `http-status:gate` and
-`subsystem:boundary`, the `scripts/tests/test_*_discipline.py` scans and
-`git diff --check`, the guards that only read the source. It compiles only
-the two small scanners: the boundary gates' self-tests are test binaries,
+gate:static`: `zig fmt --check`, the scans of `http-status:gate`,
+`subsystem:boundary` and `layer:check`, the `scripts/tests/test_*_discipline.py`
+scans and `git diff --check`, the guards that only read the source. It
+compiles only the three small scanners: the boundary gates' self-tests are test binaries,
 which install the fs-helper, so they stay in `test:units`. They take seconds, and the build runner
 has no fail-fast: inside a suite step a failed guard is reported only when
 the whole step has finished, minutes later (#587). The boundary gates and
@@ -262,6 +346,25 @@ The rules that keep the split from dropping coverage:
   by itself after the shards; every case has a time limit there, so one
   hang (#569) fails that case instead of stalling the run
   ([tests/tty/README.md](../tests/tty/README.md)).
+- **The tests that ran are recorded by ID.** On Linux the `units`,
+  `product` and `checks` legs set `METACODES_TEST_IDS_DIR` before their
+  suites. Every Zig test binary records the tests it runs: the sharded
+  suites through `scripts/sharded_test_runner.zig`, all the others, and the
+  native `zig test src/platform/platform.zig` step, through
+  `scripts/recording_test_runner.zig`, which speaks the build runner's
+  protocol as Zig's default runner does, so `--test-timeout` still applies.
+  `METACODES_TEST_ROOT` tells both where the binary's root file lives, so a
+  test's namespace is the same whichever root compiled it. The
+  `scripts/tests` suites and the evaluation shards record too. The legs
+  upload the records as `test-ids-raw-<leg>`; no test runs twice for it.
+  `Test IDs (Linux)` waits for every Linux leg to pass, merges the records
+  into the `test-ids` artifact (kept 90 days) and, on a pull request,
+  compares it with the IDs recorded on the base's tree. The comparison goes
+  to the job summary. It fails a PR labelled `migration` that drops a test
+  without explaining it in `tests/test_ids/` in that PR, or whose base has
+  no IDs recorded on its tree, and `Gates (Linux)` needs it, so the
+  required check fails too. Adding or removing the label runs CI again
+  ([tests/README.md](../tests/README.md)).
 
 What it costs:
 
@@ -302,8 +405,8 @@ ones that land nowhere:
 
 | Adding | Goes into | Runs on | Enforced by |
 |---|---|---|---|
-| A Zig test in an existing root (`src/**`, `tests/component`, the integration inventory) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
-| A new test binary or build step | `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
+| A Zig test in an existing root (`src/**`, `apps/cli/src/**`, a file the aggregate inventories `tests/integration_suite.zig` or `apps/cli/tests/suite.zig` import) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
+| A new test binary or build step | A test binary is created with `addRecordedTest` (its tests then appear in the test IDs); `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
 | A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
 | A case under `tests/tty/cases/` | Nothing to wire, unless it holds a fixed host resource (a fixed port or path) that another case also uses: then mark it `tty_driver.runs_alone`, and local `--jobs` runs it by itself | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |

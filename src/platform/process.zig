@@ -150,6 +150,42 @@ pub fn capture(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts:
     return capturePosix(argv, allocator, opts);
 }
 
+pub fn describeArgv(buf: *[1024]u8, argv: []const ?[*:0]const u8) []const u8 {
+    var written: usize = 0;
+    for (argv, 0..) |a_opt, idx| {
+        if (idx >= 8) {
+            const tail = " ...";
+            if (written + tail.len < buf.len) {
+                @memcpy(buf[written..][0..tail.len], tail);
+                written += tail.len;
+            }
+            break;
+        }
+        const a = a_opt orelse break;
+        const sp = std.mem.span(@as([*:0]const u8, a));
+        const need = if (idx == 0) sp.len else sp.len + 1;
+        if (written + need >= buf.len) break;
+        if (idx != 0) {
+            buf[written] = ' ';
+            written += 1;
+        }
+        @memcpy(buf[written..][0..sp.len], sp);
+        written += sp.len;
+    }
+    return buf[0..written];
+}
+
+pub fn captureWithSpawnRetry(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
+    return capture(argv, allocator, opts) catch |e| switch (e) {
+        error.Timeout, error.Aborted, error.OutOfMemory => return e,
+        error.ChildChdirFailed, error.ChildExecFailed => return e,
+        else => {
+            psync.sleepMs(150);
+            return capture(argv, allocator, opts);
+        },
+    };
+}
+
 /// 便捷：只捕 stdout（stderr 丢弃），无 abort/tick。
 pub fn captureStdout(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, timeout_ms: u64, max_bytes: usize) CaptureError!Captured {
     return capture(argv, allocator, .{ .timeout_ms = timeout_ms, .max_bytes = max_bytes, .want_stderr = false });

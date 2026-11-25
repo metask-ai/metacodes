@@ -6,7 +6,7 @@ write in the process into EINTR. A key read that takes that for end of input
 cancels a reverse search, closes the transcript viewer or denies a permission
 prompt; a write loop that stops on it drops the rest of a frame (#340).
 
-In ``src/repl/`` and ``src/permission/prompt.zig``:
+In ``apps/cli/src/repl/`` and ``src/permission/prompt.zig``:
 
 * a raw terminal read (``platform_term.readInput(``, ``pfs.read(``,
   ``std.c.read(``) is followed within a few lines by the retry check
@@ -33,7 +33,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCOPE_DIRS = (Path("src/repl"),)
+SCOPE_DIRS = (Path("apps/cli/src/repl"),)
 SCOPE_FILES = (Path("src/permission/prompt.zig"),)
 RAW_READ = re.compile(r"\b(?:platform_term\.readInput|pfs\.read|std\.c\.read)\s*\(")
 RAW_WRITE = re.compile(r"\b(?:pfs\.write|std\.c\.write|posix\.write)\s*\(")
@@ -121,7 +121,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
 
     def test_the_rule_still_sees_the_repl(self):
         # An empty scan would pass trivially; the seam itself must be in it.
-        self.assertIn(Path("src/repl/input.zig"), governed_sources(ROOT))
+        self.assertIn(Path("apps/cli/src/repl/input.zig"), governed_sources(ROOT))
         self.assertIn(Path("src/permission/prompt.zig"), governed_sources(ROOT))
 
     def test_scanner_reports_unchecked_reads_and_raw_writes(self):
@@ -129,7 +129,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             root = Path(directory)
             write(
                 root,
-                "src/repl/viewer.zig",
+                "apps/cli/src/repl/viewer.zig",
                 "fn run() void {\n"
                 "    const n = platform_term.readInput(fd, &b);\n"
                 "    if (n <= 0) break;\n"
@@ -139,7 +139,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             )
             write(
                 root,
-                "src/repl/fine.zig",
+                "apps/cli/src/repl/fine.zig",
                 "fn run() void {\n"
                 "    const n = platform_term.readInput(fd, &b);\n"
                 "    if (n < 0) {\n"
@@ -157,7 +157,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             )
             write(
                 root,
-                "src/repl/dialog.zig",
+                "apps/cli/src/repl/dialog.zig",
                 "fn run() void {\n"
                 "    const n = pfs.read(in_fd, &buf);\n"
                 "    if (n < 0 and input.retryInterruptedRead(in_fd)) continue;\n"
@@ -169,12 +169,12 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             self.assertEqual(
                 violations(root),
                 [
+                    "apps/cli/src/repl/dialog.zig:2: read past platform_term.readInput (key records are decoded there)",
+                    "apps/cli/src/repl/dialog.zig:4: read past platform_term.readInput (key records are decoded there)",
+                    "apps/cli/src/repl/viewer.zig:2: raw read without the EINTR retry (use input.readKey)",
+                    "apps/cli/src/repl/viewer.zig:4: raw write (use pfs.writeAll)",
+                    "apps/cli/src/repl/viewer.zig:5: raw write (use pfs.writeAll)",
                     "src/permission/prompt.zig:1: raw read without the EINTR retry (use input.readKey)",
-                    "src/repl/dialog.zig:2: read past platform_term.readInput (key records are decoded there)",
-                    "src/repl/dialog.zig:4: read past platform_term.readInput (key records are decoded there)",
-                    "src/repl/viewer.zig:2: raw read without the EINTR retry (use input.readKey)",
-                    "src/repl/viewer.zig:4: raw write (use pfs.writeAll)",
-                    "src/repl/viewer.zig:5: raw write (use pfs.writeAll)",
                 ],
             )
 
@@ -183,7 +183,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             root = Path(directory)
             write(
                 root,
-                "src/repl/late.zig",
+                "apps/cli/src/repl/late.zig",
                 "const n = platform_term.readInput(in_fd, &buf);\n"
                 "log(n);\n"
                 "redraw();\n"
@@ -192,7 +192,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             )
             self.assertEqual(
                 violations(root),
-                ["src/repl/late.zig:1: raw read without the EINTR retry (use input.readKey)"],
+                ["apps/cli/src/repl/late.zig:1: raw read without the EINTR retry (use input.readKey)"],
             )
 
     def test_missing_scope_is_an_error_not_an_empty_scan(self):

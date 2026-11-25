@@ -2,7 +2,7 @@
 
 A CLI session that needs TinyKG starts its install's service in its own state
 root, and the service outlives the session on purpose: it does not exit when
-idle (src/app/kg_autostart.zig). A test that runs the real binary in a
+idle (apps/cli/src/app/kg_autostart.zig). A test that runs the real binary in a
 throwaway HOME therefore leaves one service behind per run, unless it sets
 `METACODES_KG_AUTOSTART=0` or stops what it started. Once the temporary
 directory is gone, nobody can reach that service again.

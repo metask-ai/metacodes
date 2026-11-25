@@ -157,7 +157,7 @@ class ProfileTest(unittest.TestCase):
         self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self, **override):
-        return {'model': 'tokenjoy/test-model', 'attempts': 1, 'concurrency': 4, 'name': '回归',
+        return {'model': 'tokenjoy/test-model', 'attempts': 1, 'name': '回归',
                 'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']},
                           {'suite': 'terminal-bench-2.0', 'tasks': ['fix-git']}], **override}
 
@@ -298,11 +298,11 @@ class ProfileTest(unittest.TestCase):
             self.client.request('api/profile/rename', {'id': 'profile-elsewhere', 'name': 'x'})
         self.assertTrue(self.client.request('api/jobs?profile=all')['can_run'])
 
-    def test_features_are_refused_for_a_workbuddy_suite_and_left_out_by_a_profile(self):
-        with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持选择高级功能'):
+    def test_a_workbuddy_suite_takes_only_the_run_gates(self):
+        with self.assertRaisesRegex(ValueError, 'WorkBuddy 评测暂不支持这些高级功能：execute_code'):
             self.manager.launch({'suite': 'workbuddy-code', 'model': 'tokenjoy/test-model', 'tasks': ['x'],
-                                 'attempts': 1, 'concurrency': 1, 'features': ['execute_code']})
-        self.assertEqual(profiles.run_features(['execute_code'], 'workbuddy-code'), [])
+                                 'attempts': 1, 'concurrency': 1, 'features': ['stall_gate', 'execute_code']})
+        self.assertEqual(profiles.run_features(['stall_gate', 'execute_code'], 'workbuddy-code'), ['stall_gate'])
         self.assertEqual(profiles.run_features(['execute_code'], 'terminal-bench-2.1'), ['execute_code'])
 
     def test_a_single_run_takes_the_page_default_features(self):
@@ -379,6 +379,82 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         self.assertIsNone(record['items'][1]['run'])
 
+    def test_one_dataset_is_cancelled_stopped_resumed_or_run_again_while_the_queue_goes_on(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
+            created = self.client.request('api/profiles/run', self.request())
+            deadline = time.monotonic() + 10
+            while not (self.manager.profiles.get(created['id'])['items'][0]['run']) and time.monotonic() < deadline:
+                self.manager.profiles.advance()
+                time.sleep(.05)
+            with self.assertRaisesRegex(ValueError, '还在等待或运行'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
+            with self.assertRaisesRegex(ValueError, '不在等待'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'cancel'})
+            self.assertEqual(self.manager.profiles.get(created['id'])['items'][0]['status'], 'running')
+            with self.assertRaisesRegex(ValueError, '没有在运行'):
+                self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'stop'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'stop'})
+            record = self.wait_profile(created['id'])
+        self.assertEqual(record['status'], 'finished')
+        self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
+        with self.assertRaisesRegex(ValueError, '不在等待'):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
+        # Stopped before Harbor wrote any result: every task is still to run.
+        with patch.object(self.workbench, 'job_view', return_value=None):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'run'})
+        record = self.wait_profile(created['id'])
+        self.assertEqual([(i['suite'], i['status']) for i in record['items'][2:]],
+                         [('terminal-bench-2.1', 'finished'), ('terminal-bench-2.0', 'finished')])
+        self.assertEqual(record['items'][2]['tasks'], ['fix-git'])
+        with self.assertRaisesRegex(ValueError, '没有要运行的题'):
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'resume'})
+
+    def test_auto_rerun_queues_invalid_tasks_of_a_finished_dataset_at_most_twice(self):
+        created = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        with self.assertRaisesRegex(ValueError, 'true 或 false'):
+            self.client.request('api/profile/auto-rerun', {'id': created['id'], 'enabled': 1})
+        changed = self.client.request('api/profile/auto-rerun', {'id': created['id'], 'enabled': True})
+        self.assertEqual(changed, {'id': created['id'], 'auto_rerun_invalid': True})
+        with patch.object(self.manager.profiles, 'invalid_tasks', return_value=['fix-git']) as invalid:
+            record = self.wait_profile(created['id'])
+        self.assertEqual([(i['status'], i.get('auto_rerun'), i['tasks']) for i in record['items']],
+                         [('finished', None, ['fix-git']), ('finished', 1, ['fix-git']), ('finished', 2, ['fix-git'])])
+        self.assertEqual(invalid.call_count, 2)
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'run'})
+        self.client.request('api/profile/auto-rerun', {'id': created['id'], 'enabled': False})
+        with patch.object(self.manager.profiles, 'invalid_tasks', return_value=['fix-git']) as invalid:
+            record = self.wait_profile(created['id'])
+        self.assertEqual(len(record['items']), 4)
+        self.assertNotIn('auto_rerun', record['items'][3])
+        invalid.assert_not_called()
+
+    def test_an_unreadable_result_skips_the_auto_rerun_and_the_queue_goes_on(self):
+        first = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        self.client.request('api/profile/auto-rerun', {'id': first['id'], 'enabled': True})
+        second = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}],
+                                                                       features=['execute_code']))
+        self.client.request('api/profile/auto-rerun', {'id': second['id'], 'enabled': True})
+        self.assertNotEqual(first['id'], second['id'])
+        with patch.object(self.manager.profiles, 'invalid_tasks',
+                          side_effect=[PermissionError('denied'), AttributeError('malformed result')]):
+            for created, reason in ((first, 'denied'), (second, 'malformed result')):
+                record = self.wait_profile(created['id'])
+                self.assertEqual([i['status'] for i in record['items']], ['finished'])
+                self.assertIn(reason, record['items'][0]['auto_rerun_error'])
+
+    def test_invalid_tasks_are_read_from_the_job_directory(self):
+        job = self.manager.jobs_dir / 'job-a'
+        for task, rewards in (('fix-git', None), ('hello', {'reward': 1.0})):
+            _write(job / (task + '__x') / 'config.json', {})
+            _write(job / (task + '__x') / 'result.json', {
+                'task_name': 'terminal-bench/' + task, 'started_at': '2026-11-16T00:00:00Z',
+                'finished_at': '2026-11-16T00:01:00Z', **({'verifier_result': {'rewards': rewards}} if rewards else {})})
+        _write(job / 'result.json', {'started_at': '2026-11-16T00:00:00Z', 'finished_at': '2026-11-16T00:01:00Z'})
+        self.assertEqual(self.manager.profiles.invalid_tasks('job-a'), ['fix-git'])
+        self.assertEqual(self.manager.profiles.invalid_tasks('missing'), [])
+
     def test_concurrency_changes_while_the_profile_runs(self):
         with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '10'}):
             created = self.client.request('api/profiles/run', self.request())
@@ -411,8 +487,46 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(next(r for r in self.manager.runs() if r['name'] == run)['concurrency'], 2)
             self.client.request('api/profile/cancel', {'id': created['id']})
             self.wait_profile(created['id'])
-        with self.assertRaisesRegex(ValueError, '没有正在运行'):
-            self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3})
+
+    def test_concurrency_is_the_profiles_and_set_only_on_it(self):
+        with self.assertRaisesRegex(ValueError, '并发数在评测配置页面设置'):
+            self.client.request('api/profiles/run', self.request(concurrency=4))
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
+        self.assertEqual((created['concurrency'], created['items'][0]['concurrency']), (profiles.DEFAULT_CONCURRENCY,) * 2)
+        self.assertEqual(self.client.request('api/workbench')['defaults']['concurrency'], profiles.DEFAULT_CONCURRENCY)
+        # An idle profile takes a new value; every dataset queued after runs at it.
+        self.assertEqual(self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3}),
+                         {'id': created['id'], 'concurrency': 3})
+        self.assertEqual(self.client.request('api/profile?id=' + created['id'])['concurrency'], 3)
+        self.client.request('api/profiles/run', {**one, 'profile': created['id'], 'name': None})
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
+        record = self.wait_profile(created['id'])
+        self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']],
+                         [(10, 10), (3, 3), (3, 3)])
+        # A profile saved before it had one keeps its latest dataset's.
+        legacy = {k: v for k, v in record.items() if k != 'concurrency'}
+        self.assertEqual(profiles.profile_concurrency(legacy), 3)
+        self.assertEqual(profiles.profile_concurrency({'items': []}), profiles.DEFAULT_CONCURRENCY)
+
+    def test_queueing_from_the_new_run_page_uses_the_saved_profiles_concurrency(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
+        self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3})
+        self.assertEqual(self.client.request('api/profiles/run', one)['id'], created['id'])
+        record = self.wait_profile(created['id'])
+        self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']], [(10, 10), (3, 3)])
+
+    def test_a_profile_saved_without_concurrency_keeps_it_when_a_cli_run_appends(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
+        legacy = {k: v for k, v in self.manager.profiles.get(created['id']).items() if k != 'concurrency'}
+        self.manager.profiles.save(legacy)
+        run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'attempts': 1,
+                                               'concurrency': 1, 'features': created['features']})
+        self.assertEqual((run['profile'], run['concurrency']), (created['id'], 1))
+        record = self.wait_profile(created['id'])
+        self.assertEqual((profiles.profile_concurrency(record), record['items'][-1]['concurrency']), (profiles.DEFAULT_CONCURRENCY, 1))
 
     def test_deleting_a_profile_removes_its_runs_results_and_rows(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
@@ -906,13 +1020,15 @@ class ProfileTest(unittest.TestCase):
         old_run = created['items'][0]['run']
         legacy = self.manager.jobs_dir / '.bench-batches'
         item = {k: v for k, v in created['items'][0].items() if k not in ('model', 'attempts', 'executor', 'queued_at')}
-        for batch_id, at, features in (('batch-1', '2026-01-01T00:00:00Z', []), ('batch-2', '2026-01-02T00:00:00Z', []),
-                                       ('batch-3', '2026-01-03T00:00:00Z', ['execute_code'])):
+        for batch_id, at, features, concurrency in (
+                ('batch-1', '2026-01-01T00:00:00Z', [], 10), ('batch-2', '2026-01-02T00:00:00Z', [], 10),
+                ('batch-3', '2026-01-03T00:00:00Z', ['execute_code'], 20),
+                ('batch-4', '2026-01-04T00:00:00Z', ['execute_code'], 2)):
             atomic_json(legacy / (batch_id + '.json'), {
                 'id': batch_id, 'name': batch_id + ' 名称', 'status': 'finished', 'created_at': at,
                 'started_at': at, 'finished_at': at, 'model': 'tokenjoy/test-model', 'executor': 'local',
                 'attempts': 1, 'concurrency': 1, 'features': features, 'metacodes': created['metacodes'],
-                'items': [item], 'cancel_requested': False})
+                'items': [{**item, 'concurrency': concurrency}], 'cancel_requested': False})
         atomic_json(self.manager.records / 'launch-failed.json', {'name': 'launch-failed', 'status': 'failed',
                                                                   'batch': 'batch-2', 'error': 'OSError'})
         manager = profiles.ProfileManager(self.manager)
@@ -922,7 +1038,8 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([i['run'] for i in merged['items']], [old_run] * 3)
         self.assertEqual(merged['items'][1]['model'], 'tokenjoy/test-model')
         other = manager.get(profiles.profile_id(created['metacodes']['digest'], ['execute_code']))
-        self.assertEqual((other['name'], other['batches']), ('batch-3 名称', ['batch-3']))
+        self.assertEqual((other['name'], other['batches']), ('batch-3 名称', ['batch-3', 'batch-4']))
+        self.assertEqual(profiles.profile_concurrency(other), 2)
         self.assertEqual(profiles.runs_of(merged, self.manager.runs()), sorted([old_run, 'launch-failed']))
         again = profiles.ProfileManager(self.manager)
         self.assertEqual(len(again.get(created['id'])['items']), 3)

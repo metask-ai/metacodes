@@ -22,6 +22,44 @@ status, compatibility boundaries, and entry points are defined by
   `running` notification that suggests KillShell and a non-interactive re-run;
   like every job notification it carries no output bytes. With the feature
   off, the Bash tool and its jobs behave as before.
+- **Bench task containers can take GitHub release and Hugging Face mirrors.**
+  `container_mirrors` on an SSH executor accepts `github` (a URL standing for
+  `https://github.com`, such as `https://gh-proxy.com/https://github.com`)
+  and `hf`. A run's task containers then get `UV_INSTALLER_GITHUB_BASE_URL`
+  and `UV_PYTHON_INSTALL_MIRROR`, so the uv binary and the Python a
+  verifier's `uvx` downloads come from the mirror, and `HF_ENDPOINT`. Git
+  traffic and Docker Hub images are not redirected.
+
+- **Bench reruns invalid tasks, and can do it automatically.** The profile
+  page's 重跑未通过的题 is now 重跑无效的题: it picks the tasks whose latest
+  attempts include an invalid one (network or environment failures), not the
+  ones the model failed. Turning on 自动重跑无效的题 on a profile queues a
+  finished dataset's invalid tasks again, at most two rounds per dataset.
+
+- **Dragging over text in the TUI copies it.** On macOS and Linux the
+  interactive TUI reports the mouse; releasing a left-button drag copies the
+  text under it through OSC 52 (and `pbcopy` in a local macOS session) and
+  the prompt shows `Copied to clipboard`, like Claude Code's fullscreen
+  mode. The wheel no longer scrolls the scrollback while the TUI waits for
+  input, and the terminal's own selection needs its modifier key (Shift, or
+  Option in iTerm2).
+- **File references in replies open with Cmd/Ctrl+click.** The TUI renders a
+  Markdown link (`[notes.txt](/abs/notes.txt)`, `[x](src/a.zig:42)`,
+  `[docs](https://…)`) as an underlined OSC 8 hyperlink showing only its
+  label, and an inline code span that reads as a file reference
+  (`src/repl/render.zig:42`, `/etc/hosts`) keeps its look but becomes
+  clickable. Relative paths resolve against the working directory and the
+  `:line[:col]` suffix is dropped from the `file://` URL. Terminals without
+  OSC 8 show the same text.
+
+- **WorkBuddy suites run with the profile's run gates.** A bench profile's
+  Lean-modelled run gates now reach the WorkBuddy suites too: the workbench
+  passes them as harness parameters and the overlay turns each into its
+  metacodes flag. Preview features still run on Harbor suites only, and the
+  profile page names what a WorkBuddy dataset left out. Reinstall the overlay
+  (`python3 -m scripts.eval.workbuddy.install_overlay <checkout>`) on every
+  WorkBuddy checkout; the bench node protocol is now 9, so rerun
+  `metacodes bench setup --executor <name>`.
 
 - **Models can be priced in config.json, and bench runs use OpenRouter
   prices.** `model_prices` in `~/.metacodes/config.json` prices a model in
@@ -205,6 +243,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Bench concurrency is set only on the profile page.** The 评测 page no
+  longer has a 并发数 field and `POST /api/profiles/run` no longer takes
+  `concurrency`. A profile has one concurrency (10 when it is created); its
+  page can change it whether or not it is running, and every dataset queued on
+  it runs at it, reruns included. A profile saved earlier keeps its latest
+  dataset's value. `bench run` on the CLI still takes `--concurrency`.
+
 - **Bench profiles replace batches.** A profile (评测配置) is one frozen
   metacodes version with a fixed set of advanced features, and every run
   belongs to one; the same version with the same features is always the same
@@ -264,6 +309,37 @@ status, compatibility boundaries, and entry points are defined by
   `max_queued`.
 
 ### Fixed
+
+- **Bench no longer shows a negative 用时 for a running job.** Harbor writes a
+  job's start and finish times in the executing machine's local time without
+  a zone, and the workbench reads them as UTC, so a job running on a node at
+  UTC+8 showed about eight hours less than it had run. Harbor now runs with
+  `TZ=UTC`, locally and on SSH nodes. Jobs started before this change keep
+  their shifted start time.
+
+- **A provider overload is retried like a 503.** HTTP 529 was an unnamed
+  status that ended the turn after one attempt; it is now
+  `ServiceUnavailable` and goes through the connect retry (attempt limit,
+  backoff, `Retry-After`). An overload declared inside an accepted stream
+  (Anthropic's `overloaded_error` frame, an OpenAI-compatible or Gemini
+  `error` object, a Responses `response.failed`, a Bedrock
+  `serviceUnavailableException`) ends the stream as `ServiceUnavailable` too,
+  and the agent loop re-sends the request unless a tool call had started.
+  The HTTP and in-stream attempts of one request share one attempt limit,
+  the wait is the response head's `Retry-After` or the usual backoff, and a
+  Run's extra stream retries are not spent on an overload. When the attempts
+  run out the failure reads `API 错误帧(重试 N 次后放弃): …`, as the HTTP
+  path does. This holds for `-p`, the TUI, `serve`/`--web` and AgentCore
+  sessions.
+- **Ctrl-C stops a request that is waiting for its answer or whose stream
+  went quiet.** The interrupt only set a flag that was read when the next
+  byte arrived, so `-p` (and any caller that did not also cancel the
+  request) waited for the 120 s idle limit while the provider had not
+  answered yet, and indefinitely while a started stream sent nothing more.
+  The liveness monitor now closes the connection of every request whose
+  abort signal is set, within a quarter of a second, for every provider
+  protocol and entry point. An interrupt while the answer is awaited no
+  longer prints an error line.
 
 - **Signing in over SSH no longer waits forever for a browser that cannot come
   back** (#722). `metacodes login` and `/login` sent the browser back to

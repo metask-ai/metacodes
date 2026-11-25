@@ -1,7 +1,7 @@
 """The last line of a failed request says what to do when a retry cannot help.
 
 A rejected sign-in or key, or a balance that ran out, used to end with the advice every failure
-got, `Retry with /retry, …`. It now says what helps (src/repl/next_step.zig); every other failure
+got, `Retry with /retry, …`. It now says what helps (apps/cli/src/repl/next_step.zig); every other failure
 keeps that advice. Offline: the slow mock server answers the one request with the error.
 """
 import os

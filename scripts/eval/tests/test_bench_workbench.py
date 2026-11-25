@@ -1020,6 +1020,7 @@ class WorkbenchTest(unittest.TestCase):
         harbor_env = json.loads((job / 'harbor-env.json').read_text())
         self.assertNotIn('OPENAI_API_KEY', harbor_env)
         self.assertNotIn('OPENAI_BASE_URL', harbor_env)
+        self.assertEqual(harbor_env['TZ'], 'UTC')
         self.assertEqual(harbor_env['METACODES_BENCH_JUDGE_TOKEN'], verifier['OPENAI_API_KEY'])
         # Judge requests are not agent metrics.
         self.assertFalse((job / '.bench-metrics' / 'bench-judge.jsonl').exists())

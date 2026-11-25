@@ -922,6 +922,7 @@ pub const RetryReporter = struct {
     state: *anyopaque,
     failedFn: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) bool,
     beforeAttemptFn: *const fn (state: *anyopaque, attempt: u32, max: u32) bool,
+    attempts_before: u32 = 0,
 
     pub fn failed(self: RetryReporter, attempt: u32, max: u32, delay_ms: u64) bool {
         return self.failedFn(self.state, attempt, max, delay_ms);
@@ -1415,6 +1416,7 @@ pub const EventIterator = struct {
                         self.context_window_numbers = error_class.parseContextWindowNumbers(err_obj);
                         return error.ContextWindowExceededEvent;
                     }
+                    if (model_error.isOverloaded(err_obj)) return error.OverloadedEvent;
                     return error.ApiErrorEvent;
                 },
                 // ping / unknown → 跳过

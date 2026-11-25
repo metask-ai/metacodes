@@ -1,6 +1,7 @@
 exit: 1
-requests: 1
+requests: 2
 --- stderr
 [31m[ERROR client req=<ID>][0m HTTP 529 unknown: body={"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
-[31m[ERROR client][0m stream connect failed after 1 attempt(s): HttpError
-[31m[ERROR agent][0m sendMessageStream failed turn=1: HttpError
+[31m[ERROR client req=<ID>][0m HTTP 529 unknown: body={"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+[31m[ERROR client][0m stream connect failed after 2 attempt(s): ServiceUnavailable
+[31m[ERROR agent][0m sendMessageStream failed turn=1: ServiceUnavailable

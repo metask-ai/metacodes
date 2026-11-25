@@ -12,7 +12,7 @@
 //!
 //! Each kernel is validated by its own loader. Running this manifest through
 //! the formal loader (or the formal manifest through this one) is a schema
-//! mismatch, never a pass — `app/doctor.zig` depends on that.
+//! mismatch, never a pass — `core/doctor.zig` depends on that.
 
 const std = @import("std");
 const runtime = @import("project_harness_runtime.zig");

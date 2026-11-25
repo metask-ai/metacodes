@@ -1,8 +1,8 @@
 # `metacodes update`: bring an install up to date from where it came from
 
 Status: implemented 2026-10-25 (§12 records the decisions). Code:
-`src/app/update.zig`, `src/app/release_fetch.zig`, `src/app/unit_archive.zig`,
-`src/app/release_source.zig`, `src/platform/process_scan.zig`. Builds on [INSTALL_DESIGN.md](INSTALL_DESIGN.md) §4 (the installer
+`apps/cli/src/app/update.zig`, `apps/cli/src/app/release_fetch.zig`, `apps/cli/src/app/unit_archive.zig`,
+`apps/cli/src/app/release_source.zig`, `src/platform/process_scan.zig`. Builds on [INSTALL_DESIGN.md](INSTALL_DESIGN.md) §4 (the installer
 and `install.sh`) and [RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md)
 (what a published release contains).
 
@@ -85,7 +85,7 @@ Exit codes:
 
 The surface is fail-closed like every other subcommand: an unknown argument
 exits 2 and names itself. `update` joins the subcommand list in
-`src/main.zig` (`maybeRunAuthCommand`). Like `install`, it runs before the
+`apps/cli/src/main.zig` (`maybeRunAuthCommand`). Like `install`, it runs before the
 process resolves its own state root, so a broken state root does not stop a
 repair.
 
@@ -319,14 +319,14 @@ The cost is a cross-version contract. Every future release must accept
 `install --prefix --upgrade --sdk --allow-downgrade --release-base
 --checkout` with today's meaning, and every future `install.sh` must accept
 `--dev --source --prefix --no-link --no-sdk --allow-downgrade`.
-`tests/component/update_test.zig` asserts the first list against
+`apps/cli/tests/component/update_test.zig` asserts the first list against
 `install --help`, and `scripts/tests/test_install_scripts.py` asserts the
 second. The installer documentation names the contract, so removing a flag
 is a visible break.
 
 ## 5. Network
 
-Every transfer is a `curl` run (`src/app/release_fetch.zig`), as in
+Every transfer is a `curl` run (`apps/cli/src/app/release_fetch.zig`), as in
 `install.sh`. So proxies (`https_proxy`, `all_proxy`, SOCKS, `NO_PROXY`),
 retries and timeouts behave the same for both. On Windows, `curl.exe` ships
 with Windows 10 1803 and later. Without curl on PATH, update stops with
@@ -383,7 +383,7 @@ inode, but it reaches the runtime assets again by path:
 |---|---|---|
 | `bin/metacodes` | — | keeps running the old image |
 | formal kernel | hashed against the compiled pin on **every** invocation (`src/formal/runtime.zig:324`) | next formal check fails closed: `checker_hash_mismatch` |
-| project kernel | hashed on every invocation; an active rule bundle re-attests it **every turn** (`src/core/project_rule_bundle.zig:489`) | the next turn is refused: "The project rules refused to start this turn" (`src/repl/loop.zig:985`) |
+| project kernel | hashed on every invocation; an active rule bundle re-attests it **every turn** (`src/core/project_rule_bundle.zig:489`) | the next turn is refused: "The project rules refused to start this turn" (`apps/cli/src/repl/loop.zig:985`) |
 | tinykg CLI, rg | path resolved once, not hash-checked | silently runs the new binary |
 | kgd + tinykgd | hashed once, at service start | keeps serving the old binaries |
 
@@ -471,7 +471,7 @@ Two repairs now cover it, and they write the same value:
    when a session reports `stale_pin`. A session that holds the old pin
    re-reads the file on its next probe. The full rule is
    doc/TINYKG_INTEGRATION.md, "A stale pin"; the L2 tests are the three
-   "stale pin" tests in `tests/component/kgd_e2e_test.zig`.
+   "stale pin" tests in `apps/cli/tests/component/kgd_e2e_test.zig`.
 
 ## 7. Windows
 
@@ -502,7 +502,7 @@ The installer writes in this order:
 5. the SDK;
 6. the self check.
 
-(`src/app/install.zig:164-218`.) A failure part-way leaves the record new and
+(`apps/cli/src/app/install.zig:164-218`.) A failure part-way leaves the record new and
 the manifest old, or both new but with a file missing. The `intact`
 measurement (§4.1 step 3) catches both states, so they are repaired instead
 of reported as up to date.
@@ -547,16 +547,16 @@ under the lock.
 
 | File | Change |
 |---|---|
-| `src/app/update.zig` | options, `planRelease`, `planCheckout`, orchestration. The prefix is injected, so tests need no installed executable |
-| `src/app/release_fetch.zig` | the curl invocations (latest tag, SHA256SUMS, archives) with their policy, the exit-code mapping, SHA256SUMS parsing and asset selection |
-| `src/app/unit_archive.zig` | the restricted tar.gz and zip extractor |
+| `apps/cli/src/app/update.zig` | options, `planRelease`, `planCheckout`, orchestration. The prefix is injected, so tests need no installed executable |
+| `apps/cli/src/app/release_fetch.zig` | the curl invocations (latest tag, SHA256SUMS, archives) with their policy, the exit-code mapping, SHA256SUMS parsing and asset selection |
+| `apps/cli/src/app/unit_archive.zig` | the restricted tar.gz and zip extractor |
 | `src/platform/process_scan.zig` | the scan from §6.2 on macOS, Linux and Windows, and the stop from §6.2 |
-| `src/app/install.zig` | `update_source` with `--release-base` and `--checkout`; make `isOlder`, the manifest readers and the `intact` measurement public |
-| `src/main.zig` | the subcommand, its usage text and error hints, and the new install options |
+| `apps/cli/src/app/install.zig` | `update_source` with `--release-base` and `--checkout`; make `isOlder`, the manifest readers and the `intact` measurement public |
+| `apps/cli/src/main.zig` | the subcommand, its usage text and error hints, and the new install options |
 | `scripts/install.sh`, `scripts/install.ps1` | pass `--release-base`, `--checkout` and `-ReleaseBase` to units that know them |
-| `src/app/archive_fixture.zig` | test-only `.tar.gz` and `.zip` writers (and raw tar headers for hard links and devices) |
-| `tests/_harness/update_unit_probe.zig`, `src/install_root.zig` | the fixture unit executable of §11 and the module root that gives it the installer |
-| `tests/component/update_test.zig`, `tests/component/kgd_e2e_test.zig` | the L2 evidence of §11 |
+| `apps/cli/src/app/archive_fixture.zig` | test-only `.tar.gz` and `.zip` writers (and raw tar headers for hard links and devices) |
+| `tests/_harness/update_unit_probe.zig`, `apps/cli/src/install_root.zig` | the fixture unit executable of §11 and the module root that gives it the installer |
+| `apps/cli/tests/component/update_test.zig`, `apps/cli/tests/component/kgd_e2e_test.zig` | the L2 evidence of §11 |
 | `doc/INSTALL_DESIGN.md`, `doc/API.md` (CLI surface), `doc/GETTING_STARTED.md`, `README.md`, `CHANGELOG.md` | document `update` and `update_source`; correct the §4 sentence (§6.1) |
 
 ## 11. Evidence
@@ -575,11 +575,11 @@ Declaration = wiring = L2 (AGENTS.md).
 - `update_source` parsing and keeping;
 - process classification over a synthetic process table.
 
-**L2 (`tests/component/update_test.zig`):** a loopback HTTP server serves a
+**L2 (`apps/cli/tests/component/update_test.zig`):** a loopback HTTP server serves a
 fixture release (`/latest` 302, SUMS, an archive built in the test). The
 fixture unit's `bin/metacodes` is `zig-out/bin/update_unit_probe`, built on
 every platform. Its `install` runs the real installer
-(`src/app/install.zig`, without the doctor self check). Its `sleep` and
+(`apps/cli/src/app/install.zig`, without the doctor self check). Its `sleep` and
 `kgd` modes stand in for a session and for the service with a `tinykgd`
 child. Every invocation is recorded. The tests assert:
 
@@ -610,7 +610,7 @@ Each wiring point was mutation-checked: dropping `--release-base`, skipping
 the digest comparison, ignoring sessions or the service, skipping the repin,
 or downloading for an up-to-date install each turns a named test red.
 
-**L2, the §6.3 premise** (`tests/component/kgd_e2e_test.zig`): a real service
+**L2, the §6.3 premise** (`apps/cli/tests/component/kgd_e2e_test.zig`): a real service
 refuses a client holding a pin for other binaries, autostart would not start
 one for that state, and `kg install` repins it with the key kept.
 
@@ -670,6 +670,6 @@ with a pre-release part, `METACODES_NO_PROBE` and `METACODES_NO_UPDATE_CHECK`.
 
 | File | Change |
 |---|---|
-| `src/app/update_notice.zig` | which installs are offered what, the cache file, the background check |
-| `src/app/release_fetch.zig` | `Fetcher.echo_errors` |
-| `src/main.zig` | the notice before an interactive session, and `metacodes update` from it |
+| `apps/cli/src/app/update_notice.zig` | which installs are offered what, the cache file, the background check |
+| `apps/cli/src/app/release_fetch.zig` | `Fetcher.echo_errors` |
+| `apps/cli/src/main.zig` | the notice before an interactive session, and `metacodes update` from it |

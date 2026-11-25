@@ -46,7 +46,7 @@ check "任务管理条"  "$FULL" "TaskCreate tool"
 #       不从【API 工具池】移除工具——对齐 Claude Code(deny 规则 gate 执行,不 gate 可见性)。
 #       USING_TOOLS 段按"真正发给 API 的工具池"裁剪,故主对话(池齐全)不会去 Grep/Glob 子条。
 #       真正会裁剪工具池的是 subagent(filterToolDefs 按 agent 的 tools/disallowedTools 收窄),
-#       这条由 L2 测试 tests/component/prompt_tool_coupling_test.zig 覆盖(只读 Explore 的 Bash
+#       这条由 L2 测试 apps/cli/tests/component/prompt_tool_coupling_test.zig 覆盖(只读 Explore 的 Bash
 #       去 Git 段 + 加只读提醒)。此处不重复(--dump-prompt 只 dump 主对话)。
 echo ""
 echo "=== 2) 动态裁剪(工具池层)由 L2 测试覆盖 ==="

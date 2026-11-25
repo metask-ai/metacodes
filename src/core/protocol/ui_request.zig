@@ -9,11 +9,21 @@
 //! 进程外 backend(未来 WsBackend)可序列化传输。
 
 const std = @import("std");
-const context = @import("../../tools/context.zig");
 const util_json = @import("../../util/json.zig");
 
-pub const AskQuestion = context.AskQuestion;
-pub const AskOption = context.AskOption;
+pub const AskQuestion = struct {
+    question: []const u8,
+    header: []const u8,
+    multi: bool,
+    options: []const AskOption,
+};
+/// AskUserQuestion 的结构化输入(解析+校验在 ask_user.zig 做,渲染在 dialog/ask_question.zig)。
+pub const AskOption = struct {
+    label: []const u8,
+    description: []const u8,
+    /// 单选 preview 内容(ASCII/markdown mockup),空=无。选中时右侧 side-by-side 框展示。
+    preview: []const u8 = "",
+};
 pub const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
 
 /// UI 请求(backend → 渲染对应对话框,同步阻塞拿用户选择)。

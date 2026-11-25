@@ -150,6 +150,10 @@ test "ReadArtifact rejects malformed and negative ranges instead of defaulting" 
     try std.testing.expectError(error.InvalidArtifactArgs, execute(&ctx, "{\"artifact_id\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"offset\":-1}"));
 }
 
+test "a recovery read never costs more than one ReadArtifact call may return" {
+    try std.testing.expectEqual(artifact.MAX_READ_BYTES, result_budget.recoveryReadCost(result_budget.Budget.fromModel(1_000_000)));
+}
+
 test "ReadArtifact clamps a recovery read to the per-result budget" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
