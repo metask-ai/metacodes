@@ -77,7 +77,8 @@ REGISTRY_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:[0-9]{1,5})?(/[a-
 EGRESS_MODES = ("direct", "workbench")
 EGRESS_HELP = 'egress 只能是 "direct"、"workbench" 或 {"proxy": "http://主机:端口"}'
 
-CONTAINER_MIRRORS = ("apt", "pypi", "conda", "go", "rustup", "npm")
+GITHUB_MIRROR_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/(https?://)?[A-Za-z0-9._~/+-]*)?$")
+CONTAINER_MIRRORS = ("apt", "pypi", "conda", "go", "rustup", "npm", "github", "hf")
 APT_CACHE_PORT = 3142
 APT_CACHE_CONF = "/etc/apt/apt.conf.d/99metacodes-apt-cache"
 COMPOSE_OVERLAY = "mirrors.compose.json"
@@ -115,6 +116,12 @@ def container_mirror_env(mirrors: Dict[str, str]) -> Dict[str, str]:
         env.update(RUSTUP_DIST_SERVER=root, RUSTUP_UPDATE_ROOT=root + "/rustup")
     if "npm" in mirrors:
         env["NPM_CONFIG_REGISTRY"] = mirrors["npm"]
+    if "github" in mirrors:
+        root = mirrors["github"].rstrip("/")
+        env.update(UV_INSTALLER_GITHUB_BASE_URL=root,
+                   UV_PYTHON_INSTALL_MIRROR=root + "/astral-sh/python-build-standalone/releases/download")
+    if "hf" in mirrors:
+        env["HF_ENDPOINT"] = mirrors["hf"].rstrip("/")
     return env
 
 
@@ -374,7 +381,8 @@ def network_fields(name: str, entry: Dict) -> Dict:
     container = entry.get("container_mirrors")
     if container is not None:
         if not isinstance(container, dict) or not set(container) <= set(CONTAINER_MIRRORS) or \
-                not all(isinstance(url, str) and MIRROR_URL.fullmatch(url) for url in container.values()):
+                not all(isinstance(url, str) and (GITHUB_MIRROR_URL if kind == "github" else MIRROR_URL).fullmatch(url)
+                        for kind, url in container.items()):
             raise ValueError(f"{name}: container_mirrors 的键只能是 {'、'.join(CONTAINER_MIRRORS)}，值必须是 http(s) 地址")
         if "apt" in container and not container["apt"].startswith("http://"):
             raise ValueError(f"{name}: container_mirrors.apt 必须是 http:// 地址（apt 缓存按 HTTP 回源）")

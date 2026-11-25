@@ -979,7 +979,9 @@ packages that trials and verifiers install (`apt-get install curl`, `pip`,
   "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda",
   "go": "https://goproxy.cn",
   "rustup": "https://rsproxy.cn",
-  "npm": "https://registry.npmmirror.com"
+  "npm": "https://registry.npmmirror.com",
+  "github": "https://gh-proxy.com/https://github.com",
+  "hf": "https://hf-mirror.com"
 }
 ```
 
@@ -991,6 +993,19 @@ packages that trials and verifiers install (`apt-get install curl`, `pip`,
 | `go` | `GOPROXY=<url>,direct` |
 | `rustup` | `RUSTUP_DIST_SERVER=<url>`, `RUSTUP_UPDATE_ROOT=<url>/rustup` (crates still come from crates.io) |
 | `npm` | `NPM_CONFIG_REGISTRY` |
+| `github` | `UV_INSTALLER_GITHUB_BASE_URL=<url>` and `UV_PYTHON_INSTALL_MIRROR=<url>/astral-sh/python-build-standalone/releases/download`: the uv binary that a verifier's `astral.sh/uv/<version>/install.sh` downloads and the Python that `uvx -p 3.13` downloads, both GitHub release assets. The value stands for `https://github.com`, so a prefix proxy is written with the origin in its path (`https://gh-proxy.com/https://github.com`) |
+| `hf` | `HF_ENDPOINT` |
+
+`github` covers release downloads only. It sets no git `insteadOf`: an
+agent's own `git clone` still goes to GitHub, because a third-party proxy
+that fails where GitHub answers would fail tasks that work today. The
+install script itself is fetched from `astral.sh` by a URL written in each
+task's `test.sh`, which no variable redirects. A per-project release mirror
+does not fit this key: `mirror.nju.edu.cn/github-release` keeps only recent
+python-build-standalone releases (its 20251014 assets answered 404 in
+November 2026), while a pinned uv asks for the release it was built with.
+Docker Hub images have no mirror of this kind; `docker_mirrors` is the
+separate daemon setting above.
 
 Each run uploads `<state_dir>/runs/<name>/mirrors.compose.json` and passes
 it to Harbor as `--extra-docker-compose`: an overlay of Harbor's `main`
@@ -1015,9 +1030,7 @@ name with `--restart unless-stopped`, published on
 packages, then checks that `/acng-report.html` answers. A running container
 already labeled with the same mirror is kept; another mirror replaces it.
 The volume survives that replacement. The cache answers containers on
-Harbor's compose networks the same way the egress forwarder does. Hugging
-Face is not mirrored: `hf-mirror.com` rate-limits (HTTP 429) where the
-executor reaches `huggingface.co` directly.
+Harbor's compose networks the same way the egress forwarder does.
 
 ### Colima on Apple Silicon
 
