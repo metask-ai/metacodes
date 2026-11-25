@@ -138,6 +138,8 @@ elif name == "docker":
             sys.exit(1)
     if args[:1] == ["inspect"] and env.get("FAKE_DOCKER_INSPECT"):
         print(env["FAKE_DOCKER_INSPECT"])
+    if args[:1] == ["build"] and args[-1:] == ["-"]:
+        (state / ("dockerfile-" + args[args.index("-t") + 1])).write_text(sys.stdin.read())
     images = state / "images"
     if args[:2] == ["image", "inspect"]:
         sys.exit(0 if (images / args[2].replace("/", "_")).exists() else 1)
@@ -641,15 +643,18 @@ class ExecutorConfigTest(unittest.TestCase):
 
     def test_container_mirrors_are_validated_and_become_the_compose_overlay(self):
         base = {"name": "relay", "kind": "ssh", "host": "h"}
-        for bad in ({"apt": "https://mirrors.aliyun.com"}, {"hf": "https://hf-mirror.com"},
-                    {"pypi": "file:///simple"}, ["pypi"]):
+        for bad in ({"apt": "https://mirrors.aliyun.com"}, {"docker": "https://docker.m.daocloud.io"},
+                    {"pypi": "file:///simple"}, ["pypi"], {"pypi": "https://gh-proxy.com/https://pypi.org/simple"},
+                    {"github": "https://gh-proxy.com/https://github.com; rm -rf /"},
+                    {"github": "https://gh-proxy.com/ftp://github.com"}, {"hf": "hf-mirror.com"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 executors.parse({**base, "container_mirrors": bad})
         with self.assertRaises(ValueError):
             executors.parse({**base, "egress": "workbench", "container_mirrors": {"apt": "http://mirrors.aliyun.com"}})
         self.assertIsNone(executors.parse(base).compose_overlay())
         mirrors = {"pypi": "https://mirrors.aliyun.com/pypi/simple/", "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/",
-                   "go": "https://goproxy.cn", "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com"}
+                   "go": "https://goproxy.cn", "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com",
+                   "github": "https://gh-proxy.com/https://github.com/", "hf": "https://hf-mirror.com"}
         relay = executors.parse({**base, "egress": "workbench", "container_mirrors": mirrors})
         self.assertEqual(executors.parse(relay.spec()), relay)
         self.assertEqual(relay.compose_overlay(), {"services": {"main": {"environment": {
@@ -660,12 +665,16 @@ class ExecutorConfigTest(unittest.TestCase):
                                       "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r",
             "GOPROXY": "https://goproxy.cn,direct",
             "RUSTUP_DIST_SERVER": "https://rsproxy.cn", "RUSTUP_UPDATE_ROOT": "https://rsproxy.cn/rustup",
-            "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}}}})
+            "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com",
+            "UV_INSTALLER_GITHUB_BASE_URL": "https://gh-proxy.com/https://github.com",
+            "UV_PYTHON_INSTALL_MIRROR": "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone"
+                                        "/releases/download",
+            "HF_ENDPOINT": "https://hf-mirror.com"}}}})
 
     def test_mirror_settings_a_task_sets_itself_are_left_out(self):
         relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
             "apt": "http://mirrors.aliyun.com", "pypi": "https://mirrors.aliyun.com/pypi/simple/",
-            "go": "https://goproxy.cn"}})
+            "go": "https://goproxy.cn", "github": "https://github.example", "hf": "https://hf-mirror.com"}})
         mirrors = dict(relay.container_mirrors)
         with tempfile.TemporaryDirectory() as tmp:
             dataset = Path(tmp)
@@ -677,12 +686,74 @@ class ExecutorConfigTest(unittest.TestCase):
                 "FROM debian\nRUN echo 'Acquire::http::Proxy \"http://proxy\";' > /etc/apt/apt.conf.d/01p\n")
             (dataset / "plain/tests").mkdir(parents=True)
             (dataset / "plain/tests/test.sh").write_text("export PIP_INDEX_URL=https://example.invalid\n")
+            (dataset / "own-hub").mkdir()
+            (dataset / "own-hub/task.toml").write_text('[environment.env]\nHF_ENDPOINT = "https://hub.internal"\n')
+            (dataset / "own-python/environment").mkdir(parents=True)
+            (dataset / "own-python/environment/Dockerfile").write_text(
+                "FROM debian\nENV UV_PYTHON_INSTALL_MIRROR=https://python.internal\n")
             owned = executors.task_owned_settings(dataset, mirrors)
-        self.assertEqual(owned, ["Acquire::http::Proxy", "GOPROXY"])
+        self.assertEqual(owned, ["Acquire::http::Proxy", "GOPROXY", "HF_ENDPOINT", "UV_PYTHON_INSTALL_MIRROR"])
         self.assertEqual(relay.compose_overlay(owned), {"services": {"main": {"environment": {
             "PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/",
-            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/"}}}})
-        self.assertIsNone(relay.compose_overlay(["Acquire::http::Proxy", "GOPROXY", "PIP_INDEX_URL", "UV_DEFAULT_INDEX"]))
+            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/",
+            "UV_INSTALLER_GITHUB_BASE_URL": "https://github.example"}}}})
+        self.assertIsNone(relay.compose_overlay(owned + ["PIP_INDEX_URL", "UV_DEFAULT_INDEX",
+                                                         "UV_INSTALLER_GITHUB_BASE_URL"]))
+
+    def test_download_cache_points_the_kinds_it_routes_at_the_cache(self):
+        base = {"name": "relay", "kind": "ssh", "host": "h"}
+        mirrors = {"apt": "http://mirrors.aliyun.com", "pypi": "https://pypi.tuna.tsinghua.edu.cn/simple",
+                   "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/", "go": "https://goproxy.cn",
+                   "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com",
+                   "github": "https://gh-proxy.com/https://github.com", "hf": "https://hf-mirror.com"}
+        with self.assertRaises(ValueError):
+            executors.parse({**base, "download_cache": "yes"})
+        with self.assertRaises(ValueError):
+            executors.parse({**base, "egress": "workbench", "download_cache": True})
+        plain = executors.parse({**base, "container_mirrors": mirrors})
+        self.assertEqual((plain.download_cache, plain.download_cache_routes()), (False, {}))
+        self.assertEqual(plain.compose_overlay(cached=executors.DOWNLOAD_CACHE_KINDS), plain.compose_overlay())
+        relay = executors.parse({**base, "container_mirrors": mirrors, "download_cache": True})
+        self.assertEqual(executors.parse(relay.spec()), relay)
+        self.assertEqual(relay.download_cache_routes(), {
+            "pypi": "https://pypi.tuna.tsinghua.edu.cn", "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda",
+            "go": "https://goproxy.cn", "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com",
+            "github": "https://gh-proxy.com/https://github.com"})
+        cache = "http://172.17.0.1:3143"
+        every = executors.DOWNLOAD_CACHE_KINDS
+        self.assertEqual(relay.compose_overlay(cached=every)["services"]["main"]["environment"], {
+            "PIP_TRUSTED_HOST": "172.17.0.1",
+            "PIP_INDEX_URL": cache + "/pypi/simple/", "UV_DEFAULT_INDEX": cache + "/pypi/simple/",
+            "CONDA_CHANNEL_ALIAS": cache + "/conda/cloud",
+            "CONDA_DEFAULT_CHANNELS": cache + "/conda/pkgs/main," + cache + "/conda/pkgs/r",
+            "GOPROXY": cache + "/go,direct",
+            "RUSTUP_DIST_SERVER": cache + "/rustup", "RUSTUP_UPDATE_ROOT": cache + "/rustup/rustup",
+            "NPM_CONFIG_REGISTRY": cache + "/npm/",
+            "UV_INSTALLER_GITHUB_BASE_URL": cache + "/github",
+            "UV_PYTHON_INSTALL_MIRROR": cache + "/github/astral-sh/python-build-standalone/releases/download",
+            "HF_ENDPOINT": "https://hf-mirror.com"})
+        self.assertIn("configs", relay.compose_overlay(cached=every))
+        some = relay.compose_overlay(cached=["go", "github"])["services"]["main"]["environment"]
+        self.assertEqual((some["GOPROXY"], some["UV_INSTALLER_GITHUB_BASE_URL"], some["NPM_CONFIG_REGISTRY"],
+                          some["PIP_INDEX_URL"], "PIP_TRUSTED_HOST" in some),
+                         (cache + "/go,direct", cache + "/github", "https://registry.npmmirror.com",
+                          "https://pypi.tuna.tsinghua.edu.cn/simple", False))
+        direct = relay.compose_overlay()["services"]["main"]["environment"]
+        self.assertEqual((direct["PIP_INDEX_URL"], direct["NPM_CONFIG_REGISTRY"], "PIP_TRUSTED_HOST" in direct),
+                         ("https://pypi.tuna.tsinghua.edu.cn/simple", "https://registry.npmmirror.com", False))
+        own_index = relay.compose_overlay(["PIP_INDEX_URL"], cached=every)["services"]["main"]["environment"]
+        self.assertEqual(("PIP_TRUSTED_HOST" in own_index, own_index["UV_DEFAULT_INDEX"]), (False, cache + "/pypi/simple/"))
+        unrouted = executors.parse({**base, "download_cache": True, "container_mirrors": {
+            "pypi": "https://pypi.example/root/pypi/+simple/", "hf": "https://hf-mirror.com",
+            "apt": "http://mirrors.aliyun.com"}})
+        self.assertEqual(unrouted.download_cache_routes(), {})
+        self.assertEqual(unrouted.compose_overlay(cached=every)["services"]["main"]["environment"], {
+            "PIP_INDEX_URL": "https://pypi.example/root/pypi/+simple/",
+            "UV_DEFAULT_INDEX": "https://pypi.example/root/pypi/+simple/", "HF_ENDPOINT": "https://hf-mirror.com"})
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "own-trust").mkdir()
+            (Path(tmp) / "own-trust/task.toml").write_text('[verifier.env]\nPIP_TRUSTED_HOST = "pypi.internal"\n')
+            self.assertEqual(executors.task_owned_settings(Path(tmp), dict(relay.container_mirrors)), ["PIP_TRUSTED_HOST"])
 
     def test_apt_is_left_out_of_a_run_whose_apt_cache_does_not_answer(self):
         relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
@@ -969,7 +1040,10 @@ class SshRunTest(SetupFixture):
         manager, client, _ = self.prepare_remote()
         cfg = self.cfg()
         entry = next(e for e in cfg["executors"] if e["name"] == "relay-4090")
-        entry["container_mirrors"] = {"apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn"}
+        entry["container_mirrors"] = {"apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn",
+                                      "github": "https://gh-proxy.com/https://github.com",
+                                      "hf": "https://hf-mirror.com"}
+        entry["download_cache"] = True
         atomic_json(self.config, cfg)
         run = client.request("api/runs", self.request())
         final = wait_run(manager, run["name"])
@@ -978,9 +1052,15 @@ class SshRunTest(SetupFixture):
         overlay = self.remote_home / ".metacodes-bench/runs" / run["name"] / executors.COMPOSE_OVERLAY
         self.assertEqual(argv[argv.index("--extra-docker-compose") + 1], str(overlay.resolve()))
         # Nothing answers as the apt cache here: apt keeps the task's own sources.
-        self.assertEqual(json.loads(overlay.read_text()),
-                         {"services": {"main": {"environment": {"GOPROXY": "https://goproxy.cn,direct"}}}})
-        self.assertIn("apt 缓存 http://127.0.0.1:3142 没有响应", (manager.records / (run["name"] + ".log")).read_text())
+        self.assertEqual(json.loads(overlay.read_text()), {"services": {"main": {"environment": {
+            "GOPROXY": "https://goproxy.cn,direct",
+            "UV_INSTALLER_GITHUB_BASE_URL": "https://gh-proxy.com/https://github.com",
+            "UV_PYTHON_INSTALL_MIRROR": "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone"
+                                        "/releases/download",
+            "HF_ENDPOINT": "https://hf-mirror.com"}}}})
+        log = (manager.records / (run["name"] + ".log")).read_text()
+        self.assertIn("apt 缓存 http://127.0.0.1:3142 没有响应", log)
+        self.assertIn("下载缓存 http://127.0.0.1:3143 没有响应", log)
 
     def test_refreshed_tokens_reach_the_remote_relay_over_stdin_only(self):
         gateway = RotatingGateway(self.root, lifetime=4)
@@ -2728,6 +2808,108 @@ class NetworkSetupTest(SetupFixture):
         again = setup.run_setup(self.config, "relay-4090")
         self.assertEqual(self.step(again, "apt_cache")["status"], "ok", self.step(again, "apt_cache"))
         self.assertEqual(len([c for c in self.calls("docker", "remote") if c[1][:1] == ["build"]]), 1)
+
+    def start_download_cache(self, routes=None):
+        from scripts.eval.harbor import download_cache
+        cache = download_cache.DownloadCache(self.root / "download-cache",
+                                             routes or {"go": self.reachable.rstrip("/")}).start()
+        self.addCleanup(cache.close)
+        patcher = patch.object(executors, "DOWNLOAD_CACHE_PORT", cache.port)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return cache
+
+    def test_download_cache_starts_once_per_script_and_routes(self):
+        from scripts.eval.harbor import download_cache
+        port = self.start_download_cache().port
+        mirrors = {"apt": "http://mirrors.example", "pypi": "https://pypi.example/simple/", "go": "https://goproxy.example",
+                   "github": "https://gh.example/https://github.com", "hf": "https://hf.example"}
+        self.add_ssh_executor(metrics_bind="127.0.0.1", container_mirrors=mirrors)
+        self.remote_docker()
+        off = setup.run_setup(self.config, "relay-4090", dry_run=True)
+        self.assertEqual(self.step(off, "download_cache")["status"], "skipped", self.step(off, "download_cache"))
+        self.add_ssh_executor(metrics_bind="127.0.0.1", container_mirrors={"hf": "https://hf.example"}, download_cache=True)
+        nothing = setup.run_setup(self.config, "relay-4090", dry_run=True)
+        self.assertEqual(self.step(nothing, "download_cache")["status"], "skipped", self.step(nothing, "download_cache"))
+        self.add_ssh_executor(metrics_bind="127.0.0.1", container_mirrors=mirrors, download_cache=True)
+        name = setup.DOWNLOAD_CACHE_NAME
+        builds = lambda: [c[1] for c in self.calls("docker", "remote") if c[1][:4] == ["build", "-q", "-t", name]]  # noqa: E731
+        dry = setup.run_setup(self.config, "relay-4090", dry_run=True)
+        self.assertEqual(self.step(dry, "download_cache")["status"], "planned", self.step(dry, "download_cache"))
+        self.assertEqual(builds(), [])
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "download_cache")
+        self.assertEqual(step["status"], "done", step)
+        self.assertIn("pypi → https://pypi.example", step["detail"])
+        self.assertEqual(builds(), [["build", "-q", "-t", name, "-"]])
+        dockerfile = (self.root / "state-remote" / ("dockerfile-" + name)).read_text()
+        script = (Path(download_cache.__file__)).read_text()
+        self.assertIn("COPY <<'METACODES_DOWNLOAD_CACHE_SCRIPT' /opt/download_cache.py\n" + script
+                      + "METACODES_DOWNLOAD_CACHE_SCRIPT\n", dockerfile)
+        self.assertIn(f'"--port", "{port}", "--dir", "/cache"]', dockerfile)
+        self.assertNotIn("# syntax", dockerfile)
+        routes = {"pypi": "https://pypi.example", "go": "https://goproxy.example",
+                  "github": "https://gh.example/https://github.com"}
+        digest = setup.download_cache_image(routes)[1]
+        started = next(c[1] for c in self.calls("docker", "remote") if c[1][:2] == ["run", "-d"] and name in c[1])
+        pairs = [started[i:i + 2] for i in range(len(started) - 1)]
+        for flag in (["--restart", "unless-stopped"], ["--label", setup.DOWNLOAD_CACHE_LABEL + "=" + digest],
+                     ["-p", f"127.0.0.1:{port}:{port}"], ["-v", name + ":/cache"]):
+            self.assertIn(flag, pairs)
+        self.assertEqual(started[started.index(name, started.index("-v") + 2) + 1:],
+                         ["--route", "github=https://gh.example/https://github.com", "--route", "go=https://goproxy.example",
+                          "--route", "pypi=https://pypi.example"])
+        os.environ["FAKE_DOCKER_INSPECT"] = digest + " true"
+        again = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(self.step(again, "download_cache")["status"], "ok", self.step(again, "download_cache"))
+        self.assertEqual(len(builds()), 1)
+        self.add_ssh_executor(metrics_bind="127.0.0.1", container_mirrors={**mirrors, "go": "https://goproxy.other"},
+                              download_cache=True)
+        changed = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(self.step(changed, "download_cache")["status"], "done", self.step(changed, "download_cache"))
+        self.assertEqual(len(builds()), 2)
+
+    def test_a_run_uses_the_download_cache_only_while_it_answers(self):
+        cache = self.start_download_cache({"pypi": "https://pypi.example", "go": "https://goproxy.example"})
+        self.add_ssh_executor(metrics_bind="127.0.0.1", download_cache=True, container_mirrors={
+            "pypi": "https://pypi.example/simple/", "go": "https://goproxy.example"})
+        relay = executors.find(self.cfg(), "relay-4090")
+        logged = []
+        run = executors.RemoteRun({"name": "r", "executor": relay.spec()}, log=logged.append)
+        base = f"http://127.0.0.1:{cache.port}"
+        self.assertEqual(run.mirror_overlay(None), {"services": {"main": {"environment": {
+            "PIP_TRUSTED_HOST": "127.0.0.1", "PIP_INDEX_URL": base + "/pypi/simple/",
+            "UV_DEFAULT_INDEX": base + "/pypi/simple/", "GOPROXY": base + "/go,direct"}}}})
+        self.assertTrue(any("先走缓存" in line for line in logged), logged)
+        cache.close()
+        del logged[:]
+        self.assertEqual(run.mirror_overlay(None), {"services": {"main": {"environment": {
+            "PIP_INDEX_URL": "https://pypi.example/simple/", "UV_DEFAULT_INDEX": "https://pypi.example/simple/",
+            "GOPROXY": "https://goproxy.example,direct"}}}})
+        self.assertTrue(any("没有响应" in line and "bench setup --executor relay-4090" in line for line in logged), logged)
+
+    def test_a_run_uses_only_the_routes_the_running_cache_serves_from_the_configured_source(self):
+        cache = self.start_download_cache({"pypi": "https://pypi.example", "go": "https://goproxy.old.example"})
+        self.add_ssh_executor(metrics_bind="127.0.0.1", download_cache=True, container_mirrors={
+            "pypi": "https://pypi.example/simple/", "go": "https://goproxy.example",
+            "github": "https://gh-proxy.example/https://github.com"})
+        relay = executors.find(self.cfg(), "relay-4090")
+        logged = []
+        run = executors.RemoteRun({"name": "r", "executor": relay.spec()}, log=logged.append)
+        base = f"http://127.0.0.1:{cache.port}"
+        self.assertEqual(run.mirror_overlay(None), {"services": {"main": {"environment": {
+            "PIP_TRUSTED_HOST": "127.0.0.1", "PIP_INDEX_URL": base + "/pypi/simple/",
+            "UV_DEFAULT_INDEX": base + "/pypi/simple/", "GOPROXY": "https://goproxy.example,direct",
+            "UV_INSTALLER_GITHUB_BASE_URL": "https://gh-proxy.example/https://github.com",
+            "UV_PYTHON_INSTALL_MIRROR": "https://gh-proxy.example/https://github.com/astral-sh/"
+                                        "python-build-standalone/releases/download"}}}})
+        self.assertTrue(any("pypi 先走缓存" in line for line in logged), logged)
+        self.assertTrue(any("github、go" in line and "直接使用镜像源" in line
+                            and "bench setup --executor relay-4090" in line for line in logged), logged)
+        with self.assertRaises(urllib.error.HTTPError) as unserved:
+            urllib.request.urlopen(base + "/github/astral-sh/uv/releases/download/0.9.5/uv.tar.gz", timeout=10)
+        self.addCleanup(unserved.exception.close)
+        self.assertEqual(unserved.exception.code, 404)
 
     def test_docker_mirrors_without_sudo_report_the_command_and_change_nothing(self):
         self.add_ssh_executor(docker_mirrors=["https://docker.m.daocloud.io"])

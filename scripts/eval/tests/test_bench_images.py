@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.eval.harbor import cli
-from scripts.eval.harbor.bench import executors, images
+from scripts.eval.harbor.bench import egress, executors, images
 from scripts.eval.tests.posix_only import requires_posix_exec
 
 FAKE_DOCKER = r'''#!/bin/sh
@@ -34,6 +34,12 @@ case "$1" in
     echo "$MAIN_IMAGE_NAME" >> "$FAKE_DOCKER_IMAGES" ;;
 esac
 '''
+
+
+def egress_images(compose: str):
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "docker-compose.yaml").write_text(compose)
+        return egress.task_images(Path(tmp))
 
 
 def write_task(dataset: Path, name: str, image=None, extra=None) -> None:
@@ -99,6 +105,7 @@ class BenchPullTest(unittest.TestCase):
         self.assertEqual({tasks: r["status"] for tasks, r in self.builds(value).items()},
                          {("build-here", "build-here-2"): "missing", ("with-sidecar",): "missing"})
         self.assertFalse([c for c in self.docker_calls() if c.startswith(("pull", "compose"))])
+        self.assertEqual(value["tasks"], {"total": 7, "ready": 2})
 
     def test_builds_each_distinct_environment_like_harbor(self) -> None:
         code, value = self.bench("--task", "build-here", "--task", "build-here-2", "--task", "with-sidecar")
@@ -141,6 +148,7 @@ class BenchPullTest(unittest.TestCase):
         self.assertNotIn("pull alexgshaw/fix-git:20260403", pulls)
         self.assertEqual(pulls.count("pull alexgshaw/overfull-hbox:20251031"), images.PULL_ATTEMPTS)
         self.assertIn("alexgshaw/regex-log:20251031", self.present.read_text().splitlines())
+        self.assertEqual(value["tasks"], {"total": 7, "ready": 6})
 
     def test_unreachable_docker_fails_before_any_image(self) -> None:
         for args in (("--dry-run",), ()):
@@ -195,6 +203,43 @@ class SshPullTest(unittest.TestCase):
         self.assertIn("relay.example", calls[-1])
         self.assertIn(f"ctx=$(cd {remote} && pwd)", calls[-1][-1])
         self.assertIn(f"docker compose -p {images.BUILD_TAG}{digest}", calls[-1][-1])
+
+    def test_verifier_and_sidecar_images_are_pulled_with_the_task_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            write_task(Path(tmp), "separate", extra={"docker-compose.yaml": (
+                "services:\n  main:\n    image: org/env:1\n    depends_on:\n      db:\n        condition: x\n"
+                "  db:\n    image: \"org/db:2\"\n    expose:\n    - \"5432\"\n"
+                "  local:\n    build: ./local\n    image: org/local:3\n"
+                "  named:\n    image: ${MAIN_IMAGE_NAME}_named\n")})
+            (Path(tmp) / "separate" / "task.toml").write_text(
+                '[task]\nname = "separate"\n\n[verifier]\nenvironment_mode = "separate"\n\n'
+                '[verifier.environment]\ndocker_image = "org/verifier:1"\n\n'
+                '[environment]\ndocker_image = "org/env:1"\n')
+            found, builds = images.images_of(Path(tmp), ["separate"])
+        self.assertEqual(found, {"org/env:1": ["separate"], "org/verifier:1": ["separate"],
+                                 "org/db:2": ["separate"]})
+        self.assertEqual(builds, {})
+
+    def test_prebuilt_task_with_commented_header_and_flow_style_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp) / "prebuilt"
+            task.mkdir()
+            (task / "task.toml").write_text('[task]\nname = "prebuilt"\n\n[environment] # runtime\n'
+                                            'docker_image = "org/env:1"\n')
+            found, builds = images.images_of(Path(tmp), ["prebuilt"])
+            self.assertEqual((found, builds), ({"org/env:1": ["prebuilt"]}, {}))
+            (task / "environment").mkdir()
+            (task / "environment" / "docker-compose.yaml").write_text(
+                "services:\n  db: {image: postgres:16}  # sidecar\n  local: {build: ./local, image: org/local:3}\n")
+            found, _ = images.images_of(Path(tmp), ["prebuilt"])
+            self.assertEqual(found, {"org/env:1": ["prebuilt"], "postgres:16": ["prebuilt"]})
+            self.assertIn("ghcr.io/org/db:2", egress_images("services:\n  db: {image: ghcr.io/org/db:2}\n"))
+            (task / "environment" / "docker-compose.yaml").write_text(
+                'services:\n  db: {"image": "ghcr.io/org/db:2"}\n  local: {"build": ".", "image": "org/local:3"}\n')
+            found, _ = images.images_of(Path(tmp), ["prebuilt"])
+            self.assertEqual(found, {"org/env:1": ["prebuilt"], "ghcr.io/org/db:2": ["prebuilt"]})
+            self.assertIn("ghcr.io/org/db:2", egress_images('services:\n  db: {"image": "ghcr.io/org/db:2"}\n'))
+            self.assertEqual(egress_images("services:\n  # cached: {image: ghcr.io/example/old:1}\n"), [])
 
     def test_invalid_image_reference_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
