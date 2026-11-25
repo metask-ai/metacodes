@@ -922,7 +922,7 @@ test "L2 KG governance: large v3 recall stays complete JSON below projection cap
         .is_error = false,
     } };
     try conv.append(.{ .role = .user, .blocks = blocks });
-    const reduced = conv.truncateLargeToolResults(cc.conversation.toolResultContextBytes(200_000));
+    const reduced = cc.result_projection.truncateLargeToolResults(&conv, cc.conversation.toolResultContextBytes(200_000));
     try std.testing.expectEqual(@as(usize, 0), reduced.truncated);
     const provider_visible = conv.messages.items[0].blocks[0].tool_result.content;
     try std.testing.expectEqualStrings(output, provider_visible);

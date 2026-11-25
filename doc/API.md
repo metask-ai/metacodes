@@ -104,7 +104,8 @@ The `metacodes bench` CLI starts/opens a Bench workbench, inspects jobs and
 launches Harbor trials. Its command, JSON output, HTTP launch contract
 (`suite` and `executor` in `POST /api/runs`, `GET /api/suite`,
 `/api/setup`, `/api/login` and `/api/providers`), `bench setup`, `bench provider`,
-`bench prepare`, `bench pull` and
+`bench prepare`, `bench pull`, `bench monitor` (and `GET /api/monitor`,
+`POST /api/monitor/mirrors`) and
 the `bench db` evaluation-database commands are documented in
 [Bench workbench](BENCH_WORKBENCH.md). This adds a CLI surface;
 AgentCore ABI and SDK layouts are unchanged.
@@ -1020,9 +1021,9 @@ what made it oversized.
 A structured result that cannot be shrunk — one whose bulk is not in its
 strings — is left oversized rather than mangled, and the generic text
 truncation is reserved for content that was never structured. Being one request
-too large is recoverable; an unparseable result is not. `clearToolResultAt`
-already refuses to erase a result's only recovery capability for the same
-reason.
+too large is recoverable; an unparseable result is not. The microcompact
+clear pass already refuses to erase a result's only recovery capability for
+the same reason.
 
 `ReadArtifact` returns bounded byte ranges from a stored result. The model receives the artifact ID and offset.
 

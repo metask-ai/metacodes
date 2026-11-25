@@ -33,7 +33,7 @@ test "L2 microcompact: 老 tool_result 被清成 stub,最近的不动" {
     }
 
     // keep_recent_n=2 → boundary=4,清 [0,4) 的 tool_result
-    const cleared = conv.microcompactToolResults(2);
+    const cleared = cc.result_projection.microcompactToolResults(&conv, 2);
     try std.testing.expectEqual(@as(usize, 4), cleared);
 
     // 老的(0..3)被清
@@ -57,9 +57,9 @@ test "L2 microcompact: 幂等(重复清,第二次 0)" {
     while (i < 5) : (i += 1) {
         try appendToolResult(&conv, a, "x", "some_tool_output_data_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     }
-    const c1 = conv.microcompactToolResults(1); // 清 [0,4)
+    const c1 = cc.result_projection.microcompactToolResults(&conv, 1); // 清 [0,4)
     try std.testing.expectEqual(@as(usize, 4), c1);
-    const c2 = conv.microcompactToolResults(1); // 已 stub → 0
+    const c2 = cc.result_projection.microcompactToolResults(&conv, 1); // 已 stub → 0
     try std.testing.expectEqual(@as(usize, 0), c2);
 }
 
@@ -74,7 +74,7 @@ test "L2 microcompact: recoverable Bash channel artifact remains readable" {
     try appendToolResult(&conv, a, "bash", result);
     try conv.appendText(.assistant, "after bash");
 
-    const cleared = conv.microcompactToolResultsByRecentResults(0);
+    const cleared = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 0);
     try std.testing.expectEqual(@as(usize, 0), cleared.cleared);
     const preserved = conv.messages.items[0].blocks[0].tool_result.content;
     try std.testing.expect(std.mem.indexOf(u8, preserved, artifact_id) != null);
@@ -85,7 +85,7 @@ test "L2 microcompact: 消息少于 keep_recent_n → 不清" {
     var conv = Conversation.init(a);
     defer conv.deinit();
     try appendToolResult(&conv, a, "x", "data");
-    try std.testing.expectEqual(@as(usize, 0), conv.microcompactToolResults(5));
+    try std.testing.expectEqual(@as(usize, 0), cc.result_projection.microcompactToolResults(&conv, 5));
 }
 
 test "L2 microcompact: text/tool_use block 不受影响" {
@@ -98,7 +98,7 @@ test "L2 microcompact: text/tool_use block 不受影响" {
     try appendToolResult(&conv, a, "t", "tool_output_here_xxxxx_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     try conv.appendText(.user, "recent");
 
-    const cleared = conv.microcompactToolResults(1); // boundary=3,清 [0,3)
+    const cleared = cc.result_projection.microcompactToolResults(&conv, 1); // boundary=3,清 [0,3)
     try std.testing.expectEqual(@as(usize, 1), cleared); // 只有 1 个 tool_result
     // text 消息不变
     try std.testing.expect(std.mem.indexOf(u8, conv.messages.items[0].blocks[0].text, "old question one") != null);
@@ -115,7 +115,7 @@ test "L2 microcompact: 按最近 tool_result 个数保留,不被消息边界误�
     try conv.appendText(.assistant, "recent assistant text");
     try appendToolResult(&conv, a, "tu3", "latest_tool_result");
 
-    const reduced = conv.microcompactToolResultsByRecentResults(1);
+    const reduced = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 1);
     try std.testing.expectEqual(@as(usize, 2), reduced.cleared);
     try std.testing.expect(reduced.bytes_before > reduced.bytes_after);
     try std.testing.expect(cc.conversation.isCommittedToolResultProjection(conv.messages.items[1].blocks[0].tool_result.content));
@@ -141,7 +141,7 @@ test "L2 microcompact: huge recent tool_result is truncated before full compact 
     try appendToolResult(&conv, a, "huge", huge);
 
     const before = conv.totalTokens();
-    const reduced = conv.truncateLargeToolResults(limit);
+    const reduced = cc.result_projection.truncateLargeToolResults(&conv, limit);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
     try std.testing.expect(reduced.bytes_before > reduced.bytes_after);
     try std.testing.expect(conv.totalTokens() < before);
@@ -166,14 +166,14 @@ test "L2 microcompact: truncated projection clears without losing original commi
     try appendToolResult(&conv, a, "huge", huge);
     try conv.appendText(.assistant, "after tool");
 
-    const truncated = conv.truncateLargeToolResults(8 * 1024);
+    const truncated = cc.result_projection.truncateLargeToolResults(&conv, 8 * 1024);
     try std.testing.expectEqual(@as(usize, 1), truncated.truncated);
     const before = try a.dupe(u8, conv.messages.items[0].blocks[0].tool_result.content);
     defer a.free(before);
     const commitment_end = std.mem.indexOfScalar(u8, before, '\n') orelse return error.MissingCommitment;
     const commitment = before[0..commitment_end];
 
-    const cleared = conv.microcompactToolResultsByRecentResults(0);
+    const cleared = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 0);
     try std.testing.expectEqual(@as(usize, 1), cleared.cleared);
     const after = conv.messages.items[0].blocks[0].tool_result.content;
     try std.testing.expect(after.len < before.len);
@@ -193,7 +193,7 @@ test "L2 microcompact: truncated UTF-8 tool_result stays valid and second prefli
     try appendToolResult(&conv, a, "utf8", payload.items);
 
     const limit = cc.conversation.toolResultContextBytes(0);
-    const first = conv.truncateLargeToolResults(limit);
+    const first = cc.result_projection.truncateLargeToolResults(&conv, limit);
     try std.testing.expectEqual(@as(usize, 1), first.truncated);
     const content = conv.messages.items[0].blocks[0].tool_result.content;
     try std.testing.expect(content.len <= limit);
@@ -201,7 +201,7 @@ test "L2 microcompact: truncated UTF-8 tool_result stays valid and second prefli
     try std.testing.expect(std.mem.indexOf(u8, content, "original_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "中文") != null);
 
-    const second = conv.truncateLargeToolResults(limit);
+    const second = cc.result_projection.truncateLargeToolResults(&conv, limit);
     try std.testing.expect(!second.changed());
 }
 
@@ -220,7 +220,7 @@ test "L2 microcompact: invalid UTF-8 tool_result truncates to valid preview" {
     try appendToolResult(&conv, a, "bad_utf8", payload.items);
 
     const limit = cc.conversation.toolResultContextBytes(0);
-    const reduced = conv.truncateLargeToolResults(limit);
+    const reduced = cc.result_projection.truncateLargeToolResults(&conv, limit);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
     const content = conv.messages.items[0].blocks[0].tool_result.content;
     try std.testing.expect(std.unicode.utf8ValidateSlice(content));
@@ -241,7 +241,7 @@ test "L2 microcompact: raw marker-like output cannot impersonate a committed pro
     }
     try appendToolResult(&conv, a, "marker_like", payload.items);
 
-    const reduced = conv.truncateLargeToolResults(cc.conversation.toolResultContextBytes(0));
+    const reduced = cc.result_projection.truncateLargeToolResults(&conv, cc.conversation.toolResultContextBytes(0));
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
     const content = conv.messages.items[0].blocks[0].tool_result.content;
     try std.testing.expect(std.mem.startsWith(u8, content, cc.conversation.TOOL_RESULT_COMMITMENT_PREFIX));
@@ -350,7 +350,7 @@ test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的�
 
     // keep=2 只保护 tu_c/tu_b;tu_img_new 是第三新 → 本该被清,但它还没送达 → 保护。
     // 已送达的老图片和老文本照常清:阀对图片密集的历史仍然有效。
-    const first = conv.microcompactToolResultsByRecentResults(2);
+    const first = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 2);
     try std.testing.expectEqual(@as(usize, 2), first.cleared);
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[0].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[2].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
@@ -358,19 +358,19 @@ test "L2 microcompact: 未送达的图片不被 recent-N 阀清掉,已送达的�
     try std.testing.expectEqualStrings(text, conv.messages.items[4].blocks[1].tool_result.content);
     try std.testing.expectEqualStrings(text, conv.messages.items[4].blocks[2].tool_result.content);
     // 阻塞路径 keep=0:未送达图片仍受保护(它只记 IMAGE_TOKEN_ESTIMATE,清了也救不了窗口)。
-    const blocking = conv.microcompactToolResultsByRecentResults(0);
+    const blocking = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 0);
     try std.testing.expectEqual(@as(usize, 2), blocking.cleared);
     try std.testing.expectEqualStrings(image, conv.messages.items[4].blocks[0].tool_result.content);
 
     // 本地追加的 assistant 消息(AgentCore 预算终止标记那类)不是 provider 回复:图片仍受保护。
     try conv.appendText(.assistant, "{\"agentcore\":\"checkpoint_payload_resource_limit\"}");
-    const local_marker = conv.microcompactToolResultsByRecentResults(0);
+    const local_marker = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 0);
     try std.testing.expectEqual(@as(usize, 0), local_marker.cleared);
     try std.testing.expectEqualStrings(image, conv.messages.items[4].blocks[0].tool_result.content);
 
     // 真正随请求发出之后,同一张图片就是普通历史,keep=0 清掉它。
     conv.markDelivered(.{ .image_placeholder_ids = &.{} });
-    const delivered = conv.microcompactToolResultsByRecentResults(0);
+    const delivered = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 0);
     try std.testing.expectEqual(@as(usize, 1), delivered.cleared);
     try std.testing.expect(std.mem.startsWith(u8, conv.messages.items[4].blocks[0].tool_result.content, cc.conversation.TOOL_RESULT_CLEARED_STUB));
 }
@@ -389,7 +389,7 @@ test "L2 microcompact: 图片永不被 truncateLargeToolResults 截断,超限文
     try appendToolResult(&conv, a, "txt", big_text);
     try conv.appendText(.assistant, "after");
 
-    const reduced = conv.truncateLargeToolResults(limit);
+    const reduced = cc.result_projection.truncateLargeToolResults(&conv, limit);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
     try std.testing.expectEqualStrings(image, conv.messages.items[0].blocks[0].tool_result.content);
     try std.testing.expect(conv.messages.items[1].blocks[0].tool_result.content.len <= limit);
@@ -420,10 +420,11 @@ test "L2 microcompact: 生产组合(先清后截)——clear 保留的最近大�
     try appendToolResult(&conv, a, "recent_huge", huge);
 
     // 与 agent_loop.runAutoCompactIfNeeded 完全同序、同预算。
-    var reduced = conv.microcompactToolResultsByRecentResults(
+    var reduced = cc.result_projection.microcompactToolResultsByRecentResults(
+        &conv,
         cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
     );
-    reduced.merge(conv.truncateLargeToolResults(limit));
+    reduced.merge(cc.result_projection.truncateLargeToolResults(&conv, limit));
 
     try std.testing.expectEqual(@as(usize, 2), reduced.cleared);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
@@ -442,10 +443,11 @@ test "L2 microcompact: 生产组合(先清后截)——clear 保留的最近大�
     try std.testing.expect(std.mem.endsWith(u8, bounded, "Z"));
 
     // 幂等:再跑一遍两趟都不该有新动作。
-    var again = conv.microcompactToolResultsByRecentResults(
+    var again = cc.result_projection.microcompactToolResultsByRecentResults(
+        &conv,
         cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
     );
-    again.merge(conv.truncateLargeToolResults(limit));
+    again.merge(cc.result_projection.truncateLargeToolResults(&conv, limit));
     try std.testing.expect(!again.changed());
 }
 
@@ -481,10 +483,11 @@ test "L2 microcompact: 两趟压力阀不得毁掉唯一的恢复能力" {
     try appendToolResult(&conv, a, "tu_env", envelope);
 
     // 生产同序:先 clear(keep_recent=2 → 两条都保),再 truncate。
-    var reduced = conv.microcompactToolResultsByRecentResults(
+    var reduced = cc.result_projection.microcompactToolResultsByRecentResults(
+        &conv,
         cc.conversation.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
     );
-    reduced.merge(conv.truncateLargeToolResults(limit));
+    reduced.merge(cc.result_projection.truncateLargeToolResults(&conv, limit));
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
 
     const bounded = conv.messages.items[0].blocks[0].tool_result.content;
@@ -506,7 +509,7 @@ test "L2 microcompact: 两趟压力阀不得毁掉唯一的恢复能力" {
     try std.testing.expect(parsed.value.object.get("omitted_bytes").?.integer > 1);
 
     // 且下一轮 clear 仍然看得见恢复能力,不会把它清成 stub。
-    const again = conv.microcompactToolResultsByRecentResults(0);
+    const again = cc.result_projection.microcompactToolResultsByRecentResults(&conv, 0);
     try std.testing.expectEqual(@as(usize, 0), again.cleared);
 }
 
@@ -534,7 +537,7 @@ test "L2 microcompact: Bash 信封被结构化裁剪,而不是切成散文" {
     defer a.free(bash);
     try appendToolResult(&conv, a, "tu_bash", bash);
 
-    const reduced = conv.truncateLargeToolResults(limit);
+    const reduced = cc.result_projection.truncateLargeToolResults(&conv, limit);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
 
     const bounded = conv.messages.items[0].blocks[0].tool_result.content;
