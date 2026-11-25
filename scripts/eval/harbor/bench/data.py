@@ -26,6 +26,8 @@ import io
 import json
 import math
 import re
+from bisect import bisect_left
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -34,6 +36,7 @@ from scripts.eval.harbor.profiling import CONTEXT_PARTS, usage_values
 VALID = ("pass", "partial", "fail", "timeout")
 STATUSES = VALID + ("invalid", "running")
 Z95 = 1.959963984540054
+TTFT_BUCKETS_MS = (0,) + tuple(round(2 ** (i / 8), 3) for i in range(217))
 
 # Harbor exception types (harbor/agents/installed/base.py) that mean the model
 # provider, not the agent, failed the trial.
@@ -298,6 +301,39 @@ def performance_fields(ttfts, output, generation_ms):
     return {"ttft_ms": sum(ttfts) / len(ttfts) if ttfts else None,
             "ttft_p50_ms": percentile(ttfts, .5), "ttft_p95_ms": percentile(ttfts, .95),
             "tps": output * 1000 / generation_ms if generation_ms > 0 else None}
+
+
+def ttft_distribution(samples, summaries=()):
+    def bucket(value):
+        return TTFT_BUCKETS_MS[min(bisect_left(TTFT_BUCKETS_MS, value), len(TTFT_BUCKETS_MS) - 1)]
+
+    histogram = Counter(bucket(value) for value in samples)
+    total = sum(samples)
+    for summary in summaries:
+        entries = summary.get("ttft_histogram", ())
+        if "ttft_sum_ms" in summary:
+            total += summary["ttft_sum_ms"]
+        else:
+            total += sum(value * n for value, n in entries)
+        for value, n in entries:
+            histogram[bucket(value)] += n
+    buckets = sorted(histogram.items())
+    count = sum(histogram.values())
+
+    def quantile(q):
+        if not count:
+            return None
+        position = (count - 1) * q
+        lower = int(position)
+        end = 0
+        for i, (value, n) in enumerate(buckets):
+            end += n
+            if lower < end:
+                upper = buckets[i + 1][0] if lower + 1 == end and i + 1 < len(buckets) else value
+                return value + (upper - value) * (position - lower)
+
+    return {"ttft_histogram": buckets, "ttft_count": count, "ttft_sum_ms": total,
+            "ttft_ms": total / count if count else None, "ttft_p50_ms": quantile(.5), "ttft_p95_ms": quantile(.95)}
 
 
 def trial_order(row):
@@ -822,29 +858,8 @@ def merge_summaries(summaries):
     result.update(performance_fields(ttfts, result["tps_output_tokens"] or 0, result["tps_generation_ms"] or 0))
     result["cost_by_status"] = {status: sum(s["cost_by_status"][status] for s in summaries) for status in VALID}
     if any("ttft_histogram" in summary for summary in summaries):
-        from collections import Counter
-        histogram = Counter(ttfts)
-        for summary in summaries:
-            histogram.update(dict(summary.get("ttft_histogram", [])))
-        buckets = sorted(histogram.items())
-        count = sum(histogram.values())
-
-        def quantile(q):
-            if not count:
-                return None
-            position = (count - 1) * q
-            lower = int(position)
-            end = 0
-            for i, (value, n) in enumerate(buckets):
-                end += n
-                if lower < end:
-                    upper = buckets[i + 1][0] if lower + 1 == end and i + 1 < len(buckets) else value
-                    return value + (upper - value) * (position - lower)
-
         result.pop("ttft_samples_ms")
-        result.update(ttft_histogram=buckets, ttft_count=count,
-                      ttft_ms=sum(v * n for v, n in buckets) / count if count else None,
-                      ttft_p50_ms=quantile(.5), ttft_p95_ms=quantile(.95))
+        result.update(ttft_distribution(ttfts, summaries))
     result.update(outcome_fields(result))
     return result
 

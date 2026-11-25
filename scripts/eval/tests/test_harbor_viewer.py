@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench import data, results
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
 
@@ -158,6 +158,26 @@ class LibraryTest(unittest.TestCase):
         self.assertEqual(view["model"], "tokenjoy/GLM5.3-Flash")
         self.assertEqual(view["agent"], "MetacodesAgent")
         self.assertTrue(view["running"])
+
+    def test_remote_ttft_summaries_have_bounded_buckets_and_pool_the_exact_mean(self):
+        row = data.job_view(self.library.job_dir("glm-pilot"))["rows"][0]
+        samples = [100 + i / 13 for i in range(10000)]
+        remote_row = {**row, "ttft_samples_ms": samples}
+        remote = results.aggregate([remote_row])
+        self.assertEqual(results.task_summaries([remote_row])[row["task"]], remote)
+        self.assertNotIn("ttft_samples_ms", remote)
+        self.assertLessEqual(len(remote["ttft_histogram"]), len(data.TTFT_BUCKETS_MS))
+        self.assertEqual(sum(n for _, n in remote["ttft_histogram"]), len(samples))
+        local = data.summarize([{**row, "ttft_samples_ms": [3.1, 90000]}])
+        merged = data.merge_summaries([remote, local])
+        pooled = samples + local["ttft_samples_ms"]
+        self.assertAlmostEqual(merged["ttft_ms"], sum(pooled) / len(pooled))
+        self.assertEqual(merged["ttft_count"], len(pooled))
+        self.assertEqual(merged["ttft_histogram"], data.ttft_distribution(pooled)["ttft_histogram"])
+        for q, field in ((.5, "ttft_p50_ms"), (.95, "ttft_p95_ms")):
+            exact = data.percentile(pooled, q)
+            self.assertGreaterEqual(merged[field], exact)
+            self.assertLess(merged[field], exact * 1.1)
 
     def test_row_fields(self):
         rows = {row["task"]: row for row in data.job_view(self.library.job_dir("glm-pilot"))["rows"]}

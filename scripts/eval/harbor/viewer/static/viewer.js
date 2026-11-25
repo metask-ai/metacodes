@@ -1043,9 +1043,17 @@ async function renderNewRun() {
 }
 
 async function renderRun(name) {
-  const run = await api('/api/run?name=' + encodeURIComponent(name));
+  const endpoint = '/api/run?name=' + encodeURIComponent(name);
+  const run = await api(endpoint);
   let results;
-  try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建作业' }); }
+  if (run.result_owner) {
+    const view = run.worker_summary?.view;
+    results = view ? panel('作业结果', run.result_owner, h('div', { class: 'panel-body' },
+      outcomeBar(view.summary.counts, view.summary.trials, true), legend(view.summary.counts),
+      link('#/job/' + encodeURIComponent(name), '查看作业详情'))) : null;
+  } else {
+    try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建作业' }); }
+  }
   state.live = ['queued', 'starting', 'running', 'cancelling'].includes(run.status);
   navCurrent('overview');
   $('#title').textContent = RUN_STATUS[run.status] || run.status;
@@ -1064,7 +1072,14 @@ async function renderRun(name) {
     h('p', { text: `${run.suite_name ? run.suite_name + ' · ' : ''}${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}${run.judge ? ' · ' + judgeText(run.judge) : ''}` }),
     run.error ? h('p', { class: 'muted', text: run.error }) : null,
     h('a', { class: 'mono', href: url, text: url }));
-  const log = h('details', { class: 'panel', 'data-key': 'runlog' }, h('summary', { text: '执行日志' }), h('pre', { text: run.log || '正在准备执行环境…' }));
+  const logText = h('pre', { text: run.log || '正在准备执行环境…' });
+  const log = h('details', { class: 'panel', 'data-key': 'runlog', ontoggle: async (event) => {
+    if (!event.currentTarget.open || !run.result_owner) return;
+    try {
+      const detail = await api(endpoint + '&log=1');
+      logText.textContent = [detail.log, detail.log_error].filter(Boolean).join('\n') || '暂无执行日志';
+    } catch (error) { logText.textContent = [run.log, error.message].filter(Boolean).join('\n'); }
+  } }, h('summary', { text: '执行日志' }), logText);
   return h('div', {}, panel('运行状态', RUN_STATUS[run.status], summary, h('div', { class: 'header-actions' }, copy, stop)), log, results);
 }
 

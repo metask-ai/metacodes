@@ -220,10 +220,10 @@ class Workbench:
     def worker_read(self, run, operation, trial=None):
         snapshot = run.get("worker_summary") or {}
         name = run["name"]
-        if not snapshot:
+        if not snapshot and operation != "log":
             return None
         store = self.library.store
-        if snapshot["store_id"] == store.identity():
+        if snapshot and snapshot["store_id"] == store.identity():
             with store.read() as tx:
                 source = tx.one("SELECT source_dir FROM jobs WHERE name = ?", (name,))
             if source and source[0] == snapshot["source"]:
@@ -360,12 +360,13 @@ class Workbench:
         self.library.maybe_sync()
         records = self.result_records()
         hidden = self.library.worker_only()
-        views = {name: r["worker_summary"]["view"] for name, r in records.items() if r.get("worker_summary")}
-        for name in set(self.library.job_names()) - hidden - views.keys():
-            view = self.library.job_view(name, with_rows=False)
+        summaries = {name: r["worker_summary"]["view"] for name, r in records.items() if r.get("worker_summary")}
+        views = []
+        for name in sorted(set(self.library.job_names()).union(summaries) - hidden):
+            view = summaries.get(name) or self.library.job_view(name, with_rows=False)
             if view:
-                views[name] = view
-        return sorted(views.values(), key=lambda view: view["started_at"] or "", reverse=True)
+                views.append(view)
+        return sorted(views, key=lambda view: view["started_at"] or "", reverse=True)
 
     def leaderboard(self, suite_id=None) -> Optional[Dict[str, Any]]:
         """Published boards of one suite (default: the first that has any) and
@@ -449,13 +450,16 @@ class Workbench:
         value["tasks"] = sorted(tasks, key=lambda t: (t["suite"], t["model"] or "", t["task"]))
         return value
 
-    def run(self, name) -> Optional[Dict[str, Any]]:
+    def run(self, name, *, worker_log=False) -> Optional[Dict[str, Any]]:
         record = next((r for r in self.runs() if r["name"] == name), None)
         if not record:
             return None
         log = data.tail(self.manager.records / (record["name"] + ".log"))
-        if record.get("result_owner") and record.get("worker_summary"):
-            log += "\n" + (self.worker_read(record, "log") or "")
+        if worker_log and record.get("result_owner"):
+            try:
+                log += "\n" + (self.worker_read(record, "log") or "")
+            except results.WorkerUnavailable as exc:
+                return {**record, "log": log, "log_error": str(exc)}
         return {**record, "log": log}
 
     def launch(self, request) -> Dict[str, Any]:
@@ -536,7 +540,7 @@ class Workbench:
                 raise ValueError("评测配置还在运行，请先停止，结束后再删除")
             worker_jobs = {r["name"] for r in receipts + self.library.run_records() if r.get("result_owner")}
             self.library.delete_profile(profile, runs, manager.jobs_dir, self.profiles.path(profile),
-                                        lambda: self._remove_run_files(runs, worker_jobs), worker_jobs)
+                                        lambda protected: self._remove_run_files(runs, protected), worker_jobs)
         return {"id": profile, "deleted": True, "runs": runs}
 
     def delete_job(self, name) -> Dict[str, Any]:
@@ -553,7 +557,7 @@ class Workbench:
                 raise ValueError("作业还在运行，请先停止，结束后再删除")
             record = next((r for r in receipts if r["name"] == name), None) or self.library.run_record(name)
             worker_jobs = {name} if (record or {}).get("result_owner") else set()
-            self.library.delete_job(name, manager.jobs_dir, lambda: self._forget_run(name, worker_jobs), worker_jobs)
+            self.library.delete_job(name, manager.jobs_dir, lambda protected: self._forget_run(name, protected), worker_jobs)
         return {"name": name, "deleted": True}
 
     def _forget_run(self, name, worker_jobs) -> None:

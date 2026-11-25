@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from collections import Counter
 from pathlib import Path
 
 from scripts.eval.harbor.bench import data, executors
@@ -25,8 +24,7 @@ def task_summaries(rows):
 
 def aggregate(rows):
     summary = data.summarize(rows)
-    summary["ttft_histogram"] = sorted(Counter(summary.pop("ttft_samples_ms")).items())
-    summary["ttft_count"] = sum(n for _, n in summary["ttft_histogram"])
+    summary.update(data.ttft_distribution(summary.pop("ttft_samples_ms")))
     scored = [r["reward"] for r in rows if r["status"] in data.VALID and r.get("reward") is not None]
     summary["reward_sum"] = sum(scored)
     summary["reward_count"] = len(scored)
@@ -69,11 +67,15 @@ def stored_log(store, name):
 
 
 def worker_result(node, operation, directory, trial=None):
+    from scripts.eval.harbor.bench.remote import HARBOR_LOG
     directory = Path(directory).expanduser()
     name = directory.name
     if not data.NAME.fullmatch(name) or directory.is_symlink() or directory.parent.name != "jobs":
         raise ValueError("作业路径无效")
     run_dir = directory.parent.parent / "runs" / name
+    log = run_dir / HARBOR_LOG
+    if operation == "log":
+        return data.tail(log) if not run_dir.is_symlink() and not log.is_symlink() else ""
     store_path = run_dir / "result-store.json"
     if store_path.is_file():
         store_config = config.parse(json.loads(store_path.read_text(encoding="utf-8")), node.root)
@@ -89,13 +91,11 @@ def worker_result(node, operation, directory, trial=None):
                 result = ingest.ingest_job(store, directory, verify=operation == "final")
                 if result.outcome == "skipped" or result.trials_failed:
                     raise ValueError("作业数据尚未完整写入 worker 数据库")
-                from scripts.eval.harbor.bench.remote import HARBOR_LOG
-                log = run_dir / HARBOR_LOG
                 with store.transaction() as tx:
                     tx.execute("INSERT INTO worker_jobs (job, log_tail, ingested_at) VALUES (?, ?, ?) "
                                "ON CONFLICT (job) DO UPDATE SET log_tail = excluded.log_tail, ingested_at = excluded.ingested_at "
                                "WHERE worker_jobs.log_tail <> excluded.log_tail",
-                               (name, data.tail(log) if not log.is_symlink() else "", now()))
+                               (name, data.tail(log) if not run_dir.is_symlink() and not log.is_symlink() else "", now()))
             view = library.job_view(name)
             rows = view.pop("rows")
             view["summary"] = aggregate(rows)
@@ -109,8 +109,6 @@ def worker_result(node, operation, directory, trial=None):
             return library.job_view(name)
         if operation == "trial" and isinstance(trial, str) and data.NAME.fullmatch(trial):
             return library.trial_view(name, trial)
-        if operation == "log":
-            return stored_log(store, name)
         raise ValueError("未知的作业查询")
     finally:
         store.close()

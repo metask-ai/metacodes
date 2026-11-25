@@ -819,7 +819,9 @@ refreshing a session login, then
    and leaderboard can show the last received aggregates while the worker is offline;
 6. after Harbor exits the manager requests a final verified summary.
    If delivery fails, the receipt identifies the executor and job directory.
-   `metacodes bench sync --run NAME` retries delivery, including for an older SSH receipt whose worker has been upgraded.
+   `metacodes bench sync --run NAME` retries delivery. An older SSH run with
+   an existing manager-side mirror verifies and repairs its files in place.
+   An older receipt without a mirror can fetch a summary from an upgraded worker.
 
 Suites on an SSH executor: a `harbor-registry` suite is always downloaded on
 the workbench machine (its own Harbor, `harbor download <ref> -o <dir>`), so
@@ -1645,7 +1647,7 @@ fetch from the executor's own network and are only valid with `direct`.
 | Single-run full-score rate | Independent valid runs with reward >= 1 / all valid runs. Every failed attempt remains in the denominator when a later independent run succeeds |
 | First-attempt full-score rate | Tasks with reward >= 1 on their earliest trial / tasks whose earliest trial has a valid outcome. Later attempts never replace the first score. Infrastructure-invalid and running first trials are shown separately |
 | Generation TPS | Sum of reported output tokens / sum of generation seconds, from first semantic output until response completion. Tool execution and first-token waiting are excluded |
-| TTFT | From relay dispatch to the first non-empty text, reasoning, or tool-call output. Heartbeats and response metadata do not count. The global mean and P50/P95 pool request samples across jobs |
+| TTFT | From relay dispatch to the first non-empty text, reasoning, or tool-call output. Heartbeats and response metadata do not count. The pooled mean uses total duration and request count. Remote P50/P95 use fixed histogram buckets, eight per doubling from 1 ms through about 37 hours, with longer durations in the last bucket |
 | Estimated cost | The metacodes binary's catalog estimate, including cache pricing. It is not the provider's settlement. Missing/zero unknown prices are shown as unknown with coverage counts |
 | Pass rate 95% interval | Wilson score interval of the single-run full-score rate over valid runs. It treats every run as independent, so repeated attempts of a task and pooled jobs make it narrower than a task-level interval |
 | Solved at least once | Tasks with at least one passing run / tasks with at least one valid run |
@@ -1692,7 +1694,9 @@ manager returns that response to the browser without persisting it. When
 the worker's database ID and the job's recorded source match the manager's
 active store, the manager reads that database directly. With separate stores
 an unreachable worker leaves the dashboard available and detail requests
-report which worker is unavailable. Historical jobs already copied back are
+report which worker is unavailable. The run page and CLI read status from
+the manager receipt. Expanding the execution log reads the worker's Harbor
+output even if startup failed before the first result. Historical jobs already copied back are
 read from their existing store. Deleting a worker-owned job from the manager
 removes its manager record and aggregates and preserves the worker's files
 and detail records.

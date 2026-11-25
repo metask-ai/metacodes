@@ -579,8 +579,8 @@ def main(argv=None):
                 parser.error("bench sync 需要 --run NAME")
             from scripts.eval.harbor.bench import executors
             value = executors.sync_run(jobs_dir, args.run, log=lambda text: print(text, file=sys.stderr, flush=True))
-            print(json.dumps(value, ensure_ascii=False) if args.json else
-                  f"{value['name']}：已从 {value['executor']} 同步作业汇总")
+            target = "历史作业镜像" if "local_dir" in value else "作业汇总"
+            print(json.dumps(value, ensure_ascii=False) if args.json else f"{value['name']}：已从 {value['executor']} 同步{target}")
             return 0
         if args.action == "stop":
             client = client or receipt_client(settings(root / "service.json"), config)
