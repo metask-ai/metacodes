@@ -1945,12 +1945,18 @@ function mirrorEffect(row) {
   if (row.cached) return MIRROR_EFFECTS.next_run + '；下载缓存' + MIRROR_EFFECTS.setup + '，此前这一类直接走镜像源';
   return MIRROR_EFFECTS[row.effect] || '';
 }
-function mirrorPayload(rows, values) {
-  const settings = { container_mirrors: {} };
+function mirrorChanges(rows, values, saved) {
+  return Object.fromEntries(rows.filter((r) => values[r.setting] !== saved[r.setting]).map((r) => [r.setting, values[r.setting]]));
+}
+function mirrorPayload(rows, changes) {
+  const settings = {};
   for (const row of rows) {
-    const value = values[row.setting];
-    if (row.setting.startsWith('container_mirrors.')) { if (value) settings.container_mirrors[row.setting.slice('container_mirrors.'.length)] = value; }
-    else if (row.kind === 'urls') settings[row.setting] = value.split(/[\s,]+/).filter(Boolean);
+    if (!(row.setting in changes)) continue;
+    const value = changes[row.setting];
+    if (row.setting.startsWith('container_mirrors.')) {
+      settings.container_mirrors = settings.container_mirrors || {};
+      settings.container_mirrors[row.setting.slice('container_mirrors.'.length)] = value || null;
+    } else if (row.kind === 'urls') settings[row.setting] = value.split(/[\s,]+/).filter(Boolean);
     else settings[row.setting] = row.kind === 'bool' ? value : value || null;
   }
   return settings;
@@ -1962,7 +1968,7 @@ function mirrorsPanel(m) {
   const egress = typeof m.mirrors.egress === 'string' ? ({ direct: '直连（执行机器自己的网络）', workbench: '经工作台出网' }[m.mirrors.egress] || m.mirrors.egress) : '站点代理 ' + (m.mirrors.egress.proxy || '');
   const facts = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
     h('dt', { text: '容器出网' }), h('dd', { text: egress }),
-    h('dt', { text: 'Docker daemon 的 registry-mirrors' }), h('dd', { class: 'mono', text: daemon.length ? daemon.join('\n') : '未配置（Docker Hub 直连）' })));
+    h('dt', { text: 'Docker daemon 的 registry-mirrors' }), h('dd', { class: 'mono', text: m.error ? '未探测' : daemon.length ? daemon.join('\n') : '未配置（Docker Hub 直连）' })));
   if (!m.mirrors.editable) return panel('镜像源', '镜像源只在 SSH 执行机器上配置', h('div', {}, facts));
   const saved = Object.fromEntries(rows.map((r) => [r.setting, r.kind === 'bool' ? !!r.value : mirrorText(r)]));
   const draft = state.mirrorDraft && state.mirrorDraft.executor === name ? state.mirrorDraft.values : {};
@@ -1970,13 +1976,13 @@ function mirrorsPanel(m) {
   const feedback = h('span', { class: 'muted', role: 'status', text: state.mirrorNote && state.mirrorNote.executor === name ? state.mirrorNote.text : '' });
   const save = h('button', { type: 'submit', class: 'button primary', text: '保存' });
   const undo = h('button', { type: 'button', class: 'button', text: '还原' });
-  const changed = () => rows.some((r) => values[r.setting] !== saved[r.setting]);
   const sync = () => {
-    const dirty = changed();
+    const changes = mirrorChanges(rows, values, saved);
+    const dirty = Object.keys(changes).length > 0;
     save.disabled = !dirty;
     undo.disabled = !dirty;
     state.editing = dirty;
-    state.mirrorDraft = dirty ? { executor: name, values: { ...values } } : null;
+    state.mirrorDraft = dirty ? { executor: name, values: changes } : null;
     if (dirty && state.mirrorNote) { state.mirrorNote = null; feedback.textContent = ''; }
   };
   const field = (r) => {
@@ -2004,15 +2010,20 @@ function mirrorsPanel(m) {
   const form = h('form', { class: 'mirror-form' }, table, h('div', { class: 'panel-body mirror-actions' }, save, undo, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    const controls = [...form.querySelectorAll('input, button')];
+    for (const control of controls) control.disabled = true;
     feedback.textContent = '正在保存并探测新地址…';
-    save.disabled = true;
     try {
-      await api('/api/monitor/mirrors', { executor: name, settings: mirrorPayload(rows, values) });
+      await api('/api/monitor/mirrors', { executor: name, settings: mirrorPayload(rows, mirrorChanges(rows, values, saved)) });
       state.mirrorDraft = null;
       state.mirrorNote = { executor: name, text: '已保存到 workbench.json（保存前的版本在 backups/ 里）' };
       state.editing = false;
       render();
-    } catch (error) { feedback.textContent = '没有保存：' + error.message; save.disabled = false; }
+    } catch (error) {
+      for (const control of controls) control.disabled = false;
+      sync();
+      feedback.textContent = '没有保存：' + error.message;
+    }
   });
   undo.addEventListener('click', () => { state.mirrorDraft = null; state.mirrorNote = null; state.editing = false; render(); });
   const pending = m.mirrors.pending || [];
@@ -2031,7 +2042,8 @@ function mirrorsPanel(m) {
   const todo = pending.length ? h('div', { class: 'panel-body' }, h('div', { class: 'callout mirror-pending' },
     h('div', { text: '需要重新配置才生效：' + pending.map((x) => `${x.title}（${x.reason}）`).join('；') }),
     h('div', { class: 'mirror-actions' }, rerun, rerunNote))) : null;
-  const node = panel('镜像源', '在这里修改，保存到 workbench.json 的执行机器条目；正在运行的评测不受影响', h('div', {}, facts, form, todo));
+  const note = m.error ? '执行机器没有连上，状态未探测；设置仍可修改' : '在这里修改，保存到 workbench.json 的执行机器条目；正在运行的评测不受影响';
+  const node = panel('镜像源', note, h('div', {}, facts, form, todo));
   sync();
   return node;
 }
@@ -2090,7 +2102,8 @@ async function renderMonitor(name) {
     (m.executors || []).map((e) => { const o = h('option', { value: e.name, text: e.label }); o.selected = e.name === m.executor.name; return o; }));
   const scope = h('div', { class: 'scope' }, h('span', { text: '执行机器' }), picker,
     m.collected_at ? h('span', { class: 'meta', text: '采集于 ' + new Date(m.collected_at).toLocaleTimeString('zh-CN', { hour12: false }) }) : null);
-  if (m.error) return h('div', {}, scope, h('div', { class: 'callout', text: `无法采集 ${m.executor.label}：${m.error}` }));
+  if (m.error) return h('div', { class: 'stack monitor' }, scope, h('div', { class: 'callout', text: `无法采集 ${m.executor.label}：${m.error}` }),
+    m.mirrors ? mirrorsPanel(m) : null);
   const series = monitorHistory(m);
   return h('div', { class: 'stack monitor' }, scope, loadPanel(m, series), networkPanel(m, series), mirrorsPanel(m), dockerPanel(m), cachesPanel(m));
 }

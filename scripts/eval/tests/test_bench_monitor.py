@@ -414,6 +414,14 @@ class MonitorHttpTest(SetupFixture):
             value = self.client.request("api/monitor?executor=relay-4090")
         self.assertIn("连接执行机器失败", value["error"])
         self.assertIn("Permission denied", value["error"])
+        rows = self.settings_of(value)
+        self.assertEqual((value["mirrors"]["editable"], value["mirrors"]["pending"], rows["container_mirrors.go"]["value"],
+                          rows["container_mirrors.go"]["probes"], rows["container_mirrors.apt"]["pending"]),
+                         (True, [], self.reachable, [None], None))
+        with patch.dict(os.environ, {"FAKE_SSH_MODE": "deny"}):
+            saved = self.save({"container_mirrors": {"hf": "https://hf-mirror.example"}})
+        self.assertIn("连接执行机器失败", saved["error"])
+        self.assertEqual(self.entry()["container_mirrors"]["hf"], "https://hf-mirror.example")
         self.assertEqual(value["executor"]["name"], "relay-4090")
         self.assertEqual([e["name"] for e in value["executors"]], ["devbox-mac", "relay-4090"])
         with self.assertRaisesRegex(ValueError, "未配置执行机器 nowhere"):
@@ -534,8 +542,23 @@ class MonitorHttpTest(SetupFixture):
         self.save({"download_cache": True})
         self.assertEqual(len(list((self.config.parent / monitor.BACKUPS).iterdir())), 1)
         self.save({"download_cache": False, "container_mirrors": {}})
-        self.assertEqual((self.entry().get("download_cache"), self.entry().get("container_mirrors"),
-                          len(list((self.config.parent / monitor.BACKUPS).iterdir()))), (None, None, 2))
+        self.assertEqual((self.entry().get("download_cache"), sorted(self.entry()["container_mirrors"]),
+                          len(list((self.config.parent / monitor.BACKUPS).iterdir()))), (None, ["apt", "github", "pypi"], 2))
+        self.save({"container_mirrors": {"apt": None, "github": "", "pypi": None}})
+        self.assertNotIn("container_mirrors", self.entry())
+
+    def test_a_form_opened_before_another_save_changes_only_the_fields_it_edited(self):
+        self.save({"container_mirrors": {"hf": "https://hf-mirror.example"}, "ghcr_mirror": "ghcr.other.example"})
+        self.save({"container_mirrors": {"pypi": "https://pypi.example/simple"}, "pypi_index": "https://pypi.example/simple"})
+        entry = self.entry()
+        self.assertEqual((entry["container_mirrors"], entry["ghcr_mirror"], entry["pypi_index"]),
+                         ({"apt": "http://mirrors.example.invalid", "go": self.reachable,
+                           "hf": "https://hf-mirror.example", "pypi": "https://pypi.example/simple"},
+                          "ghcr.other.example", "https://pypi.example/simple"))
+        self.assertEqual(entry["docker_mirrors"], [self.reachable.rstrip("/")])
+        script = (Path(server.__file__).parent / "static" / "viewer.js").read_text(encoding="utf-8")
+        self.assertIn("settings: mirrorPayload(rows, mirrorChanges(rows, values, saved))", script)
+        self.assertIn("for (const control of controls) control.disabled = true;", script)
 
     def test_a_setting_the_executor_parser_refuses_is_not_saved(self):
         before = self.config.read_bytes()

@@ -89,8 +89,8 @@ def setting_rows(executor: Executor) -> List[Dict]:
     return rows
 
 
-def pending_setup(executor: Executor, probed: Dict) -> Dict[str, str]:
-    if not isinstance(executor, SshExecutor):
+def pending_setup(executor: Executor, probed: Optional[Dict]) -> Dict[str, str]:
+    if not isinstance(executor, SshExecutor) or probed is None:
         return {}
     pending: Dict[str, str] = {}
     daemon = (probed.get("docker") or {}).get("registry_mirrors")
@@ -119,7 +119,7 @@ def pending_setup(executor: Executor, probed: Dict) -> Dict[str, str]:
     return pending
 
 
-def mirror_settings(executor: Executor, probed: Dict, targets: Dict[str, Dict]) -> Dict:
+def mirror_settings(executor: Executor, probed: Optional[Dict], targets: Dict[str, Dict]) -> Dict:
     pending = pending_setup(executor, probed)
     rows = setting_rows(executor)
     for row in rows:
@@ -160,7 +160,9 @@ def save_mirrors(config_path: Path, payload) -> str:
     entry = dict(entries[index])
     for key, value in values.items():
         if key == "container_mirrors" and isinstance(value, dict):
-            value = {kind: url for kind, url in value.items() if url not in UNSET}
+            current = entry.get(key)
+            value = {kind: url for kind, url in {**(current if isinstance(current, dict) else {}), **value}.items()
+                     if url not in UNSET}
         if value in UNSET:
             entry.pop(key, None)
         else:
@@ -300,7 +302,9 @@ class Monitor:
             probed, error = run_probe(executor, probe_options(executor, state_root, jobs_dir, wanted, not counted),
                                       self.runner)
             if probed is None:
-                value = {"schema_version": 1, "executor": executor.public(), "error": error}
+                value = {"schema_version": 1, "executor": executor.public(), "error": error,
+                         "mirrors": {"egress": executor.egress_value() if isinstance(executor, SshExecutor) else "direct",
+                                     "items": [], **mirror_settings(executor, None, {})}}
             else:
                 at = probed.get("collected_at") or time.time()
                 if not fresh:

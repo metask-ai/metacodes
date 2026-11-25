@@ -1546,7 +1546,10 @@ and the `download_cache` switch. An empty field removes the setting. 保存
 sends `POST /api/monitor/mirrors` (`{"executor": NAME, "settings": {...}}`
 with any of `pypi_index`, `docker_mirrors`, `ghcr_mirror`,
 `container_mirrors`, `download_cache`; a key that is left out is not
-touched). The service builds the executor's new entry and validates it with
+touched, and `container_mirrors` names only the keys to change, `null` or
+`""` removing one). The page sends just the fields that were edited, so a
+form opened before someone else saved does not put their values back, and
+it locks its fields until the save has answered. The service builds the executor's new entry and validates it with
 the parser that reads `workbench.json` (`executors.parse`), so the page
 accepts exactly what the file accepts: the same keys, http(s) addresses,
 `container_mirrors.apt` only as `http://` and, like `download_cache`, only
@@ -1556,7 +1559,9 @@ message and nothing is written. Otherwise the current file is copied to
 kept) and the new one is written atomically; the response is a fresh
 snapshot, in which the new addresses have just been probed (状态). Saving
 is refused while a 一键配置 that changes the machine is running, since setup
-writes the same file. The local executor has no mirror settings.
+writes the same file. The local executor has no mirror settings. When the
+executor cannot be reached the block is still there, with 状态 shown as not
+probed: the settings live on the workbench machine.
 
 When a saved value takes effect is shown on each row (生效):
 
@@ -1575,7 +1580,10 @@ container label), a download cache that does not answer or whose routes
 (`/_stats`) differ from the configured ones. 重新配置 starts the same
 一键配置 as the 评测 page (`POST /api/setup`) and opens its progress there;
 it is disabled, with the reason, while a benchmark runs (`busy` in the
-snapshot) or a setup is already running (`setup_running`).
+snapshot) or a setup is already running (`setup_running`). Setup's 网络与镜像
+step does not propose `"egress": "workbench"` for an executor whose
+`download_cache` is on or whose `container_mirrors` has `apt`: both caches
+fetch from the executor's own network and are only valid with `direct`.
 
 ### Metric definitions
 
