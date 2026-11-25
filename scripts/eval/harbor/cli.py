@@ -266,7 +266,8 @@ def pull_images(args, root, cfg):
             print(f"  {labels[row['status']]}  {action} {row['image']}（{len(row['tasks'])} 道任务）"
                   + (f"：{row['error']}" if row.get("error") else ""))
         summary = "，".join(f"{labels[k]} {n}" for k, n in value["counts"].items())
-        print(f"{value['suite']} @ {value['executor']}：{len(value['images'])} 个镜像" + (f"（{summary}）" if summary else ""))
+        print(f"{value['suite']} @ {value['executor']}：{len(value['images'])} 个镜像" + (f"（{summary}）" if summary else "")
+              + f"，任务就绪 {value['tasks']['ready']}/{value['tasks']['total']}")
     return 1 if value["counts"].get("failed") else 0
 
 
