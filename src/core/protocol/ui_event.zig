@@ -26,7 +26,7 @@
 
 const std = @import("std");
 const api_stream = @import("../../api/stream.zig");
-const file_reference = @import("../file_reference.zig");
+const observation = @import("../../tools/observation.zig");
 const output_semantics = @import("../output_semantics.zig");
 const file_change = @import("../file_change.zig");
 const abort = @import("../../util/abort.zig");
@@ -213,7 +213,7 @@ pub const CoreEvent = union(enum) {
         content: []const u8,
         is_error: bool,
         elapsed_ms: u64 = 0,
-        file_refs: ?[]const file_reference.FileReference = null,
+        file_refs: ?[]const observation.FileReference = null,
     },
 
     /// **文件修改结果**(见 core/file_change.zig)。**无条件发**(它是证据不是渲染,headless/

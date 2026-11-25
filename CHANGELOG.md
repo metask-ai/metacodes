@@ -34,6 +34,21 @@ status, compatibility boundaries, and entry points are defined by
   notice. Event text is XML-escaped and labelled as command output, not
   instructions. Off by default; with it off Monitor is unchanged
   ([API.md](doc/API.md#preview-features)).
+- **Bench has a 监控 page for the execution machine.** It shows the machine's
+  CPU, load, memory, disks and network rate, whether Docker Hub, ghcr.io,
+  GitHub, PyPI, Hugging Face, astral.sh and every configured mirror answer
+  from there and how fast, Docker's images, containers and build cache with
+  their reclaimable size, and how often downloads were served from a cache:
+  the apt cache, the download cache and, for task images, Docker's local image
+  store. `metacodes bench monitor [--executor NAME] [--json]` prints the same
+  snapshot, and `GET /api/monitor` serves it. Nothing is installed on the
+  machine: each reading runs one read-only script over the existing SSH access.
+  The page's 镜像源 block edits an SSH executor's mirror settings
+  (`pypi_index`, `docker_mirrors`, `ghcr_mirror`, every `container_mirrors`
+  key and `download_cache`): a save is validated by the parser that reads
+  `workbench.json`, keeps a backup of the file, probes the new addresses at
+  once, and each row says when it takes effect and whether setup has to run
+  again.
 - **Bench prepares each task shortly before its turn and shows what its time
   is made of.** Inside a run, trials now take their slots in the order they
   were queued, and the next wave of waiting trials pulls or builds its task
@@ -276,6 +291,23 @@ status, compatibility boundaries, and entry points are defined by
   and stay empty under `--check`. The exit code stays 3 (#646).
 
 ### Changed
+
+- **Zig source API: tool-result reduction moved out of `Conversation`, and
+  the packages no longer form a cycle.** `Conversation.microcompactToolResults`,
+  `microcompactToolResultsByRecentResults`, `truncateLargeToolResults` and
+  `trimDeliveredImageBytes` are now `result_projection` functions that take the
+  `*Conversation` first: `conv.truncateLargeToolResults(n)` becomes
+  `result_projection.truncateLargeToolResults(&conv, n)`. `Conversation` gains
+  `clearToolResultLocked`, `replaceToolResultContentLocked` and a public
+  `activeImageBytesLocked`, called between `lockSnapshot` and `unlockSnapshot`.
+  `file_change.Collector` is now `tool_exec.Collector`, unchanged. The pure
+  data types of `file_reference` (`Locator`, `Range`, `Position`,
+  `FileReference`, `LocatorKind`) are defined in `tools/observation.zig`;
+  `file_reference` keeps them as aliases, so existing names still resolve, and
+  `resolveFileTarget` / `classifyPath` keep their signatures.
+  The C ABI, `agentcore.h`, the ABI revision, event JSON, stream-json, request
+  bytes and transcripts are unchanged; AgentCore consumers are not affected.
+  `layer:check` now reports 0 upward imports and 0 package cycles.
 
 - **Bench concurrency is set only on the profile page.** The 评测 page no
   longer has a 并发数 field and `POST /api/profiles/run` no longer takes
