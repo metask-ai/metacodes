@@ -78,6 +78,18 @@ fn appendFile(
     try out.appendSlice(allocator, expanded);
 }
 
+fn samePhysicalFile(a: []const u8, b: []const u8) bool {
+    var a_z: [std.fs.max_path_bytes]u8 = undefined;
+    var b_z: [std.fs.max_path_bytes]u8 = undefined;
+    var a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const a_path = std.fmt.bufPrintZ(&a_z, "{s}", .{a}) catch return false;
+    const b_path = std.fmt.bufPrintZ(&b_z, "{s}", .{b}) catch return false;
+    const a_final = pfs.finalPath(a_path.ptr, &a_buf) orelse return false;
+    const b_final = pfs.finalPath(b_path.ptr, &b_buf) orelse return false;
+    return std.mem.eql(u8, std.mem.span(a_final), std.mem.span(b_final));
+}
+
 /// 收集 cwd 向上到根的所有祖先目录,**反转成 根→cwd 顺序**返回(owned 数组,owned 字符串)。
 /// 越靠近 cwd 的越靠后 = 优先级越高(对齐 cc dirs.reverse())。
 fn ancestorDirs(allocator: std.mem.Allocator, cwd: []const u8) ![][]u8 {
@@ -133,7 +145,9 @@ pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
         for (dirs) |dir| {
             const p1 = try std.fmt.allocPrint(allocator, "{s}/CLAUDE.md", .{dir});
             defer allocator.free(p1);
-            try appendFile(allocator, &out, p1, DESC_PROJECT, opts.home);
+            const p3 = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{dir});
+            defer allocator.free(p3);
+            if (!samePhysicalFile(p1, p3)) try appendFile(allocator, &out, p1, DESC_PROJECT, opts.home);
 
             const p2 = try std.fmt.allocPrint(allocator, "{s}/.claude/CLAUDE.md", .{dir});
             defer allocator.free(p2);
@@ -141,8 +155,6 @@ pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
 
             // AGENTS.md:metacodes 原生 = 业界通用约定同一文件(codex/其它 agent 工具互操作)。
             // 放 CLAUDE.md 之后 = 该层内 AGENTS.md 优先。
-            const p3 = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{dir});
-            defer allocator.free(p3);
             try appendFile(allocator, &out, p3, DESC_PROJECT, opts.home);
 
             // 收纳进原生目录的变体(<dir>/.metacodes/AGENTS.md),该层最高。
@@ -280,6 +292,24 @@ test "load: 用户级 <state_root>/AGENTS.md 与 ~/.claude/CLAUDE.md 共存,原�
     try testing.expect(std.mem.indexOf(u8, out, "USER-AGENT-NATIVE-RULES") != null);
     // 原生 AGENTS.md 在 CLAUDE.md 之后 = 用户级最高优先。
     try testing.expect(std.mem.indexOf(u8, out, "USER-AGENT-NATIVE-RULES").? > std.mem.indexOf(u8, out, "USER-CLAUDE-RULES").?);
+}
+
+test "load: a CLAUDE.md that links to the same layer's AGENTS.md is loaded once" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpAbsPath(a, &tmp);
+    defer a.free(dir);
+    try writeFileAt(dir, "AGENTS.md", "SHARED-RULES");
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrintZ(&link_buf, "{s}/CLAUDE.md", .{dir});
+    if (std.c.symlink("AGENTS.md", link.ptr) != 0) return error.SkipZigTest;
+
+    const out = try load(a, .{ .cwd = dir, .home = "" });
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "SHARED-RULES"));
+    try testing.expect(std.mem.indexOf(u8, out, "/AGENTS.md (") != null);
 }
 
 test "load: upward recursion root->cwd order" {

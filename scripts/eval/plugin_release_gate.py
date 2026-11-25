@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -472,6 +473,14 @@ def _git_head(path: Path) -> str:
     return completed.stdout.strip()
 
 
+INSTRUCTION_ALIAS = ("CLAUDE.md", "AGENTS.md")
+
+
+def _is_instruction_alias(member: tarfile.TarInfo, regular_names: set[str]) -> bool:
+    name, target = INSTRUCTION_ALIAS
+    return member.issym() and member.name == name and member.linkname == target and target in regular_names
+
+
 def _materialize_head(root: Path, head: str, destination: Path) -> Path:
     completed = subprocess.run(
         ["git", "-C", str(root), "archive", "--format=tar", head],
@@ -484,20 +493,29 @@ def _materialize_head(root: Path, head: str, destination: Path) -> Path:
     try:
         with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
             members = archive.getmembers()
+            regular_names = {member.name for member in members if member.isreg()}
+            aliases = []
+            extracted = []
             for member in members:
                 name = member.name
                 path = PurePosixPath(name)
                 if path.is_absolute() or any(part == ".." for part in path.parts):
                     raise PluginGateError(f"unsafe archive member: {name!r}")
+                if _is_instruction_alias(member, regular_names):
+                    aliases.append(member)
+                    continue
                 if not (member.isdir() or member.isreg()):
                     raise PluginGateError(f"unsafe archive member type: {name!r}")
+                extracted.append(member)
             regular_files = sum(member.isreg() for member in members)
             if not regular_files:
                 raise PluginGateError("Git archive contains no regular files")
             if hasattr(tarfile, "data_filter"):
-                archive.extractall(destination, filter=tarfile.data_filter)
+                archive.extractall(destination, members=extracted, filter=tarfile.data_filter)
             else:
-                archive.extractall(destination)
+                archive.extractall(destination, members=extracted)
+            for alias in aliases:
+                shutil.copyfile(destination / alias.linkname, destination / alias.name)
     except (tarfile.TarError, OSError) as exc:
         raise PluginGateError(f"cannot extract Git archive: {exc}") from exc
     fixture = destination / "scripts/eval/fixtures/plugin_baseline.py"
