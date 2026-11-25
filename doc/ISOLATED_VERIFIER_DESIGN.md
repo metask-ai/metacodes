@@ -161,7 +161,7 @@ The snapshot takes the lifecycle shape of `Worktree` (create under
 
    The run-start `HEAD` is recorded when the check gate is armed.
 
-   Host Git invocations use `tools/controller_git.zig` to disable hooks,
+   Host Git invocations use `util/controller_git.zig` to disable hooks,
    fsmonitor and configured clean/smudge/process filters, including drivers
    from included configuration. The overrides apply only to the invocation;
    repository configuration is preserved. Candidate scripts are never run

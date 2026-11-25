@@ -1450,18 +1450,15 @@ test "import OAuth token response requires refresh token and positive expiry" {
 
 test "stored credentials roundtrip keeps file private" {
     const a = std.testing.allocator;
-    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/cc-zig-auth-roundtrip-{d}.json", .{ fs_util.testing.tmpRoot(&tmp_buf), process.currentPid() });
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/auth-roundtrip.json", .{root_buf[0..root_len]});
     var creds = StoredCredentials{ .api_key = try a.dupe(u8, "stored-key") };
     defer creds.deinit(a);
     try saveToPath(a, path, creds);
-    defer {
-        if (std.heap.c_allocator.dupeZ(u8, path)) |z| {
-            pfs.unlinkPath(z.ptr) catch {};
-            std.heap.c_allocator.free(z);
-        } else |_| {}
-    }
     var loaded = try loadFromPath(a, path);
     defer loaded.deinit(a);
     try std.testing.expectEqualStrings("stored-key", loaded.api_key.?);

@@ -236,15 +236,7 @@ pub fn captureWithSpawnRetry(
     allocator: std.mem.Allocator,
     opts: process.CaptureOpts,
 ) process.CaptureError!process.Captured {
-    return process.capture(argv, allocator, opts) catch |e| switch (e) {
-        error.Timeout, error.Aborted, error.OutOfMemory => return e,
-        // 子进程自己报的失败(cwd 进不去/程序起不来)是确定性的:150ms 后只会原样再失败一次。
-        error.ChildChdirFailed, error.ChildExecFailed => return e,
-        else => {
-            @import("../util/time.zig").sleepMs(150);
-            return process.capture(argv, allocator, opts);
-        },
-    };
+    return process.captureWithSpawnRetry(argv, allocator, opts);
 }
 
 fn spawnCaptureStdoutAbortableTimedCapped(
@@ -286,28 +278,7 @@ fn spawnCaptureStdoutAbortableTimedCapped(
 /// 把 argv 打印成可读形式，最多取前 N 个参数防止日志爆炸。
 fn logSpawnArgv(argv: []const ?[*:0]const u8, timeout_ms: u64) void {
     var buf: [1024]u8 = undefined;
-    var written: usize = 0;
-    for (argv, 0..) |a_opt, idx| {
-        if (idx >= 8) {
-            const tail = " ...";
-            if (written + tail.len < buf.len) {
-                @memcpy(buf[written..][0..tail.len], tail);
-                written += tail.len;
-            }
-            break;
-        }
-        const a = a_opt orelse break;
-        const sp = std.mem.span(@as([*:0]const u8, a));
-        const need = if (idx == 0) sp.len else sp.len + 1;
-        if (written + need >= buf.len) break;
-        if (idx != 0) {
-            buf[written] = ' ';
-            written += 1;
-        }
-        @memcpy(buf[written..][0..sp.len], sp);
-        written += sp.len;
-    }
-    log.info("spawn", "exec argv=[{s}] timeout_ms={d}", .{ buf[0..written], timeout_ms });
+    log.info("spawn", "exec argv=[{s}] timeout_ms={d}", .{ process.describeArgv(&buf, argv), timeout_ms });
 }
 
 fn exitCode(status: c_int) i32 {

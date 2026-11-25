@@ -2,7 +2,7 @@
 //! 工作树或提交变化则自动移除，有变化则保留路径交给父 agent/用户验收。
 
 const std = @import("std");
-const controller_git = @import("../tools/controller_git.zig");
+const controller_git = @import("../util/controller_git.zig");
 const common = @import("../tools/common.zig");
 const teammate_process = @import("../swarm/teammate_process.zig");
 const pfs = @import("platform").fs;

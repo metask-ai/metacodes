@@ -112,10 +112,10 @@ cli 用 `platform` 也写成 `@import("metacodes-internal").platform`。cli 的 
 
 迁移 2.2 清掉 `ai → coding`、`base → ai`、`base → coding`:`types.zig`、`json.zig`、`preview.zig`(消息、请求和
 provider 配置的类型)和 `core/auth.zig`、`core/recorder.zig`、`core/context_pressure.zig` 改归 `ai`,纯字符串的
-`api/model_name.zig` 改归 `base`,`api/model_name_consumers_test.zig` 改归 `coding`,路径都不变;`controller_git.zig`
-移到 `tools/`;`file_lock` 用的 stat 和 `codex_usage`/`openai_client` 用的日期、时区计算下沉到 `platform`
-(`fs.statFd`/`statPath`、`timezone.civilDate`/`formatOffset`/`boundedLocal`),`read_state` 和 `time_context`
-的公开声明不变,改为调用它们。越层 import 130,深层 import 1665,包间环缩成 kernel、guard、coding。
+`api/model_name.zig` 改归 `base`,`api/model_name_consumers_test.zig` 改归 `coding`,路径都不变;`file_lock` 用的 stat、
+`codex_usage`/`openai_client` 用的日期和时区计算、`controller_git` 用的子进程捕获下沉到 `platform`
+(`fs.statFd`/`statPath`、`timezone.civilDate`/`formatOffset`/`boundedLocal`、`process.captureWithSpawnRetry`/`describeArgv`),
+`read_state`、`time_context`、`tools/common` 的公开声明不变,改为调用它们。越层 import 130,深层 import 1665,包间环缩成 kernel、guard、coding。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。

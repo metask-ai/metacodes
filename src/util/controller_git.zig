@@ -2,8 +2,9 @@
 //! callbacks, hooks or content filters. Keep these overrides out of the
 //! repository's durable configuration and the user's own Git commands.
 const std = @import("std");
-const common = @import("common.zig");
-const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const process = @import("platform").process;
+const log = @import("log.zig");
+const AbortSignal = @import("abort.zig").AbortSignal;
 
 pub const Error = error{ OutOfMemory, Aborted, GitFailed };
 
@@ -30,7 +31,17 @@ pub fn prefix(gpa: std.mem.Allocator, cwd: []const u8, abort: ?*const AbortSigna
         "-c",           "core.hooksPath=/dev/null", "config",                                          "--includes", "--null",
         "--name-only",  "--get-regexp",             "^filter\\..*\\.(clean|smudge|process|required)$", null,
     };
-    const out = common.spawnCaptureWithStderrTimed(&query, gpa, abort, 30_000, null, max_config_bytes, cwd) catch |err| return switch (err) {
+    const timeout_ms = 30_000;
+    var argv_buf: [1024]u8 = undefined;
+    log.info("spawn", "exec argv=[{s}] timeout_ms={d}", .{ process.describeArgv(&argv_buf, &query), timeout_ms });
+    const out = process.captureWithSpawnRetry(&query, gpa, .{
+        .timeout_ms = timeout_ms,
+        .max_bytes = max_config_bytes,
+        .want_stderr = true,
+        .abort_ctx = @ptrCast(abort),
+        .abort_poll = if (abort != null) AbortBridge.poll else null,
+        .cwd = cwd,
+    }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Aborted => error.Aborted,
         else => error.GitFailed,
@@ -69,6 +80,13 @@ pub fn prefix(gpa: std.mem.Allocator, cwd: []const u8, abort: ?*const AbortSigna
     }
     return .{ .items = try items.toOwnedSlice(gpa) };
 }
+
+const AbortBridge = struct {
+    fn poll(ctx: ?*const anyopaque) bool {
+        const signal: *const AbortSignal = @ptrCast(@alignCast(ctx.?));
+        return signal.isAborted();
+    }
+};
 
 fn push(gpa: std.mem.Allocator, items: *std.ArrayList([]const u8), arg: []const u8) error{OutOfMemory}!void {
     const owned = try gpa.dupe(u8, arg);
