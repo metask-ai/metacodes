@@ -270,6 +270,17 @@ def pull_images(args, root, cfg):
     return 1 if value["counts"].get("failed") else 0
 
 
+def monitor_command(args, root, cfg, jobs_dir, client):
+    from urllib.parse import quote
+    from scripts.eval.harbor.bench import monitor
+    if client:
+        value = client.request("api/monitor" + ("?executor=" + quote(args.executor) if args.executor else ""))
+    else:
+        value = monitor.snapshot(cfg, args.executor, jobs_dir, state_root=root)
+    print(json.dumps(value, ensure_ascii=False) if args.json else monitor.render(value))
+    return 1 if value.get("error") else 0
+
+
 PROVIDER_COMMANDS = ["add", "list", "remove", "probe"]
 
 
@@ -423,7 +434,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="metacodes bench", description="查看评测、打开工作台，在页面选择任务和模型运行 Bench。")
     parser.add_argument("action", nargs="?", default="open",
                         choices=["open", "info", "list", "run", "stop", "prepare", "pull", "setup", "db", "sync", "provider",
-                                 "build"])
+                                 "build", "monitor"])
     parser.add_argument("db_command", nargs="?", choices=["status", "import", "migrate"] + PROVIDER_COMMANDS,
                         help="bench db 的子命令（status、import、migrate）或 bench provider 的子命令（add、list、remove、probe）")
     parser.add_argument("--state-root", type=Path, required=True, help=argparse.SUPPRESS)
@@ -560,6 +571,8 @@ def main(argv=None):
             if args.url or not args.suite:
                 parser.error("bench pull 需要 --suite，并在工作台机器上运行")
             return pull_images(args, root, cfg)
+        if args.action == "monitor":
+            return monitor_command(args, root, cfg, jobs_dir, client)
         if args.action == "sync":
             if not args.run:
                 parser.error("bench sync 需要 --run NAME")

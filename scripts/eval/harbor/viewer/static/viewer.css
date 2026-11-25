@@ -247,3 +247,11 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .row-actions{display:flex;gap:6px}.row-actions .button{height:26px;padding:0 8px}
 .rename{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.rename input{min-width:220px;height:32px;padding:0 10px;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;font:inherit}
 .form-submit{position:sticky;bottom:0;z-index:2;display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:14px 0;background:var(--surface);border-top:1px solid var(--border)}
+.monitor .panel{margin-bottom:0}.monitor .metrics{border-bottom:0;margin-bottom:0;padding-bottom:8px}
+.spark{width:120px;height:28px;margin-top:6px;stroke:var(--accent);stroke-width:2;overflow:visible}.spark polyline{vector-effect:non-scaling-stroke}
+.spark-empty{height:28px;margin-top:6px;font-size:11px;color:var(--faint)}
+.m-used{background:var(--accent)}.m-warn{background:var(--warning)}
+.monitor td.wrap{white-space:pre-line;min-width:0}.monitor-more{margin:8px 20px 12px}
+.cache-blocks{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:24px}
+.cache-block{display:grid;gap:10px;align-content:start;min-width:0}.cache-block h3{font-size:13px;font-weight:600}.cache-block h3 small{font-size:11px;font-weight:400;color:var(--muted);margin-left:8px}
+.cache-block .table-scroll{margin:4px -20px 0}

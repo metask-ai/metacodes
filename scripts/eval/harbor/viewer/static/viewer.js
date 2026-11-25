@@ -125,6 +125,7 @@ function route() {
   if (parts[0] === 'new') return { view: 'new' };
   if (parts[0] === 'settings') return { view: 'settings' };
   if (parts[0] === 'providers') return { view: 'providers' };
+  if (parts[0] === 'monitor') return { view: 'monitor', executor: parts[1] || null };
   if (parts[0] === 'run' && parts[1]) return { view: 'run', name: parts[1] };
   if (parts[0] === 'profile' && parts[1] && parts[2] === 'task' && parts[3] && parts[4]) return { view: 'task', profile: parts[1], job: parts[3], task: parts[4], trial: parts[5] || null };
   if (parts[0] === 'profile' && parts[1]) return { view: 'profile', profile: parts[1] };
@@ -153,6 +154,7 @@ async function render() {
     if (r.view === 'new') node = await renderNewRun();
     else if (r.view === 'settings') node = await renderSettings();
     else if (r.view === 'providers') node = await renderProviders();
+    else if (r.view === 'monitor') node = await renderMonitor(r.executor);
     else if (r.view === 'run') node = await renderRun(r.name);
     else if (r.view === 'overview') node = await renderOverview();
     else if (r.view === 'profile') node = await renderProfile(r.profile);
@@ -1843,6 +1845,168 @@ async function renderProviders() {
     panel('已导入的 Provider', `${(list.providers || []).length} 个`, h('div', { class: 'panel-body' },
       table, result)),
     panel('导入 Provider', null, form));
+}
+
+// ------------------------------------------------------------ monitor
+const MONITOR_POINTS = 120;
+const DOCKER_USAGE = [['images', '镜像'], ['containers', '容器'], ['volumes', '数据卷'], ['build_cache', '构建缓存']];
+function bytes(n) {
+  if (n === null || n === undefined) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = n, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return (unit && value < 100 ? value.toFixed(1) : Math.round(value)) + ' ' + units[unit];
+}
+function byteRate(n) { return n === null || n === undefined ? '—' : bytes(n) + '/s'; }
+function hitText(rate, hits, total) { return rate === null || rate === undefined ? '暂无请求' : `${pct(rate)}（${int(hits)} / ${int(total)}）`; }
+function sparkline(values, label, format, ceiling) {
+  const points = values.filter((v) => v !== null && v !== undefined);
+  if (points.length < 2) return h('div', { class: 'spark-empty', text: points.length ? '等待下一次采样' : '' });
+  const lo = Math.min(...points), hi = Math.max(...points), top = Math.max(ceiling || 0, hi) || 1, w = 120, ht = 28;
+  const path = points.map((v, i) => `${(i * w / (points.length - 1)).toFixed(1)},${(ht - 2 - Math.max(0, v) * (ht - 4) / top).toFixed(1)}`).join(' ');
+  const text = `${label}：最近 ${points.length} 次采样，最低 ${format(lo)}，最高 ${format(hi)}，当前 ${format(points[points.length - 1])}`;
+  return svg('svg', { class: 'spark', viewBox: `0 0 ${w} ${ht}`, role: 'img', 'aria-label': text, preserveAspectRatio: 'none' },
+    svg('title', {}, text), svg('polyline', { points: path }));
+}
+function usageBar(used, total) {
+  const share = total ? Math.min(1, used / total) : 0;
+  return h('div', { class: 'stack-bar', role: 'img', 'aria-label': `已用 ${pct(share)}` },
+    h('span', { class: share >= 0.9 ? 'm-warn' : 'm-used', width: (100 * share) + '%' }));
+}
+function probeState(probe) {
+  if (!probe) return h('span', { class: 'muted', text: '未探测' });
+  if (probe.ok) return h('span', { class: 'probe ok', text: `可达 · ${probe.seconds}s` + (probe.status ? ` · HTTP ${probe.status}` : '') });
+  return h('span', { class: 'probe bad', text: '不可达' + (probe.error ? ` · ${probe.error}` : '') + (probe.seconds ? ` · ${probe.seconds}s` : '') });
+}
+function monitorTable(heads, rows, empty) {
+  return h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, heads.map(([text, numeric]) => h('th', { class: numeric ? 'num' : null, text })))),
+    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: heads.length, class: 'empty', text: empty })))));
+}
+function cacheState(cache, setup) {
+  if (cache.error) return h('span', { class: 'probe bad', text: '读取失败：' + cache.error });
+  if (cache.answering) return h('span', { class: 'probe ok', text: '运行中' });
+  if (cache.configured) return h('span', { class: 'probe bad', text: '已配置，但没有响应（' + setup + '）' });
+  return h('span', { class: 'muted', text: '未启用' });
+}
+function monitorHistory(m) {
+  const all = state.monitorHistory || (state.monitorHistory = {});
+  const series = all[m.executor.name] || (all[m.executor.name] = []);
+  if (m.error || (series.length && series[series.length - 1].at === m.collected_at)) return series;
+  const load = m.load || {}, memory = load.memory || {};
+  const wire = (m.network.interfaces || []).filter((i) => i.physical);
+  const sum = (key) => wire.length && wire.every((i) => i[key] !== null) ? wire.reduce((acc, i) => acc + i[key], 0) : null;
+  series.push({ at: m.collected_at, cpu: load.cpu_busy_percent ?? null, load: load.average ? load.average[0] : null,
+    memory: memory.total && memory.available !== null && memory.available !== undefined ? 100 * (1 - memory.available / memory.total) : null,
+    rx: sum('rx_rate'), tx: sum('tx_rate') });
+  if (series.length > MONITOR_POINTS) series.splice(0, series.length - MONITOR_POINTS);
+  return series;
+}
+function loadPanel(m, series) {
+  const load = m.load || {}, memory = load.memory || {}, last = series[series.length - 1] || {};
+  const percent = (v) => v.toFixed(1) + '%';
+  const cards = h('div', { class: 'metrics' },
+    metric('CPU 占用', load.cpu_busy_percent === null || load.cpu_busy_percent === undefined ? '—' : percent(load.cpu_busy_percent), `${load.cpus ?? '—'} 核 · 采样 1 秒 · 曲线满刻度 100%`, true,
+      sparkline(series.map((p) => p.cpu), 'CPU 占用', percent, 100)),
+    metric('负载（1 分钟）', load.average ? load.average[0].toFixed(2) : '—', load.average ? `5 分钟 ${load.average[1].toFixed(2)} · 15 分钟 ${load.average[2].toFixed(2)} · 曲线满刻度 = 核数` : null, false,
+      sparkline(series.map((p) => p.load), '1 分钟负载', (v) => v.toFixed(2), load.cpus)),
+    metric('内存已用', last.memory === null || last.memory === undefined ? '—' : percent(last.memory), memory.total ? `可用 ${bytes(memory.available)} / 共 ${bytes(memory.total)}` : null, false,
+      sparkline(series.map((p) => p.memory), '内存已用', percent, 100)),
+    metric('交换分区已用', memory.swap_total ? bytes(memory.swap_total - memory.swap_free) : '—', memory.swap_total ? `共 ${bytes(memory.swap_total)}` : null),
+    metric('已运行', dur(load.uptime_seconds)));
+  const disks = monitorTable([['路径'], ['已用', true], ['可用', true], ['总量', true], ['占用']],
+    (m.disks || []).map((d) => h('tr', {}, h('td', { class: 'mono wrap', text: d.paths.join('\n') }), h('td', { class: 'num', text: bytes(d.used) }),
+      h('td', { class: 'num', text: bytes(d.free) }), h('td', { class: 'num', text: bytes(d.total) }), h('td', {}, usageBar(d.used, d.total)))), '没有读到磁盘信息');
+  return panel('机器负载', [m.host, m.os].filter(Boolean).join(' · '), h('div', {}, h('div', { class: 'panel-body' }, cards), disks));
+}
+function networkPanel(m, series) {
+  const all = m.network.interfaces || [];
+  const wire = all.filter((i) => i.physical), virtual = all.filter((i) => !i.physical);
+  const last = series[series.length - 1] || {};
+  const cards = h('div', { class: 'metrics' },
+    metric('下行', byteRate(last.rx ?? null), '物理网卡合计', true, sparkline(series.map((p) => p.rx), '下行速率', byteRate)),
+    metric('上行', byteRate(last.tx ?? null), '物理网卡合计', false, sparkline(series.map((p) => p.tx), '上行速率', byteRate)));
+  const row = (i) => h('tr', {}, h('td', { class: 'mono', text: i.name }), h('td', { class: 'num', text: byteRate(i.rx_rate) }), h('td', { class: 'num', text: byteRate(i.tx_rate) }),
+    h('td', { class: 'num', text: bytes(i.rx_bytes) }), h('td', { class: 'num', text: bytes(i.tx_bytes) }));
+  const heads = [['网卡'], ['下行', true], ['上行', true], ['累计接收', true], ['累计发送', true]];
+  const targets = monitorTable([['源站'], ['探测地址'], ['状态']],
+    (m.network.targets || []).filter((t) => !t.setting).map((t) => h('tr', {}, h('td', { text: t.label }), h('td', { class: 'mono', text: t.url }), h('td', {}, probeState(t.probe)))), '没有可探测的地址');
+  return panel('网络', m.network.targets_checked_at ? `源站和镜像源的连通性每分钟探测一次 · 上次 ${when(m.network.targets_checked_at)}` : null, h('div', {},
+    h('div', { class: 'panel-body' }, cards),
+    monitorTable(heads, wire.map(row), all.length ? '没有物理网卡' : '这台机器没有 /proc/net/dev（非 Linux）'),
+    virtual.length ? h('details', { class: 'reason monitor-more', 'data-key': 'monitor-virtual' }, h('summary', { text: `Docker 网桥和容器网卡 ${virtual.length} 个` }), monitorTable(heads, virtual.map(row), '')) : null,
+    targets));
+}
+function mirrorsPanel(m) {
+  const items = m.mirrors.items || [];
+  const daemon = (m.docker && m.docker.registry_mirrors) || [];
+  const egress = typeof m.mirrors.egress === 'string' ? ({ direct: '直连（执行机器自己的网络）', workbench: '经工作台出网' }[m.mirrors.egress] || m.mirrors.egress) : '站点代理 ' + (m.mirrors.egress.proxy || '');
+  return panel('镜像源', '配置在 workbench.json 的执行机器条目里', h('div', {},
+    h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
+      h('dt', { text: '容器出网' }), h('dd', { text: egress }),
+      h('dt', { text: 'Docker daemon 的 registry-mirrors' }), h('dd', { class: 'mono', text: daemon.length ? daemon.join('\n') : '未配置（Docker Hub 直连）' }))),
+    monitorTable([['范围'], ['类型'], ['配置项'], ['地址'], ['状态']],
+      items.map((t) => h('tr', {}, h('td', { text: t.scope }), h('td', { text: t.label }), h('td', { class: 'mono', text: t.setting }), h('td', { class: 'mono', text: t.url }), h('td', {}, probeState(t.probe)))),
+      '这台执行机器没有配置镜像源')));
+}
+function dockerPanel(m) {
+  const d = m.docker || {};
+  if (d.error) return panel('Docker', null, h('div', { class: 'empty', text: '读取失败：' + d.error }));
+  const usage = d.usage || {};
+  return panel('Docker', `${d.version} · ${d.driver || '—'}` + (d.usage_checked_at ? ` · 占用每 10 分钟统计一次，上次 ${when(d.usage_checked_at)}` : ''), h('div', {},
+    h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
+      h('dt', { text: '数据目录' }), h('dd', { class: 'mono', text: d.root || '—' }),
+      h('dt', { text: '容器' }), h('dd', { text: `运行中 ${d.containers_running ?? '—'} · 共 ${d.containers_total ?? '—'}` }),
+      d.usage_error ? h('dt', { text: '占用统计' }) : null, d.usage_error ? h('dd', { class: 'flag', text: '读取失败：' + d.usage_error }) : null)),
+    monitorTable([['类型'], ['数量', true], ['使用中', true], ['占用', true], ['可回收', true]],
+      DOCKER_USAGE.filter(([k]) => usage[k]).map(([k, label]) => h('tr', {}, h('td', { text: label }), h('td', { class: 'num', text: int(usage[k].count) }), h('td', { class: 'num', text: int(usage[k].active) }),
+        h('td', { class: 'num', text: bytes(usage[k].bytes) }), h('td', { class: 'num', text: bytes(usage[k].reclaimable_bytes) }))), '没有读到占用统计')));
+}
+function cachesPanel(m) {
+  const { apt = {}, download = {}, images = {} } = m.caches || {};
+  const setup = `运行 metacodes bench setup --executor ${m.executor.name}`;
+  const aptBody = apt.answering ? h('dl', { class: 'kv' },
+    h('dt', { text: '命中率' }), h('dd', { text: hitText(apt.hit_rate, apt.hits, apt.requests) + (apt.log_truncated ? '（只统计了日志的最后 64 MiB）' : '') }),
+    h('dt', { text: '未命中（回源）' }), h('dd', { text: `${int(apt.misses)} 次 · 错误 ${int(apt.errors)} 次` }),
+    h('dt', { text: '流量' }), h('dd', { text: `提供 ${bytes(apt.bytes_served)} · 回源下载 ${bytes(apt.bytes_fetched)}` }),
+    h('dt', { text: '回源地址' }), h('dd', { class: 'mono', text: apt.upstream || '各软件源自己的地址' })) : null;
+  const routes = Object.entries(download.routes || {});
+  const totals = download.totals || {};
+  const downloadBody = download.answering ? h('div', {}, h('dl', { class: 'kv' },
+    h('dt', { text: '命中率' }), h('dd', { text: hitText(totals.hit_rate, totals.hits, totals.requests) }),
+    h('dt', { text: '流量' }), h('dd', { text: `缓存提供 ${bytes(totals.bytes_cached)} · 回源下载 ${bytes(totals.bytes_fetched)}` }),
+    h('dt', { text: '占用' }), h('dd', { text: `${int(download.entries)} 个文件 · ${bytes(download.disk_bytes)}` + (download.started_at ? ` · 启动于 ${when(download.started_at)}` : '') })),
+    monitorTable([['类型'], ['回源地址'], ['请求', true], ['命中率', true], ['未命中', true], ['过期仍提供', true], ['错误', true], ['缓存提供', true], ['回源下载', true]],
+      routes.map(([kind, r]) => h('tr', {}, h('td', { text: kind }), h('td', { class: 'mono', text: r.upstream || '—' }), h('td', { class: 'num', text: int(r.requests) }), h('td', { class: 'num', text: r.hit_rate === null ? '—' : pct(r.hit_rate) }),
+        h('td', { class: 'num', text: int(r.misses) }), h('td', { class: 'num', text: int(r.stale) }), h('td', { class: 'num', text: int(r.errors) }), h('td', { class: 'num', text: bytes(r.bytes_cached) }), h('td', { class: 'num', text: bytes(r.bytes_fetched) }))), '还没有请求')) : null;
+  const prepared = (images.hits || 0) + (images.misses || 0) + (images.failed || 0);
+  const imagesBody = images.error ? h('span', { class: 'probe bad', text: '读取失败：' + images.error }) : !images.trials ? h('span', { class: 'muted', text: '暂无数据（还没有评测记录题目的准备过程）' }) : h('dl', { class: 'kv' },
+    h('dt', { text: '命中率' }), h('dd', { text: prepared ? hitText(images.hit_rate, images.hits, (images.hits || 0) + (images.misses || 0)) : '暂无镜像准备记录' }),
+    h('dt', { text: '未命中' }), h('dd', { text: `拉取 ${int(images.pulled)} 个（${dur(images.pull_seconds)}） · 构建 ${int(images.built)} 个（${dur(images.build_seconds)}） · 失败 ${int(images.failed)} 个` }),
+    h('dt', { text: '现在' }), h('dd', { text: `排队 ${int(images.queued)} · 准备中 ${int(images.preparing)} · 已就绪等待 ${int(images.ready)}` }),
+    h('dt', { text: '统计范围' }), h('dd', { text: `最近 ${int(images.trials)} 次 trial 的准备记录` }));
+  const block = (title, note, stateNode, body) => h('div', { class: 'cache-block' }, h('h3', {}, title, h('small', { text: note })), stateNode, body);
+  return panel('缓存', '先查缓存，未命中才回源', h('div', { class: 'panel-body cache-blocks' },
+    block('apt 缓存', '任务容器里的 apt-get，apt-cacher-ng', cacheState(apt, setup), aptBody),
+    block('下载缓存', 'pip / uv / npm / go / conda / rustup / GitHub Releases', cacheState(download, setup), downloadBody),
+    block('镜像', 'Docker 本地镜像库：已有就不拉取', null, imagesBody)));
+}
+async function renderMonitor(name) {
+  state.live = true;
+  navCurrent('monitor');
+  $('#title').textContent = '监控';
+  crumbs([{ text: '看板', href: '#/' }, { text: '执行机器的负载、网络、镜像源、Docker 和缓存' }]);
+  let m;
+  try { m = await api('/api/monitor' + (name ? '?executor=' + encodeURIComponent(name) : '')); } catch (e) {
+    return h('div', { class: 'empty', text: e.message || '只读模式' });
+  }
+  const picker = h('select', { 'aria-label': '执行机器', onchange: (e) => { location.hash = '#/monitor/' + encodeURIComponent(e.target.value); } },
+    (m.executors || []).map((e) => { const o = h('option', { value: e.name, text: e.label }); o.selected = e.name === m.executor.name; return o; }));
+  const scope = h('div', { class: 'scope' }, h('span', { text: '执行机器' }), picker,
+    m.collected_at ? h('span', { class: 'meta', text: '采集于 ' + new Date(m.collected_at).toLocaleTimeString('zh-CN', { hour12: false }) }) : null);
+  if (m.error) return h('div', {}, scope, h('div', { class: 'callout', text: `无法采集 ${m.executor.label}：${m.error}` }));
+  const series = monitorHistory(m);
+  return h('div', { class: 'stack monitor' }, scope, loadPanel(m, series), networkPanel(m, series), mirrorsPanel(m), dockerPanel(m), cachesPanel(m));
 }
 
 // ------------------------------------------------------------ refresh loop

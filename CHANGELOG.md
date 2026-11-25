@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Bench has a 监控 page for the execution machine.** It shows the machine's
+  CPU, load, memory, disks and network rate, whether Docker Hub, ghcr.io,
+  GitHub, PyPI, Hugging Face, astral.sh and every configured mirror answer
+  from there and how fast, Docker's images, containers and build cache with
+  their reclaimable size, and how often downloads were served from a cache:
+  the apt cache, the download cache and, for task images, Docker's local image
+  store. `metacodes bench monitor [--executor NAME] [--json]` prints the same
+  snapshot, and `GET /api/monitor` serves it. Nothing is installed on the
+  machine: each reading runs one read-only script over the existing SSH access.
+
 - **Bench reruns invalid tasks, and can do it automatically.** The profile
   page's 重跑未通过的题 is now 重跑无效的题: it picks the tasks whose latest
   attempts include an invalid one (network or environment failures), not the

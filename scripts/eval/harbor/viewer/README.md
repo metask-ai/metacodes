@@ -17,6 +17,7 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 | 评测配置 `#/profile/<id>` | frozen metacodes version and advanced features, the run history, every task's latest attempts (a rerun replaces the earlier result); set its concurrency (并发数, for every dataset it runs), rename it, run it again or rerun its tasks with invalid attempts (automatically too, when 自动重跑 is on), stop its queue, delete it once ended |
 | 任务 `#/profile/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task and the replaced runs |
 | 评测 `#/new` | a run, top to bottom: metacodes version and advanced features (the profile), models, several suites and their tasks, attempts (concurrency is set on the profile page); the start button stays at the bottom of the window |
+| 监控 `#/monitor[/<executor>]` | one execution machine: CPU, load, memory, disks, network rate, reachability of the sources and configured mirrors, Docker's images and build cache, and the hit rates of the apt cache, the download cache and the local image store |
 | 数据库 `#/settings` | the active store; test, switch and migrate to another SQLite file or PostgreSQL |
 | 作业 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
 | trial `#/job/<job>/<trial>` | per-request token distribution and context composition, time split (model / tools / other) and per-tool timing, verifier tests, the whole trajectory with each call's execution time, verifier output and metacodes stderr |
@@ -57,4 +58,4 @@ has no login (internal network); POSTs with a foreign browser `Origin` are
 refused, and a service without `--config` is read-only. Contract tests are
 `scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
 `test_bench_store.py`, `test_bench_suites.py`, `test_bench_setup.py`,
-`test_bench_profiles.py` and `test_bench_providers.py`.
+`test_bench_profiles.py`, `test_bench_providers.py` and `test_bench_monitor.py`.

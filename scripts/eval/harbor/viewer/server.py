@@ -209,10 +209,15 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.suite_tasks(query.get("id"), query.get("executor")))
                 except ValueError as exc:
                     self.send_json({"error": str(exc)}, 404)
-            elif path in ("/api/setup", "/api/login", "/api/providers", "/api/build", "/api/commits"):
+            elif path in ("/api/setup", "/api/login", "/api/providers", "/api/build", "/api/commits", "/api/monitor"):
                 # A plain viewer (no --config) has none of these.
                 if not self.authorized():
                     self.send_json({"error": "当前服务为只读模式"}, 403)
+                elif path == "/api/monitor":
+                    try:
+                        self.send_json(workbench.monitor(query.get("executor")))
+                    except ValueError as exc:
+                        self.send_json({"error": str(exc)}, 404)
                 elif path == "/api/commits":
                     try:
                         self.send_json(workbench.commits(query))

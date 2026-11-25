@@ -25,6 +25,7 @@ metacodes bench run --task fix-git --features ""      # without the default run 
 metacodes bench prepare --suite gaia2-cli             # generate a harbor-local dataset
 metacodes bench pull --suite terminal-bench-2.1 --executor relay-4090   # pre-pull/pre-build task images
 metacodes bench sync --run NAME         # copy an SSH run's results the worker could not
+metacodes bench monitor [--executor NAME] [--json]   # load, network, mirrors, Docker and caches of an execution machine
 metacodes bench node info [--json]      # this machine as a Bench node (see Bench nodes)
 metacodes bench node peers [--json]     # nodes it drives and workbenches that drove it
 metacodes bench node build              # build one git revision here ({"ref", "repo"} on stdin)
@@ -1100,7 +1101,8 @@ treated as stale.
 ## Using the page
 
 The rail opens on the dashboard (看板), then 评测 (start an evaluation), 对比
-(compare) and 数据库 (the evaluation database). The dashboard's 数据范围
+(compare), 监控 (an execution machine's load, network, mirrors, Docker and
+caches) and 数据库 (the evaluation database). The dashboard's 数据范围
 selector scopes every headline metric to one profile (the newest by default)
 or to all jobs.
 
@@ -1376,6 +1378,44 @@ come from other harnesses, runtimes, attempt counts and judges, so a rank is
 a reference, not a like-for-like comparison. To refresh a board, edit its
 entries and `retrieved` date.
 
+### Monitoring an execution machine
+
+The 监控 page (`#/monitor[/<executor>]`, `GET /api/monitor?executor=NAME`,
+`metacodes bench monitor [--executor NAME] [--json]`) shows one execution
+machine: the default executor unless another is chosen. It only reads. Each
+request runs one stdlib Python script on the machine (`bench/monitor_probe.py`,
+sent on stdin of the same SSH command path the readiness probe uses, or run
+locally for the local executor), so it needs no node update and works while a
+benchmark runs. A snapshot is reused for 10 seconds per executor, the
+reachability probes for 60 seconds and Docker's disk usage for 10 minutes
+(`docker system df` took 2.6 seconds and 12 CPU-seconds on an executor with
+382 images), so an open page neither opens an SSH session per viewer, nor
+hammers the mirrors, nor loads the machine it watches. The script reads CPU
+and network before it starts anything else, so those readings do not include
+its own work. The page refreshes every 10
+seconds and keeps the last 120 samples in the browser for the sparklines
+(drawn from zero; CPU and memory against 100%, load against the CPU count);
+closing the page drops them. A machine that cannot be reached, or whose
+script returns nothing within 30 seconds, is shown with that reason; a
+section that cannot be read (Docker not running, a cache that does not
+answer) says so and leaves the others in place. A service without `--config`
+answers 403.
+
+| Panel | Value | Source |
+|---|---|---|
+| 机器负载 | Load averages, CPU count | `/proc/loadavg` (`os.getloadavg()` where there is no `/proc`), `os.cpu_count()` |
+| | CPU 占用 | Share of non-idle time (idle and iowait count as idle) between two readings of the `cpu` line of `/proc/stat` one second apart |
+| | 内存已用, swap | `MemTotal`, `MemAvailable`, `SwapTotal`, `SwapFree` of `/proc/meminfo`; used = 1 - available / total |
+| | Disks | Size, used and free of `/`, Docker's data directory and the bench state directory (`state_dir`), one row per filesystem |
+| 网络 | 下行 / 上行 | Byte counters of `/proc/net/dev` read twice in the same second, as bytes per second. The headline sums the interfaces that have a device (`/sys/class/net/<name>/device`); Docker bridges and container `veth` pairs are listed below it, loopback is left out |
+| | 源站 | One GET each, 5 second timeout, to Docker Hub's registry, ghcr.io, github.com, pypi.org, huggingface.co and astral.sh from the machine itself. Any HTTP answer counts as reachable (a registry answers 401); the row shows the time and status |
+| 镜像源 | Configured mirrors | The executor entry's `pypi_index`, `docker_mirrors` (probed at `/v2/`), `ghcr_mirror` and every `container_mirrors` value, each probed like a source; `egress`; and the `registry-mirrors` the Docker daemon actually runs with (`docker info`) |
+| Docker | Version, data directory, storage driver, containers | `docker info --format '{{json .}}'` |
+| | Images, containers, volumes, build cache: count, in use, size, reclaimable | `docker system df --format '{{json .}}'`, at most every 10 minutes; the panel says when (Docker's decimal sizes, shown in binary units) |
+| 缓存 · apt | 命中率 | The apt cache answers on `<metrics_bind>:3142`, and the last 64 MiB of its log are read with `docker exec metacodes-apt-cache tail -c … /var/log/apt-cacher-ng/apt-cacher.log`. Each `O` line is a response served to a container (a request, with its bytes), each `I` line a download from the mirror (a miss, with its bytes), each `E` line an error. Hits = requests - misses, as in apt-cacher-ng's own report; an index file fetched again to check for updates counts as a miss. The log starts when the cache container was created |
+| 缓存 · 下载缓存 | Per kind: requests, hit rate, misses, stale answers, errors, bytes served from the cache and bytes downloaded; files and size on disk | `GET http://<metrics_bind>:3143/_stats` of the executor's download cache. 未启用 when nothing answers there |
+| 缓存 · 镜像 | 命中率, pulls, builds, failures and their time; trials 排队 / 准备中 / 已就绪等待 | Docker's local image store is the image cache: a task's image is pulled or built only when it is missing. Read from the newest 2000 `<jobs>/<job>/.bench-lifecycle/<trial>.json` records on the machine: an image already present is a hit, one pulled or built a miss. A trial counts as waiting only while its job's Harbor is alive (`<state_dir>/runs/<job>/harbor.pid` without `harbor.exit`; for the local executor, a job without a final result written to in the last day) |
+
 ### Metric definitions
 
 | Metric | Calculation |
@@ -1595,7 +1635,7 @@ The runtime and its two presentations are separate packages under
 
 | Layer | Files | Owns |
 |---|---|---|
-| Runtime | `bench/` | job projection (`data.py`), account models and keys (`account.py`), launch validation (`runner.py`), the durable worker (`worker.py`), the `Workbench` facade both presentations read (`workbench.py`) and its HTTP client (`client.py`) |
+| Runtime | `bench/` | job projection (`data.py`), account models and keys (`account.py`), launch validation (`runner.py`), the durable worker (`worker.py`), the execution machine's monitor (`monitor.py` and the script it runs there, `monitor_probe.py`), the `Workbench` facade both presentations read (`workbench.py`) and its HTTP client (`client.py`) |
 | Web page | `viewer/server.py`, `viewer/static/` | HTTP routes, authorization, the page |
 | CLI | `cli.py` | arguments, service startup, terminal output |
 
