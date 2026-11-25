@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from pathlib import Path
+
+from scripts.eval.harbor import trial_lifecycle
 
 FILE_ENV = "METACODES_BENCH_CONCURRENCY_FILE"
 POLL_SECONDS = 1.0
@@ -28,7 +29,6 @@ class LiveLimit:
     def __init__(self, path, fallback):
         self.path = path
         self.fallback = fallback
-        self.running = 0
         self.limit = read(path, fallback)
         self.read_at = time.monotonic()
 
@@ -38,14 +38,6 @@ class LiveLimit:
             self.read_at = time.monotonic()
         return self.limit
 
-    async def __aenter__(self):
-        while self.running >= self.current():
-            await asyncio.sleep(POLL_SECONDS)
-        self.running += 1
-
-    async def __aexit__(self, *exc_info):
-        self.running -= 1
-
 
 def install(queue_class, environ=os.environ):
     path = environ.get(FILE_ENV)
@@ -53,9 +45,9 @@ def install(queue_class, environ=os.environ):
         return
 
     async def run_trial(queue, trial_config):
-        if not hasattr(queue, "live_limit"):
-            queue.live_limit = LiveLimit(path, queue._n_concurrent)
-        async with queue.live_limit:
-            return await queue._execute_trial_with_retries(trial_config)
+        if not hasattr(queue, "lifecycle"):
+            queue.lifecycle = trial_lifecycle.Scheduler(LiveLimit(path, queue._n_concurrent).current,
+                                                        lambda: POLL_SECONDS)
+        return await queue.lifecycle.run(trial_config, queue._execute_trial_with_retries)
 
     queue_class._run_trial = run_trial
