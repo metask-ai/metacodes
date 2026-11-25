@@ -5833,7 +5833,7 @@ fn printHelp() void {
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
-        \\  --preview             Enable every preview feature: execute_code, teamwork, comment_guard, background_watchdog
+        \\  --preview             Enable every preview feature: execute_code, teamwork, comment_guard, background_watchdog, monitor_events
         \\  --no-preview          Disable every preview feature, overriding config.json
         \\  --preview=<list>      Enable the listed preview features, e.g. --preview=execute_code,teamwork
         \\  --no-preview=<list>   Disable the listed preview features

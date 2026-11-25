@@ -10,6 +10,7 @@ pub const PreviewFeature = enum {
     teamwork,
     comment_guard,
     background_watchdog,
+    monitor_events,
 
     pub fn parse(name: []const u8) ?PreviewFeature {
         return std.meta.stringToEnum(PreviewFeature, name);
@@ -21,7 +22,8 @@ pub const PreviewFeatures = packed struct(u8) {
     teamwork: bool = false,
     comment_guard: bool = false,
     background_watchdog: bool = false,
-    _unused: u4 = 0,
+    monitor_events: bool = false,
+    _unused: u3 = 0,
 
     comptime {
         for (@typeInfo(PreviewFeatures).@"struct".fields) |field| {

@@ -1261,8 +1261,8 @@ test "BashTool spawns no watched command when the deadline sweeper cannot start"
     const job_registry = @import("../core/job_registry.zig");
     var registry = try job_registry.JobRegistry.init(a);
     defer registry.deinit();
-    job_registry.test_refuse_sweeper_thread = true;
-    defer job_registry.test_refuse_sweeper_thread = false;
+    job_registry.JobRegistry.fail_sweeper_spawn_in_tests = true;
+    defer job_registry.JobRegistry.fail_sweeper_spawn_in_tests = false;
 
     var marker_buf: [512]u8 = undefined;
     const marker = @import("test_tmp.zig").path(&marker_buf, "sweeper-refused-marker");
@@ -1271,9 +1271,9 @@ test "BashTool spawns no watched command when the deadline sweeper cannot start"
     const on = ToolContext{ .allocator = a, .jobs = &registry, .preview = .{ .background_watchdog = true } };
     var args_buf: [1024]u8 = undefined;
     const background = try std.fmt.bufPrint(&args_buf, "{{\"command\":\"echo x > \\\"{s}\\\"\",\"run_in_background\":true}}", .{marker});
-    try std.testing.expectError(error.SweeperUnavailable, execute(&on, background));
+    try std.testing.expectError(error.SystemResources, execute(&on, background));
     const foreground = try std.fmt.bufPrint(&args_buf, "{{\"command\":\"echo x > \\\"{s}\\\"\"}}", .{marker});
-    try std.testing.expectError(error.SweeperUnavailable, execute(&on, foreground));
+    try std.testing.expectError(error.SystemResources, execute(&on, foreground));
     try std.testing.expectEqual(@as(usize, 0), registry.jobs.items.len);
     util_time.sleepMs(300);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, marker, .{}));

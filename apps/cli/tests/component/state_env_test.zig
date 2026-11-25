@@ -314,6 +314,47 @@ test "preview: background_watchdog is selected by its own switch and reaches the
     }
 }
 
+test "preview: monitor_events alone switches the Monitor tool to push events" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const scenarios = [_]struct { saved: ?[]const u8 = null, flags: []const []const u8 = &.{}, events: bool }{
+        .{ .events = false },
+        .{ .flags = &.{"--preview=monitor_events"}, .events = true },
+        .{ .flags = &.{"--preview=execute_code"}, .events = false },
+        .{ .flags = &.{"--no-preview=monitor_events"}, .events = false },
+        .{ .flags = &.{ "--preview", "--no-preview=monitor_events" }, .events = false },
+        .{ .saved = "{\"preview\":{\"monitor_events\":true}}", .events = true },
+        .{ .saved = "{\"preview\":{\"monitor_events\":true}}", .flags = &.{"--no-preview=monitor_events"}, .events = false },
+    };
+    for (scenarios) |scenario| {
+        var case: Case = undefined;
+        try case.init();
+        defer case.deinit();
+        const arena = case.arena();
+        if (scenario.saved) |saved| try case.write("state/config.json", saved);
+        var server = try harness.MockServer.start(ANTHROPIC_SSE, 0);
+        defer server.stop();
+        const url = try server.urlOwned(arena);
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(arena, &.{ "--provider", "anthropic", "--api-key", "test-key", "--base-url", url, "--no-lsp", "-p", "say ok" });
+        try args.appendSlice(arena, scenario.flags);
+        const result = try case.run(&.{}, args.items);
+        errdefer std.debug.print("monitor_events CLI exit {d}: {s}\n", .{ result.exit_code, result.stderr });
+        try testing.expectEqual(@as(i32, 0), result.exit_code);
+        try testing.expectEqual(@as(usize, 1), server.requestCount());
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, server.lastRequest().?.body(), .{});
+        var monitor: ?std.json.Value = null;
+        for (parsed.value.object.get("tools").?.array.items) |tool| {
+            if (std.mem.eql(u8, tool.object.get("name").?.string, "Monitor")) monitor = tool;
+        }
+        const tool = monitor orelse return error.MonitorNotAdvertised;
+        const properties = tool.object.get("input_schema").?.object.get("properties").?.object;
+        try testing.expectEqual(scenario.events, properties.get("timeout_ms") != null);
+        const description = tool.object.get("description").?.string;
+        try testing.expectEqual(scenario.events, std.mem.indexOf(u8, description, "do not poll or sleep") != null);
+        try testing.expectEqual(!scenario.events, std.mem.indexOf(u8, description, "BashOutput(job_id") != null);
+    }
+}
+
 test "state .env: its key and METACODES_PROVIDER reach the request; one provider's key alone selects it (#486)" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var case: Case = undefined;

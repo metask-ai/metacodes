@@ -44,6 +44,7 @@ Preview features default to disabled, and each has its own switch:
 | `teamwork` | `metacodes teamwork` run, resume and Manager MCP execution |
 | `comment_guard` | The no-comment instruction and the editors' comment check |
 | `background_watchdog` | A time limit on background Bash jobs (`timeout`, default 30 minutes, at most 2 hours) and a one-time notice when a background job seems to wait for interactive input |
+| `monitor_events` | `Monitor` pushes each batch of stdout lines to the model as a `<task-notification>` event |
 
 `--preview` enables every feature and `--no-preview` disables every feature.
 `--preview=<list>` and `--no-preview=<list>` take comma-separated feature names
@@ -76,6 +77,25 @@ text with a known baseline and up to 512 KiB on each side. It uses the bundled
 highlighter's string and comment rules, so language-specific constructs can be
 misclassified. It skips Bash sources containing `<<`, and YAML and CSS files entirely. Writes by shell commands,
 external tools and edits to unsupported formats rely on the prompt guidance.
+
+`monitor_events` turns `Monitor` from a job the model polls with `BashOutput`
+into an event stream. Each non-empty stdout line of the monitored command is an
+event (stderr is not); the lines found at a turn boundary, or while the agent
+loop waits after the model ends its turn, form one notification:
+`<task-notification><task-id>…</task-id><summary>Monitor event: "<description>"
+…</summary><event>…</event></task-notification>`. Lines are cut at 500 bytes
+and an event at 3000 bytes. A token bucket (10 notifications, one more every
+2 s) limits the rate; batches over it are dropped and the next event starts
+with `[N events suppressed — output rate too high]`, and a monitor that stays
+over it for 30 s is stopped. The schema gains `timeout_ms` (default 300000,
+1000 to 3600000): at that age the monitor is killed and the model gets one
+notice to re-arm it; `persistent: true` removes the timeout. Its exit gives a
+final notice (`stream ended`, `script failed (exit N)`) instead of the generic
+background-job exit text. Unlike job exit notifications, events carry child
+output into a user-role message, so the event text is XML-escaped, kept inside
+`<event>` and labelled as output of the monitored command, not instructions
+from the user. With the feature off, the `Monitor` schema, description and
+results are unchanged.
 
 ## JavaScript tool orchestration
 
