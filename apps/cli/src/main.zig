@@ -968,29 +968,22 @@ fn metaskSignInPresent(allocator: std.mem.Allocator, config: types.Config, file_
     return stored.api_key != null or stored.oauth != null;
 }
 
-/// Whether `auth.json` holds a key (`browserSignInKey`): an older browser
-/// sign-in's, or `login --api-key`'s.
-fn browserSignInKeyPresent(allocator: std.mem.Allocator, state_root: []const u8) bool {
-    const key = browserSignInKey(allocator, state_root) orelse return false;
-    std.crypto.secureZero(u8, key);
-    allocator.free(key);
-    return true;
+fn loadStartupMetask(slot: *?provider_oauth_mod.Session, allocator: std.mem.Allocator, state_root: []const u8) !*provider_oauth_mod.Session {
+    if (slot.* == null) {
+        var session = try provider_oauth_mod.Session.initHome(allocator, state_root, provider_ids_mod.Slug.lit("metask"));
+        errdefer session.deinit();
+        _ = try session.load();
+        slot.* = session;
+    }
+    return &slot.*.?;
 }
 
-/// The gateway origin the stored Metask session's tokens are for (owned),
-/// or `METASK_GATEWAY_URL` when it names one, as at startup; null without a
-/// usable session or origin.
-fn metaskSessionGateway(allocator: std.mem.Allocator, state_root: []const u8) ?[]const u8 {
-    var session = provider_oauth_mod.Session.initHome(allocator, state_root, provider_ids_mod.Slug.lit("metask")) catch return null;
-    defer session.deinit();
-    if (!(session.load() catch false)) return null;
-    const tokens = session.tokens orelse return null;
-    const gateway = if (std.c.getenv("METASK_GATEWAY_URL")) |raw|
-        std.mem.trimEnd(u8, std.mem.span(raw), "/")
-    else
-        std.mem.trimEnd(u8, tokens.gateway_url orelse return null, "/");
-    if (!metask_oauth_mod.isGatewayOrigin(gateway)) return null;
-    return allocator.dupe(u8, gateway) catch null;
+fn startupMetaskGateway(allocator: std.mem.Allocator, session: *const provider_oauth_mod.Session) !?[]const u8 {
+    const stored = if (session.tokens) |tokens| tokens.gateway_url orelse "" else null;
+    return metask_oauth_mod.modelGateway(stored) catch |err| {
+        std.debug.print("error: Metask requires a valid gateway origin from the stored session or METASK_GATEWAY_URL; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
+        return err;
+    };
 }
 
 /// Whether `<state root>/oauth/metask.json` holds a Metask session a start
@@ -1541,38 +1534,12 @@ pub fn main(init: std.process.Init) !void {
             log.debug("auth", "stored model selection unavailable: {s}", .{@errorName(err)});
         };
     }
-    if (config.provider_profile) |profile_name| {
-        if (std.ascii.eqlIgnoreCase(profile_name, "metask") and config.base_url == null and !metask_legacy_requested) {
-            var gateway_override: ?[]const u8 = null;
-            if (std.c.getenv("METASK_GATEWAY_URL")) |raw| {
-                const gateway = std.mem.trimEnd(u8, std.mem.span(raw), "/");
-                if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
-                    std.debug.print("error: METASK_GATEWAY_URL must be an http(s) gateway origin (no /v1 path)\n", .{});
-                    std.process.exit(2);
-                }
-                gateway_override = gateway;
-                config.base_url = allocator.dupe(u8, gateway) catch null;
-            }
-            var metask_session = provider_oauth_mod.Session.initHome(allocator, config.state_root, provider_ids_mod.Slug.lit("metask")) catch null;
-            if (metask_session) |*session| {
-                defer session.deinit();
-                if (session.load() catch false) if (session.tokens) |tokens| {
-                    // The catalog URL is derived from the selected gateway;
-                    // models_url is retained only as informational metadata.
-                    const gateway = gateway_override orelse std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/");
-                    if (gateway.len == 0) {
-                        std.debug.print("error: stored Metask session lacks gateway_url; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
-                        std.process.exit(2);
-                    }
-                    if (!metask_oauth_mod.isGatewayOrigin(gateway)) {
-                        std.debug.print("error: stored Metask gateway_url is invalid; run `{s} login --provider metask`\n", .{invokedCommand(allocator)});
-                        std.process.exit(2);
-                    }
-                    if (gateway_override == null)
-                        config.base_url = allocator.dupe(u8, gateway) catch null;
-                };
-            }
-        }
+    var startup_metask: ?provider_oauth_mod.Session = null;
+    defer if (startup_metask) |*session| session.deinit();
+    const infer_metask_gateway = config.base_url == null and !metask_legacy_requested;
+    if (infer_metask_gateway and std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask")) {
+        const session = try loadStartupMetask(&startup_metask, init.gpa, config.state_root);
+        config.base_url = try startupMetaskGateway(allocator, session);
     }
     // Whether level 4 decided the route: a stored Metask default then also
     // takes the browser sign-in's key (`browserSignInKey`).
@@ -1585,19 +1552,16 @@ pub fn main(init: std.process.Init) !void {
         applyProviderRoute(&config, allocator, null);
     } else if (stored_default.consulted() and applyPersistedGlobalSelection(&config, allocator)) {
         stored_default_applied = true;
-        // A stored Metask default the Metask session authenticates (#527):
-        // its model runs at the session's gateway, never at the compiled
-        // endpoint with the session's token, which is for that gateway alone.
-        if (std.ascii.eqlIgnoreCase(config.resolved_provider_id orelse "", "metask") and
-            !metask_legacy_requested and !browserSignInKeyPresent(allocator, config.state_root))
-        {
-            if (metaskSessionGateway(allocator, config.state_root)) |gateway| {
-                config.base_url = gateway;
-                applyProviderRoute(&config, allocator, "metask");
-            }
-        }
     } else {
         config.provider_kind = inferProviderKind(config.model);
+    }
+
+    if (infer_metask_gateway and startup_metask == null and std.ascii.eqlIgnoreCase(config.resolved_provider_id orelse "", "metask")) {
+        const session = try loadStartupMetask(&startup_metask, init.gpa, config.state_root);
+        if (session.tokens != null) if (try startupMetaskGateway(allocator, session)) |gateway| {
+            config.base_url = gateway;
+            applyProviderRoute(&config, allocator, "metask");
+        };
     }
 
     // --- OpenAI wire 协议:env METACODES_OPENAI_PROTOCOL 显式覆盖 CLI(同 auth_precedence 约定)。
@@ -1689,6 +1653,12 @@ pub fn main(init: std.process.Init) !void {
     const metask_legacy_explicit = metask_legacy_requested;
     var provider_secret: ?[]u8 = null;
     var metask_oauth_selected = false;
+    // Same handling as `ResolvedCredential.deinit`: zero the bytes before
+    // returning them to the allocator so key material does not linger in freed
+    // heap or a core dump.
+    defer if (provider_secret) |secret| {
+        provider_oauth_mod.secureFree(if (metask_oauth_selected) init.gpa else allocator, secret);
+    };
     // Where the session's credential came from, for the banner (#484): every
     // credential the Metask scope resolves is Metask's.
     var credential_origin: route_state_mod.CredentialOrigin = .metask;
@@ -1707,7 +1677,8 @@ pub fn main(init: std.process.Init) !void {
         std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
     {
         var browser_key = false;
-        provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| blk: {
+        const session = try loadStartupMetask(&startup_metask, init.gpa, config.state_root);
+        provider_secret = resolveMetaskBearer(session, init.io) catch |err| blk: {
             if (err == error.GatewayChanged) {
                 std.debug.print("Metask's model gateway changed. Restart the command to use the saved session.\n", .{});
                 return err;
@@ -1717,7 +1688,7 @@ pub fn main(init: std.process.Init) !void {
             // session authenticates with the browser sign-in's key, on the
             // stored route, as the historical path would; so does a Metask
             // preset (#489).
-            if (no_sign_in and (stored_default_applied or preset_applied)) if (browserSignInKey(allocator, config.state_root)) |key| {
+            if (no_sign_in and session.tokens == null and (stored_default_applied or preset_applied)) if (browserSignInKey(allocator, config.state_root)) |key| {
                 browser_key = true;
                 break :blk key;
             };
@@ -1735,6 +1706,7 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         metask_oauth_selected = provider_secret != null and !browser_key;
+        if (metask_oauth_selected) config.metask_session_gateway = try allocator.dupe(u8, session.tokens.?.gateway_url orelse "");
     } else if (resolves_credential and metask_scope and metask_legacy_explicit) {
         provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
     } else if (resolves_credential and !metask_scope) {
@@ -1761,13 +1733,6 @@ pub fn main(init: std.process.Init) !void {
             unbound = .{ .missing_credential = named };
         }
     }
-    // Same handling as `ResolvedCredential.deinit`: zero the bytes before
-    // returning them to the allocator so key material does not linger in freed
-    // heap or a core dump.
-    defer if (provider_secret) |secret| {
-        std.crypto.secureZero(u8, secret);
-        allocator.free(secret);
-    };
 
     // Level 7 of the startup order (#484): with no credential at all, the
     // interactive TUI opens unbound — no model, nothing sent, a reminder of
@@ -1879,6 +1844,7 @@ pub fn main(init: std.process.Init) !void {
     // be known before the REPL first enters raw mode.
     var splash: repl.Splash = .not_started;
     var init_options: app_mod.App.InitOptions = .{
+        .metask_session = &startup_metask,
         .models_cache = interactive_tui,
         .route_state = if (unbound) |why| .{ .unbound = why } else .{ .bound = credential_origin },
         .unchosen_local_providers = switch (local_choice) {
@@ -4340,21 +4306,9 @@ pub fn selectedProfileIsMetask(config: types.Config) bool {
 
 const MetaskSessionError = provider_oauth_mod.OAuthError || error{NoSession};
 
-/// Load and refresh the new Metask session. The returned token is an owned,
-/// scrubbed copy; the Session itself can be closed before App construction.
-fn resolveMetaskBearer(allocator: std.mem.Allocator, io: std.Io) MetaskSessionError![]u8 {
-    var session = try provider_oauth_mod.Session.initHome(allocator, hostRoot(), provider_ids_mod.Slug.lit("metask"));
-    defer session.deinit();
-    if (!(try session.load())) return error.NoSession;
-    var site_buf: [1024]u8 = undefined;
-    const token_url = metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf) catch
-        return error.RefreshFailed;
-    var exchange = oauth_exchange_mod.MetaskHttpExchange{
-        .allocator = allocator,
-        .io = io,
-        .token_url = token_url,
-    };
-    return session.accessToken(@import("metacodes-internal").util.time.nowUnix(), exchange.exchange());
+fn resolveMetaskBearer(session: *provider_oauth_mod.Session, io: std.Io) MetaskSessionError![]u8 {
+    if (session.tokens == null) return error.NoSession;
+    return oauth_exchange_mod.metaskAccessToken(session, io, @import("metacodes-internal").util.time.nowUnix());
 }
 
 /// Provider-scoped credential resolution (issue #16).

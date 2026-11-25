@@ -52,6 +52,13 @@ pub fn siteUrl() []const u8 {
     return DEFAULT_SITE_URL;
 }
 
+pub fn modelGateway(stored: ?[]const u8) Error!?[]const u8 {
+    const selected = if (std.c.getenv("METASK_GATEWAY_URL")) |raw| std.mem.span(raw) else stored orelse return null;
+    const origin = std.mem.trimEnd(u8, selected, "/");
+    if (!isGatewayOrigin(origin)) return error.InvalidUrl;
+    return origin;
+}
+
 pub fn deviceCodeUrl(site: []const u8, buffer: []u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}/api/oauth/device/code", .{std.mem.trimEnd(u8, site, "/")});
 }
