@@ -225,6 +225,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Bench concurrency is set only on the profile page.** The 评测 page no
+  longer has a 并发数 field and `POST /api/profiles/run` no longer takes
+  `concurrency`. A profile has one concurrency (10 when it is created); its
+  page can change it whether or not it is running, and every dataset queued on
+  it runs at it, reruns included. A profile saved earlier keeps its latest
+  dataset's value. `bench run` on the CLI still takes `--concurrency`.
+
 - **Bench profiles replace batches.** A profile (评测配置) is one frozen
   metacodes version with a fixed set of advanced features, and every run
   belongs to one; the same version with the same features is always the same

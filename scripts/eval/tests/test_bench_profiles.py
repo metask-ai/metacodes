@@ -157,7 +157,7 @@ class ProfileTest(unittest.TestCase):
         self.client = cli.Client(f'http://127.0.0.1:{self.http.server_address[1]}/')
 
     def request(self, **override):
-        return {'model': 'tokenjoy/test-model', 'attempts': 1, 'concurrency': 4, 'name': '回归',
+        return {'model': 'tokenjoy/test-model', 'attempts': 1, 'name': '回归',
                 'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']},
                           {'suite': 'terminal-bench-2.0', 'tasks': ['fix-git']}], **override}
 
@@ -487,8 +487,27 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(next(r for r in self.manager.runs() if r['name'] == run)['concurrency'], 2)
             self.client.request('api/profile/cancel', {'id': created['id']})
             self.wait_profile(created['id'])
-        with self.assertRaisesRegex(ValueError, '没有正在运行'):
-            self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3})
+
+    def test_concurrency_is_the_profiles_and_set_only_on_it(self):
+        with self.assertRaisesRegex(ValueError, '并发数在评测配置页面设置'):
+            self.client.request('api/profiles/run', self.request(concurrency=4))
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
+        self.assertEqual((created['concurrency'], created['items'][0]['concurrency']), (profiles.DEFAULT_CONCURRENCY,) * 2)
+        self.assertEqual(self.client.request('api/workbench')['defaults']['concurrency'], profiles.DEFAULT_CONCURRENCY)
+        # An idle profile takes a new value; every dataset queued after runs at it.
+        self.assertEqual(self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3}),
+                         {'id': created['id'], 'concurrency': 3})
+        self.assertEqual(self.client.request('api/profile?id=' + created['id'])['concurrency'], 3)
+        self.client.request('api/profiles/run', {**one, 'profile': created['id'], 'name': None})
+        self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
+        record = self.wait_profile(created['id'])
+        self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']],
+                         [(10, 10), (3, 3), (3, 3)])
+        # A profile saved before it had one keeps its latest dataset's.
+        legacy = {k: v for k, v in record.items() if k != 'concurrency'}
+        self.assertEqual(profiles.profile_concurrency(legacy), 3)
+        self.assertEqual(profiles.profile_concurrency({'items': []}), profiles.DEFAULT_CONCURRENCY)
 
     def test_deleting_a_profile_removes_its_runs_results_and_rows(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])

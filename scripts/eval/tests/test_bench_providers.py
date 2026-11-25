@@ -575,7 +575,7 @@ class ImportedProviderRunTest(unittest.TestCase):
         base = f'http://127.0.0.1:{self.upstream.server_port}'
         self.client.request('api/providers', {'id': 'local', 'base_url': base, 'api_key': KEY, 'models': ['echo']})
         created = self.client.request('api/profiles/run', {
-            'model': 'local/echo', 'attempts': 1, 'concurrency': 1,
+            'model': 'local/echo', 'attempts': 1,
             'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']},
                       {'suite': 'terminal-bench-2.0', 'tasks': ['fix-git']}]})
         self.assertNotIn('route', json.dumps(created['items']))  # internal, like the launch request
@@ -617,7 +617,6 @@ class ImportedProviderRunTest(unittest.TestCase):
                 self.manager.launch({**request, 'executor': 'gpu'}, dry_run=True)
             with self.assertRaisesRegex(ValueError, '回环地址'):
                 self.client.request('api/profiles/run', {'model': 'local/echo', 'executor': 'gpu', 'attempts': 1,
-                                                    'concurrency': 1,
                                                     'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]})
         self.assertEqual(self.manager.runs(), [])
 
