@@ -63,7 +63,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `base` | `util/` · `platform/` · `symbols/` · `highlight/` · `code/` · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
 | `ai` | `api/`(`model_name` 除外) · `provider/` · `client` · `types` · `json` · `preview` · `core/` 里的 `auth` · `recorder` · `context_pressure` | base |
 | `kernel` | `core/` 里的 `conversation` · `message` · `session_id` · `result_budget` | base、ai |
-| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `protocol/` 里 `PermissionContext` 的字段用到的 `ui_event` · `ui_request` · `permission_choice`,以及 `ui_event` 载荷用到的 `goal` · `output_semantics` · `core/` 里 `CoreEvent` 载荷的类型 `file_change` · `file_reference` · `tools/` 里的 `common` · `observation` · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
+| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `protocol/` 里 `PermissionContext` 的字段用到的 `ui_event` · `ui_request` · `permission_choice`,以及 `ui_event` 载荷用到的 `goal` · `output_semantics` · `core/` 里 `CoreEvent` 载荷的类型 `file_change` · `tools/` 里的 `common` · `observation`(含 `FileReference`、`Locator` 等纯数据类型) · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
 | `coding` | `core/` 其余文件(含 `agent_loop` · `tool_exec` · `protocol/` 其余文件) · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `sandbox/filesystem` · `formal/task_audit` · `api/model_name_consumers_test` | 以上各包 |
 | `session` | `core/agent_session` · `core/session_host` | 以上各包 |
 | `teamwork` | `teamwork/` | 以上各包 |
@@ -140,11 +140,12 @@ provider 配置的类型)和 `core/auth.zig`、`core/recorder.zig`、`core/conte
 `microcompactToolResults`、`microcompactToolResultsByRecentResults`、`truncateLargeToolResults`、`trimDeliveredImageBytes`
 要认得 coding 的 artifact 信封,改成 `result_projection` 里以 `*Conversation` 为第一个参数的函数,和 pi 一样把 compaction 放在
 coding;kernel 只留按位置改写工具结果的 `clearToolResultLocked`(换成带 sha256 承诺的 stub)、`replaceToolResultContentLocked`
-和 `activeImageBytesLocked`,调用方先 `lockSnapshot`。`file_change`、`file_reference` 只改归属到 `guard`:它们用 `ToolContext`
-只为取 `home_dir`、`cwd_abs`、`resolve_relative_paths`,所以 `classifyPath`、`resolveFileTarget` 和 `file_change.Collector`
-改收 `file_reference.PathOptions`(即 `util/path.NormalizeOptions`),从 `ToolContext` 取这三项留在 `coding` 的 `tool_exec`。
-所有类型的路径都不变。越层 import 3 → 0,包间环 1 → 0,深层 import 1816(新增的 12 条都是基线代码里同一个包内已有的 import),
-kernel 2775 行,依赖 base、ai。
+和 `activeImageBytesLocked`,调用方先 `lockSnapshot`。`CoreEvent` 载荷的纯数据类型下沉到 guard:`file_reference` 的 `Locator`、
+`Range`、`Position`、`FileReference`、`LocatorKind` 挪到 `tools/observation.zig`,`file_reference` 用别名保留原名,以 `ToolContext`
+为参数的 `resolveFileTarget`、`classifyPath` 留在 `coding`、签名不变;`file_change` 里只有 `Collector` 要 `ToolContext`,它原样挪到
+`tool_exec`(`tool_exec.Collector`),`file_change` 其余部分改归 `guard`。纯类型不另开新文件,因为新文件的 import 会算作新增的深层
+import;放进 `file_reference` 原本就 import 的 `tools/observation`,用的都是基线里已有的边。越层 import 3 → 0,包间环 1 → 0,
+深层 import 1815(新增的 11 条都是基线代码里同一个包内已有的 import),kernel 2775 行,依赖 base、ai。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。

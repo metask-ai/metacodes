@@ -241,11 +241,11 @@ status, compatibility boundaries, and entry points are defined by
   `result_projection.truncateLargeToolResults(&conv, n)`. `Conversation` gains
   `clearToolResultLocked`, `replaceToolResultContentLocked` and a public
   `activeImageBytesLocked`, called between `lockSnapshot` and `unlockSnapshot`.
-  `file_reference.classifyPath` and `resolveFileTarget` take a
-  `file_reference.PathOptions` (`util/path.NormalizeOptions`) instead of a
-  `*const ToolContext`, and `file_change.Collector` has a `paths` field in place
-  of `ctx`; pass `.{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs,
-  .resolve_relative = ctx.resolve_relative_paths }`. Every type keeps its path.
+  `file_change.Collector` is now `tool_exec.Collector`, unchanged. The pure
+  data types of `file_reference` (`Locator`, `Range`, `Position`,
+  `FileReference`, `LocatorKind`) are defined in `tools/observation.zig`;
+  `file_reference` keeps them as aliases, so existing names still resolve, and
+  `resolveFileTarget` / `classifyPath` keep their signatures.
   The C ABI, `agentcore.h`, the ABI revision, event JSON, stream-json, request
   bytes and transcripts are unchanged; AgentCore consumers are not affected.
   `layer:check` now reports 0 upward imports and 0 package cycles.
