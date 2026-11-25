@@ -32,6 +32,7 @@ import urllib.request
 from pathlib import Path
 
 from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.profiling import manager_tls
 from scripts.eval.harbor.bench.account import NoRedirect, private_json, refresh_lock
 
 PROTOCOLS = {"openai_chat": "OpenAI Chat Completions", "openai_responses": "OpenAI Responses",
@@ -116,6 +117,9 @@ def call(entry, key, path, body=None, timeout=PROBE_TIMEOUT, opener=None):
         payload = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(endpoint(entry, path), data=payload, headers=headers)
+    context = manager_tls(urllib.parse.urlsplit(request.full_url), key)
+    if context:
+        opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=context))
     try:
         with (opener or urllib.request.build_opener(NoRedirect)).open(request, timeout=timeout) as response:
             status, raw = response.status, response.read(4 * 1024 * 1024)

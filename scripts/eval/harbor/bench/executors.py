@@ -522,7 +522,7 @@ def find(cfg, name: Optional[str]) -> Executor:
 # ------------------------------------------------------------------ commands
 
 def ssh_argv(executor: SshExecutor, remote: Optional[List[str]] = None, *, tty=False,
-             reverse: Optional[Tuple[int, int]] = None) -> List[str]:
+             reverse: Optional[Tuple[int, int]] = None, paired=False) -> List[str]:
     """`ssh` argv for one remote command. The remote side receives one
     shell-quoted string, so every argument stays a single word there.
 
@@ -531,7 +531,9 @@ def ssh_argv(executor: SshExecutor, remote: Optional[List[str]] = None, *, tty=F
     once if the forward cannot be set up (ExitOnForwardFailure)."""
     argv = [shutil.which("ssh") or "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
-            "-o", "StrictHostKeyChecking=accept-new", "-p", str(executor.port)]
+            "-o", "StrictHostKeyChecking=" + ("yes" if paired else "accept-new"), "-p", str(executor.port)]
+    if paired:
+        argv += ["-o", "ControlPath=none", "-o", "ForwardAgent=no"]
     if executor.identity_file:
         argv += ["-i", executor.identity_file, "-o", "IdentitiesOnly=yes"]
     if reverse:

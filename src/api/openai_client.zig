@@ -484,7 +484,10 @@ pub const OpenAIClient = struct {
         var account_scratch: [8 * 1024]u8 = undefined;
         var account_fba = std.heap.FixedBufferAllocator.init(&account_scratch);
         const extra_headers = self.requestHeaders(&headers_buffer, auth, account_fba.allocator(), rid);
-        req_ptr.* = self.http_client.request(.POST, uri, .{
+        const manager = try http_connection.managerClient(&self.http_client, uri, auth.value);
+        errdefer http_connection.releaseManagerClient(manager);
+        const transport = manager orelse &self.http_client;
+        req_ptr.* = transport.request(.POST, uri, .{
             // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
             .keep_alive = false,
             // The key rides in a header; a 3xx is reported, not followed.
@@ -576,6 +579,7 @@ pub const OpenAIClient = struct {
             .content_chunks = content_chunks,
             .protocol = self.protocol,
             .request = req_ptr,
+            .manager_client = manager,
             .response = response,
             .abort = abort,
             .abort_registry = &self.abort_registry,
@@ -635,6 +639,7 @@ const OpenAIStream = struct {
     /// wire 协议(chat/completions 或 Responses):parseChunk 据此分派解析路径。
     protocol: types.OpenAIProtocol = .chat_completions,
     request: *http.Client.Request,
+    manager_client: ?*http.Client = null,
     response: http.Client.Response,
     transfer_buf: [8192]u8 = undefined,
     /// 单行 SSE 超出 transfer_buf(8KB)时的溢出累积缓冲(port 自 stream.zig 的 takeLine
@@ -737,6 +742,7 @@ const OpenAIStream = struct {
         if (self.abort_registry) |registry| registry.unregister(self.request);
         self.request.deinit();
         self.allocator.destroy(self.request);
+        http_connection.releaseManagerClient(self.manager_client);
     }
 
     /// 释放解析侧状态(累积槽、未 drain 的 flush 事件、去重键、溢出行缓冲),不碰 HTTP

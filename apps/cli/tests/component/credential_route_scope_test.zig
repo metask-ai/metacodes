@@ -560,6 +560,72 @@ fn deviceSessionApp(case: *Case, metask_origin: []const u8, io: std.Io) !*App {
     return App.init(std.testing.allocator, io, config, METASK_ACCESS);
 }
 
+test "L2 credential scope: a gateway migration between selecting a login and opening its App" {
+    var first = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, ANTHROPIC_END_TURN_SSE }, 0);
+    defer first.stop();
+    var second = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, ANTHROPIC_END_TURN_SSE }, 0);
+    defer second.stop();
+    var case: Case = undefined;
+    try case.init("{}");
+    defer case.deinit();
+    const a = case.arena.allocator();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    const first_origin = try originOf(a, first);
+    const second_origin = try originOf(a, second);
+    try case.setEnv("METASK_SITE_URL", (try a.dupeZ(u8, first_origin)).ptr);
+    const now = cc.util_time.nowUnix();
+    try case.storeOAuthLogin("metask", .{
+        .access_token = OAUTH_ACCESS_1,
+        .refresh_token = "fake-first",
+        .expires_in_seconds = 3600,
+        .gateway_url = first_origin,
+    }, now);
+    var login: ?cc.provider_oauth.Session = try cc.provider_oauth.Session.initHome(std.testing.allocator, case.root, Slug.lit("metask"));
+    defer if (login) |*session| session.deinit();
+    try std.testing.expect(try login.?.load());
+    const key = try a.dupe(u8, login.?.tokens.?.access_token);
+    var config = try case.config(&.{ "metacodes", "--provider", "metask", "--model", "glm-5.3-flash" });
+    config.resolved_provider_id = "metask";
+    config.metask_oauth_selected = true;
+    config.metask_session_gateway = first_origin;
+    config.base_url = try first.urlOwned(a);
+
+    try case.storeOAuthLogin("metask", .{
+        .access_token = OAUTH_ACCESS_2,
+        .refresh_token = "fake-second",
+        .expires_in_seconds = 3600,
+        .gateway_url = second_origin,
+    }, now);
+    const app = try App.initWithOptions(std.testing.allocator, io_runtime.io(), config, key, .{ .metask_session = &login });
+    defer app.deinit();
+    try std.testing.expect(login == null);
+    try std.testing.expect(sentBearer(first, 0, OAUTH_ACCESS_1));
+    try sendOneTurn(app);
+    try std.testing.expect(sentBearer(first, 1, OAUTH_ACCESS_1));
+    try std.testing.expectEqual(@as(usize, 0), second.requestCount());
+    const refresh = app.api_client.refresh_fn.?;
+    try std.testing.expectError(error.GatewayChanged, refresh(app.api_client.refresh_ctx.?, key));
+    try std.testing.expectError(error.GatewayChanged, App.init(std.testing.allocator, io_runtime.io(), config, key));
+    try std.testing.expectEqual(@as(usize, 0), second.requestCount());
+
+    try case.storeOAuthLogin("metask", .{
+        .access_token = METASK_ACCESS,
+        .refresh_token = "fake-rotated",
+        .expires_in_seconds = 3600,
+        .gateway_url = second_origin,
+    }, now);
+    config.metask_session_gateway = second_origin;
+    config.base_url = try second.urlOwned(a);
+    const reopened = try App.init(std.testing.allocator, io_runtime.io(), config, OAUTH_ACCESS_2);
+    defer reopened.deinit();
+    try std.testing.expect(sentBearer(second, 0, METASK_ACCESS));
+    try sendOneTurn(reopened);
+    try std.testing.expect(sentBearer(second, 1, METASK_ACCESS));
+    try std.testing.expectEqual(@as(usize, 2), first.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), second.requestCount());
+}
+
 /// Commit `provider`'s offer for `model` on the Messages wire (bound to the
 /// account `credential`, or to none) in `scope`, as the picker does after Tab
 /// set the scope.

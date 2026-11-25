@@ -32,6 +32,7 @@ pub const files = [_]File{
     .{ .path = "scripts/eval/harbor/adapters/gaia2_cli.py", .bytes = @embedFile("eval/harbor/adapters/gaia2_cli.py") },
     .{ .path = "scripts/eval/harbor/bench/__init__.py", .bytes = @embedFile("eval/harbor/bench/__init__.py") },
     .{ .path = "scripts/eval/harbor/bench/account.py", .bytes = @embedFile("eval/harbor/bench/account.py") },
+    .{ .path = "scripts/eval/harbor/bench/share.py", .bytes = @embedFile("eval/harbor/bench/share.py") },
     .{ .path = "scripts/eval/harbor/bench/data.py", .bytes = @embedFile("eval/harbor/bench/data.py") },
     .{ .path = "scripts/eval/harbor/bench/runner.py", .bytes = @embedFile("eval/harbor/bench/runner.py") },
     .{ .path = "scripts/eval/harbor/bench/worker.py", .bytes = @embedFile("eval/harbor/bench/worker.py") },

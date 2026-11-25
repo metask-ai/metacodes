@@ -11,7 +11,8 @@
 //! **解耦**：abort/tick 走 opaque 回调（`?*const anyopaque` + fn 指针），platform/ 不依赖
 //! util/abort。调用方（common.zig）把自己的 AbortSignal 包成回调传入。
 //!
-//! 未覆盖（后续增量）：双向 pipe（MCP/LSP 长连接）、JobObject 进程树 kill。
+//! 未覆盖（后续增量）：双向 pipe（MCP/LSP 长连接）。落盘 job（spawnToFiles）在 Windows 已进
+//! JobObject，killJob 整棵树终止。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -282,7 +283,7 @@ pub fn spawnService(argv: []const ?[*:0]const u8, log_fd: c_int) CaptureError!vo
     last_spawn_failure = null;
     if (is_windows) {
         const handle = try spawnToFilesWithEnv(argv, log_fd, log_fd, null, true);
-        win.CloseHandle(handle);
+        releaseExited(handle);
         return;
     }
     g_fork_serial.lock();
@@ -462,7 +463,7 @@ pub const PipeChild = struct {
     /// call this until it first returns `.exited` and not after. On POSIX a
     /// child killed by a signal reports the negated signal number.
     pub fn tryWait(self: *const PipeChild) ReapStatus {
-        const status = reapNonblock(self.proc);
+        const status = reapPid(self.proc);
         if (is_windows) {
             if (status == .exited) win.CloseHandle(self.proc);
         }
@@ -797,8 +798,17 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, options: PipeSpawnOptions) Ca
 // 后台 job 进程（Bash bg：spawn detached、stdout/stderr 落盘 fd、非阻塞 reap、kill）
 // ============================================================================
 
-/// 进程句柄：POSIX=pid；Windows=进程 HANDLE。
-pub const ProcHandle = if (is_windows) win.HANDLE else std.c.pid_t;
+/// 进程句柄：POSIX=pid；Windows=进程 HANDLE 与其所在的 Job Object。
+pub const ProcHandle = if (is_windows) WindowsProc else std.c.pid_t;
+
+const WindowsProc = struct {
+    process: win.HANDLE,
+    job: ?win.HANDLE,
+};
+
+pub const TreeStop = enum { required, best_effort };
+
+pub var test_refuse_job_assignment: bool = false;
 
 extern "c" fn _get_osfhandle(fd: c_int) callconv(.c) usize; // MSVCRT fd → HANDLE（intptr）
 extern "c" fn _wopen(path: [*:0]const u16, oflag: c_int, ...) callconv(.c) c_int;
@@ -831,6 +841,22 @@ pub fn spawnToFilesWithEnv(
     err_fd: c_int,
     cwd: ?[]const u8,
     inherit_env: bool,
+) CaptureError!ProcHandle {
+    return spawnToFilesStopping(argv, out_fd, err_fd, cwd, inherit_env, .best_effort);
+}
+
+/// `.required`: the Windows child runs only inside its own Job Object, so
+/// `killJob` reaches every descendant; a host that refuses the job gets
+/// `SpawnFailed`. `.best_effort` keeps the job when it can be had and
+/// otherwise runs the child alone, stopped by `TerminateProcess`. POSIX
+/// stops the process group either way.
+pub fn spawnToFilesStopping(
+    argv: []const ?[*:0]const u8,
+    out_fd: c_int,
+    err_fd: c_int,
+    cwd: ?[]const u8,
+    inherit_env: bool,
+    tree_stop: TreeStop,
 ) CaptureError!ProcHandle {
     last_spawn_failure = null;
     if (is_windows) {
@@ -880,7 +906,7 @@ pub fn spawnToFilesWithEnv(
         appendUniqueHandle(&inherit_handles, &inherit_count, nul_r);
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
         const cwd_ptr: ?win.LPCWSTR = if (cwd_w) |w| w.ptr else null;
-        const process_result = createProcessWithHandleList(cmdline.ptr, .{ .create_no_window = true }, cwd_ptr, &si, &pi, inherit_handles[0..inherit_count]) catch {
+        const process_result = createProcessWithHandleList(cmdline.ptr, .{ .create_no_window = true, .create_suspended = true }, cwd_ptr, &si, &pi, inherit_handles[0..inherit_count]) catch {
             win.CloseHandle(nul_r);
             _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
             _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
@@ -894,8 +920,23 @@ pub fn spawnToFilesWithEnv(
         _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
         g_spawn_serial.unlock();
         if (created == .FALSE) return windowsSpawnFailure(create_error, cwd);
+        const job = jobContaining(pi.hProcess);
+        if (job == null and tree_stop == .required) {
+            _ = TerminateProcess(pi.hProcess, 1);
+            _ = WaitForSingleObject(pi.hProcess, 2000);
+            win.CloseHandle(pi.hThread);
+            win.CloseHandle(pi.hProcess);
+            return error.SpawnFailed;
+        }
+        const proc: WindowsProc = .{ .process = pi.hProcess, .job = job };
+        if (ResumeThread(pi.hThread) == std.math.maxInt(win.DWORD)) {
+            win.CloseHandle(pi.hThread);
+            killJob(proc);
+            reapBlocking(proc);
+            return error.SpawnFailed;
+        }
         win.CloseHandle(pi.hThread);
-        return pi.hProcess;
+        return proc;
     }
     g_fork_serial.lock();
     const report = ReportPipe.open() orelse {
@@ -929,6 +970,10 @@ pub const ReapStatus = union(enum) { running, exited: i32 };
 
 /// 非阻塞查子进程是否退出。POSIX=waitpid(WNOHANG)；Windows=WaitForSingleObject(0)+GetExitCodeProcess。
 pub fn reapNonblock(h: ProcHandle) ReapStatus {
+    return reapPid(if (is_windows) h.process else h);
+}
+
+fn reapPid(h: if (is_windows) win.HANDLE else std.c.pid_t) ReapStatus {
     if (is_windows) {
         // 只有 WAIT_TIMEOUT(0x102)=仍运行;WAIT_OBJECT_0(0)=已退;WAIT_FAILED(0xFFFFFFFF)/
         // WAIT_ABANDONED 等=异常,当已退处理(否则失败的 wait 让死 job 永远"运行中"卡看板)。
@@ -949,7 +994,7 @@ pub const KILL_GRACE_MS: u64 = 200;
 
 /// 杀子进程树 = terminate → KILL_GRACE_MS → forceKill。POSIX killpg（-pid=杀整组，因
 /// spawnToFiles 已 setpgid(pid,pid) 使 pgid==pid）；不在这里收尸，未收尸的 leader 让 pgid 不被复用。
-/// Windows TerminateProcess（单进程）。之后须 reapBlocking 收尸。
+/// Windows TerminateJobObject（整棵树）。之后须 reapBlocking 收尸。
 pub fn killJob(h: ProcHandle) void {
     terminate(h);
     if (!is_windows) {
@@ -962,7 +1007,8 @@ pub fn killJob(h: ProcHandle) void {
 
 pub fn terminate(h: ProcHandle) void {
     if (is_windows) {
-        _ = TerminateProcess(h, 1);
+        const stopped_tree = if (h.job) |job| TerminateJobObject(job, 1) != 0 else false;
+        if (!stopped_tree) _ = TerminateProcess(h.process, 1);
     } else {
         _ = std.c.kill(-h, std.c.SIG.TERM);
     }
@@ -972,11 +1018,21 @@ pub fn forceKill(h: ProcHandle) void {
     if (!is_windows) _ = std.c.kill(-h, std.c.SIG.KILL);
 }
 
-/// 阻塞 reap（收尸，防僵尸）。POSIX waitpid(0)；Windows CloseHandle（已 Terminate/退出）。
+/// reapNonblock 报告 .exited 后释放句柄：Windows 关进程与 Job 句柄（不终止 Job，进程自己
+/// 留下的后代照常运行）；POSIX 已由 waitpid 收尸，无事可做。
+pub fn releaseExited(h: ProcHandle) void {
+    if (is_windows) {
+        win.CloseHandle(h.process);
+        if (h.job) |job| win.CloseHandle(job);
+    }
+}
+
+/// 阻塞 reap（收尸，防僵尸）。POSIX waitpid(0)；Windows CloseHandle 进程与 Job（已 Terminate/退出）。
 pub fn reapBlocking(h: ProcHandle) void {
     if (is_windows) {
-        _ = WaitForSingleObject(h, 2000);
-        win.CloseHandle(h);
+        _ = WaitForSingleObject(h.process, 2000);
+        win.CloseHandle(h.process);
+        if (h.job) |job| win.CloseHandle(job);
     } else {
         _ = waitpidRetry(h);
     }
@@ -1536,6 +1592,18 @@ extern "kernel32" fn CancelIoEx(hFile: win.HANDLE, lpOverlapped: ?*anyopaque) ca
 extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: win.DWORD) callconv(.winapi) win.DWORD;
 extern "kernel32" fn GetExitCodeProcess(hProcess: win.HANDLE, lpExitCode: *win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn TerminateProcess(hProcess: win.HANDLE, uExitCode: win.UINT) callconv(.winapi) c_int;
+extern "kernel32" fn CreateJobObjectW(lpJobAttributes: ?*win.SECURITY_ATTRIBUTES, lpName: ?[*:0]const u16) callconv(.winapi) ?win.HANDLE;
+extern "kernel32" fn AssignProcessToJobObject(hJob: win.HANDLE, hProcess: win.HANDLE) callconv(.winapi) c_int;
+extern "kernel32" fn TerminateJobObject(hJob: win.HANDLE, uExitCode: win.UINT) callconv(.winapi) c_int;
+extern "kernel32" fn ResumeThread(hThread: win.HANDLE) callconv(.winapi) win.DWORD;
+
+fn jobContaining(process: win.HANDLE) ?win.HANDLE {
+    if (builtin.is_test and test_refuse_job_assignment) return null;
+    const job = CreateJobObjectW(null, null) orelse return null;
+    if (AssignProcessToJobObject(job, process) != 0) return job;
+    win.CloseHandle(job);
+    return null;
+}
 extern "kernel32" fn PeekNamedPipe(hNamedPipe: win.HANDLE, lpBuffer: ?[*]u8, nBufferSize: win.DWORD, lpBytesRead: ?*win.DWORD, lpTotalBytesAvail: ?*win.DWORD, lpBytesLeftThisMessage: ?*win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn Sleep(dwMilliseconds: win.DWORD) callconv(.winapi) void;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;

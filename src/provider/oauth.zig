@@ -39,6 +39,7 @@ pub const REFRESH_MARGIN_SECONDS: i64 = 120;
 pub const OAuthError = error{
     OutOfMemory,
     NoTokens,
+    GatewayChanged,
     /// The provider refused the refresh token. Retrying cannot help — the user
     /// has to log in again — so this is deliberately not a transport error.
     RefreshRejected,
@@ -198,6 +199,8 @@ pub const Session = struct {
         const path_z = try allocator.dupeZ(u8, session.path);
         defer allocator.free(path_z);
         if (!pfs.exists(path_z)) return false;
+        const lock = session.lockStore() catch return error.RemoveFailed;
+        defer if (lock) |fd| pfs.close(fd);
         pfs.unlinkPath(path_z) catch |err| switch (err) {
             error.NotFound => return false,
             else => return error.RemoveFailed,
@@ -264,6 +267,8 @@ pub const Session = struct {
         const refresh = outcome.refresh_token orelse return error.MalformedTokenResponse;
         var tokens = try own(self.allocator, outcome, refresh, now_seconds, null);
         errdefer tokens.deinit(self.allocator);
+        const lock = try self.lockStore();
+        defer if (lock) |fd| pfs.close(fd);
         try self.persist(tokens);
         self.adopt(tokens);
     }
@@ -402,9 +407,34 @@ pub const Session = struct {
     ) OAuthError!void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const outcome = try exchange.run(exchange.ctx, self.provider_id, refresh_token, arena.allocator());
+        const lock = try self.lockStore();
+        defer if (lock) |fd| pfs.close(fd);
+        var previous = self.tokens;
+        var current_refresh = refresh_token;
+        var stored: ?TokenSet = null;
+        defer if (stored) |*tokens| tokens.deinit(self.allocator);
+        if (lock != null) {
+            const text = readFile(self.allocator, self.path) catch return error.NoTokens;
+            defer secureFree(self.allocator, text);
+            const record = try parseStored(self.allocator, text);
+            defer if (record.client_id) |id| self.allocator.free(id);
+            const disk = record.tokens;
+            stored = disk;
+            const cached = previous orelse return error.NoTokens;
+            if (!std.mem.eql(u8, cached.gateway_url orelse "", disk.gateway_url orelse "")) return self.detachGateway();
+            if ((!std.mem.eql(u8, disk.refresh_token, refresh_token) or !std.mem.eql(u8, disk.access_token, cached.access_token)) and
+                !disk.isExpiredAt(now_seconds))
+            {
+                self.adopt(disk);
+                stored = null;
+                return;
+            }
+            current_refresh = disk.refresh_token;
+            previous = disk;
+        }
+        const outcome = try exchange.run(exchange.ctx, self.provider_id, current_refresh, arena.allocator());
 
-        var replacement = try own(self.allocator, outcome, refresh_token, now_seconds, self.tokens);
+        var replacement = try own(self.allocator, outcome, current_refresh, now_seconds, previous);
         errdefer replacement.deinit(self.allocator);
 
         // Persist *before* the new tokens become the live ones. A provider that
@@ -413,6 +443,9 @@ pub const Session = struct {
         // first means the worst case is a token that is saved but not yet in
         // memory, which the next load recovers.
         try self.persist(replacement);
+        if (stored) |disk| if (disk.gateway_url) |gateway| {
+            if (!std.mem.eql(u8, gateway, replacement.gateway_url orelse "")) return self.detachGateway();
+        };
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -421,13 +454,39 @@ pub const Session = struct {
         self.tokens = replacement;
     }
 
+    fn detachGateway(self: *Session) error{GatewayChanged} {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.tokens) |*old| old.deinit(self.allocator);
+        self.tokens = null;
+        return error.GatewayChanged;
+    }
+
     fn persist(self: *Session, tokens: TokenSet) OAuthError!void {
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(self.allocator);
         renderStored(self.allocator, &buffer, tokens, self.client_id) catch return error.OutOfMemory;
         writeAtomicPrivate(self.allocator, self.path, buffer.items) catch return error.PersistFailed;
     }
+
+    fn lockStore(self: *const Session) OAuthError!?pfs.Fd {
+        if (!self.provider_id.eqlText("metask")) return null;
+        return lockMetaskStore(self.allocator, self.path);
+    }
 };
+
+fn lockMetaskStore(allocator: std.mem.Allocator, path: []const u8) OAuthError!?pfs.Fd {
+    if (!std.mem.eql(u8, std.fs.path.basename(path), "metask.json")) return null;
+    ensureParent(allocator, path) catch return error.PersistFailed;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const lock_path = try std.fs.path.joinZ(allocator, &.{ parent, "bench-oauth.lock" });
+    defer allocator.free(lock_path);
+    const fd = pfs.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
+    if (fd < 0) return error.PersistFailed;
+    errdefer pfs.close(fd);
+    pfs.lockFirstByte(fd) catch return error.PersistFailed;
+    return fd;
+}
 
 /// The exact durable bytes before a login replacement, including whether the
 /// file existed. Used to roll a failed multi-step sign-in back without
@@ -459,6 +518,8 @@ pub const StoredSnapshot = struct {
     }
 
     pub fn restore(self: *const StoredSnapshot) !void {
+        const lock = try lockMetaskStore(self.allocator, self.path);
+        defer if (lock) |fd| pfs.close(fd);
         if (self.contents) |bytes| {
             try ensureParent(self.allocator, self.path);
             try writeAtomicPrivate(self.allocator, self.path, bytes);
@@ -506,7 +567,11 @@ fn own(
     errdefer if (account_id) |value| allocator.free(value);
     const gateway_url = try ownOptional(allocator, outcome.gateway_url orelse if (previous) |p| p.gateway_url else null);
     errdefer if (gateway_url) |value| allocator.free(value);
-    const models_url = try ownOptional(allocator, outcome.models_url orelse if (previous) |p| p.models_url else null);
+    const previous_models = if (previous) |p| blk: {
+        if (!std.mem.eql(u8, p.gateway_url orelse "", gateway_url orelse "")) break :blk null;
+        break :blk p.models_url;
+    } else null;
+    const models_url = try ownOptional(allocator, outcome.models_url orelse previous_models);
     errdefer if (models_url) |value| allocator.free(value);
     const client_name = try ownOptional(allocator, outcome.client_name orelse if (previous) |p| p.client_name else null);
     errdefer if (client_name) |value| allocator.free(value);
@@ -811,6 +876,7 @@ const FakeExchange = struct {
     /// broken single flight fails its assertions instead of hanging.
     hold_until_waiters: ?struct { session: *Session, count: usize } = null,
     rotate: bool = true,
+    gateway_url: ?[]const u8 = null,
     fail: ?OAuthError = null,
     last_presented: [128]u8 = undefined,
     last_presented_len: usize = 0,
@@ -856,6 +922,7 @@ const FakeExchange = struct {
             else
                 null,
             .expires_in_seconds = 3600,
+            .gateway_url = self.gateway_url,
         };
     }
 
@@ -952,6 +1019,58 @@ test "a rotated refresh token replaces the old one and is what the next refresh 
     a.free(second);
     // Presenting the dead token again is exactly the failure rotation causes.
     try testing.expectEqualStrings("refresh-1", fake.presented());
+}
+
+test "a running Metask session renews from the pair on disk and stops when the gateway changes" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root);
+    const path = try std.fs.path.join(a, &.{ root[0..root_len], "metask.json" });
+    defer a.free(path);
+    var manager = try Session.init(a, Slug.lit("metask"), path);
+    defer manager.deinit();
+    var other = try Session.init(a, Slug.lit("metask"), path);
+    defer other.deinit();
+    var latest = RefreshOutcome{
+        .access_token = "first",
+        .refresh_token = "first-refresh",
+        .expires_in_seconds = 600,
+        .gateway_url = "https://a.invalid",
+    };
+    try manager.importOutcome(latest, 0);
+    latest.access_token = "second";
+    latest.refresh_token = "second-refresh";
+    try other.importOutcome(latest, 500);
+    var exchange = FakeExchange{};
+    const adopted = try manager.accessToken(550, exchange.exchange());
+    defer a.free(adopted);
+    try testing.expectEqualStrings("second", adopted);
+    try testing.expectEqual(@as(usize, 0), exchange.calls);
+
+    latest.access_token = "third";
+    latest.refresh_token = "third-refresh";
+    try other.importOutcome(latest, 600);
+    const renewed = try manager.accessToken(1250, exchange.exchange());
+    defer a.free(renewed);
+    try testing.expectEqualStrings("third-refresh", exchange.presented());
+
+    latest.gateway_url = "https://b.invalid";
+    try other.importOutcome(latest, 0);
+    try testing.expectError(error.GatewayChanged, manager.refreshIfStale(1300, exchange.exchange(), renewed));
+    try testing.expectEqual(@as(usize, 1), exchange.calls);
+
+    exchange.gateway_url = "https://c.invalid";
+    try testing.expectError(error.GatewayChanged, other.accessToken(1300, exchange.exchange()));
+    try testing.expectError(error.NoTokens, other.accessToken(1301, exchange.exchange()));
+    try testing.expect(try manager.load());
+    try testing.expectEqualStrings("https://c.invalid", manager.tokens.?.gateway_url.?);
+    try testing.expectEqualStrings("refresh-2", manager.tokens.?.refresh_token);
+    const migrated = try manager.accessToken(1301, exchange.exchange());
+    defer a.free(migrated);
+    try testing.expectEqualStrings("access-2", migrated);
+    try testing.expectEqual(@as(usize, 2), exchange.calls);
 }
 
 test "a provider that keeps its refresh token does not lose it" {
