@@ -43,6 +43,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlsplit
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
@@ -77,11 +78,16 @@ REGISTRY_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:[0-9]{1,5})?(/[a-
 EGRESS_MODES = ("direct", "workbench")
 EGRESS_HELP = 'egress 只能是 "direct"、"workbench" 或 {"proxy": "http://主机:端口"}'
 
-CONTAINER_MIRRORS = ("apt", "pypi", "conda", "go", "rustup", "npm")
+GITHUB_MIRROR_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/(https?://)?[A-Za-z0-9._~/+-]*)?$")
+CONTAINER_MIRRORS = ("apt", "pypi", "conda", "go", "rustup", "npm", "github", "hf")
 APT_CACHE_PORT = 3142
 APT_CACHE_CONF = "/etc/apt/apt.conf.d/99metacodes-apt-cache"
 COMPOSE_OVERLAY = "mirrors.compose.json"
 APT_PROXY_SETTING = "Acquire::http::Proxy"
+DOWNLOAD_CACHE_PORT = 3143
+DOWNLOAD_CACHE_STATS = "/_stats"
+DOWNLOAD_CACHE_KINDS = ("pypi", "conda", "go", "rustup", "npm", "github")
+PYPI_SIMPLE = re.compile(r"/simple/?$")
 APT_CACHE_PROBE = r'''
 import sys, time, urllib.request
 for _ in range(int(sys.argv[2])):
@@ -100,8 +106,64 @@ def apt_cache_probe(executor: "SshExecutor", attempts: int) -> str:
                                                     executor.apt_cache_url + "/acng-report.html", str(attempts)))
 
 
-def container_mirror_env(mirrors: Dict[str, str]) -> Dict[str, str]:
+DOWNLOAD_CACHE_PROBE = r'''
+import sys, time, urllib.request
+for _ in range(int(sys.argv[2])):
+    try:
+        with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+            if response.status != 200:
+                sys.exit(1)
+            sys.stdout.write(response.read(1 << 20).decode("utf-8", "replace"))
+            sys.exit(0)
+    except OSError:
+        time.sleep(0.5)
+sys.exit(1)
+'''
+
+
+def download_cache_probe(executor: "SshExecutor", attempts: int) -> str:
+    return " ".join(shlex.quote(part) for part in (executor.python, "-c", DOWNLOAD_CACHE_PROBE,
+                                                    executor.download_cache_url + DOWNLOAD_CACHE_STATS, str(attempts)))
+
+
+def served_routes(stats_text: str) -> Dict[str, str]:
+    try:
+        routes = json.loads(stats_text)["routes"]
+        return {kind: row["upstream"].rstrip("/") for kind, row in routes.items()
+                if isinstance(row, dict) and isinstance(row.get("upstream"), str)}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def download_cache_routes(mirrors: Dict[str, str]) -> Dict[str, str]:
+    routes = {}
+    for kind in DOWNLOAD_CACHE_KINDS:
+        url = mirrors.get(kind)
+        if url is None:
+            continue
+        if kind == "pypi":
+            if not PYPI_SIMPLE.search(url):
+                continue
+            url = PYPI_SIMPLE.sub("", url)
+        routes[kind] = url.rstrip("/")
+    return routes
+
+
+def cached_mirrors(mirrors: Dict[str, str], cache_url: str, kinds: Collection[str]) -> Dict[str, str]:
+    cached = dict(mirrors)
+    for kind in download_cache_routes(mirrors):
+        if kind in kinds:
+            cached[kind] = cache_url + "/" + kind + ("/simple/" if kind == "pypi" else "/" if kind == "npm" else "")
+    return cached
+
+
+def container_mirror_env(mirrors: Dict[str, str], cache_url: Optional[str] = None,
+                         cached: Collection[str] = ()) -> Dict[str, str]:
     env: Dict[str, str] = {}
+    if cache_url:
+        if "pypi" in cached and "pypi" in download_cache_routes(mirrors):
+            env["PIP_TRUSTED_HOST"] = urlsplit(cache_url).hostname or ""
+        mirrors = cached_mirrors(mirrors, cache_url, cached)
     if "pypi" in mirrors:
         env.update(PIP_INDEX_URL=mirrors["pypi"], UV_DEFAULT_INDEX=mirrors["pypi"])
     if "conda" in mirrors:
@@ -115,13 +177,21 @@ def container_mirror_env(mirrors: Dict[str, str]) -> Dict[str, str]:
         env.update(RUSTUP_DIST_SERVER=root, RUSTUP_UPDATE_ROOT=root + "/rustup")
     if "npm" in mirrors:
         env["NPM_CONFIG_REGISTRY"] = mirrors["npm"]
+    if "github" in mirrors:
+        root = mirrors["github"].rstrip("/")
+        env.update(UV_INSTALLER_GITHUB_BASE_URL=root,
+                   UV_PYTHON_INSTALL_MIRROR=root + "/astral-sh/python-build-standalone/releases/download")
+    if "hf" in mirrors:
+        env["HF_ENDPOINT"] = mirrors["hf"].rstrip("/")
     return env
 
 
 def task_owned_settings(dataset: Path, mirrors: Dict[str, str]) -> List[str]:
     """The mirror settings (environment variables, apt's proxy) that a task
     of `dataset` names in its compose files, task.toml or Dockerfiles."""
-    wanted = list(container_mirror_env(mirrors)) + ([APT_PROXY_SETTING] if "apt" in mirrors else [])
+    wanted = list({**container_mirror_env(mirrors),
+                   **container_mirror_env(mirrors, "http://cache", DOWNLOAD_CACHE_KINDS)}) \
+        + ([APT_PROXY_SETTING] if "apt" in mirrors else [])
     found = set()
     for path in Path(dataset).rglob("*"):
         name = path.name.lower()
@@ -186,6 +256,7 @@ class SshExecutor:
     docker_mirrors: Tuple[str, ...] = ()
     ghcr_mirror: Optional[str] = None
     container_mirrors: Tuple[Tuple[str, str], ...] = ()
+    download_cache: bool = False
     # Whether teamwork runs may give their task containers the permissions
     # bubblewrap needs (TEAMWORK_CONTAINER): near privileged, so only for a
     # disposable executor that holds no credentials.
@@ -211,20 +282,32 @@ class SshExecutor:
                 "pypi_index": self.pypi_index,
                 "docker_mirrors": list(self.docker_mirrors) or None, "ghcr_mirror": self.ghcr_mirror,
                 "container_mirrors": dict(self.container_mirrors) or None,
+                "download_cache": self.download_cache,
                 "teamwork_privileged": self.teamwork_privileged}
 
     @property
     def apt_cache_url(self) -> str:
         return f"http://{self.metrics_bind}:{APT_CACHE_PORT}"
 
-    def compose_overlay(self, left_out: Collection[str] = ()) -> Optional[Dict]:
+    @property
+    def download_cache_url(self) -> str:
+        return f"http://{self.metrics_bind}:{DOWNLOAD_CACHE_PORT}"
+
+    def download_cache_routes(self) -> Dict[str, str]:
+        return download_cache_routes(dict(self.container_mirrors)) if self.download_cache else {}
+
+    def compose_overlay(self, left_out: Collection[str] = (), cached: Collection[str] = ()) -> Optional[Dict]:
         """The Harbor compose overlay that points a run's task containers at
         container_mirrors, or None without any. Settings in `left_out`
-        (environment variables, APT_PROXY_SETTING) are not set."""
+        (environment variables, APT_PROXY_SETTING) are not set. The kinds
+        in `cached` that the download cache routes point at the cache."""
         mirrors = dict(self.container_mirrors)
         if APT_PROXY_SETTING in left_out:
             mirrors.pop("apt", None)
-        env = {k: v for k, v in container_mirror_env(mirrors).items() if k not in left_out}
+        cache_url = self.download_cache_url if cached and self.download_cache else None
+        env = {k: v for k, v in container_mirror_env(mirrors, cache_url, cached).items() if k not in left_out}
+        if "PIP_INDEX_URL" not in env:
+            env.pop("PIP_TRUSTED_HOST", None)
         if not env and "apt" not in mirrors:
             return None
         main: Dict = {}
@@ -284,7 +367,7 @@ def parse(entry) -> Executor:
         raise ValueError(f"{name}: kind 必须是 local 或 ssh")
     allowed = {"name", "kind", "host", "user", "port", "identity_file", "state_dir", "harbor", "python",
                "metrics_bind", "metrics_enabled", "egress", "egress_ports", "egress_allow", "pypi_index", "docker_mirrors",
-               "ghcr_mirror", "container_mirrors", "teamwork_privileged"}
+               "ghcr_mirror", "container_mirrors", "download_cache", "teamwork_privileged"}
     extra = set(entry) - allowed
     if extra:
         raise ValueError(f"{name}: 不支持的字段 {', '.join(sorted(extra))}")
@@ -374,13 +457,20 @@ def network_fields(name: str, entry: Dict) -> Dict:
     container = entry.get("container_mirrors")
     if container is not None:
         if not isinstance(container, dict) or not set(container) <= set(CONTAINER_MIRRORS) or \
-                not all(isinstance(url, str) and MIRROR_URL.fullmatch(url) for url in container.values()):
+                not all(isinstance(url, str) and (GITHUB_MIRROR_URL if kind == "github" else MIRROR_URL).fullmatch(url)
+                        for kind, url in container.items()):
             raise ValueError(f"{name}: container_mirrors 的键只能是 {'、'.join(CONTAINER_MIRRORS)}，值必须是 http(s) 地址")
         if "apt" in container and not container["apt"].startswith("http://"):
             raise ValueError(f"{name}: container_mirrors.apt 必须是 http:// 地址（apt 缓存按 HTTP 回源）")
         if "apt" in container and values["egress"] != "direct":
             raise ValueError(f"{name}: container_mirrors.apt 只能和 egress = direct 一起用（apt 缓存由执行机器直接回源）")
         values["container_mirrors"] = tuple(sorted(container.items()))
+    cache = entry.get("download_cache", False)
+    if not isinstance(cache, bool):
+        raise ValueError(f"{name}: download_cache 必须是布尔值")
+    if cache and values["egress"] != "direct":
+        raise ValueError(f"{name}: download_cache 只能和 egress = direct 一起用（下载缓存由执行机器直接回源）")
+    values["download_cache"] = cache
     return values
 
 
@@ -1243,8 +1333,8 @@ class RemoteRun:
 
     def mirror_overlay(self, local: Optional[Path]) -> Optional[Dict]:
         """This run's compose overlay: without the settings the dataset's
-        tasks make themselves, and without apt when the executor's apt cache
-        does not answer."""
+        tasks make themselves, without apt when the executor's apt cache
+        does not answer, and through the download cache when it answers."""
         mirrors = dict(self.executor.container_mirrors)
         left_out = task_owned_settings(local, mirrors) if mirrors and local is not None else []
         if left_out:
@@ -1259,7 +1349,31 @@ class RemoteRun:
                 self.log(f"apt 缓存 {self.executor.apt_cache_url} 没有响应：本次运行的任务容器直接使用自己的 apt 源；"
                          f"运行 metacodes bench setup --executor {self.executor.name} 重新启动缓存")
                 left_out.append(APT_PROXY_SETTING)
-        return self.executor.compose_overlay(left_out)
+        return self.executor.compose_overlay(left_out, cached=self.download_cache_kinds())
+
+    def download_cache_kinds(self) -> List[str]:
+        routes = self.executor.download_cache_routes()
+        if not routes:
+            return []
+        url = self.executor.download_cache_url
+        setup = f"运行 metacodes bench setup --executor {self.executor.name} "
+        try:
+            done = self.runner(shell_argv(self.executor, download_cache_probe(self.executor, 3)),
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            done = None
+        if done is None or done.returncode != 0:
+            self.log(f"下载缓存 {url} 没有响应：本次运行的任务容器直接使用镜像源；{setup}重新启动缓存")
+            return []
+        served = served_routes(done.stdout or "")
+        kinds = sorted(kind for kind, upstream in routes.items() if served.get(kind) == upstream)
+        if kinds:
+            self.log(f"下载缓存 {url}：" + "、".join(kinds) + " 先走缓存，未命中再回源")
+        stale = sorted(set(routes) - set(kinds))
+        if stale:
+            self.log(f"下载缓存 {url} 还没有按当前配置提供 " + "、".join(stale) + "（缺少路由或回源地址不同）："
+                     f"本次运行这些类型直接使用镜像源；{setup}更新缓存")
+        return kinds
 
     def remote_spec(self, upstream=None, auth=("Authorization", "Bearer "), record=True) -> Dict:
         from scripts.eval.harbor.bench.worker import command

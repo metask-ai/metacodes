@@ -21,6 +21,24 @@ status, compatibility boundaries, and entry points are defined by
   store. `metacodes bench monitor [--executor NAME] [--json]` prints the same
   snapshot, and `GET /api/monitor` serves it. Nothing is installed on the
   machine: each reading runs one read-only script over the existing SSH access.
+- **Bench executors can cache what task containers download.**
+  `"download_cache": true` on an SSH executor makes `metacodes bench setup`
+  run `metacodes-download-cache` on the executor, and every run's task
+  containers then fetch PyPI, npm, Go, conda and rustup packages and GitHub
+  release assets (uv, uv's Python) through it: a file is downloaded from the
+  `container_mirrors` mirror once and served from the executor afterwards,
+  concurrent trials share one download, and index pages are served from the
+  stored copy when the mirror is down. `GET <metrics_bind>:3143/_stats`
+  reports hits, misses and bytes per kind. apt keeps its apt-cacher-ng
+  cache; Hugging Face, Docker images and git traffic are not behind it.
+
+- **Bench task containers can take GitHub release and Hugging Face mirrors.**
+  `container_mirrors` on an SSH executor accepts `github` (a URL standing for
+  `https://github.com`, such as `https://gh-proxy.com/https://github.com`)
+  and `hf`. A run's task containers then get `UV_INSTALLER_GITHUB_BASE_URL`
+  and `UV_PYTHON_INSTALL_MIRROR`, so the uv binary and the Python a
+  verifier's `uvx` downloads come from the mirror, and `HF_ENDPOINT`. Git
+  traffic and Docker Hub images are not redirected.
 
 - **Bench reruns invalid tasks, and can do it automatically.** The profile
   page's 重跑未通过的题 is now 重跑无效的题: it picks the tasks whose latest

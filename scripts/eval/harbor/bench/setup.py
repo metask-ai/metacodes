@@ -1033,6 +1033,62 @@ def step_apt_cache(s: Setup):
     return "done", f"apt 缓存在 {s.executor.apt_cache_url}，回源 {mirror}"
 
 
+DOWNLOAD_CACHE_NAME = "metacodes-download-cache"
+DOWNLOAD_CACHE_LABEL = "metacodes.download-cache"
+DOWNLOAD_CACHE_SCRIPT = Path(__file__).resolve().parents[1] / "download_cache.py"
+DOWNLOAD_CACHE_HEREDOC = "METACODES_DOWNLOAD_CACHE_SCRIPT"
+DOWNLOAD_CACHE_DOCKERFILE = """FROM debian:bookworm-slim
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 ca-certificates \\
+ && rm -rf /var/lib/apt/lists/*
+COPY <<'{heredoc}' /opt/download_cache.py
+{script}
+{heredoc}
+ENTRYPOINT ["python3", "-I", "/opt/download_cache.py", "--bind", "0.0.0.0", "--port", "{port}", "--dir", "/cache"]
+"""
+
+
+def download_cache_image(routes: Dict[str, str]):
+    script = DOWNLOAD_CACHE_SCRIPT.read_text(encoding="utf-8")
+    if DOWNLOAD_CACHE_HEREDOC in script:
+        raise Failed("download_cache.py 含有 Dockerfile 的结束标记，无法构建缓存镜像")
+    dockerfile = DOWNLOAD_CACHE_DOCKERFILE.format(heredoc=DOWNLOAD_CACHE_HEREDOC, script=script.rstrip("\n"),
+                                                  port=executors.DOWNLOAD_CACHE_PORT)
+    digest = hashlib.sha256((dockerfile + json.dumps(routes, sort_keys=True)).encode()).hexdigest()[:16]
+    return dockerfile, digest
+
+
+def download_cache_answers(s: Setup) -> bool:
+    done = s.sh(executors.download_cache_probe(s.executor, 20))
+    return bool(done) and done.returncode == 0
+
+
+def step_download_cache(s: Setup):
+    s.require_shell()
+    if not s.executor.download_cache:
+        raise Skip("未开启 download_cache")
+    routes = s.executor.download_cache_routes()
+    if not routes:
+        raise Skip("container_mirrors 里没有可以缓存的镜像源（" + "、".join(executors.DOWNLOAD_CACHE_KINDS) + "）")
+    dockerfile, digest = download_cache_image(routes)
+    url = s.executor.download_cache_url
+    covered = "、".join(f"{kind} → {upstream}" for kind, upstream in sorted(routes.items()))
+    running = s.out("docker inspect -f " + shlex.quote("{{index .Config.Labels \"" + DOWNLOAD_CACHE_LABEL + "\"}} "
+                                                      "{{.State.Running}}") + " " + DOWNLOAD_CACHE_NAME + " 2>/dev/null")
+    if running == digest + " true" and download_cache_answers(s):
+        return "ok", f"下载缓存在 {url}，回源 {covered}"
+    s.sh(f"docker build -q -t {DOWNLOAD_CACHE_NAME} -", mutate=True, input=dockerfile, check=True)
+    arguments = " ".join("--route " + shlex.quote(kind + "=" + upstream) for kind, upstream in sorted(routes.items()))
+    s.sh(f"docker rm -f {DOWNLOAD_CACHE_NAME} >/dev/null 2>&1; docker run -d --name {DOWNLOAD_CACHE_NAME} "
+         f"--restart unless-stopped --label {DOWNLOAD_CACHE_LABEL}={digest} "
+         f"-p {s.executor.metrics_bind}:{executors.DOWNLOAD_CACHE_PORT}:{executors.DOWNLOAD_CACHE_PORT} "
+         f"-v {DOWNLOAD_CACHE_NAME}:/cache {DOWNLOAD_CACHE_NAME} {arguments}", mutate=True, check=True)
+    if s.dry_run:
+        return "planned", f"将在 {url} 启动下载缓存，回源 {covered}"
+    if not download_cache_answers(s):
+        raise Failed(f"下载缓存已启动，但 {url} 没有响应；查看 docker logs {DOWNLOAD_CACHE_NAME}")
+    return "done", f"下载缓存在 {url}，回源 {covered}"
+
+
 def step_egress(s: Setup):
     """End to end: a container on a user-defined network reaches the egress
     proxy (workbench mode: forwarder -> ssh -R -> this machine's proxy)."""
@@ -1152,7 +1208,8 @@ def plan(s: Setup):
               ("docker", "Docker" + ("" if s.remote else "（macOS: Colima）"), step_docker)]
     if s.remote:
         steps += [("docker_mirrors", "Docker 镜像加速", step_docker_mirrors),
-                  ("apt_cache", "apt 缓存（任务容器）", step_apt_cache)]
+                  ("apt_cache", "apt 缓存（任务容器）", step_apt_cache),
+                  ("download_cache", "下载缓存（任务容器）", step_download_cache)]
     steps += [("openssl", "OpenSSL", step_openssl), ("bundle", "Linux 发行包", step_bundle)]
     if s.remote:
         steps += [("node", "metacodes 节点", step_node),
