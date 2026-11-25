@@ -87,8 +87,6 @@ const SUBSYSTEMS = [_]Subsystem{
             "src/api/model_name.zig",
             "src/util/log.zig",
             "src/util/time.zig",
-            "src/core/read_state.zig",
-            "src/tools/test_tmp.zig",
         },
     },
     .{

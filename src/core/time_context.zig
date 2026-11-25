@@ -55,8 +55,7 @@ pub fn currentUnixSeconds() i64 {
 
 /// The process's zone at `unix_seconds`, or UTC marked unknown.
 pub fn systemZone(unix_seconds: i64) Zone {
-    const local = platform_tz.local(unix_seconds) orelse return Zone.utc_unknown;
-    if (local.offset_minutes < min_offset_minutes or local.offset_minutes > max_offset_minutes) return Zone.utc_unknown;
+    const local = platform_tz.boundedLocal(unix_seconds) orelse return Zone.utc_unknown;
     var zone = Zone{ .offset_minutes = local.offset_minutes, .source = .system };
     const local_name = local.name();
     @memcpy(zone.name_storage[0..local_name.len], local_name);
@@ -79,33 +78,13 @@ pub const LocalDate = struct {
 
 /// The calendar date at `unix_seconds` in a zone `offset_minutes` east of UTC.
 pub fn localDate(unix_seconds: i64, offset_minutes: i32) LocalDate {
-    const local_seconds = unix_seconds + @as(i64, offset_minutes) * 60;
-    const days = @divFloor(local_seconds, std.time.s_per_day);
-    // Civil-from-days (Howard Hinnant), valid on both sides of 1970.
-    const z = days + 719_468;
-    const era = @divFloor(z, 146_097);
-    const doe: i64 = z - era * 146_097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const day: i64 = doy - @divFloor(153 * mp + 2, 5) + 1;
-    const month: i64 = if (mp < 10) mp + 3 else mp - 9;
-    const year: i64 = yoe + era * 400 + @as(i64, if (month <= 2) 1 else 0);
-    // 1970-01-01 was a Thursday.
-    const weekday: u3 = @intCast(@mod(days + 4, 7));
-    return .{
-        .year = @intCast(year),
-        .month = @intCast(month),
-        .day = @intCast(day),
-        .weekday = @enumFromInt(weekday),
-    };
+    const date = platform_tz.civilDate(unix_seconds, offset_minutes);
+    return .{ .year = date.year, .month = date.month, .day = date.day, .weekday = @enumFromInt(date.weekday) };
 }
 
 /// `UTC+08:00`, `UTC-05:30`, `UTC+00:00`.
 pub fn formatOffset(buf: *[9]u8, offset_minutes: i32) []const u8 {
-    const sign: u8 = if (offset_minutes < 0) '-' else '+';
-    const magnitude: u32 = @abs(offset_minutes);
-    return std.fmt.bufPrint(buf, "UTC{c}{d:0>2}:{d:0>2}", .{ sign, magnitude / 60, magnitude % 60 }) catch unreachable;
+    return platform_tz.formatOffset(buf, offset_minutes);
 }
 
 fn writeDate(w: *std.Io.Writer, date: LocalDate) !void {

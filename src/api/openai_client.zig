@@ -1952,9 +1952,9 @@ fn noteCodexUsageRefusal(status: u16, body: []const u8) bool {
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const refusal = codex_usage.parse(fba.allocator(), status, body) orelse return false;
     const now = @import("../util/time.zig").nowUnix();
-    const zone = @import("../core/time_context.zig").systemZone(now);
+    const offset_minutes = if (@import("platform").timezone.boundedLocal(now)) |zone| zone.offset_minutes else 0;
     var detail_buffer: [256]u8 = undefined;
-    const summary = codex_usage.summarize(refusal, now, zone.offset_minutes, &detail_buffer);
+    const summary = codex_usage.summarize(refusal, now, offset_minutes, &detail_buffer);
     log.err("openai", "{s}: {s}", .{ summary.kind, summary.detail });
     last_error.recordNamed(summary.kind, summary.detail);
     if (codex_usage.waitMs(refusal, now)) |wait| model_error.noteRetryAfterInBody(wait);

@@ -665,6 +665,7 @@ def run(spec_path):
     # Harbor imports the agent from this node's own runtime.
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4])
     env["PYTHONUNBUFFERED"] = "1"
+    env["TZ"] = "UTC"
     limit_path = run_dir / LIMIT_FILE
     env[live_concurrency.FILE_ENV] = str(limit_path)
     relay = None
