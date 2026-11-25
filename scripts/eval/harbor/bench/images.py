@@ -65,7 +65,7 @@ def flow_mapping(text: str) -> Dict[str, str]:
     if not (text.startswith("{") and text.endswith("}")):
         return {}
     pairs = (item.partition(":") for item in text[1:-1].split(","))
-    return {key.strip(): value.strip().strip("\"'") for key, _, value in pairs if key.strip()}
+    return {key.strip().strip("\"'"): value.strip().strip("\"'") for key, _, value in pairs if key.strip()}
 
 
 def compose_images(task_dir: Path) -> List[str]:

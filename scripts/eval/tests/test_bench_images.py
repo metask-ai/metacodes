@@ -234,6 +234,12 @@ class SshPullTest(unittest.TestCase):
             found, _ = images.images_of(Path(tmp), ["prebuilt"])
             self.assertEqual(found, {"org/env:1": ["prebuilt"], "postgres:16": ["prebuilt"]})
             self.assertIn("ghcr.io/org/db:2", egress_images("services:\n  db: {image: ghcr.io/org/db:2}\n"))
+            (task / "environment" / "docker-compose.yaml").write_text(
+                'services:\n  db: {"image": "ghcr.io/org/db:2"}\n  local: {"build": ".", "image": "org/local:3"}\n')
+            found, _ = images.images_of(Path(tmp), ["prebuilt"])
+            self.assertEqual(found, {"org/env:1": ["prebuilt"], "ghcr.io/org/db:2": ["prebuilt"]})
+            self.assertIn("ghcr.io/org/db:2", egress_images('services:\n  db: {"image": "ghcr.io/org/db:2"}\n'))
+            self.assertEqual(egress_images("services:\n  # cached: {image: ghcr.io/example/old:1}\n"), [])
 
     def test_invalid_image_reference_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
