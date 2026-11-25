@@ -100,6 +100,11 @@ def write_lifecycle(jobs, runs):
                                         {"kind": "build", "image": "metacodes-prebuild-1", "status": "built", "seconds": 30.4},
                                         {"kind": "pull", "image": "tb/regex-log", "status": "pulled", "seconds": 61.5,
                                          "shared": True}]}),
+        "cold__h": lifecycle_record("cold__h", started_at="2026-11-25T03:00:01Z",
+                                    prepare_started_at="2026-11-25T03:00:01Z"),
+        "broken__i": lifecycle_record("broken__i", **prepared, prepare={"status": "failed", "items": [
+            {"kind": "pull", "image": "tb/broken", "status": "failed", "seconds": 45.0, "attempts": 3,
+             "error": "manifest unknown"}]}),
     }
     ended = {
         "swe__f": lifecycle_record("swe__f", **prepared, started_at="2026-11-25T02:00:00Z",
@@ -186,17 +191,56 @@ class ProbeParserTest(unittest.TestCase):
             jobs, runs = Path(tmp) / "jobs", Path(tmp) / "runs"
             write_lifecycle(jobs, runs)
             counted = monitor_probe.lifecycle(str(jobs), str(runs))
-            self.assertEqual(counted, {"trials": 7, "hits": 2, "misses": 2, "failed": 1, "pulled": 1, "built": 1,
-                                       "pull_seconds": 61.5, "build_seconds": 30.4, "queued": 1, "preparing": 1,
-                                       "ready": 1})
+            self.assertEqual(counted, {"trials": 9, "hits": 2, "misses": 2, "failed": 2, "pulled": 1, "built": 1,
+                                       "pull_seconds": 61.5, "build_seconds": 30.4, "queued": 1, "preparing": 2,
+                                       "ready": 1, "unprepared": 1})
             self.assertEqual(monitor_probe.lifecycle(str(jobs), str(runs), cap=1)["trials"], 1)
             local = monitor_probe.lifecycle(str(jobs), None)
-            self.assertEqual((local["queued"], local["preparing"], local["ready"]), (2, 1, 1))
+            self.assertEqual((local["queued"], local["preparing"], local["ready"], local["unprepared"]), (2, 2, 1, 1))
             (jobs / "bench-ended" / "result.json").write_text('{"finished_at": "2026-11-25T03:30:00"}')
             self.assertEqual(monitor_probe.lifecycle(str(jobs), None)["queued"], 1)
             stale = monitor_probe.lifecycle(str(jobs), None, now=time.time() + 90000)
             self.assertEqual((stale["queued"], stale["preparing"], stale["ready"], stale["hits"]), (0, 0, 0, 2))
         self.assertEqual(monitor_probe.lifecycle(str(Path(tmp) / "gone"))["trials"], 0)
+
+    def test_a_trial_preparing_in_its_slot_counts_as_preparing_and_a_failed_preparation_is_not_ready(self):
+        stages = {
+            "cold start, holds its slot": ({"started_at": "t", "prepare_started_at": "t"}, {}, "preparing"),
+            "ahead of its turn": ({"prepare_started_at": "t"}, {}, "preparing"),
+            "ready": ({"prepare_started_at": "t", "prepare_finished_at": "t"}, {"status": "prepared"}, "ready"),
+            "found everything": ({"prepare_started_at": "t", "prepare_finished_at": "t"}, {"status": "present"}, "ready"),
+            "pull retries used up": ({"prepare_started_at": "t", "prepare_finished_at": "t"}, {"status": "failed"},
+                                     "unprepared"),
+            "nothing found to prepare": ({"prepare_started_at": "t", "prepare_finished_at": "t"},
+                                         {"status": "skipped"}, "unprepared"),
+            "not reached": ({}, {}, "queued"),
+            "running": ({"started_at": "t", "prepare_started_at": "t", "prepare_finished_at": "t"},
+                        {"status": "prepared"}, None),
+            "done": ({"started_at": "t", "prepare_started_at": "t", "finished_at": "t"}, {}, None),
+        }
+        for name, (record, prepare, expected) in stages.items():
+            with self.subTest(name=name):
+                self.assertEqual(monitor_probe.waiting_stage(record, prepare), expected)
+
+    def test_the_local_machine_leaves_out_jobs_that_ran_on_an_ssh_executor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs"
+            pulled = {"status": "prepared", "items": [{"kind": "pull", "image": "tb/x", "status": "pulled", "seconds": 5}]}
+            for job in ("ran-on-4090", "ran-here", "started-by-hand"):
+                directory = jobs / job / ".bench-lifecycle"
+                directory.mkdir(parents=True)
+                (directory / "a__1.json").write_text(json.dumps(lifecycle_record("a__1", prepare=pulled)))
+            records = jobs / ".bench-runs"
+            records.mkdir()
+            (records / "ran-on-4090.spec").write_text(json.dumps({"executor": {"name": "relay-4090", "kind": "ssh"}}))
+            (records / "ran-here.spec").write_text(json.dumps({"executor": {"name": "devbox-mac", "kind": "local"}}))
+            (records / "broken.spec").write_text("{not json")
+            self.assertEqual(monitor_probe.jobs_run_elsewhere(str(records)), {"ran-on-4090"})
+            everything = monitor_probe.lifecycle(str(jobs), None)
+            here = monitor_probe.lifecycle(str(jobs), None, records_dir=str(records))
+            self.assertEqual((everything["trials"], everything["pulled"], everything["queued"]), (3, 3, 3))
+            self.assertEqual((here["trials"], here["pulled"], here["queued"]), (2, 2, 2))
+            self.assertEqual(monitor_probe.jobs_run_elsewhere(str(Path(tmp) / "gone")), set())
 
 
 class ProbeCollectTest(unittest.TestCase):
@@ -314,8 +358,9 @@ class MonitorHttpTest(SetupFixture):
         self.assertEqual((download["routes"]["pypi"]["hit_rate"], download["routes"]["github"]["hit_rate"],
                           download["totals"]["hit_rate"]), (0.9, None, 0.9))
         images = value["caches"]["images"]
-        self.assertEqual((images["hits"], images["misses"], images["failed"], images["hit_rate"]), (2, 2, 1, 0.5))
-        self.assertEqual((images["queued"], images["preparing"], images["ready"]), (1, 1, 1))
+        self.assertEqual((images["hits"], images["misses"], images["failed"], images["hit_rate"]), (2, 2, 2, 0.5))
+        self.assertEqual((images["queued"], images["preparing"], images["ready"], images["unprepared"]), (1, 2, 1, 1))
+        self.assertIsNone(self.options_sent(self.probes()[0])["records_dir"])
         targets = {row["key"]: row for row in value["network"]["targets"]}
         self.assertEqual(sorted(targets), ["mirror.container.apt", "mirror.container.go", "mirror.docker.0", "mirror.ghcr",
                                            "mirror.pypi_index", "source.github", "source.pypi"])
@@ -386,6 +431,21 @@ class MonitorHttpTest(SetupFixture):
         self.assertIn("docker", value["docker"]["error"])
         self.assertEqual(value["caches"]["apt"]["answering"], False)
         self.assertEqual(value["mirrors"]["items"], [])
+        self.assertEqual(value["caches"]["images"]["trials"], 0)
+        synced = self.manager.jobs_dir / "synced-from-4090" / ".bench-lifecycle"
+        synced.mkdir(parents=True)
+        (synced / "a__1.json").write_text(json.dumps(lifecycle_record("a__1", prepare={"status": "prepared", "items": [
+            {"kind": "pull", "image": "tb/x", "status": "pulled", "seconds": 5}]})))
+        local = self.manager.jobs_dir / "ran-here" / ".bench-lifecycle"
+        local.mkdir(parents=True)
+        (local / "b__1.json").write_text(json.dumps(lifecycle_record("b__1", prepare={"status": "present", "items": [
+            {"kind": "pull", "image": "tb/y", "status": "present", "seconds": 0.1}]})))
+        self.manager.records.mkdir(parents=True, exist_ok=True)
+        (self.manager.records / "synced-from-4090.spec").write_text(json.dumps(
+            {"executor": {"name": "relay-4090", "kind": "ssh"}}))
+        with patch.object(monitor, "SNAPSHOT_SECONDS", 0):
+            images = self.client.request("api/monitor")["caches"]["images"]
+        self.assertEqual((images["trials"], images["hits"], images["misses"], images["pulled"]), (1, 1, 0, 0))
         viewer = server.make_server(Workbench(data.Library([self.manager.jobs_dir])), "127.0.0.1", 0)
         threading.Thread(target=viewer.serve_forever, daemon=True).start()
         self.addCleanup(viewer.server_close)
@@ -407,7 +467,7 @@ class MonitorHttpTest(SetupFixture):
         self.assertEqual(code, 0)
         self.assertIn("apt 缓存：命中 3 / 5（60%）", out.getvalue())
         self.assertIn("下载缓存：命中 900 / 1000（90%）", out.getvalue())
-        self.assertIn("镜像（本地镜像库）：命中 2 · 拉取或构建 2 · 失败 1 · 排队 1 · 准备中 1 · 就绪等待 1", out.getvalue())
+        self.assertIn("镜像（本地镜像库）：命中 2 · 拉取或构建 2 · 失败 2 · 排队 1 · 准备中 2 · 就绪等待 1 · 准备失败等待 1", out.getvalue())
 
 
 if __name__ == "__main__":

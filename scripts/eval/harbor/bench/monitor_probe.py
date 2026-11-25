@@ -18,6 +18,7 @@ DF_TYPES = {"Images": "images", "Containers": "containers", "Local Volumes": "vo
 APT_LOG_LIMIT = 64 * 1024 * 1024
 ROUTE_COUNTERS = ("requests", "hits", "misses", "stale", "errors", "bytes_cached", "bytes_fetched")
 PREPARED = {"present": "hits", "pulled": "misses", "built": "misses", "failed": "failed"}
+READY = ("present", "prepared")
 
 
 def read_text(path):
@@ -184,16 +185,50 @@ def job_active(jobs_dir, runs_dir, job, newest, now, window):
     return not finished and now - newest <= window
 
 
-def lifecycle(jobs_dir, runs_dir=None, cap=2000, now=None, window=86400):
+def jobs_run_elsewhere(records_dir):
+    elsewhere = set()
+    try:
+        entries = list(os.scandir(records_dir)) if records_dir else []
+    except OSError:
+        return elsewhere
+    for entry in entries:
+        if not entry.name.endswith(".spec") or not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            spec = json.loads(read_text(entry.path) or "null")
+        except ValueError:
+            continue
+        executor = spec.get("executor") if isinstance(spec, dict) else None
+        if isinstance(executor, dict) and executor.get("kind") == "ssh":
+            elsewhere.add(entry.name[:-len(".spec")])
+    return elsewhere
+
+
+def waiting_stage(record, prepare):
+    if record.get("finished_at"):
+        return None
+    if record.get("prepare_started_at") and not record.get("prepare_finished_at"):
+        return "preparing"
+    if record.get("started_at"):
+        return None
+    if not record.get("prepare_finished_at"):
+        return "queued"
+    return "ready" if prepare.get("status") in READY else "unprepared"
+
+
+def lifecycle(jobs_dir, runs_dir=None, cap=2000, now=None, window=86400, records_dir=None):
     now = time.time() if now is None else now
     result = {"trials": 0, "hits": 0, "misses": 0, "failed": 0, "pulled": 0, "built": 0,
-              "pull_seconds": 0.0, "build_seconds": 0.0, "queued": 0, "preparing": 0, "ready": 0}
+              "pull_seconds": 0.0, "build_seconds": 0.0, "queued": 0, "preparing": 0, "ready": 0, "unprepared": 0}
     files, newest = [], {}
     try:
         jobs = sorted(entry.name for entry in os.scandir(jobs_dir) if entry.is_dir(follow_symlinks=False))
     except OSError:
         return result
+    elsewhere = jobs_run_elsewhere(records_dir)
     for job in jobs:
+        if job in elsewhere:
+            continue
         try:
             entries = list(os.scandir(os.path.join(jobs_dir, job, ".bench-lifecycle")))
         except OSError:
@@ -225,13 +260,9 @@ def lifecycle(jobs_dir, runs_dir=None, cap=2000, now=None, window=86400):
             elif item["status"] == "built":
                 result["built"] += 1
                 result["build_seconds"] += seconds
-        if active.get(job) and not record.get("started_at") and not record.get("finished_at"):
-            if record.get("prepare_finished_at"):
-                result["ready"] += 1
-            elif record.get("prepare_started_at"):
-                result["preparing"] += 1
-            else:
-                result["queued"] += 1
+        stage = waiting_stage(record, prepare) if active.get(job) else None
+        if stage:
+            result[stage] += 1
     result["pull_seconds"] = round(result["pull_seconds"], 1)
     result["build_seconds"] = round(result["build_seconds"], 1)
     return result
@@ -358,7 +389,8 @@ def collect(options):
     sections, probes = {}, {}
     work = {"docker": lambda: docker_section(options.get("docker_usage", True)),
             "apt": lambda: apt_section(options), "download": lambda: download_section(options),
-            "images": lambda: lifecycle(options.get("jobs_dir") or "", options.get("runs_dir"))}
+            "images": lambda: lifecycle(options.get("jobs_dir") or "", options.get("runs_dir"),
+                                        records_dir=options.get("records_dir"))}
     threads = [threading.Thread(target=guarded, args=(sections, key, job), daemon=True) for key, job in work.items()]
     timeout = float(options.get("target_timeout") or 5)
     for key, url in sorted((options.get("targets") or {}).items()):
@@ -399,7 +431,7 @@ def collect(options):
 
 def main(argv):
     options = json.loads(argv[1])
-    for key in ("state_dir", "jobs_dir", "runs_dir"):
+    for key in ("state_dir", "jobs_dir", "runs_dir", "records_dir"):
         if options.get(key):
             options[key] = os.path.abspath(os.path.expanduser(options[key]))
     print(json.dumps(collect(options)))

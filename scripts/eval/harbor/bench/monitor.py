@@ -17,6 +17,7 @@ from scripts.eval.harbor.bench.executors import Executor, SshExecutor, shell_arg
 PROBE_SOURCE = Path(__file__).with_name("monitor_probe.py")
 APT_CACHE_CONTAINER = "metacodes-apt-cache"
 DOWNLOAD_CACHE_PORT = 3143
+RUN_RECORDS = ".bench-runs"
 SNAPSHOT_SECONDS = 10.0
 TARGET_SECONDS = 60.0
 USAGE_SECONDS = 600.0
@@ -75,6 +76,7 @@ def probe_options(executor: Executor, state_root: Path, jobs_dir: Path, targets:
         "state_dir": executor.state_dir if remote else str(state_root),
         "jobs_dir": executor.remote("jobs") if remote else str(jobs_dir),
         "runs_dir": executor.remote("runs") if remote else None,
+        "records_dir": None if remote else str(Path(jobs_dir) / RUN_RECORDS),
         "targets": targets, "target_timeout": TARGET_TIMEOUT, "docker_usage": docker_usage,
     }
 
@@ -247,5 +249,6 @@ def render(value: Dict) -> str:
     if not images.get("error"):
         lines.append(f"镜像（本地镜像库）：命中 {images.get('hits', 0)} · 拉取或构建 {images.get('misses', 0)}"
                      f" · 失败 {images.get('failed', 0)} · 排队 {images.get('queued', 0)}"
-                     f" · 准备中 {images.get('preparing', 0)} · 就绪等待 {images.get('ready', 0)}")
+                     f" · 准备中 {images.get('preparing', 0)} · 就绪等待 {images.get('ready', 0)}"
+                     f" · 准备失败等待 {images.get('unprepared', 0)}")
     return "\n".join(lines)

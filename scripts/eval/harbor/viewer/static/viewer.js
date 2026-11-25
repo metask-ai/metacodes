@@ -1983,7 +1983,7 @@ function cachesPanel(m) {
   const imagesBody = images.error ? h('span', { class: 'probe bad', text: '读取失败：' + images.error }) : !images.trials ? h('span', { class: 'muted', text: '暂无数据（还没有评测记录题目的准备过程）' }) : h('dl', { class: 'kv' },
     h('dt', { text: '命中率' }), h('dd', { text: prepared ? hitText(images.hit_rate, images.hits, (images.hits || 0) + (images.misses || 0)) : '暂无镜像准备记录' }),
     h('dt', { text: '未命中' }), h('dd', { text: `拉取 ${int(images.pulled)} 个（${dur(images.pull_seconds)}） · 构建 ${int(images.built)} 个（${dur(images.build_seconds)}） · 失败 ${int(images.failed)} 个` }),
-    h('dt', { text: '现在' }), h('dd', { text: `排队 ${int(images.queued)} · 准备中 ${int(images.preparing)} · 已就绪等待 ${int(images.ready)}` }),
+    h('dt', { text: '现在' }), h('dd', { text: `排队 ${int(images.queued)} · 准备中 ${int(images.preparing)}（含已排到、占着名额继续准备的） · 已就绪等待 ${int(images.ready)} · 准备失败等待 ${int(images.unprepared || 0)}` }),
     h('dt', { text: '统计范围' }), h('dd', { text: `最近 ${int(images.trials)} 次 trial 的准备记录` }));
   const block = (title, note, stateNode, body) => h('div', { class: 'cache-block' }, h('h3', {}, title, h('small', { text: note })), stateNode, body);
   return panel('缓存', '先查缓存，未命中才回源', h('div', { class: 'panel-body cache-blocks' },
