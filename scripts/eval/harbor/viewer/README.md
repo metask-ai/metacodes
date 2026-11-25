@@ -19,6 +19,7 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 | 创建作业 `#/new` | executor, metacodes version and advanced features (the profile), models, several suites and their tasks, attempts (concurrency is set on the profile page); the start button stays at the bottom of the window |
 | 系统配置 `#/settings` | database selection and migration, model providers and Metask account login |
 | 评测结果 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
+| 监控 `#/monitor[/<executor>]` | one execution machine: CPU, load, memory, disks, network rate, reachability of the sources and configured mirrors, the mirror settings (editable), Docker's images and build cache, and the hit rates of the apt cache, the download cache and the local image store |
 | trial `#/job/<job>/<trial>` | per-request token distribution and context composition, time split (model / tools / other) and per-tool timing, verifier tests, the whole trajectory with each call's execution time, verifier output and metacodes stderr |
 | 对比 `#/compare/<job>,<job>` | the same tasks across jobs (models), the pass rate on tasks every job scored |
 | 榜单 `#/leaderboard/<suite>` | published results of other agents and models on the suite, with this workbench's jobs ranked among them |
@@ -57,4 +58,4 @@ has no login (internal network); POSTs with a foreign browser `Origin` are
 refused, and a service without `--config` is read-only. Contract tests are
 `scripts/eval/tests/test_harbor_viewer.py`, `test_bench_workbench.py`,
 `test_bench_store.py`, `test_bench_suites.py`, `test_bench_setup.py`,
-`test_bench_profiles.py` and `test_bench_providers.py`.
+`test_bench_profiles.py`, `test_bench_providers.py` and `test_bench_monitor.py`.
