@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -348,6 +349,9 @@ class BaseTest(unittest.TestCase):
 
 class MigrationBaselineTest(unittest.TestCase):
     def setUp(self):
+        stdout = mock.patch.object(sys, "stdout", new_callable=io.StringIO)
+        stdout.start()
+        self.addCleanup(stdout.stop)
         self.root = Path(self.enter_temp())
         previous = Path.cwd()
         os.chdir(self.root)
@@ -419,7 +423,7 @@ class MigrationBaselineTest(unittest.TestCase):
         self.head.write_text(self.head.read_text().replace('zig:one\tsrc.suite\tpass\t1\n', ''))
         self.stamp_head()
         self.assertEqual(baseline.compare(self.args), 1)
-        self.assertIn('zig:one', Path(os.environ['GITHUB_STEP_SUMMARY']).read_text())
+        self.assertIn('zig:one', Path(os.environ['GITHUB_STEP_SUMMARY']).read_text(encoding='utf-8'))
 
     def test_failed_replay_missing_shard_wrong_tree_and_partial_scope_fail(self):
         with mock.patch.dict(os.environ, REPLAY_RESULT='failure'), self.assertRaisesRegex(ValueError, 'collection failed'):
