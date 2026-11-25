@@ -317,7 +317,7 @@ class ProfileManager:
                     run_request["max_tokens"] = request["max_tokens"]
                 label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
                 planned.append(self.planned(target, run_request, request.get("executor"), label))
-        return self.append(target, name, planned)
+        return self.append(target, name, planned, at_profile_concurrency=True)
 
     def launch_now(self, request: Any) -> Dict[str, Any]:
         """One dataset started at once, on the profile of the configured
@@ -393,26 +393,25 @@ class ProfileManager:
                 "request": run_request, "route": checked["route"], "status": "pending", "run": None,
                 "error": None, "queued_at": None, "started_at": None, "finished_at": None}
 
-    def append(self, target, name, planned) -> Dict[str, Any]:
+    def append(self, target, name, planned, at_profile_concurrency=False) -> Dict[str, Any]:
         with self.lock:
-            record = self._append(target, name, planned)
+            record = self._append(target, name, planned, at_profile_concurrency)
         self.wake()
         return record
 
-    def _append(self, target, name, planned) -> Dict[str, Any]:
+    def _append(self, target, name, planned, at_profile_concurrency=False) -> Dict[str, Any]:
         if target["id"] is None:
             metacodes = freeze(target["choice"], self.runs.config_path)
             git = builds.provenance(target["choice"]["path"])
             if git:
                 metacodes["git"] = git
             target = {"id": profile_id(metacodes["digest"], target["features"]), "metacodes": metacodes,
-                      "features": target["features"], "concurrency": target.get("concurrency")}
+                      "features": target["features"]}
         record = self.get(target["id"])
         if record is None:
             record = {"id": target["id"], "name": name, "status": "finished", "created_at": now(),
                       "started_at": None, "finished_at": None, "metacodes": target["metacodes"],
                       "features": target["features"], "items": [], "cancel_requested": False,
-                      "concurrency": target.get("concurrency") or DEFAULT_CONCURRENCY,
                       "url": "/#/profile/" + target["id"]}
         elif record["status"] == "cancelling":
             raise ValueError("评测配置正在停止，请等它停止后再运行")
@@ -420,8 +419,11 @@ class ProfileManager:
             record["name"] = name
         if record["status"] not in PROFILE_ACTIVE:
             record.update(status="queued", cancel_requested=False, finished_at=None)
+        concurrency = pin_concurrency(record)
         queued = now()
         for item in planned:
+            if at_profile_concurrency:
+                item = at_concurrency(item, concurrency)
             record["items"].append({**item, "queued_at": queued})
         self.save(record)
         return record
@@ -552,8 +554,7 @@ class ProfileManager:
             item["auto_rerun_error"] = f"读取结果失败，没有自动重跑无效的题：{exc}"
             return
         if tasks:
-            record["items"].append({**rerun(item, tasks, next_round, profile_concurrency(record)),
-                                    "queued_at": now()})
+            record["items"].append({**rerun(item, tasks, next_round, pin_concurrency(record)), "queued_at": now()})
 
     # -------------------------------------------------------------- scheduler
 
@@ -674,6 +675,7 @@ class ProfileManager:
                     for item in batch.get("items") or []:
                         record["items"].append({**item, "model": batch.get("model"), "attempts": batch.get("attempts"),
                                                 "executor": batch.get("executor"), "queued_at": batch.get("created_at")})
+                    pin_concurrency(record)
                     record["started_at"] = record.get("started_at") or batch.get("started_at")
                     record["finished_at"] = max(filter(None, (record.get("finished_at"), batch.get("finished_at"))),
                                                 default=None)
@@ -694,13 +696,8 @@ def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int, concurrency: 
     `concurrency`; `auto_round` counts the automatic reruns of invalid tasks
     it descends from (0: asked for)."""
     again = {key: value for key, value in item.items() if key not in ("waiting", "auto_rerun", "auto_rerun_error")}
-    try:
-        applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
-    except ValueError:  # a suite no longer listed: its launch reports that
-        applied = concurrency
-    again.update(tasks=list(tasks), concurrency=applied,
-                 request={**item["request"], "tasks": list(tasks), "concurrency": applied}, status="pending",
-                 run=None, error=None, started_at=None, finished_at=None)
+    again = at_concurrency({**again, "request": {**item["request"], "tasks": list(tasks)}}, concurrency)
+    again.update(tasks=list(tasks), status="pending", run=None, error=None, started_at=None, finished_at=None)
     if auto_round:
         again["auto_rerun"] = auto_round
     return again
@@ -718,6 +715,19 @@ def runs_of(record: Dict[str, Any], receipts: List[Dict[str, Any]]) -> List[str]
     names = {item.get("run") for item in record.get("items") or []}
     names |= {r.get("name") for r in receipts if r.get("profile") in owners or r.get("batch") in owners}
     return sorted(n for n in names if isinstance(n, str) and data.NAME.fullmatch(n))
+
+
+def at_concurrency(item: Dict[str, Any], concurrency: int) -> Dict[str, Any]:
+    try:
+        applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
+    except ValueError:  # a suite no longer listed: its launch reports that
+        applied = concurrency
+    return {**item, "concurrency": applied, "request": {**item["request"], "concurrency": applied}}
+
+
+def pin_concurrency(record: Dict[str, Any]) -> int:
+    record["concurrency"] = profile_concurrency(record)
+    return record["concurrency"]
 
 
 def profile_concurrency(record: Dict[str, Any]) -> int:
