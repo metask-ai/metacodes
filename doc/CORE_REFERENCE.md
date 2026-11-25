@@ -63,7 +63,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `base` | `util/` · `platform/` · `symbols/` · `highlight/` · `code/` · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
 | `ai` | `api/`(`model_name` 除外) · `provider/` · `client` · `types` · `json` · `preview` · `core/` 里的 `auth` · `recorder` · `context_pressure` | base |
 | `kernel` | `core/` 里的 `conversation` · `message` · `session_id` · `result_budget` | base、ai |
-| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `protocol/` 里 `PermissionContext` 的字段用到的 `ui_event` · `ui_request` · `permission_choice` · `tools/` 里的 `common` · `observation` · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
+| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `protocol/` 里 `PermissionContext` 的字段用到的 `ui_event` · `ui_request` · `permission_choice`,以及 `ui_event` 载荷用到的 `goal` · `output_semantics` · `tools/` 里的 `common` · `observation` · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
 | `coding` | `core/` 其余文件(含 `agent_loop` · `tool_exec` · `protocol/` 其余文件) · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `sandbox/filesystem` · `formal/task_audit` · `api/model_name_consumers_test` | 以上各包 |
 | `session` | `core/agent_session` · `core/session_host` | 以上各包 |
 | `teamwork` | `teamwork/` | 以上各包 |
@@ -135,10 +135,10 @@ provider 配置的类型)和 `core/auth.zig`、`core/recorder.zig`、`core/conte
 引用改成私有常量,`tools/read_artifact.zig` 里的测试保证两者相等)。`code/`(QuickJS 引擎的 Zig 包装,只依赖 std)改归 `base`。
 `protocol/` 里 `ui_event`、`ui_request`、`permission_choice` 是 `PermissionContext` 公开字段的类型,改归 `coding` 会让 `guard`
 新增越层边,所以归 `guard`;`AskQuestion`、`AskOption` 挪到 `ui_request.zig` 定义,`tools/context.zig` 用别名保留,`ui_request`
-不再依赖 `tools/context`。路径、Zig API 快照、测试 ID 都不变。越层 import 94 → 5,深层 import 1799,kernel 3264 行,依赖 base、ai、coding。
-包间环 kernel、guard、coding 还在,剩下的 5 条越层边都卡在 Zig API 快照里的公开类型上:`conversation → result_projection` 1 条
-(`Conversation` 的 microcompact、截断等公开方法要认得 artifact 信封),`ui_event → file_change`、`file_reference`、`goal`、
-`output_semantics` 4 条(`CoreEvent` 的载荷类型)。在 3.2 抽最小循环时一并处理。
+不再依赖 `tools/context`;`ui_event` 载荷用到的 `goal`、`output_semantics` 的 import 闭包都在 guard 及以下,也归 `guard`。路径、Zig API 快照、测试 ID 都不变。越层 import 94 → 3,深层 import 1803,kernel 3264 行,依赖 base、ai、coding。
+包间环 kernel、guard、coding 还在,剩下的 3 条越层边都卡在 Zig API 快照里的公开类型上:`conversation → result_projection` 1 条
+(`Conversation` 的 microcompact、截断等公开方法要认得 artifact 信封),`ui_event → file_change`、`file_reference` 2 条(`CoreEvent` 的载荷类型,
+两者都以 `ToolContext` 为参数)。在 3.2 抽最小循环时一并处理。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。
