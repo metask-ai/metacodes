@@ -43,6 +43,53 @@ pub fn local(unix_seconds: i64) ?LocalZone {
     };
 }
 
+pub const min_offset_minutes: i32 = -14 * 60;
+pub const max_offset_minutes: i32 = 14 * 60;
+
+pub fn boundedLocal(unix_seconds: i64) ?LocalZone {
+    const zone = local(unix_seconds) orelse return null;
+    if (zone.offset_minutes < min_offset_minutes or zone.offset_minutes > max_offset_minutes) return null;
+    return zone;
+}
+
+pub const CivilDate = struct {
+    year: i32,
+    month: u8,
+    day: u8,
+    weekday: u3,
+};
+
+/// The calendar date at `unix_seconds` in a zone `offset_minutes` east of UTC.
+pub fn civilDate(unix_seconds: i64, offset_minutes: i32) CivilDate {
+    const local_seconds = unix_seconds + @as(i64, offset_minutes) * 60;
+    const days = @divFloor(local_seconds, std.time.s_per_day);
+    // Civil-from-days (Howard Hinnant), valid on both sides of 1970.
+    const z = days + 719_468;
+    const era = @divFloor(z, 146_097);
+    const doe: i64 = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const day: i64 = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const month: i64 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = yoe + era * 400 + @as(i64, if (month <= 2) 1 else 0);
+    // 1970-01-01 was a Thursday.
+    const weekday: u3 = @intCast(@mod(days + 4, 7));
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(month),
+        .day = @intCast(day),
+        .weekday = weekday,
+    };
+}
+
+/// `UTC+08:00`, `UTC-05:30`, `UTC+00:00`.
+pub fn formatOffset(buf: *[9]u8, offset_minutes: i32) []const u8 {
+    const sign: u8 = if (offset_minutes < 0) '-' else '+';
+    const magnitude: u32 = @abs(offset_minutes);
+    return std.fmt.bufPrint(buf, "UTC{c}{d:0>2}:{d:0>2}", .{ sign, magnitude / 60, magnitude % 60 }) catch unreachable;
+}
+
 // ── POSIX ─────────────────────────────────────────────────────────────────
 
 /// `struct tm` with the BSD/glibc/musl `tm_gmtoff` and `tm_zone` members, on

@@ -25,7 +25,6 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const util_time = @import("time.zig");
 const log = @import("log.zig");
-const read_state = @import("../core/read_state.zig");
 
 const is_windows = @import("builtin").os.tag == .windows;
 
@@ -179,7 +178,7 @@ const Observation = struct {
 ///   等待者数 × 读窗口的碰撞概率与实测吻合)。mtime 语义等价:tryCreate 创建即写。
 fn observe(path: [*:0]const u8) ?Observation {
     if (is_windows) {
-        const st = read_state.statPath(std.mem.span(path)) catch return null;
+        const st = pfs.statPath(std.mem.span(path)) catch return null;
         return .{
             .record = .{ .mtime_ns = st.mtime_ns, .size = st.size },
             .held_ms = @divTrunc(st.mtime_ns, std.time.ns_per_ms),
@@ -188,7 +187,7 @@ fn observe(path: [*:0]const u8) ?Observation {
     const fd = pfs.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
     if (fd < 0) return null;
     defer pfs.close(fd);
-    const st = read_state.statFd(fd) catch return null;
+    const st = pfs.statFd(fd) catch return null;
     var record: Record = .{ .mtime_ns = st.mtime_ns, .size = st.size };
     const n = pfs.read(fd, &record.content);
     record.content_len = if (n > 0) @intCast(n) else 0;
@@ -268,7 +267,7 @@ fn readLockPid(lock: *Lock) ?i64 {
 
 /// 锁文件 mtime(wall 毫秒)。stat 失败(文件已消失等)→ null。
 fn lockMtimeMs(lock: *Lock) ?i128 {
-    const st = read_state.statPath(lock.lock_path[0..lock.lock_path_len]) catch return null;
+    const st = pfs.statPath(lock.lock_path[0..lock.lock_path_len]) catch return null;
     return @divTrunc(@as(i128, st.mtime_ns), 1_000_000);
 }
 

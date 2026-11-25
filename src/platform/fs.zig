@@ -503,6 +503,91 @@ extern "kernel32" fn GetFileTime(
     lpLastWriteTime: ?*std.os.windows.FILETIME,
 ) callconv(.winapi) c_int;
 
+// Windows 路径 stat(对目录也有效)。
+const WIN32_FILE_ATTRIBUTE_DATA = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: [2]u32,
+    ftLastAccessTime: [2]u32,
+    ftLastWriteTime: [2]u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+};
+extern "kernel32" fn GetFileAttributesExW(lpFileName: [*:0]const u16, fInfoLevelId: i32, lpFileInformation: *WIN32_FILE_ATTRIBUTE_DATA) callconv(.winapi) c_int;
+
+pub const StatInfo = struct { mtime_ns: i128, size: u64 };
+
+/// 从 fd stat 出 mtime_ns 和 size。
+/// Linux：std.c.fstat 为 void，必须走 statx。
+/// macOS/BSD：std.c.Stat 可用，直接 fstat。
+pub fn statFd(fd: Fd) !StatInfo {
+    if (is_windows) {
+        var st: Stat64 = undefined;
+        if (_fstat64(fd, &st) != 0) return error.StatFailed;
+        return .{ .mtime_ns = @as(i128, st.st_mtime) * std.time.ns_per_s, .size = @intCast(st.st_size) };
+    }
+    if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        const empty_path: [*:0]const u8 = "";
+        // AT_EMPTY_PATH（0x1000）让 statx 对 fd 本身 stat
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        const rc = std.os.linux.statx(fd, empty_path, AT_EMPTY_PATH, std.os.linux.STATX.BASIC_STATS, &stx);
+        if (@as(isize, @bitCast(rc)) < 0) return error.StatFailed;
+        const sec: i128 = @intCast(stx.mtime.sec);
+        const nsec: i128 = @intCast(stx.mtime.nsec);
+        return .{ .mtime_ns = sec * std.time.ns_per_s + nsec, .size = stx.size };
+    } else {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
+        const mt = st.mtime();
+        const sec: i128 = @intCast(mt.sec);
+        const nsec: i128 = @intCast(mt.nsec);
+        return .{
+            .mtime_ns = sec * std.time.ns_per_s + nsec,
+            .size = @intCast(st.size),
+        };
+    }
+}
+
+/// 从 path 打开并 stat；caller 不需要 fd 时用这个。
+pub fn statPath(path: []const u8) !StatInfo {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return error.PathTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&buf);
+
+    if (is_windows) {
+        // **GetFileAttributesExW 而非 open+fstat**:Windows _open 打不开目录 → 对目录路径
+        // (Grep/Glob 的搜索目录参数)会误判 StatFailed。GetFileAttributesEx 对文件/目录都работает。
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return error.StatFailed;
+        if (wlen >= wbuf.len) return error.StatFailed;
+        wbuf[wlen] = 0;
+        var data: WIN32_FILE_ATTRIBUTE_DATA = undefined;
+        if (GetFileAttributesExW(@ptrCast(&wbuf), 0, &data) == 0) return error.StatFailed;
+        // FILETIME(100ns since 1601)→ unix ns
+        const ticks: i128 = (@as(i128, data.ftLastWriteTime[1]) << 32) | @as(i128, data.ftLastWriteTime[0]);
+        const mtime_ns = (ticks - 116_444_736_000_000_000) * 100;
+        const size: u64 = (@as(u64, data.nFileSizeHigh) << 32) | @as(u64, data.nFileSizeLow);
+        return .{ .mtime_ns = mtime_ns, .size = size };
+    }
+    if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        const AT_FDCWD: std.c.fd_t = -100;
+        const rc = std.os.linux.statx(AT_FDCWD, path_z, 0, std.os.linux.STATX.BASIC_STATS, &stx);
+        if (@as(isize, @bitCast(rc)) < 0) return error.StatFailed;
+        const sec: i128 = @intCast(stx.mtime.sec);
+        const nsec: i128 = @intCast(stx.mtime.nsec);
+        return .{ .mtime_ns = sec * std.time.ns_per_s + nsec, .size = stx.size };
+    } else {
+        // macOS arm64: std.c.stat 绑定缺失（private.stat 未声明）。改为 open + fstat。
+        const fd = open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.StatFailed;
+        defer _ = close(fd);
+        return statFd(fd);
+    }
+}
+
 /// 禁止 fd 穿过后续 exec 边界。POSIX 用 FD_CLOEXEC；Windows 清底层 HANDLE 的
 /// HANDLE_FLAG_INHERIT，避免 bInheritHandles=TRUE 的工具子进程拿到可信 artifact fd。
 pub fn makeCloseOnExec(fd: Fd) error{CloseOnExecFailed}!void {
