@@ -39,6 +39,7 @@ import tarfile
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple, Union
@@ -1735,16 +1736,31 @@ class RemoteRun:
 RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]*$")
 
 
-def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = None) -> Dict:
+def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = None, *, store_config=None) -> Dict:
     """Retry a worker summary or finish an existing historical mirror."""
     from scripts.eval.harbor.store.ingest import root_lock
     if not isinstance(name, str) or not RUN_NAME.fullmatch(name):
         raise ValueError("运行名称无效")
     with root_lock(Path(jobs_dir)):
-        return _sync_run(Path(jobs_dir), name, log, timeout)
+        return _sync_run(Path(jobs_dir), name, log, timeout, store_config)
 
 
-def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
+def _has_archived_mirror(local, store_config, spec):
+    from scripts.eval.harbor.store import config
+    from scripts.eval.harbor.store.backend import Store
+    if store_config is None:
+        if not spec.get("store"):
+            return False
+        store_config = config.parse(spec["store"], local.parent)
+    if isinstance(store_config, config.SqliteConfig) and not store_config.path.is_file():
+        return False
+    with closing(Store(store_config)) as store, store.read() as tx:
+        return tx.one("SELECT 1 FROM jobs WHERE name = ? AND source_dir = ? "
+                      "AND NOT EXISTS (SELECT 1 FROM worker_jobs WHERE job = jobs.name)",
+                      (local.name, str(local.resolve()))) is not None
+
+
+def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float], store_config) -> Dict:
     from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json
     records = Path(jobs_dir) / ".bench-runs"
     record_path, spec_path = records / (name + ".json"), records / (name + ".spec")
@@ -1762,7 +1778,15 @@ def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
     local = jobs_dir / name
     response = {"name": name, "executor": remote.executor.name}
     timeout = RemoteRun.FINAL_SYNC_TIMEOUT if timeout is None else timeout
-    if not (record.get("result_owner") or spec.get("result_owner")) and local.is_dir():
+    legacy_files = not (record.get("result_owner") or spec.get("result_owner")) and local.is_dir()
+    archived = not (spec.get("result_owner") or legacy_files) and _has_archived_mirror(local, store_config, spec)
+    if archived and not local.exists() and not record.get("remote_results"):
+        if "result_owner" in record or "worker_summary" in record:
+            record.pop("result_owner", None)
+            record.pop("worker_summary", None)
+            atomic_json(record_path, record)
+        return {**response, "status": record.get("status"), "archived": True}
+    if archived or legacy_files:
         if local.is_symlink():
             raise ValueError("历史镜像目录无效")
         mirror = JobSync(remote.executor, remote.remote_job_dir, local, log=log)
@@ -1773,6 +1797,8 @@ def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
             if not mirror.sync():
                 time.sleep(1)
         response.update(local_dir=str(local), files=mirror.files)
+        record.pop("result_owner", None)
+        record.pop("worker_summary", None)
     else:
         problem = "；".join(reach_reasons(remote.executor, probe(remote.executor)))
         if problem:

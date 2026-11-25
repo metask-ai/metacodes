@@ -821,6 +821,8 @@ refreshing a session login, then
    If delivery fails, the receipt identifies the executor and job directory.
    `metacodes bench sync --run NAME` retries delivery. An older SSH run with
    an existing manager-side mirror verifies and repairs its files in place.
+   If the manager has already archived the completed mirror in its active
+   database and cleared the directory, sync keeps the archive readable offline.
    An older receipt without a mirror can fetch a summary from an upgraded worker.
 
 Suites on an SSH executor: a `harbor-registry` suite is always downloaded on
@@ -1708,7 +1710,9 @@ the manager receipt. Expanding the execution log reads the worker's Harbor
 output even if startup failed before the first result. Historical jobs already copied back are
 read from their existing store. Deleting a worker-owned job from the manager
 removes its manager record and aggregates and preserves the worker's files
-and detail records.
+and detail records. On the worker, `bench list --jobs-dir <executor state_dir>/jobs`
+lists the originals in that directory, including jobs whose manager uses a separate
+database. A deleted manager entry stays hidden in that manager's jobs directory.
 
 The layout on the machine that owns the data is:
 

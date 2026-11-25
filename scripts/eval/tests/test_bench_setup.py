@@ -1137,6 +1137,40 @@ class SshRunTest(SetupFixture):
         self.assertFalse(local.exists())
         self.assertTrue(original.is_dir())
 
+    def test_manual_sync_preserves_a_database_only_historical_mirror(self):
+        manager, client, _ = self.prepare_remote()
+        name = client.request("api/runs", self.request())["name"]
+        self.assertEqual(wait_run(manager, name)["status"], "finished")
+        original = self.remote_home / ".metacodes-bench/jobs" / name
+        local = manager.jobs_dir / name
+        shutil.copytree(original, local)
+        for suffix in (".spec", ".json"):
+            path = manager.records / (name + suffix)
+            old = json.loads(path.read_text())
+            old.pop("result_owner")
+            old.pop("worker_summary", None)
+            if suffix == ".spec":
+                old["store"] = {"backend": "sqlite", "path": str(self.root / "retired.sqlite3")}
+            atomic_json(path, old)
+        self.assertEqual(client.request("api/job?name=" + name)["rows"][0]["status"], "pass")
+        shutil.rmtree(local)
+        with patch.object(executors, "probe", side_effect=AssertionError("unexpected SSH probe")), \
+                patch("scripts.eval.harbor.bench.results.request", side_effect=AssertionError("unexpected worker read")):
+            for attempt in range(2):
+                if attempt:
+                    receipt = manager.records / (name + ".json")
+                    atomic_json(receipt, {**json.loads(receipt.read_text()), "result_owner": "relay-4090"})
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(cli.main(["--state-root", str(self.state), "sync", "--run", name, "--json"]), 0)
+                self.assertTrue(json.loads(output.getvalue())["archived"])
+                self.assertFalse(local.exists())
+                self.assertEqual(client.request("api/trial?job=" + name + "&trial=fix-git__fake")["row"]["status"], "pass")
+            client.request("api/job/delete", {"name": name})
+            self.assertEqual(client.request("api/jobs")["jobs"], [])
+            self.assertEqual(client.request("api/store")["counts"]["trials"], 0)
+        self.assertTrue((original / "fix-git__fake/result.json").is_file())
+
     def test_container_mirrors_reach_harbor_as_a_compose_overlay(self):
         manager, client, _ = self.prepare_remote()
         cfg = self.cfg()

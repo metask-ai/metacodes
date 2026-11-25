@@ -6,6 +6,7 @@ store and the page API are read back over HTTP. No provider or Docker calls.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -578,6 +579,9 @@ class ProfileTest(unittest.TestCase):
         self.assertTrue((self.manager.jobs_dir / name / 'result.json').is_file())
         self.assertEqual(self.client.request('api/store')['counts']['trials'], 1)
         self.assertEqual(self.client.request('api/jobs')['jobs'], [])
+        with contextlib.closing(workbench_module.open_local(self.workbench.library.store.config, self.manager.jobs_dir)) as reopened:
+            self.assertEqual(reopened.overview(), [])
+            self.assertIsNone(reopened.job(name))
 
     def test_deleting_a_job_removes_its_run_files_and_rows_and_keeps_its_profile(self):
         record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])

@@ -698,6 +698,26 @@ class CliTest(StoreCase):
             code = cli.main(["--state-root", str(self.temp / "state"), *argv])
         return code, output.getvalue()
 
+    def test_worker_list_reads_its_original_jobs_without_manager_receipts(self):
+        job = _job(self.root, "worker-run", "model", planned=1)
+        _trial(job, "task__one", reward=1)
+        config = store_config.SqliteConfig(self.temp / "state/bench/bench.sqlite3")
+        with contextlib.closing(Store(config)) as store:
+            ingest.ingest_job(store, job)
+            with store.transaction() as tx:
+                tx.execute("INSERT INTO worker_jobs (job, log_tail, ingested_at) VALUES (?, '', ?)",
+                           (job.name, FIXED.isoformat()))
+        other = self.temp / "other-jobs"
+        other.mkdir()
+        for root, names in ((self.root, [job.name]), (other, [])):
+            code, output = self.bench("list", "--jobs-dir", str(root), "--json")
+            self.assertEqual(code, 0, output)
+            self.assertEqual([view["name"] for view in json.loads(output)["jobs"]], names)
+            with contextlib.closing(cli.open_local(config, root)) as bench:
+                self.assertEqual([view["name"] for view in bench.jobs()["jobs"]], names)
+                self.assertEqual(bool(bench.job(job.name)), bool(names))
+                self.assertEqual(bool(bench.trial(job.name, "task__one")), bool(names))
+
     def test_db_import_status_migrate_switch_and_list(self):
         frozen_time(self)
         build_fixture(self.root)

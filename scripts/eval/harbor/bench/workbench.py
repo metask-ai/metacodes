@@ -22,7 +22,7 @@ from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.store import migrate as migration
 from scripts.eval.harbor.store.backend import Store, open_ephemeral
-from scripts.eval.harbor.store.library import StoreLibrary
+from scripts.eval.harbor.store.library import HIDDEN_WORKER_JOBS, StoreLibrary
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[4]
 READ_ONLY = "当前服务为只读模式"
@@ -586,6 +586,9 @@ class Workbench:
                 receipts = []
             for run in runs:
                 if run in worker_jobs:
+                    hidden = manager.records / HIDDEN_WORKER_JOBS
+                    hidden.mkdir(parents=True, exist_ok=True)
+                    (hidden / run).touch()
                     continue
                 try:
                     shutil.rmtree(manager.jobs_dir / run)

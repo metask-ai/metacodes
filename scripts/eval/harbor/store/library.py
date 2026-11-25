@@ -18,6 +18,8 @@ from scripts.eval.harbor.store import ingest
 from scripts.eval.harbor.store.backend import Store
 from scripts.eval.harbor.bench import data
 
+HIDDEN_WORKER_JOBS = ".hidden-worker-jobs"
+
 
 def _refresh(row: Dict[str, Any], moment: dt.datetime) -> Dict[str, Any]:
     return data.refresh_running(row, moment)
@@ -153,13 +155,21 @@ class StoreLibrary:
         return detail
 
     def worker_only(self, name=None):
-        query = "SELECT job FROM worker_jobs WHERE NOT EXISTS (SELECT 1 FROM runs WHERE name = worker_jobs.job)"
+        query = ("SELECT w.job, j.source_dir FROM worker_jobs w JOIN jobs j ON j.name = w.job "
+                 "WHERE NOT EXISTS (SELECT 1 FROM runs WHERE name = w.job)")
         args = []
         if name is not None:
-            query += " AND job = ?"
+            query += " AND w.job = ?"
             args.append(name)
         with self.store.read() as tx:
-            return {job for job, in tx.query(query, args)}
+            rows = tx.query(query, args)
+        hidden = set()
+        for job, source in rows:
+            path = Path(source)
+            if (path.name != job or path.parent not in self.roots or not ingest.is_job_dir(path)
+                    or (path.parent / ".bench-runs" / HIDDEN_WORKER_JOBS / job).exists()):
+                hidden.add(job)
+        return hidden
 
     def _protected_jobs(self, jobs, receipts):
         with self.store.read() as tx:
