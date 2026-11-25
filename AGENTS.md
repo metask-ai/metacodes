@@ -132,6 +132,12 @@ These rules apply to the entire repository.
 
 ## Preview features
 
+Preview is for new harness capability: what the agent can do or what reaches
+the model or a host (tools, prompts, protocols, run gates, Teamwork). A
+user-experience change to the CLI or TUI, such as input, rendering, terminal
+integration or copy and paste, is not a preview feature: it ships enabled,
+without a switch.
+
 Every preview feature has its own switch; there is no umbrella flag to hide a
 new feature behind. Users pick features one by one with
 `--preview=<list>` / `--no-preview=<list>` or a root `"preview"` object in

@@ -166,8 +166,8 @@ first would have to come with a change to this record.
 
 ### Copy on select
 
-With the `copy_on_select` preview feature, `screen_mirror` keeps a copy of
-the main screen: the Renderer's `flush`, the command output and the region
+While the TUI reports the mouse (macOS and Linux), `screen_mirror` keeps a
+copy of the main screen: the Renderer's `flush`, the command output and the region
 dialogs feed it the bytes they write, and it applies the subset of VT the
 REPL sends. It writes nothing. A drag asks for the cursor position
 (`ESC[6n`) and sends the copied text as OSC 52, both through

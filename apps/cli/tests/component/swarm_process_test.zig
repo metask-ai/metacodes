@@ -283,7 +283,7 @@ test "L2: lead LSP and preview settings reach the teammate process" {
     const Features = cc.types_mod.PreviewFeatures;
     for ([_]struct { lsp: bool, preview: Features, flag: ?[]const u8 }{
         .{ .lsp = true, .preview = .none, .flag = null },
-        .{ .lsp = true, .preview = .all, .flag = "--preview=execute_code,teamwork,comment_guard,copy_on_select" },
+        .{ .lsp = true, .preview = .all, .flag = "--preview=execute_code,teamwork,comment_guard" },
         .{ .lsp = false, .preview = .none, .flag = null },
         .{ .lsp = false, .preview = .{ .comment_guard = true }, .flag = "--preview=comment_guard" },
     }) |scenario| {

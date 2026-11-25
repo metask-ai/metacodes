@@ -1901,7 +1901,7 @@ pub fn main(init: std.process.Init) !void {
         break :app try app_mod.App.initWithOptions(gpa, init.io, config, api_key, init_options);
     };
     defer app.deinit();
-    if (interactive_tui) @import("repl/tui/copy_select.zig").enable(app.config.preview.features().copy_on_select, 2);
+    if (interactive_tui) @import("repl/tui/copy_select.zig").enable(2);
 
     app.installSigintHandler() catch |err| {
         repl.stopSplash(splash);
@@ -5833,7 +5833,7 @@ fn printHelp() void {
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
-        \\  --preview             Enable every preview feature: execute_code, teamwork, comment_guard, copy_on_select
+        \\  --preview             Enable every preview feature: execute_code, teamwork, comment_guard
         \\  --no-preview          Disable every preview feature, overriding config.json
         \\  --preview=<list>      Enable the listed preview features, e.g. --preview=execute_code,teamwork
         \\  --no-preview=<list>   Disable the listed preview features
