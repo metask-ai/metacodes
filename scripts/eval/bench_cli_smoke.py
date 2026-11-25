@@ -145,6 +145,25 @@ def check_shared_models(binary, root, config, binary_dir):
                     assert not (peer / 'oauth/metask.json').exists()
                 finally:
                     on_peer('bench', 'stop')
+                target = RotatingGateway(gateway.state, lifetime=3600)
+                try:
+                    gateway.next_gateway = target
+                    gateway.revoke(gateway.current_access)
+                    args = [str(binary), '--state-dir', str(gateway.state), '--provider', 'metask',
+                            '--model', 'session-model', '-p', 'reply ok']
+                    manager_env = {**env, 'METASK_SITE_URL': gateway.url}
+                    stopped = subprocess.run(args, cwd=root, env=manager_env, capture_output=True, timeout=40)
+                    assert stopped.returncode != 0
+                    stored = json.loads((gateway.state / 'oauth/metask.json').read_bytes())
+                    assert (stored['gateway_url'], stored['access_token'], stored['refresh_token']) == (
+                        target.url, gateway.current_access, gateway.refresh_token)
+                    assert all(token != gateway.current_access for token, _, _ in gateway.requests)
+                    resumed = subprocess.run(args, cwd=root, env=manager_env, capture_output=True, timeout=40)
+                    assert resumed.returncode == 0 and b'ok' in resumed.stdout
+                    assert target.requests[-1][:2] == (gateway.current_access, True)
+                    assert len(gateway.refreshes) == 2 and not gateway.rejected
+                finally:
+                    target.close()
             finally:
                 if manager.poll() is None:
                     os.killpg(manager.pid, signal.SIGTERM)

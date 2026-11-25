@@ -29,6 +29,11 @@ def origin_url(value):
     return value
 
 
+class SessionGatewayChanged(ValueError):
+    def __init__(self):
+        super().__init__("Metask 会话已更换网关，请重新连接")
+
+
 @dataclass(frozen=True)
 class SessionLogin:
     """The current CLI's OAuth store, separate from legacy auth.json."""
@@ -54,7 +59,7 @@ class SessionLogin:
         with refresh_lock(self.path.parent):
             current = self.read()
             if current["gateway_url"] != expected_gateway:
-                raise ValueError("Metask 会话已更换网关，请重新连接")
+                raise SessionGatewayChanged()
             if stale is not None and current["access_token"] != stale:
                 return current
             if stale is None and current["expires_at"] > time.time() + margin:
@@ -66,15 +71,20 @@ class SessionLogin:
                     or any(not isinstance(token.get(k), str) or not token[k] for k in ("access_token", "refresh_token"))):
                 raise ValueError("Metask 登录刷新失败，请重新运行 metacodes login")
             latest = self.read()
-            if latest["gateway_url"] != expected_gateway or token.get("gateway_url", expected_gateway) != expected_gateway:
-                raise ValueError("Metask 会话已更换网关，请重新连接")
+            if latest["gateway_url"] != expected_gateway:
+                raise SessionGatewayChanged()
             if latest["refresh_token"] != current["refresh_token"]:
                 return latest
             updated = {**latest, **{k: token[k] for k in (
                 "access_token", "refresh_token", "token_type", "scope", "gateway_url", "models_url", "client_name") if k in token},
                 "expires_at": int(time.time()) + token["expires_in"]}
             origin_url(updated["gateway_url"])
+            moved = updated["gateway_url"] != expected_gateway
+            if moved and "models_url" not in token:
+                updated.pop("models_url", None)
             private_json(self.path, updated)
+            if moved:
+                raise SessionGatewayChanged()
             return updated
 
 

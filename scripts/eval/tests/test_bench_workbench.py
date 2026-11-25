@@ -414,6 +414,7 @@ class RotatingGateway:
         self.issued = []
         self.revoked = set()
         self.deny_refresh = False
+        self.next_gateway = None
         self.refreshes = []   # (time, seconds the replaced access token still had)
         self.first_request_at = None
         self.rejected = []    # refresh tokens refused
@@ -524,8 +525,13 @@ class RotatingGateway:
             self.current_access = self.issue()
             self.refresh_token = f'live-refresh-{self.serial}'
             self.issued.append(self.refresh_token)
-            return {'access_token': self.current_access, 'refresh_token': self.refresh_token,
-                    'expires_in': int(self.lifetime), 'token_type': 'Bearer'}, 200
+            token = {'access_token': self.current_access, 'refresh_token': self.refresh_token,
+                     'expires_in': int(self.lifetime), 'token_type': 'Bearer'}
+            if self.next_gateway:
+                with self.next_gateway.lock:
+                    self.next_gateway.expiry[self.current_access] = self.expiry[self.current_access]
+                token['gateway_url'] = self.next_gateway.url
+            return token, 200
 
 
 def stalled_account_fixture(root):

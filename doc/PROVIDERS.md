@@ -109,7 +109,10 @@ metacodes bench --auth provider --model "manager/$model"
 The node can list models and make inference requests while the manager
 provides access. During a disconnect the node checks the certificate on
 each new connection before sending its pairing key or prompt. Signing out
-on the manager prevents subsequent requests.
+on the manager prevents subsequent requests. If the authorization server moves the
+session to a new model gateway during renewal, the manager saves the renewed
+session. Restart the share and any manager conversation or Bench run bound to
+the old gateway. The node can keep its pairing file.
 To withdraw access from one node, stop its share. To pair it with a fresh
 identity before its certificate expires, start the share with a new pairing
 filename, copy the new pairing line to the node and restart its clients.

@@ -1708,6 +1708,10 @@ pub fn main(init: std.process.Init) !void {
     {
         var browser_key = false;
         provider_secret = resolveMetaskBearer(allocator, init.io) catch |err| blk: {
+            if (err == error.GatewayChanged) {
+                std.debug.print("Metask's model gateway changed. Restart the command to use the saved session.\n", .{});
+                return err;
+            }
             const no_sign_in = err == error.RefreshRejected or err == error.NoTokens or err == error.NoSession;
             // Level 4 (#485): a stored Metask default with no device-code
             // session authenticates with the browser sign-in's key, on the

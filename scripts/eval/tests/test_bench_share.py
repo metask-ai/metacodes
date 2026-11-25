@@ -9,12 +9,56 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.eval.harbor.bench.providers import call
+from scripts.eval.harbor.bench.credentials import SessionCredential, for_judge
 from scripts.eval.harbor.bench.share import ManagerSession, manager_identity, peer_key, share
 from scripts.eval.harbor.profiling import TimingRelay, manager_tls
 from scripts.eval.tests.test_bench_workbench import RotatingGateway
 
 
 class ModelShareTest(unittest.TestCase):
+    def test_issuer_moves_model_gateway_during_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            issuer = RotatingGateway(root, lifetime=3600)
+            self.addCleanup(issuer.close)
+            target = RotatingGateway(issuer.state, lifetime=3600)
+            self.addCleanup(target.close)
+            issuer.next_gateway = target
+            with patch.dict(os.environ, {"METASK_SITE_URL": issuer.url, "METACODES_OAUTH_DIR":
+                                         str(issuer.state / "oauth")}):
+                manager = ManagerSession(issuer.state)
+                worker = SessionCredential(manager.account)
+                old = worker.current()
+                issuer.revoke(old)
+                with TimingRelay(manager.gateway, manager, root, bind="127.0.0.1", record=False,
+                                 model_gateway=True) as relay:
+                    request = urllib.request.Request(relay.url + "/v1/messages", data=b"{}",
+                                                     headers={"Authorization": "Bearer " + relay.token})
+                    with self.assertRaises(urllib.error.HTTPError) as denied:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(denied.exception.code, 401)
+                    denied.exception.close()
+                self.assertEqual([(token, ok) for token, ok, _ in issuer.requests], [(old, False)])
+                stored = json.loads((issuer.state / "oauth/metask.json").read_bytes())
+                self.assertEqual((stored["gateway_url"], stored["access_token"], stored["refresh_token"]),
+                                 (target.url, issuer.current_access, issuer.refresh_token))
+                self.assertNotEqual(old, stored["access_token"])
+                self.assertNotIn("models_url", stored)
+                self.assertIsNone(manager.current())
+                self.assertIsNone(worker.refresh(old))
+                self.assertTrue(worker.failed)
+                self.assertIsNone(worker.current())
+                with self.assertRaisesRegex(ValueError, "已更换网关"):
+                    for_judge({"judge": {"model": "session-model"}, "account_state_dir": issuer.state,
+                               "account_gateway": issuer.url}, worker)
+                reopened = ManagerSession(issuer.state)
+                self.assertEqual(reopened.gateway, target.url)
+                self.assertEqual(reopened.account.request("/v1/models", reopened.current())["data"],
+                                 [{"id": "session-model"}])
+                self.assertNotEqual(reopened.refresh(reopened.current()), stored["access_token"])
+                self.assertEqual(len(issuer.refreshes), 2)
+                self.assertFalse(issuer.rejected)
+
     def test_share_opens_one_paired_forward_and_reconnects(self):
         cfg = {"executors": [{"name": "B", "kind": "ssh", "host": "node-b"}]}
         with tempfile.TemporaryDirectory() as directory:

@@ -39,6 +39,7 @@ pub const REFRESH_MARGIN_SECONDS: i64 = 120;
 pub const OAuthError = error{
     OutOfMemory,
     NoTokens,
+    GatewayChanged,
     /// The provider refused the refresh token. Retrying cannot help — the user
     /// has to log in again — so this is deliberately not a transport error.
     RefreshRejected,
@@ -420,7 +421,7 @@ pub const Session = struct {
             const disk = record.tokens;
             stored = disk;
             const cached = previous orelse return error.NoTokens;
-            if (!std.mem.eql(u8, cached.gateway_url orelse "", disk.gateway_url orelse "")) return error.NoTokens;
+            if (!std.mem.eql(u8, cached.gateway_url orelse "", disk.gateway_url orelse "")) return self.detachGateway();
             if ((!std.mem.eql(u8, disk.refresh_token, refresh_token) or !std.mem.eql(u8, disk.access_token, cached.access_token)) and
                 !disk.isExpiredAt(now_seconds))
             {
@@ -432,9 +433,6 @@ pub const Session = struct {
             previous = disk;
         }
         const outcome = try exchange.run(exchange.ctx, self.provider_id, current_refresh, arena.allocator());
-        if (stored) |disk| if (disk.gateway_url) |gateway| {
-            if (outcome.gateway_url) |next| if (!std.mem.eql(u8, gateway, next)) return error.RefreshRejected;
-        };
 
         var replacement = try own(self.allocator, outcome, current_refresh, now_seconds, previous);
         errdefer replacement.deinit(self.allocator);
@@ -445,12 +443,23 @@ pub const Session = struct {
         // first means the worst case is a token that is saved but not yet in
         // memory, which the next load recovers.
         try self.persist(replacement);
+        if (stored) |disk| if (disk.gateway_url) |gateway| {
+            if (!std.mem.eql(u8, gateway, replacement.gateway_url orelse "")) return self.detachGateway();
+        };
 
         self.mutex.lock();
         defer self.mutex.unlock();
         self.exchange_count += 1;
         if (self.tokens) |*old| old.deinit(self.allocator);
         self.tokens = replacement;
+    }
+
+    fn detachGateway(self: *Session) error{GatewayChanged} {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.tokens) |*old| old.deinit(self.allocator);
+        self.tokens = null;
+        return error.GatewayChanged;
     }
 
     fn persist(self: *Session, tokens: TokenSet) OAuthError!void {
@@ -558,7 +567,11 @@ fn own(
     errdefer if (account_id) |value| allocator.free(value);
     const gateway_url = try ownOptional(allocator, outcome.gateway_url orelse if (previous) |p| p.gateway_url else null);
     errdefer if (gateway_url) |value| allocator.free(value);
-    const models_url = try ownOptional(allocator, outcome.models_url orelse if (previous) |p| p.models_url else null);
+    const previous_models = if (previous) |p| blk: {
+        if (!std.mem.eql(u8, p.gateway_url orelse "", gateway_url orelse "")) break :blk null;
+        break :blk p.models_url;
+    } else null;
+    const models_url = try ownOptional(allocator, outcome.models_url orelse previous_models);
     errdefer if (models_url) |value| allocator.free(value);
     const client_name = try ownOptional(allocator, outcome.client_name orelse if (previous) |p| p.client_name else null);
     errdefer if (client_name) |value| allocator.free(value);
@@ -863,6 +876,7 @@ const FakeExchange = struct {
     /// broken single flight fails its assertions instead of hanging.
     hold_until_waiters: ?struct { session: *Session, count: usize } = null,
     rotate: bool = true,
+    gateway_url: ?[]const u8 = null,
     fail: ?OAuthError = null,
     last_presented: [128]u8 = undefined,
     last_presented_len: usize = 0,
@@ -908,6 +922,7 @@ const FakeExchange = struct {
             else
                 null,
             .expires_in_seconds = 3600,
+            .gateway_url = self.gateway_url,
         };
     }
 
@@ -1043,8 +1058,19 @@ test "a running Metask session renews from the pair on disk and stops when the g
 
     latest.gateway_url = "https://b.invalid";
     try other.importOutcome(latest, 0);
-    try testing.expectError(error.NoTokens, manager.refreshIfStale(1300, exchange.exchange(), renewed));
+    try testing.expectError(error.GatewayChanged, manager.refreshIfStale(1300, exchange.exchange(), renewed));
     try testing.expectEqual(@as(usize, 1), exchange.calls);
+
+    exchange.gateway_url = "https://c.invalid";
+    try testing.expectError(error.GatewayChanged, other.accessToken(1300, exchange.exchange()));
+    try testing.expectError(error.NoTokens, other.accessToken(1301, exchange.exchange()));
+    try testing.expect(try manager.load());
+    try testing.expectEqualStrings("https://c.invalid", manager.tokens.?.gateway_url.?);
+    try testing.expectEqualStrings("refresh-2", manager.tokens.?.refresh_token);
+    const migrated = try manager.accessToken(1301, exchange.exchange());
+    defer a.free(migrated);
+    try testing.expectEqualStrings("access-2", migrated);
+    try testing.expectEqual(@as(usize, 2), exchange.calls);
 }
 
 test "a provider that keeps its refresh token does not lose it" {
