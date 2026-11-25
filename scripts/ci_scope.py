@@ -62,6 +62,7 @@ import argparse
 import html
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -90,7 +91,8 @@ TEST_STEP = re.compile(r'\bb\.step\(\s*"(test:[\w-]+)"')
 BUILD_SCRIPT_SUITE = re.compile(r'"(scripts\.tests\.test_\w+)"')
 MIGRATION_LABEL = "migration"
 MODEL_EVAL_PATHS = ("src/core/", "src/provider/", "src/api/", "packages/kernel/", "packages/ai/")
-MODEL_EVAL_FILES = {"src/client.zig", "src/types.zig", "src/ai.zig", "evals/suites/core-e2e.json"}
+CORE_E2E_SUITE = "evals/suites/core-e2e.json"
+MODEL_EVAL_FILES = {"src/client.zig", "src/types.zig", "src/ai.zig", CORE_E2E_SUITE}
 SHOWN = 5
 
 
@@ -346,12 +348,49 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
 Change = Tuple[str, str]  # (git status letter, path)
 
 
-def needs_model_eval(changes: Sequence[Change], labels: Sequence[str]) -> bool:
-    return "model-eval" in labels or not changes or any(
-        path in MODEL_EVAL_FILES or
-        (path.startswith(MODEL_EVAL_PATHS) and PurePosixPath(path).name != "README.md")
-        for _, path in changes
-    )
+def core_eval_inputs(root: Path, candidate: Optional[str]) -> set[str]:
+    read = tree_reader(root, candidate)
+    tasks = json.loads(read(CORE_E2E_SUITE))["tasks"]
+    if not tasks:
+        raise ValueError(f"{CORE_E2E_SUITE} has no tasks")
+    inputs = set()
+    configs = set()
+    for task in tasks:
+        scenario = PurePosixPath(task["scenario"])
+        if scenario.is_absolute() or ".." in scenario.parts:
+            raise ValueError(f"invalid scenario path: {scenario}")
+        inputs.add(scenario.as_posix())
+        configs.add(scenario.with_suffix(".conf").as_posix())
+        inputs.update(task["environment"].get("fixtures", []))
+        inputs.update(check["validator"] for check in task["success"]["checks"] if check["type"] == "validator")
+    inputs.update(configs)
+    if candidate is None:
+        existing = [path for path in configs if (root / path).is_file()]
+    else:
+        paths = git_bytes(root, "ls-tree", "-z", "--name-only", candidate, "--", *sorted(configs))
+        existing = paths.decode("utf-8").split("\0")[:-1]
+    for path in existing:
+        for line in read(path).splitlines():
+            key, _, value = line.partition("#")[0].partition("=")
+            if key.strip() in {"ANSWERS", "SETTINGS", "KG_SEED"} and value.strip():
+                inputs.add((PurePosixPath("tests/e2e") / value.strip()).as_posix())
+    return {posixpath.normpath(path) for path in inputs}
+
+
+def needs_model_eval(changes: Sequence[Change], labels: Sequence[str], root: Path, candidate: Optional[str]) -> bool:
+    paths = {path for _, path in changes}
+    if "model-eval" in labels or not paths or paths & MODEL_EVAL_FILES:
+        return True
+    for path in paths:
+        file = PurePosixPath(path)
+        if file.parent.as_posix() == "tests/e2e/fixtures/agents" and file.suffix == ".md":
+            return True
+        if path.startswith(MODEL_EVAL_PATHS) and not (
+            file.name == "README.md" or path.endswith("_test.zig")
+            or path.startswith(("packages/kernel/tests/", "packages/ai/tests/"))
+        ):
+            return True
+    return bool(paths & core_eval_inputs(root, candidate))
 
 
 @dataclass(frozen=True)
@@ -785,7 +824,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         selection = select(scope)
     reason = " ".join(reason.split())
     print(reason)
-    model_eval = args.event in DIFF_EVENTS and needs_model_eval(observed, args.labels.split(","))
+    try:
+        model_eval = args.event in DIFF_EVENTS and needs_model_eval(observed, args.labels.split(","), root, candidate)
+    except Exception as exc:
+        print(f"Cannot attribute core evaluation inputs: {exc}")
+        model_eval = True
     if model_eval:
         print("Provider-backed comparison required before merge (evals/README.md).")
 

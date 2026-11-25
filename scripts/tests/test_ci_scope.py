@@ -556,7 +556,7 @@ class LayoutTest(unittest.TestCase):
             selection = ci_scope.select(scope, changes, layout)
             self.assertEqual(selection.offline_eval, bool(extra))
             self.assertIn(target, ci_scope.local_commands(scope, selection)[0])
-            self.assertFalse(ci_scope.needs_model_eval(changes, []))
+            self.assertFalse(ci_scope.needs_model_eval(changes, [], ROOT, None))
 
     def test_local_commands_follow_the_selection(self) -> None:
         layout = fixture_layout()
@@ -617,6 +617,9 @@ class PackageScopeMainTest(unittest.TestCase):
                 {"source": "README.md", "destination": "share/doc/README.md"}]}), encoding="utf-8")
         (self.repo / "evals/plugin-v1").mkdir(parents=True)
         (self.repo / ci_scope.PROTOCOL).write_text(json.dumps({"implementation_paths": ["build.zig"]}), encoding="utf-8")
+        suite = self.repo / ci_scope.CORE_E2E_SUITE
+        suite.parent.mkdir(parents=True)
+        suite.write_bytes((ROOT / ci_scope.CORE_E2E_SUITE).read_bytes())
         (self.repo / ci_scope.LAYERS).write_text(FIXTURE_LAYERS, encoding="utf-8")
         (self.repo / ci_scope.LAYER_BASELINE).write_text(FIXTURE_BASELINE, encoding="utf-8")
         (self.repo / ci_scope.BUILD).write_text(FIXTURE_BUILD, encoding="utf-8")
@@ -707,6 +710,49 @@ class PackageScopeMainTest(unittest.TestCase):
                                       ("model-eval", "true", "true")):
             got = self.run_main("--event", "pull_request", "--base", "HEAD^1", "--labels", label)
             self.assertEqual((got["offline_eval"], got["model_eval"]), (offline, model))
+
+    def test_model_comparison_tracks_individual_suite_inputs_and_runtime_files(self) -> None:
+        conf = "tests/e2e/scenarios/13_perm_interactive.conf"
+        (self.repo / conf).parent.mkdir(parents=True)
+        (self.repo / conf).write_bytes((ROOT / conf).read_bytes())
+        self.commit("install the core scenario configuration")
+        for path, required in (
+            ("tests/e2e/scenarios/00_smoke.txt", True),
+            ("tests/e2e/scenarios/02_html_game.conf", True),
+            ("tests/e2e/fixtures/answers_13.txt", True),
+            ("tests/e2e/scenarios/01_game_design.txt", False),
+            ("src/core/kernel/loop_test.zig", False),
+            ("src/api/model_name_consumers_test.zig", False),
+            ("src/provider/capability_matrix_test.zig", False),
+            ("packages/kernel/tests/loop.zig", False),
+            ("src/core/kernel/loop.zig", True),
+            ("src/core/test_integrity.zig", True),
+        ):
+            with self.subTest(path=path):
+                (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+                self.edit(path)
+                self.commit(path)
+                got = self.run_main("--event", "pull_request", "--base", "HEAD^1")
+                self.assertEqual((got["model_eval"], got["offline_eval"]), (str(required).lower(), "true"))
+        (self.repo / conf).unlink()
+        changes = [("M", "tests/e2e/fixtures/answers_13.txt")]
+        self.assertTrue(ci_scope.needs_model_eval(changes, [], self.repo, "HEAD"))
+        self.assertFalse(ci_scope.needs_model_eval(changes, [], self.repo, None))
+        self.assertTrue(ci_scope.needs_model_eval([("D", conf)], [], self.repo, None))
+
+    def test_local_suite_selects_its_declared_fixture_and_validator(self) -> None:
+        manifest = self.repo / ci_scope.CORE_E2E_SUITE
+        suite = json.loads(manifest.read_text(encoding="utf-8"))
+        task = suite["tasks"][0]
+        fixture = "tests/e2e/fixtures/new.json"
+        validator = "evals/validators/new.py"
+        task["environment"]["fixtures"] = [fixture]
+        task["success"]["checks"].append({"type": "validator", "validator": validator})
+        manifest.write_text(json.dumps(suite), encoding="utf-8")
+        for path in (fixture, validator):
+            with self.subTest(path=path):
+                self.assertTrue(ci_scope.needs_model_eval([("D", path)], [], self.repo, None))
+                self.assertFalse(ci_scope.needs_model_eval([("D", path)], [], self.repo, "HEAD"))
 
     def test_the_nightly_report_reads_what_each_pull_request_recorded(self) -> None:
         self.edit("src/mid/a.zig")
