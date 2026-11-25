@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.eval.harbor.bench import data, results
-from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.bench.workbench import Workbench, model_comparison
 from scripts.eval.harbor.viewer import server
 
 
@@ -178,6 +178,17 @@ class LibraryTest(unittest.TestCase):
             exact = data.percentile(pooled, q)
             self.assertGreaterEqual(merged[field], exact)
             self.assertLess(merged[field], exact * 1.1)
+
+    def test_model_comparison_combines_worker_and_local_results_across_suites(self):
+        row = next(r for r in data.job_view(self.library.job_dir("glm-pilot"))["rows"] if r["status"] == "pass")
+        remote = results.aggregate([row])
+        latest = {("suite-a", "m1", row["task"]): ({}, "remote", remote),
+                  ("suite-b", "m1", row["task"]): ({}, "local", [row]),
+                  ("suite-a", "m2", row["task"]): ({}, "other", [row])}
+        models, common = model_comparison(latest)
+        self.assertEqual(common, 1)
+        self.assertEqual([model["summary"]["tasks_solved"] for model in models], [2, 1])
+        self.assertEqual([model["common_summary"]["first_tasks"] for model in models], [1, 1])
 
     def test_row_fields(self):
         rows = {row["task"]: row for row in data.job_view(self.library.job_dir("glm-pilot"))["rows"]}

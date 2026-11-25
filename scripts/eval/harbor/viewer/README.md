@@ -13,13 +13,13 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 
 | View | Answers |
 |---|---|
-| 看板 `#/` | profiles first, then metrics scoped to one profile (or all jobs), its jobs and their initial context composition |
-| 评测配置 `#/profile/<id>` | frozen metacodes version and advanced features, the run history, every task's latest attempts (a rerun replaces the earlier result); set its concurrency (并发数, for every dataset it runs), rename it, run it again or rerun its tasks with invalid attempts (automatically too, when 自动重跑 is on), stop its queue, delete it once ended |
+| Profiles `#/` | profile versions and status, profile comparison, and historical standalone evaluations |
+| Profile `#/profile/<id>` | frozen metacodes version and advanced features, jobs grouped by submission with job and evaluation controls, comparisons between jobs, every task's latest attempts (a rerun replaces the earlier result); set its concurrency (并发数, for every dataset it runs), rename it, run it again or rerun its tasks with invalid attempts (automatically too, when 自动重跑 is on), stop its queue, delete it once ended |
 | 任务 `#/profile/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task and the replaced runs |
-| 评测 `#/new` | a run, top to bottom: metacodes version and advanced features (the profile), models, several suites and their tasks, attempts (concurrency is set on the profile page); the start button stays at the bottom of the window |
+| 创建作业 `#/new` | executor, metacodes version and advanced features (the profile), models, several suites and their tasks, attempts (concurrency is set on the profile page); the start button stays at the bottom of the window |
+| 系统配置 `#/settings` | database selection and migration, model providers and Metask account login |
+| 评测结果 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
 | 监控 `#/monitor[/<executor>]` | one execution machine: CPU, load, memory, disks, network rate, reachability of the sources and configured mirrors, the mirror settings (editable), Docker's images and build cache, and the hit rates of the apt cache, the download cache and the local image store |
-| 数据库 `#/settings` | the active store; test, switch and migrate to another SQLite file or PostgreSQL |
-| 作业 `#/job/<job>` | per task: outcome, reward, verifier tests passed, stop reason, turns, tool calls, tokens and cache share, cost, time split (environment / install / agent / verifier); filter, sort, CSV |
 | trial `#/job/<job>/<trial>` | per-request token distribution and context composition, time split (model / tools / other) and per-tool timing, verifier tests, the whole trajectory with each call's execution time, verifier output and metacodes stderr |
 | 对比 `#/compare/<job>,<job>` | the same tasks across jobs (models), the pass rate on tasks every job scored |
 | 榜单 `#/leaderboard/<suite>` | published results of other agents and models on the suite, with this workbench's jobs ranked among them |
@@ -35,7 +35,7 @@ directories into the [evaluation database](../../../../doc/BENCH_WORKBENCH.md#ev
 in the database, never used as paths, and every value reaches the page as
 plain text (no markup from the data).
 
-The overview, job, trial and CSV views expose total/initial tokens, first-attempt
+The profile, job, trial and CSV views expose total/initial tokens, first-attempt
 full-score rate, request-weighted generation TPS, TTFT mean/P50/P95, and cost
 coverage, plus the pass-rate 95% interval, tasks solved at least once, cost per
 task and per pass, the cost share of non-passing runs, cache hit rate and turns

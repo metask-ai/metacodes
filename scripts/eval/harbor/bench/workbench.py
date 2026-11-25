@@ -107,10 +107,9 @@ def board_job(view, tasks):
 
 
 def group_summary(groups):
-    groups = list(groups)
-    if not any(isinstance(group, dict) for group in groups):
-        return data.summarize([row for group in groups for row in group])
-    summaries = [group if isinstance(group, dict) else results.aggregate(group) for group in groups]
+    if not any(isinstance(group, dict) for group in groups.values()):
+        return data.summarize([{**row, "task": key} for key, group in groups.items() for row in group])
+    summaries = [group if isinstance(group, dict) else results.aggregate(group) for group in groups.values()]
     summary = data.merge_summaries(summaries)
     causes = {}
     for group in summaries:
@@ -135,9 +134,9 @@ def model_comparison(latest):
     common = set.intersection(*task_sets) if len(task_sets) > 1 and len({frozenset(t) for t in task_sets}) > 1 else None
     result = []
     for model, tasks in sorted(by_model.items(), key=lambda pair: pair[0] or ""):
-        entry = {"model": model, "tasks": len(tasks), "summary": summary(tasks.values())}
+        entry = {"model": model, "tasks": len(tasks), "summary": summary(tasks)}
         if common is not None:
-            entry["common_summary"] = summary(tasks[key] for key in common)
+            entry["common_summary"] = summary({key: tasks[key] for key in common})
         result.append(entry)
     return result, (len(common) if common is not None else None)
 
@@ -319,7 +318,7 @@ class Workbench:
                                                         "finished_at", "dataset", "execution_status")}
                 item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
         latest, _ = latest_results(record, views)
-        value["summary"] = group_summary(group for _, _, group in latest.values())
+        value["summary"] = group_summary({key: group for key, (_, _, group) in latest.items()})
         value["by_model"], value["common_tasks"] = model_comparison(latest)
         value["progress"] = {"done": done, "planned": planned} if planned else None
         value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
@@ -432,9 +431,11 @@ class Workbench:
         record = next((r for r in self.profile_records() if r["id"] == profile), None)
         if record is None:
             return None
+        runs = self.runs()
+        local_names = {r["name"] for r in runs}
         full = {}
         for item in record["items"]:
-            view = self.job_view(item["run"]) if item.get("run") else None
+            view = self.job_view(item["run"], runs=runs) if item.get("run") else None
             if view is not None:
                 full[view["name"]] = view
         value = self.profile_summary(record, full)
@@ -442,6 +443,7 @@ class Workbench:
         tasks = [{**task_group(task, rows, item, job), "history": history.get(key, [])}
                  for key, (item, job, rows) in latest.items() for task in [key[2]]]
         for item in value["items"]:
+            item["local_run"] = item.get("run") in local_names
             if item["status"] in ("pending", "running") and item.get("run") not in full:
                 tasks += [{"task": t, "job": None, "suite": item["suite"], "suite_name": item.get("suite_name"),
                            "model": item.get("model"), "attempts": [], "first_status": None, "passed": 0,
@@ -481,6 +483,11 @@ class Workbench:
         if not self.manager:
             raise ValueError(READ_ONLY)
         return self.profiles.cancel(profile)
+
+    def submission_action(self, profile, submission, action):
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        return self.profiles.submission_action(profile, submission, action)
 
     def profile_item(self, profile, index, action) -> Dict[str, Any]:
         """Act on one queued dataset: `cancel` a waiting one, `stop` the running
