@@ -64,8 +64,7 @@ class Upstream:
                 upstream.release.wait(10)
                 self.wfile.write(body[half:])
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
+        self.server = download_cache.Server(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_port}"
 

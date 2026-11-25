@@ -80,6 +80,7 @@ class Fetch:
         self.length: Optional[int] = None
         self.relayed = b""
         self.written = 0
+        self.readable = 0
         self.done = False
         self.error: Optional[str] = None
 
@@ -187,6 +188,7 @@ class Store:
             return self.read_entry(self.body_path(kind, key), False, False)
 
     def download(self, fetch: Fetch, kind: str, key: str, url: str, headers: Dict[str, str], body: Path) -> None:
+        counted = False
         try:
             request = urllib.request.Request(url, headers={**headers, "Accept-Encoding": "identity"})
             try:
@@ -215,11 +217,17 @@ class Store:
                         out.flush()
                         with fetch.cond:
                             fetch.written += len(chunk)
+                            if length is None or fetch.written < length:
+                                fetch.readable = fetch.written
                             fetch.cond.notify_all()
             if length is not None and fetch.written != length:
                 raise OSError(f"upstream closed after {fetch.written} of {length} bytes")
+            self.count(kind, bytes_fetched=fetch.written)
+            counted = True
             self.commit(fetch, kind, body, url)
         except Exception as exc:
+            if not counted:
+                self.count(kind, bytes_fetched=fetch.written)
             with fetch.cond:
                 fetch.error = f"{type(exc).__name__}: {exc}"
                 fetch.done = True
@@ -229,7 +237,6 @@ class Store:
             except OSError:
                 pass
         finally:
-            self.count(kind, bytes_fetched=fetch.written)
             with self.lock:
                 self.inflight.pop((kind, key), None)
 
@@ -258,6 +265,7 @@ class Store:
                 self.disk_bytes += fetch.written - (replaced or 0)
                 self.dirty = True
             fetch.final = body
+            fetch.readable = fetch.written
             fetch.done = True
             fetch.cond.notify_all()
 
@@ -419,27 +427,33 @@ class Handler(BaseHTTPRequestHandler):
                 handle = open(fetch.final if fetch.final is not None else fetch.temporary, "rb")
             with handle:
                 while sent < fetch.length:
-                    chunk = handle.read(min(CHUNK, fetch.length - sent))
-                    if chunk:
-                        self.wfile.write(chunk)
-                        sent += len(chunk)
-                        continue
                     with fetch.cond:
+                        while fetch.readable <= sent and fetch.error is None:
+                            fetch.cond.wait(1)
                         if fetch.error is not None:
                             self.close_connection = True
                             return
-                        if fetch.written <= sent:
-                            fetch.cond.wait(1)
+                        available = fetch.readable - sent
+                    chunk = handle.read(min(CHUNK, available))
+                    if not chunk:
+                        self.close_connection = True
+                        return
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
         finally:
             store.count(kind, **{"misses" if outcome == "miss" else "hits": 1},
                         bytes_cached=sent if outcome == "hit" else 0)
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 256
+
+
 class DownloadCache:
     def __init__(self, directory, routes: Dict[str, str], bind="127.0.0.1", port=0, ttl: float = DEFAULT_TTL):
         self.store = Store(Path(directory), routes, ttl)
-        self.server = ThreadingHTTPServer((bind, port), Handler)
-        self.server.daemon_threads = True
+        self.server = Server((bind, port), Handler)
         self.server.store = self.store
         self.stopped = threading.Event()
 
