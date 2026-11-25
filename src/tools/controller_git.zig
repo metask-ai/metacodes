@@ -2,8 +2,8 @@
 //! callbacks, hooks or content filters. Keep these overrides out of the
 //! repository's durable configuration and the user's own Git commands.
 const std = @import("std");
-const common = @import("../tools/common.zig");
-const AbortSignal = @import("abort.zig").AbortSignal;
+const common = @import("common.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const Error = error{ OutOfMemory, Aborted, GitFailed };
 
