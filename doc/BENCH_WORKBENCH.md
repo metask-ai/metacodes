@@ -1275,17 +1275,17 @@ treated as stale.
 
 ## Using the page
 
-The rail opens on the dashboard (看板), then 评测 (start an evaluation), 对比
-(compare), 监控 (an execution machine's load, network, mirrors, Docker and
-caches) and 数据库 (the evaluation database). The dashboard's 数据范围
-selector scopes every headline metric to one profile (the newest by default)
-or to all jobs.
+The workbench opens on Profiles. Open one to see its frozen MetaCodes version,
+latest results and submitted jobs. Select profiles in the list to compare
+their summaries and choose results from the same suite for a task comparison.
+System settings (系统配置) contains the database, model providers and Metask login.
+Open 监控 in the rail to inspect an execution machine's load, network, mirrors, Docker and caches.
 
 ### Profiles
 
 A profile (评测配置) is what an evaluation tests: one frozen metacodes version
 with a fixed set of advanced features. Every run belongs to a profile, and a
-profile is run on as often as wanted. The 评测 page picks the version (the
+profile is run on as often as wanted. The 创建作业 form picks the executor and version (the
 configured Linux bundle by default, or any valid bundle under
 `<state root>/bench/bundles/`, including those `metacodes bench build --ref`
 builds), the advanced features, several suites with their tasks, the model
@@ -1428,6 +1428,15 @@ queues it with one. The profile page compares the models' latest results
 when the models ran different tasks it adds the same comparison over only the
 tasks all of them ran (`common_tasks` and each model's `common_summary` in
 `GET /api/profile`).
+Each submission creates one job (作业). All suite/model pairs in the request
+carry the same `submission` ID. The profile page can cancel one job or rerun
+its original evaluations together (`POST /api/profile/submission` with `id`,
+`submission` and `action` of `cancel` or `run`). Rerunning a whole job
+creates a new job on its recorded executor. A single evaluation retry and an
+automatic retry stay in the original job. For older records, the workbench
+groups evaluations by their original queue timestamp and assigns automatic
+retries to their source submission when the recorded history identifies it.
+
 The queued datasets run one after another, each as an ordinary workbench run
 (one Harbor job) whose record names the profile. The durable state is
 `<jobs-dir>/.bench-profiles/<id>.json`; the service's scheduler only advances
@@ -1461,8 +1470,8 @@ A rerun replaces the earlier result: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the
 replaced runs as the task's history. A run that stopped (cancelled,
 interrupted or failed) with only invalid attempts of a task leaves that
-task's earlier result in place. 再次运行 and 重跑无效的题 use one model: the
-page's model filter, else the last run's. The profile page's 再次运行 opens the 评测
+task's earlier result in place. 创建作业 and 重跑无效的题 use one model: the
+page's model filter, else the last run's. The profile page's 创建作业 opens the launch
 page on that profile with its datasets, tasks and last parameters, and
 重跑无效的题 keeps only the tasks whose latest attempts include an invalid one
 (an infrastructure failure such as a network error, not a failed answer).
@@ -1475,8 +1484,8 @@ when its results cannot be read, the item records why (`auto_rerun_error`)
 and the queue goes on.
 A profile can be renamed at any time (`POST /api/profile/rename` with `id`
 and `name`, 重命名 on its page; an empty name falls back to the id).
-Deleting a profile whose queue has ended (`POST /api/profile/delete`, 删除评测配置
-on its page or 删除 in the overview's list) removes its record, its runs'
+Deleting a profile whose queue has ended (`POST /api/profile/delete`, 删除 Profile
+under Profile 设置) removes its record, its runs'
 records and logs, their job directories and their rows in the evaluation
 database; the frozen bundle copy stays, since other profiles may share it.
 A profile still running must be stopped first. Only a profile recorded in

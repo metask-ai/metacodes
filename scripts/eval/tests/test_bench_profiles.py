@@ -969,11 +969,63 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(sorted(m['model'] for m in view['by_model']), sorted(models))
         self.assertEqual([m['summary']['trials'] for m in view['by_model']], [2, 2])
         self.assertEqual(len(view['tasks']), 4)
+        self.assertEqual(view['summary']['tasks_attempted'], 4)
+        self.assertEqual([m['summary']['first_tasks'] for m in view['by_model']], [2, 2])
         for override in ({'models': []}, {'models': models, 'model': models[0]}, {'models': [models[0]] * 2},
                          {'models': 'tokenjoy/test-model'}, {'models': ['tokenjoy/missing']}):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 request = {k: v for k, v in self.request(**override).items() if k != 'model' or 'model' in override}
                 self.client.request('api/profiles/run', request)
+
+    def test_submission_controls_affect_only_the_selected_submission(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        first = self.client.request('api/profiles/run', self.request())
+        pid = first['id']
+        group = first['items'][0]['submission']
+        self.assertEqual([i['submission'] for i in first['items']], [group, group])
+        self.client.request('api/profiles/run', self.request(profile=pid))
+        with patch.dict(os.environ, {'FAKE_BENCH_RELEASE_FILE': str(self.root / 'hold-first')}):
+            self.manager.profiles.advance()
+            command = {'id': pid, 'submission': group}
+            self.client.request('api/profile/submission', {**command, 'action': 'cancel'})
+        ended = self.wait_profile(pid)
+        self.assertEqual(ended['items'][0]['status'], 'cancelled')
+        self.assertEqual([i['status'] for i in ended['items'][1:]], ['skipped', 'finished', 'finished'])
+        self.assertNotEqual(group, ended['items'][2]['submission'])
+        again = self.client.request('api/profile/item', {'id': pid, 'index': 1, 'action': 'run'})
+        self.assertEqual(again['items'][-1]['submission'], group)
+        self.wait_profile(pid)
+        replay = self.client.request('api/profile/submission', {**command, 'action': 'run'})
+        self.assertEqual(len(replay['items']), 7)
+        left, right = replay['items'][-2:]
+        self.assertEqual(left['submission'], right['submission'])
+        self.assertNotIn(left['submission'], {group, ended['items'][2]['submission']})
+        self.assertEqual([i['suite'] for i in replay['items'][-2:]], [i['suite'] for i in first['items']])
+
+    def test_old_queued_auto_retry_is_cancelled_and_its_original_replayed_once(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        manager = self.manager.profiles
+        record = manager.queue(self.request())
+        first, waiting = record['items']
+        for item in record['items']:
+            del item['submission']
+        first.update(status='finished', finished_at='2026-01-01T10:05:00Z')
+        first['queued_at'] = waiting['queued_at'] = '2026-01-01T10:00:00Z'
+        separate = {**first, 'status': 'pending', 'finished_at': None, 'queued_at': '2026-01-01T10:03:00Z'}
+        retry = {**separate, 'auto_rerun': 1, 'queued_at': '2026-01-01T10:05:01Z'}
+        record['items'].extend([separate, retry])
+        manager.save(record)
+        visible = self.workbench.profile(record['id'])['items']
+        group = visible[0]['submission']
+        self.assertEqual(visible[-1]['submission'], group)
+        self.assertTrue(visible[-1]['retry'])
+        command = {'id': record['id'], 'submission': group}
+        stopped = self.client.request('api/profile/submission', {**command, 'action': 'cancel'})
+        self.assertEqual([i['status'] for i in stopped['items']], ['finished', 'skipped', 'pending', 'skipped'])
+        replay = self.client.request('api/profile/submission', {**command, 'action': 'run'})
+        self.assertEqual([i['suite'] for i in replay['items'][4:]], [first['suite'], waiting['suite']])
 
     def test_models_that_ran_different_tasks_are_also_compared_on_the_common_ones(self):
         def entry(status):
