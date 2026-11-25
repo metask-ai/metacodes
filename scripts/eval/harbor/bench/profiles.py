@@ -267,14 +267,14 @@ class ProfileManager:
         for path in paths:
             value = data.read_json(path)
             if isinstance(value, dict) and value.get("id") == path.stem and data.NAME.fullmatch(path.stem):
-                found.append(value)
+                found.append(restore_submissions(value))
         return sorted(found, key=lambda r: r.get("created_at", ""), reverse=True)
 
     def get(self, profile: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(profile, str) or not data.NAME.fullmatch(profile):
             return None
         value = data.read_json(self.path(profile))
-        return value if isinstance(value, dict) and value.get("id") == profile else None
+        return restore_submissions(value) if isinstance(value, dict) and value.get("id") == profile else None
 
     def active_id(self) -> Optional[str]:
         """The profile that owns the executor now (reads files only, no lock:
@@ -399,7 +399,7 @@ class ProfileManager:
         self.wake()
         return record
 
-    def _append(self, target, name, planned, at_profile_concurrency=False) -> Dict[str, Any]:
+    def _append(self, target, name, planned, at_profile_concurrency=False, submission=None) -> Dict[str, Any]:
         if target["id"] is None:
             metacodes = freeze(target["choice"], self.runs.config_path)
             git = builds.provenance(target["choice"]["path"])
@@ -421,10 +421,11 @@ class ProfileManager:
             record.update(status="queued", cancel_requested=False, finished_at=None)
         concurrency = pin_concurrency(record)
         queued = now()
+        submission = submission or uuid.uuid4().hex
         for item in planned:
             if at_profile_concurrency:
                 item = at_concurrency(item, concurrency)
-            record["items"].append({**item, "queued_at": queued})
+            record["items"].append({**item, "queued_at": queued, "submission": submission})
         self.save(record)
         return record
 
@@ -497,6 +498,35 @@ class ProfileManager:
             raise ValueError("评测集不存在")
         return record, record["items"][index]
 
+    def submission_action(self, profile, submission, action):
+        with self.lock:
+            record = self.get(profile)
+            if record is None:
+                raise ValueError("Profile 不存在")
+            items = [item for item in record["items"] if item["submission"] == submission]
+            if not items:
+                raise ValueError("作业不存在")
+            if action == "cancel":
+                for item in items:
+                    if item["status"] == "pending":
+                        item.pop("waiting", None)
+                        item.update(status="skipped", finished_at=now())
+                    elif item["status"] == "running":
+                        item["cancel_requested"] = True
+                self.save(record)
+            elif action == "run":
+                if any(item["status"] not in ITEM_DONE for item in items):
+                    raise ValueError("作业还在等待或运行")
+                originals = [item for item in items if not item.get("retry")]
+                if any(not isinstance(item.get("request"), dict) for item in originals):
+                    raise ValueError("旧记录缺少启动参数，请从 Profile 创建作业")
+                planned = [rerun(item, item["tasks"], 0, profile_concurrency(record)) for item in originals]
+                record = self._append({"id": profile}, None, planned)
+            else:
+                raise ValueError("作业操作只能是 cancel 或 run")
+        self.wake()
+        return public(record)
+
     def cancel_item(self, profile: Any, index: Any) -> Dict[str, Any]:
         """Drop one waiting dataset from the queue; the rest of it goes on."""
         with self.lock:
@@ -529,7 +559,9 @@ class ProfileManager:
                 raise ValueError("这个评测集是早期版本排的，请在评测配置上重新运行")
             if not tasks:
                 raise ValueError("这个评测集没有要运行的题")
-            record = self._append({"id": record["id"]}, None, [rerun(item, tasks, 0, profile_concurrency(record))])
+            again = rerun(item, tasks, 0, profile_concurrency(record))
+            record = self._append({"id": record["id"]}, None, [{**again, "retry": True}],
+                                  submission=item["submission"])
         self.wake()
         return public(record)
 
@@ -554,7 +586,9 @@ class ProfileManager:
             item["auto_rerun_error"] = f"读取结果失败，没有自动重跑无效的题：{exc}"
             return
         if tasks:
-            record["items"].append({**rerun(item, tasks, next_round, pin_concurrency(record)), "queued_at": now()})
+            again = rerun(item, tasks, next_round, pin_concurrency(record))
+            record["items"].append({**again, "queued_at": now(), "retry": True,
+                                    "submission": item["submission"]})
 
     # -------------------------------------------------------------- scheduler
 
@@ -577,7 +611,7 @@ class ProfileManager:
         if current is not None:
             run = runs.get(current.get("run"))
             if run is not None and run.get("status") in ACTIVE:
-                if record.get("cancel_requested") and run["status"] != "cancelling":
+                if (record.get("cancel_requested") or current.get("cancel_requested")) and run["status"] != "cancelling":
                     try:
                         self.runs.cancel(run["name"])
                     except ValueError:
@@ -586,7 +620,7 @@ class ProfileManager:
             current.update(status=run["status"] if run else "interrupted",
                            error=(run or {}).get("error") or (None if run else "运行记录丢失"),
                            finished_at=(run or {}).get("finished_at") or now())
-            if not record.get("cancel_requested"):
+            if not record.get("cancel_requested") and not current.get("cancel_requested"):
                 self.queue_invalid_rerun(record, current)
         if record.get("cancel_requested"):
             for item in items:
@@ -674,7 +708,8 @@ class ProfileManager:
                     record["batches"].append(batch["id"])
                     for item in batch.get("items") or []:
                         record["items"].append({**item, "model": batch.get("model"), "attempts": batch.get("attempts"),
-                                                "executor": batch.get("executor"), "queued_at": batch.get("created_at")})
+                                                "executor": batch.get("executor"), "queued_at": batch.get("created_at"),
+                                                "submission": batch["id"]})
                     record["started_at"] = record.get("started_at") or batch.get("started_at")
                     record["finished_at"] = max(filter(None, (record.get("finished_at"), batch.get("finished_at"))),
                                                 default=None)
@@ -694,7 +729,8 @@ def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int, concurrency: 
     """An ended dataset queued again with `tasks` at the profile's
     `concurrency`; `auto_round` counts the automatic reruns of invalid tasks
     it descends from (0: asked for)."""
-    again = {key: value for key, value in item.items() if key not in ("waiting", "auto_rerun", "auto_rerun_error")}
+    again = {key: value for key, value in item.items()
+             if key not in ("waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry")}
     again = at_concurrency({**again, "request": {**item["request"], "tasks": list(tasks)}}, concurrency)
     again.update(tasks=list(tasks), status="pending", run=None, error=None, started_at=None, finished_at=None)
     if auto_round:
@@ -705,6 +741,35 @@ def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int, concurrency: 
 def queued_since(record: Dict[str, Any]) -> str:
     waiting = [i.get("queued_at") or "" for i in record.get("items") or [] if i.get("status") in ("pending", "running")]
     return min(waiting, default=record.get("created_at") or "")
+
+
+def restore_submissions(record):
+    items = record.get("items") or []
+    for index, item in enumerate(items):
+        if item.get("submission"):
+            continue
+        item["submission"] = "legacy-" + str(item.get("queued_at") or index)
+        if not item.get("auto_rerun"):
+            continue
+        queued = data.parse_time(item.get("queued_at"))
+        sources = []
+        for previous in items[:index]:
+            if previous.get("status") != "finished" or previous.get("auto_rerun", 0) + 1 != item["auto_rerun"]:
+                continue
+            if any(previous.get(k) != item.get(k) for k in ("suite", "model", "executor", "attempts", "route")):
+                continue
+            finished = data.parse_time(previous.get("finished_at"))
+            if finished and queued and finished > queued:
+                continue
+            if set(item.get("tasks") or []).issubset(previous.get("tasks") or []):
+                sources.append((finished, previous["submission"]))
+        if sources and queued and all(time for time, _ in sources):
+            latest = max(time for time, _ in sources)
+            sources = [source for source in sources if source[0] == latest]
+        owners = {owner for _, owner in sources}
+        if len(owners) == 1:
+            item.update(submission=owners.pop(), retry=True)
+    return record
 
 
 def runs_of(record: Dict[str, Any], receipts: List[Dict[str, Any]]) -> List[str]:
@@ -741,7 +806,7 @@ def profile_concurrency(record: Dict[str, Any]) -> int:
 
 def public(record: Dict[str, Any]) -> Dict[str, Any]:
     """A profile record without the internal per-item launch requests."""
-    value = json.loads(json.dumps(record))
+    value = restore_submissions(json.loads(json.dumps(record)))
     value["default_name"] = default_name(record)
     value["concurrency"] = profile_concurrency(record)
     for item in value.get("items") or []:
