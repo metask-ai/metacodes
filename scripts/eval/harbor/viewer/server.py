@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.eval.harbor.bench import data
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.results import WorkerUnavailable
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.store.backend import json_text
 
@@ -193,6 +194,8 @@ def make_handler(workbench: Workbench, public_url=None):
                 return
             try:
                 self.route(url.path, query)
+            except WorkerUnavailable as exc:
+                self.send_json({"error": str(exc)}, 503)
             except BrokenPipeError:
                 pass
             except Exception:  # never leak paths or tracebacks to the page

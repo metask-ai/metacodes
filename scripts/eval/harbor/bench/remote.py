@@ -881,17 +881,17 @@ def run_harbor(spec, argv, env, stop, hung_up, egress, cwd, prepare, finish, run
             terminal(run_dir, "error", message=str(exc))
             return 2
         emit("started", pid=harbor.pid)
-        return follow(harbor, stop, hung_up, run_dir, control, handoff, finishing)
+        return follow(harbor, stop, hung_up, run_dir, control, handoff, finishing, spec.get("worker_results"))
     finally:
         if run_dir is None:
             shutil.rmtree(directory, ignore_errors=True)
 
 
-def follow(harbor, stop, hung_up, run_dir, control, handoff, finishing):
+def follow(harbor, stop, hung_up, run_dir, control, handoff, finishing, worker_results=False):
     """Supervise a started Harbor until it ends (the run's terminal event
     and exit code), or until `handoff` gave the run to a newer driver
     (None). Harbor's output reaches the session meanwhile (pump)."""
-    output = threading.Thread(target=harbor.pump, args=(lambda: control.quiet,), daemon=True)
+    output = threading.Thread(target=harbor.pump, args=(lambda: worker_results or control.quiet,), daemon=True)
     output.start()
     if handoff is not None:
         handoff.offer(harbor, control)
@@ -995,7 +995,7 @@ def take_over(spec_path, report):
     harbor = Harbor(run_dir, state["keeper"], state["harbor"], state["log_offset"])
     try:
         watch_sessions(control, stop, hung_up)
-        code = follow(harbor, stop, hung_up, run_dir, control, handoff, lambda: None)
+        code = follow(harbor, stop, hung_up, run_dir, control, handoff, lambda: None, spec.get("worker_results"))
         return 0 if code is None else code
     finally:
         control.close()

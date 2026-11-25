@@ -821,6 +821,30 @@ def merge_summaries(summaries):
     result["ttft_samples_ms"] = ttfts
     result.update(performance_fields(ttfts, result["tps_output_tokens"] or 0, result["tps_generation_ms"] or 0))
     result["cost_by_status"] = {status: sum(s["cost_by_status"][status] for s in summaries) for status in VALID}
+    if any("ttft_histogram" in summary for summary in summaries):
+        from collections import Counter
+        histogram = Counter(ttfts)
+        for summary in summaries:
+            histogram.update(dict(summary.get("ttft_histogram", [])))
+        buckets = sorted(histogram.items())
+        count = sum(histogram.values())
+
+        def quantile(q):
+            if not count:
+                return None
+            position = (count - 1) * q
+            lower = int(position)
+            end = 0
+            for i, (value, n) in enumerate(buckets):
+                end += n
+                if lower < end:
+                    upper = buckets[i + 1][0] if lower + 1 == end and i + 1 < len(buckets) else value
+                    return value + (upper - value) * (position - lower)
+
+        result.pop("ttft_samples_ms")
+        result.update(ttft_histogram=buckets, ttft_count=count,
+                      ttft_ms=sum(v * n for v, n in buckets) / count if count else None,
+                      ttft_p50_ms=quantile(.5), ttft_p95_ms=quantile(.95))
     result.update(outcome_fields(result))
     return result
 

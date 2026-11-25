@@ -238,12 +238,21 @@ V4 = [
     )""",
 ]
 
+V5 = [
+    """CREATE TABLE worker_jobs (
+        job TEXT PRIMARY KEY REFERENCES jobs(name) ON DELETE CASCADE,
+        log_tail TEXT NOT NULL,
+        ingested_at TEXT NOT NULL
+    )""",
+]
+
 # (version, description, statements). Append only.
 MIGRATIONS: List[Tuple[int, str, List[str]]] = [
     (1, "evaluation store: raw files, jobs, trials, requests, tests, runs", V1),
     (2, "bounded tail of oversize files", V2),
     (3, "batches: a frozen metacodes version across datasets", V3),
     (4, "profiles replace batches: a frozen metacodes version with fixed features", V4),
+    (5, "worker-owned job details and execution log", V5),
 ]
 LATEST = MIGRATIONS[-1][0]
 
@@ -252,6 +261,7 @@ LATEST = MIGRATIONS[-1][0]
 TABLES: List[Tuple[str, Tuple[str, ...]]] = [
     ("blobs", ("sha256",)),
     ("jobs", ("name",)),
+    ("worker_jobs", ("job",)),
     ("files", ("job", "relpath")),
     ("trials", ("job", "name")),
     ("requests", ("job", "trial", "seq")),
@@ -262,6 +272,7 @@ TABLES: List[Tuple[str, Tuple[str, ...]]] = [
 ]
 COLUMNS: Dict[str, Tuple[str, ...]] = {
     "blobs": ("sha256", "size", "encoding", "content"),
+    "worker_jobs": ("job", "log_tail", "ingested_at"),
     "jobs": ("name", "source_dir", "agent", "model", "dataset", "attempts", "concurrency", "planned",
              "started_at", "finished_at", "header_json", "inputs_digest", "projection", "ingested_at"),
     "files": ("job", "relpath", "trial", "kind", "size", "mtime_ns", "state", "sha256", "tail_sha256"),

@@ -93,7 +93,7 @@ function measurementCards(s) {
     metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), `${s.initial_token_trials || 0} 次有数据`, false,
       s.initial_composition_mean ? stackBar(compositionSegments(s.initial_composition_mean), true) : null),
     metric('TPS（生成）', tps(s.tps), `${s.profiled_requests || 0}/${s.requests || 0} 个请求`),
-    metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_samples_ms?.length || 0} 个请求`),
+    metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_count ?? s.ttft_samples_ms?.length ?? 0} 个请求`),
     metric('估算成本', usd(s.cost_usd), `${s.cost_trials || 0}/${s.trials || 0} 次有价格`),
     metric('至少通过一次', pct(s.solved_rate), `${s.tasks_solved || 0} / ${s.tasks_attempted || 0} 道`),
     metric('每题平均成本', usd(s.cost_per_task), `${s.task_cost_tasks || 0} 道`),
@@ -238,7 +238,7 @@ function runAgain(b, onlyInvalid) {
   location.hash = '#/new';
 }
 async function deleteProfile(b, button) {
-  if (!confirm(`删除评测配置 ${profileName(b)}？它的所有运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
+  if (!confirm(`删除评测配置 ${profileName(b)}？工作台会删除运行记录、本机作业和汇总。远程 worker 会保留作业详情。`)) return false;
   button.disabled = true;
   try { await api('/api/profile/delete', { id: b.id }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return false; }
@@ -246,7 +246,8 @@ async function deleteProfile(b, button) {
   return true;
 }
 async function deleteJob(j, button) {
-  if (!confirm(`删除作业 ${j.name}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
+  const impact = j.result_owner ? `工作台会删除运行记录和汇总，作业详情保留在 ${j.result_owner}。` : '工作台会删除运行记录、日志和评测结果，不能恢复。';
+  if (!confirm(`删除作业 ${j.name}？${impact}`)) return;
   button.disabled = true;
   try { await api('/api/job/delete', { name: j.name }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return; }
@@ -1085,6 +1086,12 @@ const COLUMNS = [
   ['elapsed_s', '总用时', (r) => r.elapsed_s ?? -1],
 ];
 
+function resultLocation(value) {
+  if (!value.result_owner) return null;
+  const source = value.detail_source === 'database' ? '共用数据库' : 'worker 节点';
+  return h('div', { class: 'muted', text: `作业所在节点 · ${value.result_owner}　详情来源 · ${source}` });
+}
+
 async function renderJob(name) {
   navCurrent('overview');
   const job = await api('/api/job?name=' + encodeURIComponent(name));
@@ -1101,6 +1108,7 @@ async function renderJob(name) {
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
+    resultLocation(job),
     h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（评测配置冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
@@ -1343,7 +1351,7 @@ async function renderTrial(jobName, trialName) {
   state.live = r.status === 'running';
   $('#title').textContent = r.task;
   crumbs([{ text: '看板', href: '#/' }, { text: jobName, href: '#/job/' + encodeURIComponent(jobName) }, { text: r.trial }]);
-  return h('div', {}, trialBody(t));
+  return h('div', {}, resultLocation(t), trialBody(t));
 }
 
 // ------------------------------------------------------------ compare

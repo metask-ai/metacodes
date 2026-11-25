@@ -44,7 +44,7 @@ def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
-        with tmp.open("x", encoding="utf-8") as output:
+        with tmp.open("x", encoding="utf-8", errors="backslashreplace") as output:
             json.dump(value, output, ensure_ascii=False, allow_nan=False)
         tmp.replace(path)
     finally:
@@ -545,6 +545,8 @@ class RunManager:
                       **suites.label(suite.id), "runner": suite.runner, "executor": executor.name,
                       "tasks": tasks, "attempts": attempts, "concurrency": concurrency,
                       "url": "/#/run/" + name, "exit_code": None, "error": None}
+            if executor.kind == "ssh":
+                record["result_owner"] = executor.name
             if max_tokens is not None:
                 record["max_tokens"] = max_tokens
             shown_judge = suites.judge_label(suite, cfg)

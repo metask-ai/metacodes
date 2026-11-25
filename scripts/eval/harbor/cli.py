@@ -567,7 +567,7 @@ def main(argv=None):
             from scripts.eval.harbor.bench import executors
             value = executors.sync_run(jobs_dir, args.run, log=lambda text: print(text, file=sys.stderr, flush=True))
             print(json.dumps(value, ensure_ascii=False) if args.json else
-                  f"{value['name']}：已同步 {value['files']} 个文件到 {value['local_dir']}（{value['status']}）")
+                  f"{value['name']}：已从 {value['executor']} 同步作业汇总")
             return 0
         if args.action == "stop":
             client = client or receipt_client(settings(root / "service.json"), config)

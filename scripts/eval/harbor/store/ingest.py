@@ -852,6 +852,7 @@ class WorkerSync:
         self.interval = interval
         self.job_dir = Path(spec.get("jobs_dir", ".")) / str(spec.get("name", ""))
         self.records_dir = Path(spec.get("jobs_dir", ".")) / ".bench-runs"
+        self.worker_owned = bool(spec.get("result_owner"))
         self.config = None
         self.store: Optional[Store] = None
         self.stop = threading.Event()
@@ -869,6 +870,8 @@ class WorkerSync:
         return self.store
 
     def once(self, verify: bool = False) -> None:
+        if self.worker_owned:
+            return
         try:
             store = self._open()
             if store is not None and is_job_dir(self.job_dir):
