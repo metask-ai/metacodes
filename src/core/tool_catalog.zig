@@ -749,7 +749,6 @@ test "builtin admission verifies runtime dependencies before advertisement" {
 
 test "Selection redescribes builtin tool descriptions via describe_fn (缺陷 A)" {
     // 缺陷 A:Selection.init 必须调 redescribeForContext,让 describe_fn 生成平台化动态长描述,
-    // 而非静态短句(builtin.description)。Bash 的 describe_fn 输出 "Executes a given bash command"(POSIX)
     var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Bash", "Grep" });
     defer catalog.deinit();
     var selection = try Selection.init(std.testing.allocator, &catalog, &.{ "Read", "Bash", "Grep" });
@@ -762,11 +761,10 @@ test "Selection redescribes builtin tool descriptions via describe_fn (缺陷 A)
     }
     try std.testing.expect(bash_desc.len > 0);
     try std.testing.expect(!std.mem.eql(u8, bash_desc, tools.getTool("Bash").?.description));
-    // POSIX 上含 "Executes a given bash command";Windows 上含 "PowerShell"。
     if (@import("builtin").os.tag == .windows) {
         try std.testing.expect(std.mem.indexOf(u8, bash_desc, "PowerShell") != null);
     } else {
-        try std.testing.expect(std.mem.indexOf(u8, bash_desc, "Executes a given bash command") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bash_desc, "/bin/sh") != null);
     }
 }
 

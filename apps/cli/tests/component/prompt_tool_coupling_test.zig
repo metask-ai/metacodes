@@ -381,6 +381,7 @@ test "L2: redescribeForContext 给只读 agent 的 Bash 加只读提醒" {
 
     const bash_after = findDef(defs, "Bash").?;
     try std.testing.expect(std.mem.indexOf(u8, bash_after.description, "Committing changes with git") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_after.description, "Creating pull requests") == null);
     try std.testing.expect(std.mem.indexOf(u8, bash_after.description, "read-only agent") != null);
 }
 
@@ -422,6 +423,17 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "cat -n format") != null); // Read 长描述
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "exact string replacements") != null); // Edit 长描述
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "rg --files") != null);
+    var tool_list = try std.json.parseFromSlice(std.json.Value, a, tools_field, .{});
+    defer tool_list.deinit();
+    for (tool_list.value.array.items) |tool| {
+        if (!std.mem.eql(u8, tool.object.get("name").?.string, "Bash")) continue;
+        const desc = tool.object.get("description").?.string;
+        for ([_][]const u8{ "fresh process", "Choosing a tool", "Running commands", "Long-running commands and results", "Committing changes with git", "Creating pull requests", "git diff <base>...HEAD" }) |rule|
+            try std.testing.expect(std.mem.indexOf(u8, desc, rule) != null);
+        const timeout = tool.object.get("input_schema").?.object.get("properties").?.object.get("timeout").?;
+        try std.testing.expectEqualStrings("Foreground timeout in milliseconds (default 120000, maximum 86400000)", timeout.object.get("description").?.string);
+        break;
+    } else return error.BashToolMissing;
 }
 
 test "L2 e2e: execution policy hides deferred tools from schema and system prompt" {

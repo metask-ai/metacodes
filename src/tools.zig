@@ -239,7 +239,7 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "command", .type = "string", .description = "The command to execute" },
             .{ .name = "description", .type = "string", .description = "Clear, concise description of what this command does in 5-10 words" },
-            .{ .name = "timeout", .type = "integer", .description = "Optional timeout in milliseconds (max 600000)" },
+            .{ .name = "timeout", .type = "integer", .description = std.fmt.comptimePrint("Foreground timeout in milliseconds (default {d}, maximum {d})", .{ bash_tool.DEFAULT_TIMEOUT_MS, bash_tool.MAX_TIMEOUT_MS }) },
             .{ .name = "run_in_background", .type = "boolean", .description = "Set to true to run this command in the background" },
         }, .required = &.{"command"} },
         .execute = .{ .result_body = bash_tool.executeBody },

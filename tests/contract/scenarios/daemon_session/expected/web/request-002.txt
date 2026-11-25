@@ -284,31 +284,34 @@ Usage:\n
 "patch"]}},
 {
 "name":"Bash",
-"description":"Executes a given bash command in a persistent shell session with an optional timeout, ensuring proper handling and security measures.\n
+"description":"Run a shell command through /bin/sh. Use portable shell syntax, or invoke a specific interpreter when the task requires it.\n
+Each call starts a fresh process in the session working directory. A directory change, variable assignment or shell option lasts only for that call. Supply the directory to the command when possible, e.g. `git -C \"project with spaces\" status --short`.\n
 \n
-Usage:\n
-- The command argument is required.\n
-- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.\n
-- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.\n
-- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms). You do not need to use '&' at the end of the command when using this parameter.\n
-- Use the shell to search the workspace, run builds and tests, and inspect Git. Find files with `rg --files -g '*.zig'` and literal text with `rg -n -F -- 'text' src`. Narrow the path where possible. When available, use Read for the matching lines, Edit for changes, and Write for new files. If rg is unavailable, use find and grep within the project.\n
-- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.\n
-- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked \"...[middle omitted]...\" and its \"<channel>_truncated\" field is set to true.\n
-- To read truncated output, pass its \"<channel>_artifact_id\" to ReadArtifact and continue at next_offset.\n
+# Choosing a tool\n
+Find files with `rg --files -g \"*.zig\"` and literal text with `rg -n -F -- \"text\" src`. Scope searches to the project or a relevant subdirectory. If rg is unavailable, list files with `find src -type f -name '*.zig'`. If rg is unavailable, search text with `grep -rnF -- 'text' src`. Use Read to inspect the matching lines. Use Edit for targeted replacements. Use Write to create files.\n
+\n
+# Running commands\n
+Pass the command in `command`. Give the user a short description of its purpose, such as \"Run the parser regression tests\". Quote paths with spaces. Before creating files in an unfamiliar directory, verify the parent and destination.\n
+Run independent inspections in parallel. Keep dependent operations in order: a successful build must finish before an install that consumes its output. If a prerequisite fails, inspect the error before continuing.\n
+Use `&&` when the next command requires the previous one to succeed. For independent checks, separate calls preserve each exit status.\n
+\n
+# Long-running commands and results\n
+The foreground timeout is in milliseconds. Set it to suit the work. For background work on a host with job support, set `run_in_background` and use the returned `job_id`. A long foreground call can also return a job ID while work continues. Starting a job does not mean it succeeded. Use BashOutput with that ID when you need the result: it waits for exit up to `wait_ms` by default. The CLI also delivers a completion notification. Avoid sleep loops and repeated empty polls.\n
+For a completed command, inspect `exit_code`, `stdout` and `stderr`. A search exit code of 1 from rg means no match; check diagnostics for other failures. A channel marked truncated contains only a preview. Pass the returned channel artifact ID to ReadArtifact and continue at `next_offset` to recover the omitted output. Report the relevant finding or failure to the user; they may only see your summary.\n
 \n
 # Committing changes with git\n
-\n
-When the user asks you to create a new git commit, follow these steps carefully:\n
-1. Run a git status, git diff, and git log in parallel to see staged/unstaged changes and recent commit message style.\n
-2. Stage relevant files, then create the commit with a concise message focused on \"why\" rather than \"what\". Do NOT add co-author or tool attribution unless asked.\n
-3. Do NOT use destructive flags. NEVER force-push, run `git reset --hard`, amend published commits, or use `--no-verify` to bypass hooks.\n
+Commit when the user or the requested workflow calls for it. Use noninteractive Git commands and preserve the user's other work.\n
+1. Inspect the working tree, index and recent history. Independent checks such as `git status --short`, `git diff`, `git diff --cached` and `git log -5 --oneline` can run together. The staged diff is what the commit will contain.\n
+2. Stage paths belonging to this change by name. Inspect previously staged files for unrelated work and check for credentials or local configuration before committing. If someone else's changes are staged, preserve them and keep them out of this commit.\n
+3. Match the repository's message style and explain the reason for the change. Create a new commit after staging and checking its contents. If a hook fails, the proposed commit did not land: fix the cause, stage that fix and retry. Amending HEAD at that point would change the preceding commit.\n
+4. Verify the new commit and the remaining working tree with `git log -1 --oneline` and `git status --short`. Report any work still unstaged. Push only when the task includes publication.\n
+Keep hooks, signing and Git configuration intact. Preserve existing history and local changes. Destructive resets, broad cleans and force-pushes can erase another person's work; check the target and obtain explicit authorization for destructive actions. Never force-push a shared branch.\n
 \n
 # Creating pull requests\n
-\n
-Use the `gh` command for GitHub operations. To create a PR:\n
-1. Run git status / git diff / git log on the base branch in parallel to understand the full set of changes.\n
-2. Push the branch with -u if needed, then create the PR with a summary and test plan.\n
-3. NEVER force-push to shared branches or close others' PRs without confirmation.",
+1. Identify the intended base and the current branch's upstream. Review the branch's entire change using `git log <base>..HEAD` and `git diff <base>...HEAD`; also check the working tree for changes the PR would leave behind.\n
+2. Run the checks relevant to those changes. Summarize the user-visible effect, why it was needed, and the checks actually run. State outstanding validation separately.\n
+3. Push the intended branch, setting its upstream if needed. Once the push succeeds, use `gh pr create` with the intended base and head. For a multiline description, pass a body file so quoting and formatting survive. If the branch already has a PR, update that PR.\n
+4. Return the PR URL and its verification state. A successful local commit or push alone does not establish that a PR exists.",
 "input_schema":{
 "type":"object",
 "properties":{
@@ -320,7 +323,7 @@ Use the `gh` command for GitHub operations. To create a PR:\n
 "description":"Clear, concise description of what this command does in 5-10 words"},
 "timeout":{
 "type":"integer",
-"description":"Optional timeout in milliseconds (max 600000)"},
+"description":"Foreground timeout in milliseconds (default 120000, maximum 86400000)"},
 "run_in_background":{
 "type":"boolean",
 "description":"Set to true to run this command in the background"}},

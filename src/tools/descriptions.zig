@@ -138,77 +138,80 @@ const BASH_GIT_SECTION =
     \\
     \\
     \\# Committing changes with git
-    \\
-    \\When the user asks you to create a new git commit, follow these steps carefully:
-    \\1. Run a git status, git diff, and git log in parallel to see staged/unstaged changes and recent commit message style.
-    \\2. Stage relevant files, then create the commit with a concise message focused on "why" rather than "what". Do NOT add co-author or tool attribution unless asked.
-    \\3. Do NOT use destructive flags. NEVER force-push, run `git reset --hard`, amend published commits, or use `--no-verify` to bypass hooks.
+    \\Commit when the user or the requested workflow calls for it. Use noninteractive Git commands and preserve the user's other work.
+    \\1. Inspect the working tree, index and recent history. Independent checks such as `git status --short`, `git diff`, `git diff --cached` and `git log -5 --oneline` can run together. The staged diff is what the commit will contain.
+    \\2. Stage paths belonging to this change by name. Inspect previously staged files for unrelated work and check for credentials or local configuration before committing. If someone else's changes are staged, preserve them and keep them out of this commit.
+    \\3. Match the repository's message style and explain the reason for the change. Create a new commit after staging and checking its contents. If a hook fails, the proposed commit did not land: fix the cause, stage that fix and retry. Amending HEAD at that point would change the preceding commit.
+    \\4. Verify the new commit and the remaining working tree with `git log -1 --oneline` and `git status --short`. Report any work still unstaged. Push only when the task includes publication.
+    \\Keep hooks, signing and Git configuration intact. Preserve existing history and local changes. Destructive resets, broad cleans and force-pushes can erase another person's work; check the target and obtain explicit authorization for destructive actions. Never force-push a shared branch.
     \\
     \\# Creating pull requests
-    \\
-    \\Use the `gh` command for GitHub operations. To create a PR:
-    \\1. Run git status / git diff / git log on the base branch in parallel to understand the full set of changes.
-    \\2. Push the branch with -u if needed, then create the PR with a summary and test plan.
-    \\3. NEVER force-push to shared branches or close others' PRs without confirmation.
-;
-
-const BASH_READONLY_NOTE =
-    \\
-    \\
-    \\NOTE: You are a read-only agent. Use Bash ONLY for read-only operations (ls, git status, git log, git diff, find, cat, head, tail). NEVER run state-changing commands (mkdir, touch, rm, cp, mv, git add, git commit, npm/pip install) or use redirection (>, >>) / heredocs to write files.
+    \\1. Identify the intended base and the current branch's upstream. Review the branch's entire change using `git log <base>..HEAD` and `git diff <base>...HEAD`; also check the working tree for changes the PR would leave behind.
+    \\2. Run the checks relevant to those changes. Summarize the user-visible effect, why it was needed, and the checks actually run. State outstanding validation separately.
+    \\3. Push the intended branch, setting its upstream if needed. Once the push succeeds, use `gh pr create` with the intended base and head. For a multiline description, pass a body file so quoting and formatting survive. If the branch already has a PR, update that PR.
+    \\4. Return the PR URL and its verification state. A successful local commit or push alone does not establish that a PR exists.
 ;
 
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    const has_glob = ctx.hasTool("Glob");
-    const has_grep = ctx.hasTool("Grep");
-    const find_files = if (has_glob) "Glob" else "`rg --files -g '*.zig'`";
-    const find_text = if (has_grep) "Grep" else "`rg -n -F -- 'text' src`";
-    const specialized_search = has_glob or has_grep;
-    const shell_role = if (specialized_search)
-        "Use the shell to run builds and tests and inspect Git."
+    const windows = @import("builtin").os.tag == .windows;
+    const readonly = ctx.isReadonlyAgent();
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    const out = &text.writer;
+
+    try out.writeAll(if (windows)
+        "Run a Windows shell command. Use PowerShell syntax when PowerShell is installed; the fallback shell is cmd.exe."
     else
-        "Use the shell to search the workspace, run builds and tests, and inspect Git.";
-    const fallback = if (specialized_search) "" else if (@import("builtin").os.tag == .windows)
-        " If rg is unavailable, use Get-ChildItem and Select-String."
-    else
-        " If rg is unavailable, use find and grep within the project.";
-    const search = try std.fmt.allocPrint(allocator, "{s} Find files with {s} and literal text with {s}. " ++
-        "Narrow the path where possible. When available, use Read for the matching lines, Edit for changes, and Write for new files.{s}", .{ shell_role, find_files, find_text, fallback });
-    defer allocator.free(search);
-    const git_section = if (ctx.include_git and !ctx.isReadonlyAgent()) BASH_GIT_SECTION else "";
-    const readonly_note = if (ctx.isReadonlyAgent()) BASH_READONLY_NOTE else "";
-    // 复刻 codex 第③层:平台化工具描述。Windows 上用系统自带 PowerShell 跑(零 git-bash),
-    // 故告诉模型产 **PowerShell** cmdlet 而非 bash 命令(codex 实证:比 bash→ps 翻译层更稳)。
-    if (@import("builtin").os.tag == .windows) {
-        return std.fmt.allocPrint(allocator,
-            \\Runs a PowerShell command (Windows) in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
-            \\
-            \\Usage:
-            \\- The command argument is required. Write **PowerShell** syntax (this runs via `powershell -NoProfile -Command`, not bash).
-            \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
-            \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-            \\- Use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms); do not append '&'.
-            \\- {s}
-            \\- Chain multiple commands with ';'. DO NOT use newlines.
-            \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
-            \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
-            \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-            \\- To read truncated output, pass its "<channel>_artifact_id" to ReadArtifact and continue at next_offset.{s}{s}
-        , .{ search, git_section, readonly_note });
-    }
-    return std.fmt.allocPrint(allocator,
-        \\Executes a given bash command in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
+        "Run a shell command through /bin/sh. Use portable shell syntax, or invoke a specific interpreter when the task requires it.");
+    try out.writeAll(
         \\
-        \\Usage:
-        \\- The command argument is required.
-        \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
-        \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-        \\- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms). You do not need to use '&' at the end of the command when using this parameter.
-        \\- {s}
-        \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
-        \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-        \\- To read truncated output, pass its "<channel>_artifact_id" to ReadArtifact and continue at next_offset.{s}{s}
-    , .{ search, git_section, readonly_note });
+        \\Each call starts a fresh process in the session working directory. A directory change, variable assignment or shell option lasts only for that call. Supply the directory to the command when possible, e.g. `git -C "project with spaces" status --short`.
+        \\
+        \\# Choosing a tool
+    );
+    try out.print("\nFind files with {s} and literal text with {s}. Scope searches to the project or a relevant subdirectory.", .{
+        if (ctx.hasTool("Glob")) "Glob" else "`rg --files -g \"*.zig\"`",
+        if (ctx.hasTool("Grep")) "Grep" else "`rg -n -F -- \"text\" src`",
+    });
+    if (!ctx.hasTool("Glob")) try out.writeAll(if (windows)
+        " In PowerShell, Get-ChildItem can list matching files when rg is unavailable."
+    else
+        " If rg is unavailable, list files with `find src -type f -name '*.zig'`.");
+    if (!ctx.hasTool("Grep")) try out.writeAll(if (windows)
+        " In PowerShell, use Select-String with -SimpleMatch to search known files without rg."
+    else
+        " If rg is unavailable, search text with `grep -rnF -- 'text' src`.");
+    if (ctx.hasTool("Read")) try out.writeAll(" Use Read to inspect the matching lines.");
+    if (!readonly and ctx.hasTool("Edit")) try out.writeAll(" Use Edit for targeted replacements.");
+    if (!readonly and ctx.hasTool("Write")) try out.writeAll(" Use Write to create files.");
+
+    try out.writeAll(
+        \\
+        \\
+        \\# Running commands
+        \\Pass the command in `command`. Give the user a short description of its purpose, such as "Run the parser regression tests". Quote paths with spaces. Before creating files in an unfamiliar directory, verify the parent and destination.
+        \\Run independent inspections in parallel. Keep dependent operations in order: a successful build must finish before an install that consumes its output. If a prerequisite fails, inspect the error before continuing.
+    );
+    try out.writeAll(if (windows)
+        "\nIn PowerShell, use -LiteralPath for exact paths and check $LASTEXITCODE after a native executable before running a dependent step. Use a single shell for file operations; verify the resolved target before recursive deletion."
+    else
+        "\nUse `&&` when the next command requires the previous one to succeed. For independent checks, separate calls preserve each exit status.");
+    try out.writeAll(
+        \\
+        \\
+        \\# Long-running commands and results
+        \\The foreground timeout is in milliseconds. Set it to suit the work. For background work on a host with job support, set `run_in_background` and use the returned `job_id`. A long foreground call can also return a job ID while work continues. Starting a job does not mean it succeeded.
+    );
+    if (ctx.hasTool("BashOutput")) try out.writeAll(" Use BashOutput with that ID when you need the result: it waits for exit up to `wait_ms` by default. The CLI also delivers a completion notification. Avoid sleep loops and repeated empty polls.");
+    try out.writeAll("\nFor a completed command, inspect `exit_code`, `stdout` and `stderr`. A search exit code of 1 from rg means no match; check diagnostics for other failures. A channel marked truncated contains only a preview.");
+    if (ctx.hasTool("ReadArtifact")) try out.writeAll(" Pass the returned channel artifact ID to ReadArtifact and continue at `next_offset` to recover the omitted output.");
+    try out.writeAll(" Report the relevant finding or failure to the user; they may only see your summary.");
+    if (readonly) {
+        try out.writeAll("\n\nYou are a read-only agent. Limit shell use to inspection. Builds, installations, filesystem writes (including redirection), staging and commits can change state.");
+    } else if (ctx.include_git) {
+        try out.writeAll(BASH_GIT_SECTION);
+    }
+    return text.toOwnedSlice();
 }
 
 // ============================================================================

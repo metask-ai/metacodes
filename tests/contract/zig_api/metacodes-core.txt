@@ -9645,7 +9645,7 @@ metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
 metacodes-core.tools.ToolEntry.embedding_only: bool = false
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <41515 bytes, sha256 b2868b679719>
+metacodes-core.tools.registry: const []const ToolEntry = <41615 bytes, sha256 b0be58688a4c>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8
