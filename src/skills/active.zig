@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const PolicyFrame = @import("runtime/policy_frame.zig").PolicyFrame;
-const model_tool = @import("runtime/model_tool.zig");
 
 pub const ActiveSkillState = struct {
     /// Borrowed from the immutable catalog record that owns the activation.
@@ -57,7 +56,7 @@ pub const ActiveSkillState = struct {
         // Skill is the typed narrowing boundary itself. Keeping it visible
         // cannot widen authority because the child frame is derived from this
         // frame; AgentCore applies the same special case in its tool overlay.
-        if (std.mem.eql(u8, tool_name, model_tool.TOOL_NAME))
+        if (std.mem.eql(u8, tool_name, "Skill"))
             return self.policy_frame.allowsSkillTool();
         return self.policy_frame.executionPolicy().allowsTool(tool_name);
     }
@@ -73,7 +72,7 @@ pub const ActiveSkillState = struct {
         tool_name: []const u8,
         arguments_json: []const u8,
     ) bool {
-        if (std.mem.eql(u8, tool_name, model_tool.TOOL_NAME))
+        if (std.mem.eql(u8, tool_name, "Skill"))
             return !self.policy_frame.allowsSkillInvocation(arguments_json);
         return !self.policy_frame.allowsInvocation(tool_name, arguments_json);
     }

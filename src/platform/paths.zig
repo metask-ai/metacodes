@@ -260,6 +260,13 @@ pub fn uid() u32 {
 }
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
+pub fn hashCwd(cwd: []const u8) [16]u8 {
+    const h = std.hash.XxHash64.hash(0, cwd);
+    var out: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&out, "{x:0>16}", .{h}) catch unreachable;
+    return out;
+}
+
 test "null_device 平台正确" {
     const nd = std.mem.span(null_device);
     if (is_windows) {

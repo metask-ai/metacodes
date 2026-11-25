@@ -60,11 +60,11 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 
 | 包 | 现在的路径(按前缀归属,长前缀优先) | 可以 import 的包 |
 |----|------------------------------------|------------------|
-| `base` | `util/` · `platform/` · `types` · `json` · `symbols/` · `highlight/` · `version*` · `preview` · `release_contract` | 无 |
-| `ai` | `api/` · `provider/` · `client` | base |
+| `base` | `util/` · `platform/` · `symbols/` · `highlight/` · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
+| `ai` | `api/`(`model_name` 除外) · `provider/` · `client` · `types` · `json` · `preview` · `core/` 里的 `auth` · `recorder` · `context_pressure` | base |
 | `kernel` | `core/` 里的 `agent_loop` · `conversation` · `message` · `tool_exec` · `session_id` · `protocol/` | base、ai |
-| `guard` | `permission*` · `sandbox/` · `formal/` · `core/` 里的 `result_budget` · `workspace_policy` · `tool_result_artifact` | 以上各包 |
-| `coding` | `core/` 其余文件 · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `code/` | 以上各包 |
+| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `result_budget` · `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `tools/` 里的 `common` · `observation` · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
+| `coding` | `core/` 其余文件 · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `code/` · `sandbox/filesystem` · `formal/task_audit` · `api/model_name_consumers_test` | 以上各包 |
 | `session` | `core/agent_session` · `core/session_host` | 以上各包 |
 | `teamwork` | `teamwork/` | 以上各包 |
 | `facade` | `lib.zig`(`metacodes-core` 的对外门面,汇总导出以上各包) · `internal.zig`(cli 访问下层的唯一入口,不对外) | 以上各包 |
@@ -116,6 +116,16 @@ provider 配置的类型)和 `core/auth.zig`、`core/recorder.zig`、`core/conte
 `codex_usage`/`openai_client` 用的日期和时区计算、`controller_git` 用的子进程捕获下沉到 `platform`
 (`fs.statFd`/`statPath`、`timezone.civilDate`/`formatOffset`/`boundedLocal`、`process.captureWithSpawnRetry`/`describeArgv`),
 `read_state`、`time_context`、`tools/common` 的公开声明不变,改为调用它们。越层 import 130,深层 import 1665,包间环缩成 kernel、guard、coding。
+
+迁移 2.1 清掉 `guard → coding` 的 34 条边,只改归属,不搬文件:一个文件的 import 闭包已经都在目标包或更低的包里,就把它
+单个归到那个包,路径和 `lib.zig`、`internal.zig` 的名字都不变,Zig API 快照和测试 ID 不变。归到 `guard` 的有
+`tools/common`、`mcp/naming`、`core/shell`、`core/answer_queue`、`core/shutdown`、`memory/memdir`、
+`skills/active` 和 `policy_frame`,以及 `project_harness_runtime` 读的工具观测与规则影响证据这 10 个文件;`tools/test_tmp`
+只给测试用,归到 `base`。反过来,以 `ToolContext` 为参数的工具实现 `sandbox/filesystem`、`formal/task_audit` 归到 `coding`,
+沙箱机制(`exec`、`config`、`filesystem_helper`)和 formal 检查器仍在 `guard`。代码改了两处:`ToolExecutionPolicy`
+挪到 `permission/category.zig`,`tools/context.zig` 用别名保留,`policy_frame` 不再 import `tools.zig`;`hashCwd` 的实现挪到
+`platform.paths`,`transcript.hashCwd` 签名不变、转调它,`memdir` 直接用它,`transcript` 留在 `coding`。越层 import 94
+(`guard → coding` 清零,`kernel` 对 `test_tmp` 的 2 条也随之消失),深层 import 1804(新增的 154 条都是基线代码里已有的 import:147 条原在同一个包里,7 条原是越层 import)。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。
