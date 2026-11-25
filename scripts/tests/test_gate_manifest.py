@@ -96,6 +96,9 @@ class GateManifestTest(unittest.TestCase):
         args = [sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"]
         repair = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
         self.assertIn(repair, missing.stderr)
+        self.assertIn("-m venv .venv", missing.stderr)
+        activate = r"call .venv\Scripts\activate.bat" if os.name == "nt" else ". .venv/bin/activate"
+        self.assertIn(f"{activate}\npython -m pip install -r requirements-dev.txt\nzig build gate:pr", missing.stderr)
 
     def test_every_script_suite_runs_on_every_pull_request(self):
         """A suite nothing runs passes forever. Every scripts/tests module is
