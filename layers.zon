@@ -47,6 +47,7 @@
                 "src/core/kernel/",
             },
             .allowed_dependencies = .{ "base", "ai" },
+            .root = "src/core/kernel.zig",
         },
         .{
             .name = "guard",

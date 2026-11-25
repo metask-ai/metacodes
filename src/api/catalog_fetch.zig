@@ -162,7 +162,10 @@ fn exchange(
         header_count += 1;
     }
 
-    var http_request = client.request(.GET, uri, .{
+    const manager = http_connection.managerClient(&client, uri, if (authorization) |header| header.value else "") catch return error.RequestFailed;
+    defer http_connection.releaseManagerClient(manager);
+    const transport = manager orelse &client;
+    var http_request = transport.request(.GET, uri, .{
         .extra_headers = headers[0..header_count],
         // std's client re-sends `extra_headers` on every redirect hop,
         // whatever host it points at, and in 0.16 never sends

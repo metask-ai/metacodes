@@ -747,6 +747,12 @@ usable. Readiness probes are cached for 15 seconds.
 
 ### Bench nodes
 
+For ordinary conversations and Bench runs started independently on a node,
+the manager can keep a certificate-verified HTTPS model connection open between runs with
+`metacodes bench share --executor NAME --peer-env FILE`.
+[Pairing a node](PROVIDERS.md#using-a-managers-login-on-an-ssh-node)
+also covers the node's provider setup and stopping the share.
+
 Every machine with `metacodes` installed is a Bench node. A workbench drives
 an SSH executor the way an editor drives a remote host: it runs that host's
 own `metacodes bench node …` over SSH and talks to it on the channel's stdin
@@ -1455,16 +1461,21 @@ answers. After 30 minutes it fails, and the queue moves on.
 A profile's concurrency is set on its page (并发数; `POST /api/profile/concurrency`
 with `id` and `concurrency`, any positive integer), running or not; `POST
 /api/profiles/run` does not take one. A suite's `max_concurrency`, when set,
-caps it. The value applies to the running dataset at once, to the datasets
-still waiting in the queue and to every one queued later, reruns included. A
-profile saved before it had a concurrency uses its latest dataset's. Lowering it lets the trials already running finish;
+caps it. Each queued dataset, including manual and automatic reruns, reads
+the saved profile value when it starts. While it waits, its row shows what
+it would use now. An older profile without a saved value uses its latest
+dataset's concurrency. A CLI `bench run` uses its own concurrency for that
+launch only. Saving also updates an active Harbor run. Lowering it lets the trials already running finish;
 raising it starts more within about a second. The workbench writes the value
 to `<jobs>/.bench-runs/<run>.concurrency`; on an SSH executor the worker sends
 it over the run's control channel and the node writes it beside the run's
 spec. Harbor reads that file (named by `METACODES_BENCH_CONCURRENCY_FILE`)
 through `scripts/eval/harbor/live_concurrency.py`, which the metacodes agent
 installs in Harbor's trial queue in place of its fixed `-n` semaphore. A
-WorkBuddy run keeps the concurrency it started with.
+WorkBuddy run keeps the concurrency it started with. The profile page confirms
+that the new value was saved and shows the concurrency WorkBuddy is still using.
+If an active run cannot be updated, the page reports the failure and the
+saved value still applies to the queue.
 
 A rerun replaces the earlier result: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the

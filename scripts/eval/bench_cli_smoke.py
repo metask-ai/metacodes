@@ -18,7 +18,8 @@ from urllib.request import Request, urlopen
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json  # noqa: E402
-from scripts.eval.tests.test_bench_workbench import fixture, wait_run, wait_status  # noqa: E402
+from scripts.eval.harbor.bench.share import manager_identity, peer_key  # noqa: E402
+from scripts.eval.tests.test_bench_workbench import RotatingGateway, fixture, wait_run, wait_status  # noqa: E402
 
 # A service from before the login was dropped, in a separate process: the
 # base revision's headers, a capability every POST must carry, and a
@@ -65,6 +66,109 @@ server.SECURITY_HEADERS = (
 )
 sys.exit(server.main())
 """
+
+
+def check_shared_models(binary, root, config, binary_dir):
+    peer = root / 'peer'
+    peer.mkdir()
+    mapping = root / 'ssh-forward'
+    ssh = binary_dir / 'ssh'
+    ssh.write_text(f'#!{sys.executable}\nimport pathlib, sys\n'
+                   f'pathlib.Path({str(mapping)!r}).write_text(sys.argv[sys.argv.index("-R") + 1])\n'
+                   'sys.stdin.buffer.read()\n')
+    ssh.chmod(0o755)
+    gateway = RotatingGateway(root, lifetime=3600)
+    env = {'PATH': str(binary_dir) + os.pathsep + os.environ['PATH'], 'HOME': str(root),
+           'PYTHONPATH': str(REPO), 'FAKE_RELAY_REQUESTS': '1', 'FAKE_RELAY_INTERVAL': '0'}
+    pairing = root / 'node-b.env'
+    atomic_json(gateway.state / 'bench/workbench.json', {
+        'executors': [{'name': 'B', 'kind': 'ssh', 'host': 'node-b'}]})
+    command = [str(binary), '--state-dir', str(gateway.state), 'bench', 'share',
+               '--executor', 'B', '--peer-env', str(pairing)]
+    def on_peer(*args, success=True):
+        p = subprocess.run([str(binary), '--state-dir', str(peer), *args], cwd=root, env=env,
+                           capture_output=True, text=True, timeout=40)
+        assert (p.returncode == 0) == success, (args, p.returncode)
+        return p.stdout + p.stderr
+
+    try:
+        with subprocess.Popen(command, cwd=root, env={**env, 'METASK_SITE_URL': gateway.url},
+                              start_new_session=True) as manager:
+            try:
+                deadline = time.monotonic() + 10
+                while not mapping.exists() or not mapping.read_text():
+                    assert manager.poll() is None and time.monotonic() < deadline, 'missing SSH forward'
+                    time.sleep(.05)
+                remote_host, remote_port, local_host, port = mapping.read_text().split(':')
+                assert (remote_host, remote_port, local_host) == ('127.0.0.1', '18767', '127.0.0.1')
+                shutil.copy2(pairing, peer / '.env')
+                on_peer('providers', 'add', 'manager', '--base-url', f'https://127.0.0.1:{port}',
+                        '--protocol', 'anthropic_messages', '--auth', 'bearer',
+                        '--key-env', 'MODEL_MANAGER_KEY', '--model', 'session-model')
+                assert 'manager' in on_peer('login', 'status')
+                assert 'session-model' in on_peer('providers', 'probe', 'manager')
+                assert 'ok' in on_peer('-p', 'reply ok') and gateway.requests[-1][1]
+                other = root / 'other.env'
+                peer_key(other, manager_identity(other)[1])
+                shutil.copy2(other, peer / '.env')
+                before = len(gateway.requests)
+                assert 'tls' in on_peer('-p', 'reply ok', success=False).lower()
+                assert len(gateway.requests) == before
+                shutil.copy2(pairing, peer / '.env')
+                cfg = {k: v for k, v in config.items() if k not in ('key_env', 'provider_config')}
+                atomic_json(peer / 'bench/workbench.json', {**cfg, 'metrics_enabled': True})
+                try:
+                    on_peer('bench', '--no-open', '--auth', 'provider', '--model', 'manager/session-model')
+                    sys.path.insert(0, str(REPO / 'tests/tty'))
+                    from tty_driver import IDLE, READY, run
+
+                    def turns():
+                        yield from [READY, 'type:first', 'key:enter', 'sleep:5', IDLE]
+                        assert len(gateway.requests) > before and gateway.requests[-1][1], 'first manager turn'
+                        old = gateway.current_access
+                        gateway.revoke(old)
+                        on_peer('bench', 'run', '--task', 'fix-git', '--wait')
+                        assert gateway.current_access != old, 'node must rotate the manager session'
+                        before_second = len(gateway.requests)
+                        yield from ['type:second', 'key:enter', 'sleep:5', IDLE]
+                        assert any(token == gateway.current_access and ok for token, ok, _ in
+                                   gateway.requests[before_second:]), 'open manager conversation must recover'
+                        yield from ['type:/exit', 'key:enter']
+
+                    run(str(binary), turns(), cwd=str(root), base_url=None, per_key_drain=.04,
+                        extra_args=['--state-dir', str(gateway.state), '--provider', 'metask', '--model', 'session-model'],
+                        env={**env, 'METASK_SITE_URL': gateway.url, 'METASK_GATEWAY_URL': gateway.url,
+                             'METACODES_OAUTH_DIR': str(gateway.state / 'oauth'), 'METASK_API_KEY': None})
+                    status, = (peer / 'bench/jobs').glob('*/relay-statuses.json')
+                    assert json.loads(status.read_bytes()) == [200] and len(gateway.refreshes) == 1
+                    assert not gateway.rejected
+                    assert not (peer / 'oauth/metask.json').exists()
+                finally:
+                    on_peer('bench', 'stop')
+                target = RotatingGateway(gateway.state, lifetime=3600)
+                try:
+                    gateway.next_gateway = target
+                    gateway.revoke(gateway.current_access)
+                    args = [str(binary), '--state-dir', str(gateway.state), '--provider', 'metask',
+                            '--model', 'session-model', '-p', 'reply ok']
+                    manager_env = {**env, 'METASK_SITE_URL': gateway.url}
+                    stopped = subprocess.run(args, cwd=root, env=manager_env, capture_output=True, timeout=40)
+                    assert stopped.returncode != 0
+                    stored = json.loads((gateway.state / 'oauth/metask.json').read_bytes())
+                    assert (stored['gateway_url'], stored['access_token'], stored['refresh_token']) == (
+                        target.url, gateway.current_access, gateway.refresh_token)
+                    assert all(token != gateway.current_access for token, _, _ in gateway.requests)
+                    resumed = subprocess.run(args, cwd=root, env=manager_env, capture_output=True, timeout=40)
+                    assert resumed.returncode == 0 and b'ok' in resumed.stdout
+                    assert target.requests[-1][:2] == (gateway.current_access, True)
+                    assert len(gateway.refreshes) == 2 and not gateway.rejected
+                finally:
+                    target.close()
+            finally:
+                if manager.poll() is None:
+                    os.killpg(manager.pid, signal.SIGTERM)
+    finally:
+        gateway.close()
 
 
 def main():
@@ -200,6 +304,7 @@ def main():
                         os.kill(record['pid'], signal.SIGTERM)
                     except ProcessLookupError:
                         pass
+        check_shared_models(native, root, config, binary_dir)
     return 0
 
 

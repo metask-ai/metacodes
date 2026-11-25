@@ -43,6 +43,7 @@ Preview features default to disabled, and each has its own switch:
 | `execute_code` | The `ExecuteCode` JavaScript orchestration tool |
 | `teamwork` | `metacodes teamwork` run, resume and Manager MCP execution |
 | `comment_guard` | The no-comment instruction and the editors' comment check |
+| `background_watchdog` | A time limit on background Bash jobs (`timeout`, default 30 minutes, at most 2 hours) and a one-time notice when a background job seems to wait for interactive input |
 | `monitor_events` | `Monitor` pushes each batch of stdout lines to the model as a `<task-notification>` event |
 
 `--preview` enables every feature and `--no-preview` disables every feature.

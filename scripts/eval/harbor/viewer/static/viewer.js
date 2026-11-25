@@ -550,16 +550,20 @@ function concurrencyControl(b) {
   const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, step: 1, required: true, value: b.concurrency ?? '',
     'aria-label': '并发数', onfocus: () => { state.editing = true; },
     onblur: () => { if (input.value === String(b.concurrency ?? '')) state.editing = false; } });
-  const feedback = h('span', { class: 'muted', role: 'status', text: profileActive(b)
-    ? '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中和之后运行的评测集也按新值运行'
-    : '之后在这个Profile上运行的评测集都按这个并发运行' });
+  const result = state.concurrencyResult;
+  const warning = result?.id === b.id && result.concurrency === b.concurrency &&
+    b.items.some((item) => item.run === result.run && item.status === 'running') && result.warning;
+  const hint = profileActive(b)
+    ? '排队中的评测集启动时使用新值。正在运行的 WorkBuddy 保持原并发，其他评测集会立即调整，已开始的 trial 会继续跑完。'
+    : '之后在这个 Profile 上运行的评测集都按这个并发运行';
+  const feedback = h('span', { class: 'muted', role: 'status', text: warning || hint });
   const form = h('form', { class: 'rename' }, input, h('button', { type: 'submit', class: 'button primary' }, '应用'), feedback);
   form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { state.editing = false; render(); } });
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     feedback.textContent = '正在应用…';
     try {
-      await api('/api/profile/concurrency', { id: b.id, concurrency: Number(input.value) });
+      state.concurrencyResult = await api('/api/profile/concurrency', { id: b.id, concurrency: Number(input.value) });
       state.editing = false;
       render();
     } catch (error) { feedback.textContent = error.message; }
