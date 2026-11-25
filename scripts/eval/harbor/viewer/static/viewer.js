@@ -1937,17 +1937,103 @@ function networkPanel(m, series) {
     virtual.length ? h('details', { class: 'reason monitor-more', 'data-key': 'monitor-virtual' }, h('summary', { text: `Docker 网桥和容器网卡 ${virtual.length} 个` }), monitorTable(heads, virtual.map(row), '')) : null,
     targets));
 }
+const MIRROR_EFFECTS = { next_run: '下一次评测开始生效', next_setup: '下次一键配置安装 Harbor 时使用', setup: '重新配置后生效' };
+const MIRROR_HINTS = { url: 'http(s):// 地址，留空表示不用', urls: '多个地址用空格分开，留空表示不用', host: '镜像仓库主机名，如 ghcr.nju.edu.cn' };
+function mirrorText(row) { return row.kind === 'urls' ? (row.value || []).join(' ') : row.value || ''; }
+function mirrorEffect(row) {
+  if (row.setting === 'docker_mirrors') return MIRROR_EFFECTS.setup + '（写入 Docker daemon 并 reload，只追加不删除）';
+  if (row.cached) return MIRROR_EFFECTS.next_run + '；下载缓存' + MIRROR_EFFECTS.setup + '，此前这一类直接走镜像源';
+  return MIRROR_EFFECTS[row.effect] || '';
+}
+function mirrorPayload(rows, values) {
+  const settings = { container_mirrors: {} };
+  for (const row of rows) {
+    const value = values[row.setting];
+    if (row.setting.startsWith('container_mirrors.')) { if (value) settings.container_mirrors[row.setting.slice('container_mirrors.'.length)] = value; }
+    else if (row.kind === 'urls') settings[row.setting] = value.split(/[\s,]+/).filter(Boolean);
+    else settings[row.setting] = row.kind === 'bool' ? value : value || null;
+  }
+  return settings;
+}
 function mirrorsPanel(m) {
-  const items = m.mirrors.items || [];
+  const name = m.executor.name;
+  const rows = m.mirrors.settings || [];
   const daemon = (m.docker && m.docker.registry_mirrors) || [];
   const egress = typeof m.mirrors.egress === 'string' ? ({ direct: '直连（执行机器自己的网络）', workbench: '经工作台出网' }[m.mirrors.egress] || m.mirrors.egress) : '站点代理 ' + (m.mirrors.egress.proxy || '');
-  return panel('镜像源', '配置在 workbench.json 的执行机器条目里', h('div', {},
-    h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
-      h('dt', { text: '容器出网' }), h('dd', { text: egress }),
-      h('dt', { text: 'Docker daemon 的 registry-mirrors' }), h('dd', { class: 'mono', text: daemon.length ? daemon.join('\n') : '未配置（Docker Hub 直连）' }))),
-    monitorTable([['范围'], ['类型'], ['配置项'], ['地址'], ['状态']],
-      items.map((t) => h('tr', {}, h('td', { text: t.scope }), h('td', { text: t.label }), h('td', { class: 'mono', text: t.setting }), h('td', { class: 'mono', text: t.url }), h('td', {}, probeState(t.probe)))),
-      '这台执行机器没有配置镜像源')));
+  const facts = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
+    h('dt', { text: '容器出网' }), h('dd', { text: egress }),
+    h('dt', { text: 'Docker daemon 的 registry-mirrors' }), h('dd', { class: 'mono', text: daemon.length ? daemon.join('\n') : '未配置（Docker Hub 直连）' })));
+  if (!m.mirrors.editable) return panel('镜像源', '镜像源只在 SSH 执行机器上配置', h('div', {}, facts));
+  const saved = Object.fromEntries(rows.map((r) => [r.setting, r.kind === 'bool' ? !!r.value : mirrorText(r)]));
+  const draft = state.mirrorDraft && state.mirrorDraft.executor === name ? state.mirrorDraft.values : {};
+  const values = { ...saved, ...draft };
+  const feedback = h('span', { class: 'muted', role: 'status', text: state.mirrorNote && state.mirrorNote.executor === name ? state.mirrorNote.text : '' });
+  const save = h('button', { type: 'submit', class: 'button primary', text: '保存' });
+  const undo = h('button', { type: 'button', class: 'button', text: '还原' });
+  const changed = () => rows.some((r) => values[r.setting] !== saved[r.setting]);
+  const sync = () => {
+    const dirty = changed();
+    save.disabled = !dirty;
+    undo.disabled = !dirty;
+    state.editing = dirty;
+    state.mirrorDraft = dirty ? { executor: name, values: { ...values } } : null;
+    if (dirty && state.mirrorNote) { state.mirrorNote = null; feedback.textContent = ''; }
+  };
+  const field = (r) => {
+    if (r.kind === 'bool') {
+      const box = h('input', { type: 'checkbox', 'aria-label': r.label });
+      box.checked = values[r.setting];
+      box.addEventListener('change', () => { values[r.setting] = box.checked; sync(); });
+      return h('label', { class: 'check' }, box, '开启');
+    }
+    const input = h('input', { type: 'text', class: 'mirror-input mono', value: values[r.setting], placeholder: MIRROR_HINTS[r.kind],
+      'aria-label': r.setting, spellcheck: 'false', autocomplete: 'off' });
+    input.addEventListener('input', () => { values[r.setting] = input.value.trim(); sync(); });
+    return input;
+  };
+  const status = (r) => {
+    const probes = (r.probes || []).filter(Boolean);
+    const parts = probes.map((probe) => h('div', {}, probeState(probe)));
+    if (r.pending) parts.push(h('div', { class: 'flag', text: '需要重新配置：' + r.pending }));
+    if (!parts.length) return h('span', { class: 'muted', text: r.kind === 'bool' ? (r.value ? '已开启' : '未开启') : mirrorText(r) ? '未探测' : '未配置' });
+    return parts;
+  };
+  const table = monitorTable([['范围'], ['类型'], ['配置项'], ['地址'], ['生效'], ['状态']],
+    rows.map((r) => h('tr', {}, h('td', { text: r.scope }), h('td', { text: r.label }), h('td', { class: 'mono', text: r.setting }),
+      h('td', {}, field(r)), h('td', { class: 'muted', text: mirrorEffect(r) }), h('td', {}, status(r)))), '没有可配置的镜像源');
+  const form = h('form', { class: 'mirror-form' }, table, h('div', { class: 'panel-body mirror-actions' }, save, undo, feedback));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    feedback.textContent = '正在保存并探测新地址…';
+    save.disabled = true;
+    try {
+      await api('/api/monitor/mirrors', { executor: name, settings: mirrorPayload(rows, values) });
+      state.mirrorDraft = null;
+      state.mirrorNote = { executor: name, text: '已保存到 workbench.json（保存前的版本在 backups/ 里）' };
+      state.editing = false;
+      render();
+    } catch (error) { feedback.textContent = '没有保存：' + error.message; save.disabled = false; }
+  });
+  undo.addEventListener('click', () => { state.mirrorDraft = null; state.mirrorNote = null; state.editing = false; render(); });
+  const pending = m.mirrors.pending || [];
+  const blocked = m.setup_running ? '一键配置正在进行' : m.busy ? '有评测在运行，结束后才能重新配置' : '';
+  const rerun = h('button', { type: 'button', class: 'button', text: '重新配置', disabled: !!blocked });
+  const rerunNote = h('span', { class: 'muted', role: 'status', text: blocked });
+  rerun.addEventListener('click', async () => {
+    rerun.disabled = true;
+    try {
+      await api('/api/setup', { executor: name, dry_run: false });
+      state.executor = name;
+      state.setupWatch = true;
+      location.hash = '#/new';
+    } catch (error) { rerunNote.textContent = error.message; rerun.disabled = false; }
+  });
+  const todo = pending.length ? h('div', { class: 'panel-body' }, h('div', { class: 'callout mirror-pending' },
+    h('div', { text: '需要重新配置才生效：' + pending.map((x) => `${x.title}（${x.reason}）`).join('；') }),
+    h('div', { class: 'mirror-actions' }, rerun, rerunNote))) : null;
+  const node = panel('镜像源', '在这里修改，保存到 workbench.json 的执行机器条目；正在运行的评测不受影响', h('div', {}, facts, form, todo));
+  sync();
+  return node;
 }
 function dockerPanel(m) {
   const d = m.docker || {};

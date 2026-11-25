@@ -21,6 +21,12 @@ status, compatibility boundaries, and entry points are defined by
   store. `metacodes bench monitor [--executor NAME] [--json]` prints the same
   snapshot, and `GET /api/monitor` serves it. Nothing is installed on the
   machine: each reading runs one read-only script over the existing SSH access.
+  The page's 镜像源 block edits an SSH executor's mirror settings
+  (`pypi_index`, `docker_mirrors`, `ghcr_mirror`, every `container_mirrors`
+  key and `download_cache`): a save is validated by the parser that reads
+  `workbench.json`, keeps a backup of the file, probes the new addresses at
+  once, and each row says when it takes effect and whether setup has to run
+  again.
 - **Bench executors can cache what task containers download.**
   `"download_cache": true` on an SSH executor makes `metacodes bench setup`
   run `metacodes-download-cache` on the executor, and every run's task

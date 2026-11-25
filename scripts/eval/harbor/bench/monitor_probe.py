@@ -340,8 +340,15 @@ def apt_section(options):
         answering = fetch(url, 3)[0] == 200
     except Exception:
         answering = False
-    section = {"url": url, "answering": answering}
-    if not answering or not shutil.which("docker"):
+    section = {"url": url, "answering": answering, "mirror": None}
+    if not shutil.which("docker"):
+        return section
+    label = options.get("apt_label")
+    if label:
+        text, _error = command(["docker", "inspect", "-f", '{{index .Config.Labels "%s"}}' % label,
+                                options["apt_container"]], 10)
+        section["mirror"] = (text or "").strip() or None
+    if not answering:
         return section
     text, error = command(["docker", "exec", options["apt_container"], "tail", "-c", str(APT_LOG_LIMIT),
                            "/var/log/apt-cacher-ng/apt-cacher.log"], 20)

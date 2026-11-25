@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from unittest.mock import patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.bench import data, executors, monitor, monitor_probe
-from scripts.eval.harbor.bench.runner import RunManager
+from scripts.eval.harbor.bench.runner import RunManager, atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
 from scripts.eval.tests.test_bench_setup import SetupFixture
@@ -71,6 +72,9 @@ elif args[:2] == ["system", "df"]:
     sys.stdout.write({df!r})
 elif args[:1] == ["exec"]:
     sys.stdout.write({apt!r})
+elif args[:1] == ["inspect"]:
+    label = os.environ["FAKE_LOG"] + ".apt-mirror"
+    print(open(label).read() if os.path.exists(label) else "http://mirrors.example.invalid")
 else:
     sys.exit(1)
 METACODES_FAKE_DOCKER
@@ -309,7 +313,7 @@ class MonitorHttpTest(SetupFixture):
         download_port = self.serve({"/_stats": json.dumps(DOWNLOAD_STATS).encode()})
         self.dead = "http://127.0.0.1:9/"
         for patcher in (patch.object(executors, "APT_CACHE_PORT", apt_port),
-                        patch.object(monitor, "DOWNLOAD_CACHE_PORT", download_port),
+                        patch.object(executors, "DOWNLOAD_CACHE_PORT", download_port),
                         patch.object(monitor, "TARGET_TIMEOUT", 2),
                         patch.object(monitor, "SOURCES", (("pypi", "PyPI", self.reachable), ("github", "GitHub", self.dead)))):
             patcher.start()
@@ -322,7 +326,8 @@ class MonitorHttpTest(SetupFixture):
         docker.chmod(0o755)
         write_lifecycle(self.remote_home / ".metacodes-bench/jobs", self.remote_home / ".metacodes-bench/runs")
         self.manager = RunManager(self.state / "bench/jobs", self.config)
-        http = server.make_server(Workbench(data.Library([self.manager.jobs_dir]), self.manager), "127.0.0.1", 0)
+        self.workbench = Workbench(data.Library([self.manager.jobs_dir]), self.manager)
+        http = server.make_server(self.workbench, "127.0.0.1", 0)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
@@ -415,7 +420,7 @@ class MonitorHttpTest(SetupFixture):
             self.client.request("api/monitor?executor=nowhere")
 
     def test_missing_caches_are_reported_as_not_answering(self):
-        with patch.object(executors, "APT_CACHE_PORT", 9), patch.object(monitor, "DOWNLOAD_CACHE_PORT", 9):
+        with patch.object(executors, "APT_CACHE_PORT", 9), patch.object(executors, "DOWNLOAD_CACHE_PORT", 9):
             value = self.client.request("api/monitor?executor=relay-4090")
         self.assertEqual((value["caches"]["apt"]["answering"], value["caches"]["apt"]["configured"]), (False, True))
         self.assertNotIn("requests", value["caches"]["apt"])
@@ -452,6 +457,129 @@ class MonitorHttpTest(SetupFixture):
         self.addCleanup(viewer.shutdown)
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(f"http://127.0.0.1:{viewer.server_address[1]}/api/monitor")
+        self.assertEqual(caught.exception.code, 403)
+        caught.exception.close()
+
+    def settings_of(self, value):
+        return {row["setting"]: row for row in value["mirrors"]["settings"]}
+
+    def test_every_mirror_setting_is_listed_with_what_still_needs_setup(self):
+        value = self.client.request("api/monitor?executor=relay-4090")
+        rows = self.settings_of(value)
+        self.assertEqual(list(rows), ["pypi_index", "docker_mirrors", "ghcr_mirror"]
+                         + ["container_mirrors." + kind for kind in executors.CONTAINER_MIRRORS] + ["download_cache"])
+        self.assertEqual((value["mirrors"]["editable"], value["busy"], value["setup_running"]), (True, False, False))
+        self.assertEqual((rows["container_mirrors.github"]["value"], rows["container_mirrors.github"]["probes"],
+                          rows["download_cache"]["value"]), (None, [None], False))
+        self.assertEqual((rows["container_mirrors.go"]["value"], rows["container_mirrors.go"]["probes"][0]["ok"],
+                          rows["container_mirrors.go"]["effect"]), (self.reachable, True, "next_run"))
+        self.assertEqual((rows["container_mirrors.apt"]["effect"], rows["container_mirrors.apt"]["step"],
+                          rows["container_mirrors.apt"]["pending"]), ("setup", "apt_cache", None))
+        self.assertEqual((rows["docker_mirrors"]["value"], rows["docker_mirrors"]["step"]),
+                         ([self.reachable.rstrip("/")], "docker_mirrors"))
+        self.assertIn("registry-mirrors 里还没有 " + self.reachable.rstrip("/"), rows["docker_mirrors"]["pending"])
+        self.assertEqual([step["step"] for step in value["mirrors"]["pending"]], ["docker_mirrors"])
+        Path(os.environ["FAKE_LOG"] + ".apt-mirror").write_text("http://old.example.invalid")
+        with patch.object(monitor, "SNAPSHOT_SECONDS", 0):
+            stale = self.client.request("api/monitor?executor=relay-4090")
+        self.assertEqual(self.settings_of(stale)["container_mirrors.apt"]["pending"],
+                         "apt 缓存还在按 http://old.example.invalid 回源")
+        with patch.object(self.manager, "runs", return_value=[{"status": "running"}]), \
+                patch.object(self.workbench.setups, "mutating", return_value=True):
+            busy = self.client.request("api/monitor?executor=relay-4090")
+        self.assertEqual((busy["busy"], busy["setup_running"]), (True, True))
+        local = self.client.request("api/monitor")["mirrors"]
+        self.assertEqual((local["editable"], local["settings"], local["pending"]), (False, [], []))
+
+    def save(self, settings, executor="relay-4090"):
+        return self.client.request("api/monitor/mirrors", {"executor": executor, "settings": settings})
+
+    def entry(self):
+        return next(e for e in self.cfg()["executors"] if e["name"] == "relay-4090")
+
+    def test_saving_mirrors_rewrites_the_entry_keeps_a_backup_and_probes_the_new_addresses(self):
+        self.client.request("api/monitor?executor=relay-4090")
+        before = self.config.read_bytes()
+        other = self.serve({"/": b"ok"})
+        mirror = f"http://127.0.0.1:{other}"
+        value = self.save({"pypi_index": mirror + "/simple", "docker_mirrors": [], "ghcr_mirror": None,
+                           "container_mirrors": {"apt": "http://mirrors.example.invalid", "go": "", "pypi": mirror + "/simple",
+                                                 "github": mirror + "/https://github.com"},
+                           "download_cache": True})
+        entry = self.entry()
+        self.assertEqual({key: entry.get(key) for key in monitor.MIRROR_SETTINGS}, {
+            "pypi_index": mirror + "/simple", "docker_mirrors": None, "ghcr_mirror": None,
+            "container_mirrors": {"apt": "http://mirrors.example.invalid", "pypi": mirror + "/simple",
+                                  "github": mirror + "/https://github.com"},
+            "download_cache": True})
+        self.assertEqual((entry["host"], entry["user"], entry["metrics_bind"]), ("10.126.126.1", "bench", "127.0.0.1"))
+        self.assertEqual(executors.find(self.cfg(), "relay-4090").download_cache_routes(),
+                         {"pypi": mirror, "github": mirror + "/https://github.com"})
+        backups = sorted((self.config.parent / monitor.BACKUPS).iterdir())
+        self.assertEqual([path.read_bytes() for path in backups], [before])
+        rows = self.settings_of(value)
+        self.assertEqual((rows["container_mirrors.pypi"]["value"], rows["container_mirrors.pypi"]["probes"][0]["ok"],
+                          rows["container_mirrors.github"]["probes"][0]["ok"], rows["container_mirrors.go"]["value"],
+                          rows["docker_mirrors"]["value"], rows["download_cache"]["value"]),
+                         (mirror + "/simple", True, True, None, [], True))
+        self.assertEqual(len(self.probes()), 2)
+        self.assertEqual(sorted(self.options_sent(self.probes()[1])["targets"]),
+                         ["mirror.container.apt", "mirror.container.github", "mirror.container.pypi",
+                          "mirror.pypi_index", "source.github", "source.pypi"])
+        self.assertEqual({step["step"]: step["reason"] for step in value["mirrors"]["pending"]},
+                         {"download_cache": "下载缓存的 github、pypi 还不是当前配置"})
+        self.assertEqual((rows["container_mirrors.pypi"]["pending"], rows["download_cache"]["pending"],
+                          rows["container_mirrors.apt"]["pending"]),
+                         ("下载缓存的 github、pypi 还不是当前配置", "下载缓存的 github、pypi 还不是当前配置", None))
+        self.save({"download_cache": True})
+        self.assertEqual(len(list((self.config.parent / monitor.BACKUPS).iterdir())), 1)
+        self.save({"download_cache": False, "container_mirrors": {}})
+        self.assertEqual((self.entry().get("download_cache"), self.entry().get("container_mirrors"),
+                          len(list((self.config.parent / monitor.BACKUPS).iterdir()))), (None, None, 2))
+
+    def test_a_setting_the_executor_parser_refuses_is_not_saved(self):
+        before = self.config.read_bytes()
+        refused = {
+            "apt 必须是 http://": {"container_mirrors": {"apt": "https://mirrors.aliyun.com"}},
+            "container_mirrors 的键只能是": {"container_mirrors": {"maven": "https://repo.example"}},
+            "pypi_index 必须是 http(s) 地址": {"pypi_index": "ftp://pypi.example/simple"},
+            "docker_mirrors 必须是 http(s) 地址列表": {"docker_mirrors": "https://docker.example"},
+            "download_cache 必须是布尔值": {"download_cache": "yes"},
+            "settings 只接受": {"egress": "workbench"},
+        }
+        for reason, settings in refused.items():
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, re.escape(reason)):
+                self.save(settings)
+        with self.assertRaisesRegex(ValueError, "只有 SSH 执行机器有镜像源设置"):
+            self.save({"pypi_index": "https://pypi.example/simple"}, executor="devbox-mac")
+        with self.assertRaisesRegex(ValueError, "executors 里没有 nowhere"):
+            self.save({"pypi_index": "https://pypi.example/simple"}, executor="nowhere")
+        cfg = self.cfg()
+        next(e for e in cfg["executors"] if e["name"] == "relay-4090")["egress"] = "workbench"
+        cfg["executors"][1].pop("container_mirrors")
+        atomic_json(self.config, cfg)
+        proxied = self.config.read_bytes()
+        with self.assertRaisesRegex(ValueError, "container_mirrors.apt 只能和 egress = direct 一起用"):
+            self.save({"container_mirrors": {"apt": "http://mirrors.example.invalid"}})
+        with self.assertRaisesRegex(ValueError, "download_cache 只能和 egress = direct 一起用"):
+            self.save({"download_cache": True})
+        with patch.object(self.workbench.setups, "mutating", return_value=True), \
+                self.assertRaisesRegex(ValueError, "一键配置正在进行"):
+            self.save({"pypi_index": "https://pypi.example/simple"})
+        self.assertEqual((before != proxied, self.config.read_bytes()), (True, proxied))
+        self.assertFalse((self.config.parent / monitor.BACKUPS).exists())
+
+    def test_a_read_only_viewer_cannot_save_mirrors(self):
+        viewer = server.make_server(Workbench(data.Library([self.manager.jobs_dir])), "127.0.0.1", 0)
+        threading.Thread(target=viewer.serve_forever, daemon=True).start()
+        self.addCleanup(viewer.server_close)
+        self.addCleanup(viewer.shutdown)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{viewer.server_address[1]}/api/monitor/mirrors", method="POST",
+            data=json.dumps({"executor": "relay-4090", "settings": {"download_cache": True}}).encode(),
+            headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
         self.assertEqual(caught.exception.code, 403)
         caught.exception.close()
 

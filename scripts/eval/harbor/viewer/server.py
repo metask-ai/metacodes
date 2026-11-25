@@ -158,6 +158,8 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.store_action(payload))
                 elif path == "/api/setup":
                     self.send_json(workbench.start_setup(payload), 202)
+                elif path == "/api/monitor/mirrors":
+                    self.send_json(workbench.save_mirrors(payload))
                 elif path == "/api/build":
                     self.send_json(workbench.start_build(payload), 202)
                 elif path == "/api/build/cancel" and payload == {}:

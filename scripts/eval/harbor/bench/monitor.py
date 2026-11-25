@@ -13,11 +13,15 @@ from typing import Dict, List, Optional, Tuple
 
 from scripts.eval.harbor.bench import executors
 from scripts.eval.harbor.bench.executors import Executor, SshExecutor, shell_argv
+from scripts.eval.harbor.bench.runner import atomic_json, settings
+from scripts.eval.harbor.bench.setup import APT_CACHE_LABEL, APT_CACHE_NAME
 
 PROBE_SOURCE = Path(__file__).with_name("monitor_probe.py")
-APT_CACHE_CONTAINER = "metacodes-apt-cache"
-DOWNLOAD_CACHE_PORT = 3143
 RUN_RECORDS = ".bench-runs"
+MIRROR_SETTINGS = ("pypi_index", "docker_mirrors", "ghcr_mirror", "container_mirrors", "download_cache")
+UNSET = (None, "", [], {}, False)
+BACKUPS = "backups"
+BACKUPS_KEPT = 20
 SNAPSHOT_SECONDS = 10.0
 TARGET_SECONDS = 60.0
 USAGE_SECONDS = 600.0
@@ -61,6 +65,115 @@ def mirror_rows(executor: Executor) -> List[Dict]:
     return rows
 
 
+def setting_rows(executor: Executor) -> List[Dict]:
+    if not isinstance(executor, SshExecutor):
+        return []
+    container = dict(executor.container_mirrors)
+    cached = executor.download_cache_routes()
+    rows = [
+        {"setting": "pypi_index", "scope": "执行机器", "label": "PyPI（安装 Harbor）", "kind": "url",
+         "value": executor.pypi_index, "effect": "next_setup", "step": None, "keys": ["mirror.pypi_index"]},
+        {"setting": "docker_mirrors", "scope": "执行机器", "label": "Docker Hub 镜像加速", "kind": "urls",
+         "value": list(executor.docker_mirrors), "effect": "setup", "step": "docker_mirrors",
+         "keys": [f"mirror.docker.{index}" for index in range(len(executor.docker_mirrors))]},
+        {"setting": "ghcr_mirror", "scope": "执行机器", "label": "ghcr.io 镜像", "kind": "host",
+         "value": executor.ghcr_mirror, "effect": "next_run", "step": None, "keys": ["mirror.ghcr"]},
+    ]
+    for kind in executors.CONTAINER_MIRRORS:
+        rows.append({"setting": "container_mirrors." + kind, "scope": "任务容器",
+                     "label": CONTAINER_LABELS.get(kind, kind), "kind": "url", "value": container.get(kind),
+                     "effect": "setup" if kind == "apt" else "next_run", "step": "apt_cache" if kind == "apt" else None,
+                     "cached": kind in cached, "keys": ["mirror.container." + kind]})
+    rows.append({"setting": "download_cache", "scope": "任务容器", "label": "下载缓存", "kind": "bool",
+                 "value": executor.download_cache, "effect": "setup", "step": "download_cache", "keys": []})
+    return rows
+
+
+def pending_setup(executor: Executor, probed: Dict) -> Dict[str, str]:
+    if not isinstance(executor, SshExecutor):
+        return {}
+    pending: Dict[str, str] = {}
+    daemon = (probed.get("docker") or {}).get("registry_mirrors")
+    if executor.docker_mirrors and isinstance(daemon, list):
+        have = {mirror.rstrip("/") for mirror in daemon if isinstance(mirror, str)}
+        missing = [mirror for mirror in executor.docker_mirrors if mirror.rstrip("/") not in have]
+        if missing:
+            pending["docker_mirrors"] = "Docker daemon 的 registry-mirrors 里还没有 " + "、".join(missing)
+    caches = probed.get("caches") or {}
+    wanted = dict(executor.container_mirrors).get("apt")
+    apt = caches.get("apt") or {}
+    if wanted and not apt.get("answering"):
+        pending["apt_cache"] = "apt 缓存没有响应"
+    elif wanted and apt.get("mirror") and apt["mirror"] != wanted.rstrip("/"):
+        pending["apt_cache"] = "apt 缓存还在按 " + apt["mirror"] + " 回源"
+    routes = executor.download_cache_routes()
+    download = caches.get("download") or {}
+    if routes and not download.get("answering"):
+        pending["download_cache"] = "下载缓存没有启动"
+    elif routes:
+        served = {kind: (route.get("upstream") or "").rstrip("/")
+                  for kind, route in (download.get("routes") or {}).items() if isinstance(route, dict)}
+        changed = sorted(kind for kind in set(served) | set(routes) if served.get(kind) != routes.get(kind))
+        if changed:
+            pending["download_cache"] = "下载缓存的 " + "、".join(changed) + " 还不是当前配置"
+    return pending
+
+
+def mirror_settings(executor: Executor, probed: Dict, targets: Dict[str, Dict]) -> Dict:
+    pending = pending_setup(executor, probed)
+    rows = setting_rows(executor)
+    for row in rows:
+        row["probes"] = [targets.get(key) for key in row.pop("keys")]
+        row["pending"] = pending.get(row["step"]) if row["step"] else None
+        if row.get("cached") and "download_cache" in pending:
+            row["pending"] = pending["download_cache"]
+    titles = {"docker_mirrors": "Docker 镜像加速", "apt_cache": "apt 缓存", "download_cache": "下载缓存"}
+    return {"editable": isinstance(executor, SshExecutor), "settings": rows,
+            "pending": [{"step": step, "title": titles[step], "reason": reason} for step, reason in pending.items()]}
+
+
+def backup(config_path: Path) -> Path:
+    directory = config_path.parent / BACKUPS
+    directory.mkdir(mode=0o700, exist_ok=True)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    target = directory / f"{config_path.stem}-{stamp}{config_path.suffix}"
+    shutil.copy2(config_path, target)
+    for old in sorted(directory.glob(f"{config_path.stem}-*{config_path.suffix}"))[:-BACKUPS_KEPT]:
+        old.unlink()
+    return target
+
+
+def save_mirrors(config_path: Path, payload) -> str:
+    if not isinstance(payload, dict) or set(payload) - {"executor", "settings"}:
+        raise ValueError("只接受 executor、settings")
+    name, values = payload.get("executor"), payload.get("settings")
+    if not isinstance(name, str) or not isinstance(values, dict) or not values or set(values) - set(MIRROR_SETTINGS):
+        raise ValueError("settings 只接受 " + "、".join(MIRROR_SETTINGS))
+    cfg = settings(config_path)
+    entries = cfg.get("executors")
+    entries = entries if isinstance(entries, list) else []
+    index = next((i for i, entry in enumerate(entries) if isinstance(entry, dict) and entry.get("name") == name), None)
+    if index is None:
+        raise ValueError(f"workbench.json 的 executors 里没有 {name}")
+    if entries[index].get("kind") != "ssh":
+        raise ValueError(f"{name}: 只有 SSH 执行机器有镜像源设置")
+    entry = dict(entries[index])
+    for key, value in values.items():
+        if key == "container_mirrors" and isinstance(value, dict):
+            value = {kind: url for kind, url in value.items() if url not in UNSET}
+        if value in UNSET:
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+    executors.parse(entry)
+    updated = {**cfg, "executors": entries[:index] + [entry] + entries[index + 1:]}
+    executors.configured(updated)
+    if entry != entries[index]:
+        backup(Path(config_path))
+        atomic_json(Path(config_path), updated)
+    return name
+
+
 def source_rows() -> List[Dict]:
     return [{"key": "source." + key, "scope": "源站", "label": label, "setting": None, "url": url}
             for key, label, url in SOURCES]
@@ -71,8 +184,8 @@ def probe_options(executor: Executor, state_root: Path, jobs_dir: Path, targets:
     remote = isinstance(executor, SshExecutor)
     return {
         "bind": executor.metrics_bind if remote else None,
-        "apt_port": executors.APT_CACHE_PORT, "apt_container": APT_CACHE_CONTAINER,
-        "download_port": DOWNLOAD_CACHE_PORT,
+        "apt_port": executors.APT_CACHE_PORT, "apt_container": APT_CACHE_NAME, "apt_label": APT_CACHE_LABEL,
+        "download_port": executors.DOWNLOAD_CACHE_PORT,
         "state_dir": executor.state_dir if remote else str(state_root),
         "jobs_dir": executor.remote("jobs") if remote else str(jobs_dir),
         "runs_dir": executor.remote("runs") if remote else None,
@@ -119,7 +232,7 @@ def cache_views(executor: Executor, caches: Dict) -> Dict:
     apt["upstream"] = container.get("apt")
     apt["hit_rate"] = rate(apt.get("hits"), apt.get("requests"))
     download = dict(caches.get("download") or {})
-    download["configured"] = bool(getattr(executor, "download_cache", False))
+    download["configured"] = isinstance(executor, SshExecutor) and executor.download_cache
     for route in (download.get("routes") or {}).values():
         route["hit_rate"] = rate(route.get("hits"), route.get("requests"))
     totals = download.get("totals")
@@ -147,7 +260,8 @@ def assemble(executor: Executor, probed: Dict, targets: Dict[str, Dict], targets
                     "targets_checked_at": iso(targets_at)},
         "docker": docker,
         "mirrors": {"egress": executor.egress_value() if isinstance(executor, SshExecutor) else "direct",
-                    "items": [row for row in rows if row["setting"]]},
+                    "items": [row for row in rows if row["setting"]],
+                    **mirror_settings(executor, probed, targets)},
         "caches": cache_views(executor, probed.get("caches") or {}),
     }
 
@@ -245,6 +359,8 @@ def render(value: Dict) -> str:
                          + (f"（{hit_rate * 100:.0f}%）" if hit_rate is not None else ""))
         else:
             lines.append(f"{label}：" + ("已配置，但没有响应" if cache.get("configured") else "未启用"))
+    for step in (value.get("mirrors") or {}).get("pending") or []:
+        lines.append(f"需要重新配置：{step['title']}（{step['reason']}）")
     images = caches.get("images") or {}
     if not images.get("error"):
         lines.append(f"镜像（本地镜像库）：命中 {images.get('hits', 0)} · 拉取或构建 {images.get('misses', 0)}"

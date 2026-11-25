@@ -255,3 +255,4 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .cache-blocks{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:24px}
 .cache-block{display:grid;gap:10px;align-content:start;min-width:0}.cache-block h3{font-size:13px;font-weight:600}.cache-block h3 small{font-size:11px;font-weight:400;color:var(--muted);margin-left:8px}
 .cache-block .table-scroll{margin:4px -20px 0}
+.mirror-input{width:100%;min-width:400px;height:28px;padding:0 8px;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:4px;font-size:12px}.mirror-input:focus{border-color:var(--accent);outline:none}.mirror-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.mirror-pending{margin-bottom:0}.mirror-pending .mirror-actions{margin-top:10px}
