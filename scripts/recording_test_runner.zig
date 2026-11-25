@@ -30,7 +30,7 @@ fn openPickerTrace(environ: std.process.Environ, argv0: []const u8) !void {
         else => return err,
     };
     defer std.heap.page_allocator.free(path);
-    const file = try std.Io.Dir.cwd().createFile(runner_io, path, .{ .truncate = false });
+    const file = try std.Io.Dir.cwd().createFile(runner_io, path, .{ .read = true, .truncate = false });
     errdefer file.close(runner_io);
     var writer = file.writer(runner_io, &trace_buffer);
     try writer.seekTo(try file.length(runner_io));

@@ -1349,12 +1349,12 @@ jobs:
         env:
           METACODES_PICKER_TRACE: ${{ runner.temp }}\picker.log
         run: zig build test:units -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
-      - name: Last picker server events
+      - name: Picker server events
         if: failure() && steps.windows_units.outcome == 'failure'
         shell: pwsh
         run: |
           $trace = Join-Path $env:RUNNER_TEMP picker.log
-          if (Test-Path $trace) { Get-Content $trace -Tail 16 } else { Write-Output "No picker server events recorded" }
+          if (Test-Path $trace) { Get-Content $trace } else { Write-Output "No picker server events recorded" }
       - name: Offline test suite (affected packages)
         if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false' && env.PACKAGE_TESTS != ''
         shell: cmd
