@@ -1,12 +1,12 @@
 const std = @import("std");
-const util_time = @import("../util/time.zig");
-const utf8 = @import("../util/utf8.zig");
+
+pub const Millis = i64;
 
 pub const LINE_MAX_BYTES: usize = 500;
 pub const EVENT_MAX_BYTES: usize = 3000;
 pub const BUCKET_CAPACITY: u8 = 10;
-pub const REFILL_MS: util_time.Millis = 2_000;
-pub const OVER_BUDGET_STOP_MS: util_time.Millis = 30_000;
+pub const REFILL_MS: Millis = 2_000;
+pub const OVER_BUDGET_STOP_MS: Millis = 30_000;
 pub const READ_MAX_BYTES: usize = 64 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 pub const MIN_TIMEOUT_MS: u64 = 1_000;
@@ -19,33 +19,33 @@ pub const State = struct {
     timeout_ms: ?u64,
     stdout_cursor: u64 = 0,
     tokens: u8 = BUCKET_CAPACITY,
-    refilled_ms: util_time.Millis,
+    refilled_ms: Millis,
     suppressed: u32 = 0,
-    over_budget_since_ms: ?util_time.Millis = null,
+    over_budget_since_ms: ?Millis = null,
     events_delivered: u32 = 0,
     stop: ?Stop = null,
-    kill_at_ms: ?util_time.Millis = null,
+    kill_at_ms: ?Millis = null,
     skipping_line: bool = false,
 
-    pub fn init(description: []const u8, timeout_ms: ?u64, now: util_time.Millis) State {
+    pub fn init(description: []const u8, timeout_ms: ?u64, now: Millis) State {
         return .{ .description = description, .timeout_ms = timeout_ms, .refilled_ms = now };
     }
 
-    pub fn expired(self: *const State, started_ms: util_time.Millis, now: util_time.Millis) bool {
+    pub fn expired(self: *const State, started_ms: Millis, now: Millis) bool {
         const limit = self.timeout_ms orelse return false;
-        return now - started_ms >= @as(util_time.Millis, @intCast(limit));
+        return now - started_ms >= @as(Millis, @intCast(limit));
     }
 
-    pub fn overBudgetTooLong(self: *const State, now: util_time.Millis) bool {
+    pub fn overBudgetTooLong(self: *const State, now: Millis) bool {
         const since = self.over_budget_since_ms orelse return false;
         return now - since >= OVER_BUDGET_STOP_MS;
     }
 
-    fn refill(self: *State, now: util_time.Millis) void {
+    fn refill(self: *State, now: Millis) void {
         if (now <= self.refilled_ms) return;
         const earned = @divFloor(now - self.refilled_ms, REFILL_MS);
         if (earned <= 0) return;
-        const room: util_time.Millis = BUCKET_CAPACITY - self.tokens;
+        const room: Millis = BUCKET_CAPACITY - self.tokens;
         if (earned >= room) {
             self.tokens = BUCKET_CAPACITY;
             self.refilled_ms = now;
@@ -94,7 +94,7 @@ pub const Batch = struct {
 
 pub const Mode = enum { streaming, final };
 
-pub fn take(allocator: std.mem.Allocator, state: *State, chunk: []const u8, mode: Mode, now: util_time.Millis) !Batch {
+pub fn take(allocator: std.mem.Allocator, state: *State, chunk: []const u8, mode: Mode, now: Millis) !Batch {
     state.refill(now);
     if (state.tokens == BUCKET_CAPACITY) state.over_budget_since_ms = null;
     var skipped: usize = 0;
@@ -146,6 +146,12 @@ fn completeLength(body: []const u8, mode: Mode, chunk_full: bool) usize {
     return 0;
 }
 
+fn utf8PrefixEnd(bytes: []const u8, limit: usize) usize {
+    var end = @min(limit, bytes.len);
+    while (end > 0 and end < bytes.len and (bytes[end] & 0b1100_0000) == 0b1000_0000) end -= 1;
+    return end;
+}
+
 fn renderEvent(allocator: std.mem.Allocator, state: *State, lines: []const []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -157,10 +163,10 @@ fn renderEvent(allocator: std.mem.Allocator, state: *State, lines: []const []con
     for (lines) |line| {
         if (!first) try out.writer.writeByte('\n');
         first = false;
-        try out.writer.writeAll(line[0..utf8.prefixEnd(line, LINE_MAX_BYTES)]);
+        try out.writer.writeAll(line[0..utf8PrefixEnd(line, LINE_MAX_BYTES)]);
     }
     const written = out.written();
-    const kept = utf8.prefixEnd(written, EVENT_MAX_BYTES);
+    const kept = utf8PrefixEnd(written, EVENT_MAX_BYTES);
     out.shrinkRetainingCapacity(kept);
     state.suppressed = 0;
     return try out.toOwnedSlice();
@@ -227,18 +233,18 @@ test "monitor stream token bucket suppresses batches and reports the count later
     const dropped = try take(testing.allocator, &state, "a\nb\nc\n", .streaming, 100);
     try testing.expectEqual(@as(usize, 0), dropped.event.len);
     try testing.expectEqual(@as(u32, 3), state.suppressed);
-    try testing.expectEqual(@as(?util_time.Millis, 100), state.over_budget_since_ms);
+    try testing.expectEqual(@as(?Millis, 100), state.over_budget_since_ms);
     const after = try take(testing.allocator, &state, "d\n", .streaming, REFILL_MS);
     defer testing.allocator.free(after.event);
     try testing.expectEqualStrings("[3 events suppressed — output rate too high]\nd", after.event);
     try testing.expectEqual(@as(u32, 0), state.suppressed);
-    try testing.expectEqual(@as(?util_time.Millis, 100), state.over_budget_since_ms);
+    try testing.expectEqual(@as(?Millis, 100), state.over_budget_since_ms);
 }
 
 test "monitor stream stops a source that stays over budget and forgives one that quiets down" {
     var state = testState();
     state.tokens = 0;
-    var now: util_time.Millis = 0;
+    var now: Millis = 0;
     while (now < OVER_BUDGET_STOP_MS) : (now += 200) {
         const batch = try take(testing.allocator, &state, "spam\n", .streaming, now);
         testing.allocator.free(batch.event);
@@ -306,7 +312,7 @@ test "monitor stream forgives the over-budget period once the bucket has refille
     state.tokens = 0;
     const dropped = try take(testing.allocator, &state, "a\n", .streaming, 0);
     try testing.expectEqual(@as(usize, 0), dropped.event.len);
-    try testing.expectEqual(@as(?util_time.Millis, 0), state.over_budget_since_ms);
+    try testing.expectEqual(@as(?Millis, 0), state.over_budget_since_ms);
     const resumed = try take(testing.allocator, &state, "b\n", .streaming, OVER_BUDGET_STOP_MS + 1_000);
     defer testing.allocator.free(resumed.event);
     try testing.expectEqualStrings("[1 events suppressed — output rate too high]\nb", resumed.event);

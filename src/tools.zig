@@ -153,6 +153,13 @@ const SESSION_TASK_UPDATE_PROPS: []const json.PropSpec = &.{
     json.PropSpec{ .name = "addBlockedBy", .type = "array", .description = "Task ids that block this task", .items_type = "string" },
 };
 
+const MONITOR_EVENTS_PROP_SPECS: []const json.PropSpec = &.{
+    .{ .name = "command", .type = "string", .description = "Shell command to run; each stdout line becomes an event" },
+    .{ .name = "description", .type = "string", .description = "Short description of what is being monitored, shown in every event notification" },
+    .{ .name = "timeout_ms", .type = "integer", .description = "Kill the monitor after this many milliseconds (default 300000, minimum 1000, maximum 3600000)" },
+    .{ .name = "persistent", .type = "boolean", .description = "If true, run with no timeout for the session lifetime" },
+};
+
 pub const registry: []const ToolEntry = &.{
     .{
         .name = "Read",
@@ -847,7 +854,7 @@ pub fn toToolDefinitionsFull(
         const prop_specs = if (!tinykg_on and std.mem.eql(u8, tool.name, "TaskUpdate"))
             SESSION_TASK_UPDATE_PROPS
         else if (monitor_events)
-            monitor_tool.EVENTS_PROP_SPECS
+            MONITOR_EVENTS_PROP_SPECS
         else
             tool.input_schema.prop_specs;
         try defs.append(allocator, .{
@@ -907,7 +914,7 @@ pub fn redescribeForContext(
             }
             if (prompt_ctx.preview.monitor_events and std.mem.eql(u8, d.name, "Monitor")) {
                 d.description = monitor_tool.EVENTS_DESCRIPTION;
-                d.input_schema.prop_specs = monitor_tool.EVENTS_PROP_SPECS;
+                d.input_schema.prop_specs = MONITOR_EVENTS_PROP_SPECS;
             }
             if (t.describe_fn) |df| {
                 d.description = try df(allocator, prompt_ctx);

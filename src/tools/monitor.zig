@@ -20,17 +20,9 @@ const std = @import("std");
 const common = @import("common.zig");
 const util_json = @import("../util/json.zig");
 const ToolContext = @import("context.zig").ToolContext;
-const json = @import("../json.zig");
 const monitor_stream = @import("../core/monitor_stream.zig");
 
 pub const EVENTS_DESCRIPTION = "Start a background monitor that streams events from a long-running script. Each stdout line is an event: lines that arrive together are batched into one <task-notification> that reaches you on its own, so keep working and do not poll or sleep waiting for it. Events arrive on their own schedule and are not replies from the user. Only stdout is the event stream, stderr is not. In pipes use `grep --line-buffered` or awk with `fflush()` so lines are not held back in a buffer. Make the filter match failure states too (errors, tracebacks, FAILED, the process exiting), not only success: silence is not success. Output faster than the event rate limit is dropped and reported as a suppressed count, and a monitor that stays over the limit for 30 s is stopped. The monitor is killed after timeout_ms (default 300000, maximum 3600000) with one notice to re-arm it if still needed; persistent: true removes the timeout. Its exit produces a final notice. Stop it early with KillShell(job_id). For a single \"tell me when X is ready\", use Bash with run_in_background and an until-loop instead. Args: command (required), description (required, shown in every notification).";
-
-pub const EVENTS_PROP_SPECS: []const json.PropSpec = &.{
-    .{ .name = "command", .type = "string", .description = "Shell command to run; each stdout line becomes an event" },
-    .{ .name = "description", .type = "string", .description = "Short description of what is being monitored, shown in every event notification" },
-    .{ .name = "timeout_ms", .type = "integer", .description = "Kill the monitor after this many milliseconds (default 300000, minimum 1000, maximum 3600000)" },
-    .{ .name = "persistent", .type = "boolean", .description = "If true, run with no timeout for the session lifetime" },
-};
 
 const EVENTS_HINT = "Each stdout line reaches you as a <task-notification> event; keep working and do not poll, sleep or call BashOutput for it. A final notice arrives when the monitor exits or times out. KillShell(job_id) to stop.";
 
@@ -288,7 +280,7 @@ fn waitForExit(jobs: *@import("../core/job_registry.zig").JobRegistry, job_id: [
     while (waited < 5_000) : (waited += 20) {
         jobs.reapExited();
         if ((jobs.get(job_id) orelse return error.JobNotFound).status != .running) return;
-        @import("../util/time.zig").sleepMs(20);
+        testSleepMs(20);
     }
     return error.JobDidNotExit;
 }
@@ -316,14 +308,14 @@ test "Monitor with monitor_events: start result describes push events and stdout
     defer @import("../core/job_registry.zig").freeJobExitEvents(a, exits);
     try testing.expectEqual(@as(usize, 0), exits.len);
 
-    const notices = try jobs.takeMonitorEvents(owner, a, @import("../util/time.zig").nowMs());
+    const notices = try jobs.takeMonitorEvents(owner, a, (jobs.get(job_id) orelse return error.JobNotFound).started_ms);
     defer monitor_stream.freeNotices(a, notices);
     try testing.expectEqual(@as(usize, 1), notices.len);
     try testing.expectEqualStrings("ready", notices[0].event);
     try testing.expectEqualStrings("build", notices[0].description);
     try testing.expectEqual(@as(?monitor_stream.End, .{ .script_failed = 3 }), notices[0].end);
 
-    const again = try jobs.takeMonitorEvents(owner, a, @import("../util/time.zig").nowMs());
+    const again = try jobs.takeMonitorEvents(owner, a, (jobs.get(job_id) orelse return error.JobNotFound).started_ms);
     defer monitor_stream.freeNotices(a, again);
     try testing.expectEqual(@as(usize, 0), again.len);
     try testing.expectEqual(@as(u32, 0), jobs.pendingNotifySummary(owner).count);
@@ -351,7 +343,7 @@ test "Monitor with monitor_events: an expired monitor is killed with one re-arm 
         first = try jobs.takeMonitorEvents(ctx.session, a, started);
         if (first.len == 0) {
             a.free(first);
-            @import("../util/time.zig").sleepMs(20);
+            testSleepMs(20);
         }
     }
     defer monitor_stream.freeNotices(a, first);
@@ -406,6 +398,12 @@ test "Monitor with monitor_events: a timed monitor whose timer cannot start is n
     try testing.expect(std.mem.indexOf(u8, out, "\"error\":\"spawn_failed\"") != null);
     try testing.expect(common.extractJsonArg(out, "job_id") == null);
     try testing.expectEqual(@as(usize, 0), jobs.jobs.items.len);
-    @import("../util/time.zig").sleepMs(300);
+    testSleepMs(300);
     try testing.expect(!@import("platform").fs.exists(marker));
+}
+
+fn testSleepMs(ms: u64) void {
+    var ts = std.c.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+    var rem: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&ts, &rem);
 }
