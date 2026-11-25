@@ -166,7 +166,7 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        for directory in ("src/kg", "src/core", "src/tools", "tests/component"):
+        for directory in ("src/kg", "src/core", "src/tools", "tests/component", "apps/cli/tests/component"):
             (root / directory).mkdir(parents=True, exist_ok=True)
         (root / "src/kg/scoped_recall.zig").write_text(
             'const line = std.fmt.allocPrint(a, "- [node_id={d}]", .{h.node_id});\n'
@@ -217,11 +217,11 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
             '  try std.testing.expect(resultHas("verification_edge_count"));\n'
             '}\n'
         )
-        (root / "tests/component/kg_integration_test.zig").write_text(kg_test, encoding="utf-8")
+        (root / "apps/cli/tests/component/kg_integration_test.zig").write_text(kg_test, encoding="utf-8")
         (root / "build.zig").write_text(
             'const kg_governance_step = b.step("test:kg-governance", "fixture");\n'
             'const files = [_][]const u8{\n'
-            '  "tests/component/kg_integration_test.zig",\n'
+            '  "apps/cli/tests/component/kg_integration_test.zig",\n'
             '};\n'
             'kg_governance_step.dependOn(&run.step);\n'
             'const later_step = b.step("test:later", "boundary");\n',
@@ -269,7 +269,7 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
         build = root / "build.zig"
         build.write_text(
             'const kg_governance_step = b.step("test:kg-governance", "fixture");\n'
-            '// tests/component/kg_integration_test.zig is only an inert comment\n'
+            '// apps/cli/tests/component/kg_integration_test.zig is only an inert comment\n'
             'const later_step = b.step("test:later", "boundary");\n',
             encoding="utf-8",
         )
@@ -288,6 +288,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
             "src/kg",
             "src/tools",
             "tests/component",
+            "apps/cli/tests/component",
         ):
             (root / relative).mkdir(parents=True, exist_ok=True)
         (root / "src/core/tool_exec.zig").write_text(
@@ -347,7 +348,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
             "}\n",
             encoding="utf-8",
         )
-        (root / "tests/component/kg_integration_test.zig").write_text(
+        (root / "apps/cli/tests/component/kg_integration_test.zig").write_text(
             'test "L2 KG ontology feedback: successful host execution projects without model self-report" {\n'
             '  try cc.tool_exec.executeSlots();\n'
             '  try cc.task_tools.executeUpdate();\n'
@@ -363,7 +364,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
         )
         (root / "build.zig").write_text(
             'const kg_ontology_feedback_step = b.step("test:kg-ontology-feedback", "fixture");\n'
-            'const test_file = "tests/component/kg_integration_test.zig";\n'
+            'const test_file = "apps/cli/tests/component/kg_integration_test.zig";\n'
             'kg_ontology_feedback_step.dependOn(&run_t.step);\n'
             'const later_step = b.step("test:later", "boundary");\n',
             encoding="utf-8",
@@ -429,7 +430,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         (root / "build.zig").write_text(
             'const kg_ontology_feedback_step = b.step("test:kg-ontology-feedback", "fixture");\n'
-            '// tests/component/kg_integration_test.zig and dependOn are inert comments\n'
+            '// apps/cli/tests/component/kg_integration_test.zig and dependOn are inert comments\n'
             'const later_step = b.step("test:later", "boundary");\n',
             encoding="utf-8",
         )
@@ -442,7 +443,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        for relative in ("src/core", "src/kg", "tests/component"):
+        for relative in ("src/core", "src/kg", "tests/component", "apps/cli/tests/component"):
             (root / relative).mkdir(parents=True, exist_ok=True)
         (root / "src/kg/experience_packet.zig").write_text(
             'const QUERY_BYTES = 400;\n'
@@ -508,7 +509,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
             'const RULE = "experience_packet before any work; bounded exact lexical probe; tentative/confirmed state; LEXICAL EXPANSION: TinyKG has no vectors; before work actively infer 2-4 separate compact semantic variants; declare them once in lexical-query-plan-v3; host executes the fixed batch; Never combine the whole neighborhood into one keyword bag";\n',
             encoding="utf-8",
         )
-        (root / "tests/component/kg_integration_test.zig").write_text(
+        (root / "apps/cli/tests/component/kg_integration_test.zig").write_text(
             'test "L2 KG experience feedback: claim exposes verified prior execution before work" {\n'
             '  const result = try tool_exec.executeOne(ctx, "TaskUpdate", args);\n'
             '  const recovered = try tool_exec.executeOne(ctx, "TaskGet", get_args);\n'
@@ -546,7 +547,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
         )
         (root / "build.zig").write_text(
             'const kg_experience_feedback_step = b.step("test:kg-experience-feedback", "fixture");\n'
-            'const test_file = "tests/component/kg_integration_test.zig";\n'
+            'const test_file = "apps/cli/tests/component/kg_integration_test.zig";\n'
             'kg_experience_feedback_step.dependOn(&run_t.step);\n'
             'const later_step = b.step("test:later", "boundary");\n',
             encoding="utf-8",
@@ -635,7 +636,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         (root / "build.zig").write_text(
             'const kg_experience_feedback_step = b.step("test:kg-experience-feedback", "fixture");\n'
-            '// tests/component/kg_integration_test.zig and dependOn are inert comments\n'
+            '// apps/cli/tests/component/kg_integration_test.zig and dependOn are inert comments\n'
             'const later_step = b.step("test:later", "boundary");\n',
             encoding="utf-8",
         )
@@ -1236,7 +1237,7 @@ class EvalBudgetCheckpointSensorTests(unittest.TestCase):
 class TreatmentActivationSensorTests(unittest.TestCase):
     RELATIVE_SOURCES = (
         "src/kg/task_protocol.zig",
-        "tests/component/prompt_tool_coupling_test.zig",
+        "apps/cli/tests/component/prompt_tool_coupling_test.zig",
         "src/core/conversation.zig",
         "tests/component/microcompact_test.zig",
         "scripts/eval/treatment_activation.py",

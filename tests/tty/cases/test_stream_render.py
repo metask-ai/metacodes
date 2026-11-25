@@ -1,6 +1,6 @@
 """Real binary, offline mock: what a streamed reply leaves on a real terminal (#319, #318).
 
-The component tests (tests/component/render_region_contract_test.zig,
+The component tests (apps/cli/tests/component/render_region_contract_test.zig,
 md_stream_convergence_test.zig) found two bugs by replaying RenderRegion
 through a virtual terminal. These cases check the fixes end to end, through
 the binary, a pty and the mock SSE server.

@@ -74,6 +74,23 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 /// Every Zig test executable that can run on Windows shares the same legacy
 /// `/tmp` compatibility prerequisite. Keep that policy at test-run creation so
 /// new isolated suites cannot silently forget it.
+fn addInternal(b: *std.Build, mod: *std.Build.Module) *std.Build.Module {
+    const internal = b.createModule(.{
+        .root_source_file = b.path("src/internal.zig"),
+        .target = mod.resolved_target,
+        .optimize = mod.optimize,
+        .link_libc = mod.link_libc,
+    });
+    mod.addImport("metacodes-internal", internal);
+    return internal;
+}
+
+fn addAppInternal(b: *std.Build, mod: *std.Build.Module, evaluation_shadow: bool) void {
+    const internal = addInternal(b, mod);
+    addHlWithProjectHarnessActuation(b, internal, evaluation_shadow);
+    mod.addImport("bench_assets", internal.import_table.get("bench_assets").?);
+}
+
 fn addTestRunArtifact(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
@@ -84,11 +101,20 @@ fn addTestRunArtifact(
     // steps regardless, but state the doctrine here so a future caching change
     // cannot silently turn cached test binaries into stale green evidence.
     run.has_side_effects = true;
+    if (sourcePath(b, artifact.root_module)) |root| {
+        run.setEnvironmentVariable("METACODES_TEST_ROOT", std.fs.path.dirnamePosix(root) orelse "");
+    }
     if (g_sandbox_helper_install) |install| {
         run.step.dependOn(install);
         run.setEnvironmentVariable("METACODES_SANDBOX_HELPER", g_sandbox_helper_path.?);
     }
     return run;
+}
+
+fn addRecordedTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Compile {
+    var recorded = options;
+    recorded.test_runner = .{ .path = b.path("scripts/recording_test_runner.zig"), .mode = .server };
+    return b.addTest(recorded);
 }
 
 /// A nested `zig build` is part of the caller's build graph, so it must honor
@@ -641,9 +667,9 @@ const aggregate_test_exclusions = [_][]const u8{
     "component/tool_dispatcher_metadata_test.zig",
 };
 
-fn isAggregateTestExclusion(path: []const u8) bool {
-    for (aggregate_test_exclusions) |excluded| {
-        if (std.mem.eql(u8, path, excluded)) return true;
+fn isListed(list: []const []const u8, path: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, path, item)) return true;
     }
     return false;
 }
@@ -659,22 +685,42 @@ fn countAggregateImport(source: []const u8, expected_line: []const u8) usize {
     return count;
 }
 
+const AggregateRoot = struct { dir: []const u8, prefix: []const u8 };
+
 /// Fail during build-graph construction if a new component/integration test
-/// is not wired into the aggregate suite. The old one-artifact-per-file graph
+/// is not wired into its aggregate suite. The old one-artifact-per-file graph
 /// discovered new files implicitly; aggregation is much faster, but needs this
 /// explicit guard so the speedup can never silently reduce coverage.
 fn validateAggregateTestInventory(b: *std.Build) void {
-    const suite = b.build_root.handle.readFileAlloc(
-        b.graph.io,
-        "tests/integration_suite.zig",
-        b.allocator,
-        .limited(1024 * 1024),
-    ) catch |err| std.debug.panic("cannot read aggregate test inventory: {t}", .{err});
-
-    const roots = [_]struct { dir: []const u8, prefix: []const u8 }{
+    validateSuiteInventory(b, "tests/integration_suite.zig", &.{
         .{ .dir = "tests/component", .prefix = "component" },
         .{ .dir = "tests/integration", .prefix = "integration" },
-    };
+    }, &aggregate_test_exclusions);
+    validateSuiteInventory(b, "apps/cli/tests/suite.zig", &.{
+        .{ .dir = "apps/cli/tests/component", .prefix = "component" },
+    }, &.{});
+    for (aggregate_test_exclusions) |excluded| {
+        const path = b.fmt("tests/{s}", .{excluded});
+        const stat = b.build_root.handle.statFile(b.graph.io, path, .{
+            .follow_symlinks = false,
+        }) catch |err| std.debug.panic("dedicated test exclusion is missing: {s}: {t}", .{ path, err });
+        if (stat.kind != .file) std.debug.panic("dedicated test exclusion is not a regular file: {s}", .{path});
+    }
+}
+
+fn validateSuiteInventory(
+    b: *std.Build,
+    inventory: []const u8,
+    roots: []const AggregateRoot,
+    exclusions: []const []const u8,
+) void {
+    const suite = b.build_root.handle.readFileAlloc(
+        b.graph.io,
+        inventory,
+        b.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| std.debug.panic("cannot read aggregate test inventory {s}: {t}", .{ inventory, err });
+
     for (roots) |root| {
         var dir = b.build_root.handle.openDir(b.graph.io, root.dir, .{
             .iterate = true,
@@ -698,25 +744,18 @@ fn validateAggregateTestInventory(b: *std.Build) void {
             std.mem.replaceScalar(u8, path, '\\', '/');
             const expected_line = b.fmt("_ = @import(\"{s}\");", .{path});
             const occurrences = countAggregateImport(suite, expected_line);
-            if (isAggregateTestExclusion(path)) {
+            if (isListed(exclusions, path)) {
                 if (occurrences != 0) std.debug.panic(
-                    "dedicated test {s} must not also appear in tests/integration_suite.zig",
-                    .{path},
+                    "dedicated test {s} must not also appear in {s}",
+                    .{ path, inventory },
                 );
             } else if (occurrences != 1) {
                 std.debug.panic(
-                    "aggregate test inventory requires exactly one @import for {s}; found {}",
-                    .{ path, occurrences },
+                    "{s} requires exactly one @import for {s}; found {}",
+                    .{ inventory, path, occurrences },
                 );
             }
         }
-    }
-    for (aggregate_test_exclusions) |excluded| {
-        const path = b.fmt("tests/{s}", .{excluded});
-        const stat = b.build_root.handle.statFile(b.graph.io, path, .{
-            .follow_symlinks = false,
-        }) catch |err| std.debug.panic("dedicated test exclusion is missing: {s}: {t}", .{ path, err });
-        if (stat.kind != .file) std.debug.panic("dedicated test exclusion is not a regular file: {s}", .{path});
     }
 }
 
@@ -756,7 +795,7 @@ const AgentCoreAbiModuleOptions = struct {
 /// a delivery concern and must never leak into in-tree test executables.
 fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path("src/agentcore/abi_v1.zig"),
+        .root_source_file = b.path("packages/agentcore/abi_v1.zig"),
         .target = options.target,
         .optimize = options.optimize,
         .strip = options.strip,
@@ -769,9 +808,9 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
     if (options.target.result.os.tag == .windows)
         mod.linkSystemLibrary("advapi32", .{ .use_pkg_config = .no });
     if (options.target.result.os.tag == .windows and options.target.result.abi == .msvc)
-        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_msvc_crt_shims.c"), .flags = &.{"-std=c11"} });
+        mod.addCSourceFile(.{ .file = b.path("packages/agentcore/windows_msvc_crt_shims.c"), .flags = &.{"-std=c11"} });
     if (options.target.result.os.tag == .windows and options.target.result.abi == .gnu)
-        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_gnu_crt_shims.c"), .flags = &.{"-std=c11"} });
+        mod.addCSourceFile(.{ .file = b.path("packages/agentcore/windows_gnu_crt_shims.c"), .flags = &.{"-std=c11"} });
     return mod;
 }
 
@@ -834,6 +873,72 @@ fn addCoreSuiteRun(
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.expectExitCode(0);
         wireLeanKernelTestInputs(run_shard, lean_kernels);
+        report.* = run_shard.captureStdOut(.{
+            .basename = b.fmt("{s}-shard-{}.txt", .{ suite.name, shard_index }),
+        });
+    }
+    const run_reporter = b.addRunArtifact(reporter);
+    for (reports) |report| run_reporter.addFileArg(report);
+    return &run_reporter.step;
+}
+
+/// One compilation of a component/integration inventory (tests/integration_suite.zig,
+/// apps/cli/tests/suite.zig) whose tests scripts/sharded_test_runner.zig partitions.
+fn addAggregateSuite(
+    b: *std.Build,
+    name: []const u8,
+    root_module: *std.Build.Module,
+    tfilter: ?[]const u8,
+) *std.Build.Step.Compile {
+    return b.addTest(.{
+        .name = name,
+        .root_module = root_module,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        .test_runner = .{
+            .path = b.path("scripts/sharded_test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+}
+
+/// What every process of an aggregate suite runs against: the installed CLI,
+/// the test probes, and the staged TinyKG, Lean kernels and ripgrep.
+const AggregateSuiteInputs = struct {
+    cli_bin: []const u8,
+    installs: []const *std.Build.Step,
+    tinykg: ?StagedTinyKg,
+    tinykgd: ?StagedTinyKgd,
+    lean_kernels: StagedLeanKernels,
+    ripgrep: RipgrepBundleInfo,
+};
+
+fn wireAggregateSuiteInputs(b: *std.Build, run: *std.Build.Step.Run, inputs: AggregateSuiteInputs) void {
+    run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", inputs.cli_bin);
+    for (inputs.installs) |install| run.step.dependOn(install);
+    wireTinyKgTestInput(run, inputs.tinykg);
+    wireTinyKgdTestInput(run, inputs.tinykgd);
+    wireLeanKernelTestInputs(run, inputs.lean_kernels);
+    wirePinnedRipgrepTestInput(b, run, inputs.ripgrep);
+}
+
+/// Runs an aggregate suite as `shards` processes; the returned step is the
+/// reporter, which accepts the reports only when together they cover exactly
+/// the compiled test inventory.
+fn addAggregateSuiteRun(
+    b: *std.Build,
+    suite: *std.Build.Step.Compile,
+    shards: u8,
+    reporter: *std.Build.Step.Compile,
+    inputs: AggregateSuiteInputs,
+) *std.Build.Step {
+    const reports = b.allocator.alloc(std.Build.LazyPath, shards) catch @panic("OOM");
+    for (reports, 0..) |*report, shard_index| {
+        const run_shard = addTestRunArtifact(b, suite);
+        run_shard.has_side_effects = true;
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{shards}));
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
+        run_shard.expectExitCode(0);
+        wireAggregateSuiteInputs(b, run_shard, inputs);
         report.* = run_shard.captureStdOut(.{
             .basename = b.fmt("{s}-shard-{}.txt", .{ suite.name, shard_index }),
         });
@@ -907,7 +1012,7 @@ pub fn build(b: *std.Build) void {
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
     const release_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("apps/cli/src/main.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
         .link_libc = true,
@@ -919,14 +1024,14 @@ pub fn build(b: *std.Build) void {
         // (doc/PERF_MEMORY_PRINCIPLES.md §3f). Windows x64 needs its unwind
         // data for SEH; macOS is left as is.
         .unwind_tables = if (target.result.os.tag == .linux) std.builtin.UnwindTables.none else null,
-        // With symbols the link keeps DWARF for the split below. src/main.zig
+        // With symbols the link keeps DWARF for the split below. apps/cli/src/main.zig
         // turns stack tracing off for every ReleaseSmall build, which DWARF
         // would otherwise switch on (~100 KB), so the code stays within a few
         // bytes of a stripped link's.
         .strip = if (release_symbols) false else null,
     });
-    addHl(b, release_mod);
     release_mod.addOptions("build_info", build_info);
+    addAppInternal(b, release_mod, false);
     const exe = b.addExecutable(.{
         .name = "metacodes",
         .root_module = release_mod,
@@ -976,12 +1081,12 @@ pub fn build(b: *std.Build) void {
     // but formal blocks are observed rather than actuated.  There is no env or
     // CLI switch and this artifact is deliberately absent from default install.
     const project_harness_shadow_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("apps/cli/src/main.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
         .link_libc = true,
     });
-    addHlWithProjectHarnessActuation(b, project_harness_shadow_mod, true);
+    addAppInternal(b, project_harness_shadow_mod, true);
     const project_harness_shadow_exe = b.addExecutable(.{
         .name = "metacodes-project-harness-shadow",
         .root_module = project_harness_shadow_mod,
@@ -1227,13 +1332,13 @@ pub fn build(b: *std.Build) void {
     }
 
     const debug_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("apps/cli/src/main.zig"),
         .target = target,
         .optimize = .Debug,
         .link_libc = true,
     });
-    addHl(b, debug_mod);
     debug_mod.addOptions("build_info", debug_build_info);
+    addAppInternal(b, debug_mod, false);
     const debug_exe = b.addExecutable(.{
         .name = "metacodes-debug",
         .root_module = debug_mod,
@@ -1254,13 +1359,13 @@ pub fn build(b: *std.Build) void {
     // 复用 debug_mod(少一个模块实例,非少一次编译)。
     const test_cc_mod = if (optimize == .Debug) debug_mod else blk: {
         const m2 = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("apps/cli/src/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
-        addHl(b, m2);
         m2.addOptions("build_info", buildInfoOptions(b, target.result, optimize, release_layout, tinykg_input, build_identity));
+        addAppInternal(b, m2, false);
         break :blk m2;
     };
     const test_harness_mod = b.createModule(.{
@@ -1270,6 +1375,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, test_harness_mod); // harness socket 层走 platform/net(POSIX+Winsock 双后端)
+    // The staged TinyKG resolver, shared by tests/component and apps/cli/tests.
+    const test_tinykg_binary_mod = b.createModule(.{
+        .root_source_file = b.path("tests/component/tinykg_binary.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // mock MCP server 二进制：测试专用，只装这个 artifact 即可运行 aggregate
     // integration；测试不应依赖全局 install step，否则会顺带冷编译 release/debug/replay。
@@ -1310,15 +1421,15 @@ pub fn build(b: *std.Build) void {
     const install_selfexe_probe = b.addInstallArtifact(selfexe_probe_exe, .{});
 
     // update_unit_probe 二进制:`metacodes update` 组件测试里 fixture release unit 的
-    // `bin/metacodes`。`install …` 跑真安装器(src/app/install.zig,不做 doctor 自检),
+    // `bin/metacodes`。`install …` 跑真安装器(apps/cli/src/app/install.zig,不做 doctor 自检),
     // 其余调用只记 argv;只链 platform + 安装器那一小块,不拖整个 app 图。
     const install_probe_root_mod = b.createModule(.{
-        .root_source_file = b.path("src/install_root.zig"),
+        .root_source_file = b.path("apps/cli/src/install_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    addPlatform(b, install_probe_root_mod);
+    addPlatform(b, addInternal(b, install_probe_root_mod));
     const update_unit_probe_mod = b.createModule(.{
         .root_source_file = b.path("tests/_harness/update_unit_probe.zig"),
         .target = target,
@@ -1388,7 +1499,7 @@ pub fn build(b: *std.Build) void {
     const http_status_gate_run = b.addRunArtifact(http_status_gate_exe);
     http_status_gate_run.setCwd(b.path("."));
     http_status_gate_run.addArg(".");
-    const http_status_gate_unit = b.addTest(.{
+    const http_status_gate_unit = addRecordedTest(b, .{
         .name = "http-status-boundary-gate-unit",
         .root_module = http_status_gate_mod,
     });
@@ -1485,25 +1596,25 @@ pub fn build(b: *std.Build) void {
 
     const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
     agentcore_test_step.dependOn(http_status_gate_step);
-    const agentcore_abi_test = b.addTest(.{
+    const agentcore_abi_test = addRecordedTest(b, .{
         .name = "agentcore-abi-unit",
         .root_module = agentcore_abi_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test).step);
-    const agentcore_types_test = b.addTest(.{
+    const agentcore_types_test = addRecordedTest(b, .{
         .name = "agentcore-types-unit",
         .root_module = agentcore_types_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test).step);
-    const agentcore_protocol_test = b.addTest(.{
+    const agentcore_protocol_test = addRecordedTest(b, .{
         .name = "agentcore-protocol-unit",
         .root_module = agentcore_protocol_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test).step);
-    const agentcore_sdk_test = b.addTest(.{
+    const agentcore_sdk_test = addRecordedTest(b, .{
         .name = "agentcore-sdk-unit",
         .root_module = agentcore_sdk_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1514,7 +1625,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
-    const agentcore_zig_package_build_test = b.addTest(.{
+    const agentcore_zig_package_build_test = addRecordedTest(b, .{
         .name = "agentcore-zig-package-build-unit",
         .root_module = agentcore_zig_package_build_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1525,7 +1636,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const agentcore_manifest_contract_test = b.addTest(.{
+    const agentcore_manifest_contract_test = addRecordedTest(b, .{
         .name = "agentcore-manifest-contract",
         .root_module = agentcore_manifest_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1546,7 +1657,7 @@ pub fn build(b: *std.Build) void {
         .name = "agentcore-manifest",
         .root_module = agentcore_manifest_tool_mod,
     });
-    const agentcore_manifest_tool_test = b.addTest(.{
+    const agentcore_manifest_tool_test = addRecordedTest(b, .{
         .name = "agentcore-manifest-unit",
         .root_module = agentcore_manifest_tool_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1581,12 +1692,12 @@ pub fn build(b: *std.Build) void {
         .name = "release-manifest",
         .root_module = release_manifest_tool_mod,
     });
-    const release_manifest_tool_test = b.addTest(.{
+    const release_manifest_tool_test = addRecordedTest(b, .{
         .name = "release-manifest-unit",
         .root_module = release_manifest_tool_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const manifest_common_test = b.addTest(.{
+    const manifest_common_test = addRecordedTest(b, .{
         .name = "manifest-common-unit",
         .root_module = b.createModule(.{
             .root_source_file = b.path("scripts/manifest_common.zig"),
@@ -1595,7 +1706,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const release_contract_test = b.addTest(.{
+    const release_contract_test = addRecordedTest(b, .{
         .name = "release-manifest-contract",
         .root_module = b.createModule(.{
             .root_source_file = b.path("release/manifest_contract.zig"),
@@ -1716,7 +1827,7 @@ pub fn build(b: *std.Build) void {
         .name = "agentcore-symbol-gate",
         .root_module = agentcore_symbol_gate_mod,
     });
-    const agentcore_symbol_gate_test = b.addTest(.{
+    const agentcore_symbol_gate_test = addRecordedTest(b, .{
         .name = "agentcore-symbol-gate-unit",
         .root_module = agentcore_symbol_gate_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1760,7 +1871,7 @@ pub fn build(b: *std.Build) void {
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     agentcore_contract_mod.addImport("metacodes-core", core_mod);
     addPlatform(b, agentcore_contract_mod);
-    const agentcore_contract_test = b.addTest(.{
+    const agentcore_contract_test = addRecordedTest(b, .{
         .name = "agentcore-abi-contract",
         .root_module = agentcore_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -1793,7 +1904,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = target.result.ofmt != .macho,
     });
     if (target.result.ofmt == .elf)
-        agentcore_shared_lib.setVersionScript(b.path("src/agentcore/shared_exports.map"));
+        agentcore_shared_lib.setVersionScript(b.path("packages/agentcore/shared_exports.map"));
     const agentcore_shared_gate_cmd = b.addRunArtifact(agentcore_symbol_gate_tool);
     agentcore_shared_gate_cmd.addArg("--shared");
     agentcore_shared_gate_cmd.addFileArg(agentcore_shared_lib.getEmittedBin());
@@ -2302,7 +2413,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    const shard_reporter_tests = b.addTest(.{
+    const shard_reporter_tests = addRecordedTest(b, .{
         .root_module = b.createModule(.{
             .root_source_file = b.path("scripts/sharded_test_reporter.zig"),
             .target = b.graph.host,
@@ -2311,7 +2422,7 @@ pub fn build(b: *std.Build) void {
     });
     const core_shard_harness_step = b.step("test:lib-shard-harness", "Test core shard partition and aggregate fail-closed checks");
     core_shard_harness_step.dependOn(&b.addRunArtifact(shard_runner_tests).step);
-    core_shard_harness_step.dependOn(&b.addRunArtifact(shard_reporter_tests).step);
+    core_shard_harness_step.dependOn(&addTestRunArtifact(b, shard_reporter_tests).step);
 
     // Diagnostic companion to test:lib. It runs the identical test graph and
     // semantics, but emits per-test timings plus slow-test buckets/top-N so
@@ -2342,7 +2453,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, lsp_test_mod); // lsp/ 依赖 platform（sync/process），隔离测试也需
-    const lsp_test = b.addTest(.{ .name = "lsp-test", .root_module = lsp_test_mod });
+    const lsp_test = addRecordedTest(b, .{ .name = "lsp-test", .root_module = lsp_test_mod });
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
     lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test).step);
 
@@ -2356,7 +2467,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, mcp_test_mod);
-    const mcp_test = b.addTest(.{
+    const mcp_test = addRecordedTest(b, .{
         .name = "mcp-test",
         .root_module = mcp_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -2379,7 +2490,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addPlatform(b, provider_test_mod); // control_plane guards its state with platform/sync
-    const provider_test = b.addTest(.{ .name = "provider-test", .root_module = provider_test_mod });
+    const provider_test = addRecordedTest(b, .{ .name = "provider-test", .root_module = provider_test_mod });
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
 
@@ -2387,7 +2498,7 @@ pub fn build(b: *std.Build) void {
     // may import only what their doc comments say, and so may every file they
     // reach; nothing metacodes-core reaches from `src/lib.zig` may import the
     // application side beyond a baseline that only shrinks (#448), and no
-    // file under `src/daemon/` or `src/web/` may import the AgentLoop beyond
+    // file under `apps/cli/src/daemon/` or `apps/cli/src/web/` may import the AgentLoop beyond
     // another such baseline (#445). The
     // compile-from-a-narrow-root gates and `test:lib` cannot enforce it: their
     // module root is `src/`, so any file under it is importable, and lazy
@@ -2405,7 +2516,7 @@ pub fn build(b: *std.Build) void {
     const subsystem_boundary_run = b.addRunArtifact(subsystem_boundary_exe);
     subsystem_boundary_run.setCwd(b.path("."));
     subsystem_boundary_run.addArg(".");
-    const subsystem_boundary_unit = b.addTest(.{
+    const subsystem_boundary_unit = addRecordedTest(b, .{
         .name = "subsystem-boundary-gate-unit",
         .root_module = subsystem_boundary_mod,
     });
@@ -2422,13 +2533,13 @@ pub fn build(b: *std.Build) void {
     // provider kernel and the terminal theme is enforced by
     // `subsystem:boundary`.
     const picker_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/picker_test_root.zig"),
+        .root_source_file = b.path("apps/cli/src/picker_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    addPlatform(b, picker_test_mod);
-    const picker_test = b.addTest(.{ .name = "picker-test", .root_module = picker_test_mod });
+    addPlatform(b, addInternal(b, picker_test_mod));
+    const picker_test = addRecordedTest(b, .{ .name = "picker-test", .root_module = picker_test_mod });
     const picker_test_step = b.step("test:picker", "Test the cross-UI model picker in isolation (issue #16)");
     picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
 
@@ -2442,7 +2553,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    const platform_test = b.addTest(.{ .name = "platform-test", .root_module = platform_test_mod });
+    const platform_test = addRecordedTest(b, .{ .name = "platform-test", .root_module = platform_test_mod });
     const platform_test_step = b.step("test:platform", "Test the portable platform abstraction layer");
     const platform_test_run = addTestRunArtifact(b, platform_test);
     platform_test_step.dependOn(&platform_test_run.step);
@@ -2533,6 +2644,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(units_test_step);
     test_step.dependOn(integration_test_step);
     test_step.dependOn(product_test_step);
+    // `test:cli` is the cli package's tests: the inline tests of apps/cli/src,
+    // the picker root, apps/cli/tests in its shards and the termios spike. It is
+    // part of `test:units`, and what CI runs for a change scripts/ci_scope.py
+    // confines to the cli package.
+    const cli_test_step = b.step("test:cli", "Run the cli package's tests: apps/cli/src inline tests, the picker root and apps/cli/tests (part of `test:units`)");
+    units_test_step.dependOn(cli_test_step);
     // Built by nothing else in the suite; compiling it here keeps it in step
     // with the runtime API it calls.
     product_test_step.dependOn(&jev_recall_eval_driver.step);
@@ -2558,7 +2675,7 @@ pub fn build(b: *std.Build) void {
     units_test_step.dependOn(subsystem_boundary_step);
     units_test_step.dependOn(provider_test_step);
     units_test_step.dependOn(mcp_test_step);
-    units_test_step.dependOn(picker_test_step);
+    cli_test_step.dependOn(picker_test_step);
     units_test_step.dependOn(lsp_test_step);
     units_test_step.dependOn(platform_test_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
@@ -2765,6 +2882,44 @@ pub fn build(b: *std.Build) void {
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
     units_test_step.dependOn(&gate_manifest_test_cmd.step);
+    const test_id_fixture = addRecordedTest(b, .{
+        .name = "test-id-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/test_id_fixture.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const test_id_fixture_run = addTestRunArtifact(b, test_id_fixture);
+    const test_id_fixture_records = test_id_fixture_run.addPrefixedOutputDirectoryArg("--test-ids-dir=", "test-ids");
+    const test_id_fixture_check = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/test_ids.py",
+        "collect",
+        "--raw",
+    });
+    test_id_fixture_check.addDirectoryArg(test_id_fixture_records);
+    test_id_fixture_check.expectStdOutEqual(
+        "zig:<unnamed>\tscripts.test_id_fixture\tpass\t1\n" ++
+            "zig:passes\tscripts.test_id_fixture\tpass\t1\n" ++
+            "zig:skips\tscripts.test_id_fixture\tskip\t1\n",
+    );
+    units_test_step.dependOn(&test_id_fixture_check.step);
+    const test_ids_check_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/test_ids.py",
+        "check",
+    });
+    const test_ids_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_test_ids",
+        "-v",
+    });
+    const test_ids_test_step = b.step("test:test-ids", "Test the executed-test ID lists and their base comparison");
+    test_ids_test_step.dependOn(&test_ids_test_cmd.step);
+    test_ids_test_step.dependOn(&test_id_fixture_check.step);
+    units_test_step.dependOn(&test_ids_test_cmd.step);
     const pr_loop_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2803,7 +2958,7 @@ pub fn build(b: *std.Build) void {
     const rule_control_test_step = b.step("test:rule-control", "Test the rule-control sensors on fixtures and on the checked-in tree");
     rule_control_test_step.dependOn(&rule_control_test_cmd.step);
     units_test_step.dependOn(&rule_control_test_cmd.step);
-    const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true });
+    const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "apps", "packages", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
     else
@@ -2843,6 +2998,7 @@ pub fn build(b: *std.Build) void {
     gate_static_step.dependOn(&builtin_egress_test_cmd.step);
     gate_static_step.dependOn(&http_answer_test_cmd.step);
     gate_static_step.dependOn(&keep_server_open_test_cmd.step);
+    gate_static_step.dependOn(&test_ids_check_cmd.step);
     gate_static_step.dependOn(&gate_diff_check.step);
     const gate_lint = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
@@ -2857,6 +3013,24 @@ pub fn build(b: *std.Build) void {
     gate_pr_step.dependOn(gate_core_suite);
     gate_pr_step.dependOn(&gate_coverage.step);
     gate_pr_step.dependOn(doc_check_step);
+    const affected_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "scripts/ci_scope.py",
+        "--event",
+        "local",
+        "--base",
+        b.option([]const u8, "affected-base", "test:affected: the revision whose merge base with HEAD the change is measured from") orelse "origin/main",
+        "--candidate",
+        "",
+        "--github-summary",
+        "",
+        "--run",
+        "--zig",
+        b.graph.zig_exe,
+    });
+    affected_cmd.setCwd(b.path("."));
+    affected_cmd.has_side_effects = true;
+    b.step("test:affected", "Run the tests CI selects for the change against origin/main, working tree included (scripts/ci_scope.py)").dependOn(&affected_cmd.step);
 
     const update_contract = b.option(bool, "update-contract", "test:contract: rewrite the snapshots under tests/contract instead of comparing") orelse false;
     const contract_step = b.step("test:contract", "Compare the external contracts with their snapshots under tests/contract: ABI, Zig API, provider requests, events, on-disk formats, CLI");
@@ -2896,7 +3070,7 @@ pub fn build(b: *std.Build) void {
     contract_mod.addImport("agentcore_binary", b.createModule(.{ .root_source_file = b.path("scripts/agentcore_binary.zig") }));
     contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     addPlatform(b, contract_mod);
-    const contract_test = b.addTest(.{
+    const contract_test = addRecordedTest(b, .{
         .name = "contract",
         .root_module = contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -2944,7 +3118,7 @@ pub fn build(b: *std.Build) void {
     contract_run.step.dependOn(&install_mock_mcp.step);
     contract_step.dependOn(&contract_run.step);
 
-    const contract_units = b.addTest(.{
+    const contract_units = addRecordedTest(b, .{
         .name = "contract-units",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/contract/units.zig"),
@@ -2954,7 +3128,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     units_test_step.dependOn(&addTestRunArtifact(b, contract_units).step);
-    const test_obj = b.addTest(.{
+    const test_obj = addRecordedTest(b, .{
         .name = "cc-test",
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -2963,7 +3137,17 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(test_run, staged_tinykg);
     wireTinyKgdTestInput(test_run, staged_tinykgd);
     wireLeanKernelTestInputs(test_run, staged_lean_kernels);
-    units_test_step.dependOn(&test_run.step);
+    cli_test_step.dependOn(&test_run.step);
+    const internal_test = addRecordedTest(b, .{
+        .name = "internal-test",
+        .root_module = test_cc_mod.import_table.get("metacodes-internal").?,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    const internal_test_run = addTestRunArtifact(b, internal_test);
+    wireTinyKgTestInput(internal_test_run, staged_tinykg);
+    wireTinyKgdTestInput(internal_test_run, staged_tinykgd);
+    wireLeanKernelTestInputs(internal_test_run, staged_lean_kernels);
+    units_test_step.dependOn(&internal_test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
     // This is the runtime actuator for the daemon transport control plane.
@@ -3227,11 +3411,9 @@ pub fn build(b: *std.Build) void {
     const spike_step = b.step("test:spike", "Run spike / harness tests");
     const spike_files = [_][]const u8{
         "tests/unit/stream_reader_spike.zig",
-        "tests/unit/termios_spike.zig", // POSIX-only(termios)——Windows 目标下面跳过
         "tests/_harness/mock_sse_server.zig",
     };
     for (spike_files) |f| {
-        if (target.result.os.tag == .windows and std.mem.endsWith(u8, f, "termios_spike.zig")) continue;
         // mock_sse_server 复用共享 harness 模块做 root(它就是同一份编译);其余 spike 各自建。
         const shared_harness = std.mem.endsWith(u8, f, "mock_sse_server.zig");
         const m = if (shared_harness) test_harness_mod else b.createModule(.{
@@ -3241,13 +3423,29 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         if (!shared_harness) addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "spike",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
         const run_t = addTestRunArtifact(b, t);
         spike_step.dependOn(&run_t.step);
+    }
+    // POSIX-only (termios): skipped on Windows targets.
+    if (target.result.os.tag != .windows) {
+        const termios_spike_mod = b.createModule(.{
+            .root_source_file = b.path("apps/cli/tests/unit/termios_spike.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        addPlatform(b, termios_spike_mod);
+        const termios_spike = addRecordedTest(b, .{
+            .name = "spike",
+            .root_module = termios_spike_mod,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
+        cli_test_step.dependOn(&addTestRunArtifact(b, termios_spike).step);
     }
 
     // Integration / Component tests share one compilation root. The old graph
@@ -3263,51 +3461,38 @@ pub fn build(b: *std.Build) void {
     integration_suite_mod.addImport("harness", test_harness_mod);
     integration_suite_mod.addImport("cc", test_cc_mod);
     addPlatform(b, integration_suite_mod);
-    const integration_suite_test = b.addTest(.{
-        .name = "integration-suite",
-        .root_module = integration_suite_mod,
-        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
-        .test_runner = .{
-            .path = b.path("scripts/sharded_test_runner.zig"),
-            .mode = .simple,
-        },
+    const integration_suite_test = addAggregateSuite(b, "integration-suite", integration_suite_mod, tfilter);
+    const aggregate_suite_inputs: AggregateSuiteInputs = .{
+        .cli_bin = b.getInstallPath(.bin, exe.out_filename),
+        .installs = &.{ install_cli, &install_mock_mcp.step, &install_selfexe_probe.step, &install_update_unit_probe.step },
+        .tinykg = staged_tinykg,
+        .tinykgd = staged_tinykgd,
+        .lean_kernels = staged_lean_kernels,
+        .ripgrep = ripgrep_bundle,
+    };
+    const run_integration_reporter = addAggregateSuiteRun(b, integration_suite_test, integration_test_shards, core_shard_reporter, aggregate_suite_inputs);
+    spike_step.dependOn(run_integration_reporter);
+
+    // The CLI's component tests: their own inventory, compiled and sharded
+    // the same way, and run by `test:cli` (and so by `test:units`).
+    const cli_suite_mod = b.createModule(.{
+        .root_source_file = b.path("apps/cli/tests/suite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
-    const integration_reports = b.allocator.alloc(std.Build.LazyPath, integration_test_shards) catch @panic("OOM");
-    for (0..integration_test_shards) |shard_index| {
-        const run_shard = addTestRunArtifact(b, integration_suite_test);
-        run_shard.has_side_effects = true;
-        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{integration_test_shards}));
-        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
-        run_shard.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-        run_shard.expectExitCode(0);
-        run_shard.step.dependOn(install_cli);
-        run_shard.step.dependOn(&install_mock_mcp.step);
-        run_shard.step.dependOn(&install_selfexe_probe.step);
-        run_shard.step.dependOn(&install_update_unit_probe.step);
-        wireTinyKgTestInput(run_shard, staged_tinykg);
-        wireTinyKgdTestInput(run_shard, staged_tinykgd);
-        wireLeanKernelTestInputs(run_shard, staged_lean_kernels);
-        wirePinnedRipgrepTestInput(b, run_shard, ripgrep_bundle);
-        integration_reports[shard_index] = run_shard.captureStdOut(.{
-            .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
-        });
-    }
-    const run_integration_reporter = b.addRunArtifact(core_shard_reporter);
-    for (integration_reports) |report| run_integration_reporter.addFileArg(report);
-    spike_step.dependOn(&run_integration_reporter.step);
+    cli_suite_mod.addImport("harness", test_harness_mod);
+    cli_suite_mod.addImport("cc", test_cc_mod);
+    cli_suite_mod.addImport("tinykg_binary", test_tinykg_binary_mod);
+    cli_suite_mod.addAnonymousImport("vterm_screen_parity", .{ .root_source_file = b.path("tests/fixtures/vterm/screen_parity.jsonl") });
+    addPlatform(b, cli_suite_mod);
+    const cli_suite_test = addAggregateSuite(b, "cli-suite", cli_suite_mod, tfilter);
+    cli_test_step.dependOn(addAggregateSuiteRun(b, cli_suite_test, integration_test_shards, core_shard_reporter, aggregate_suite_inputs));
 
     const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test);
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
-    integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-    integration_monolithic_run.step.dependOn(install_cli);
-    integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
-    integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
-    integration_monolithic_run.step.dependOn(&install_update_unit_probe.step);
-    wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
-    wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
-    wireLeanKernelTestInputs(integration_monolithic_run, staged_lean_kernels);
-    wirePinnedRipgrepTestInput(b, integration_monolithic_run, ripgrep_bundle);
+    wireAggregateSuiteInputs(b, integration_monolithic_run, aggregate_suite_inputs);
     const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
     integration_monolithic_step.dependOn(&integration_monolithic_run.step);
 
@@ -3321,15 +3506,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const integration_timed_run = addTestRunArtifact(b, integration_timed_test);
-    integration_timed_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-    integration_timed_run.step.dependOn(install_cli);
-    integration_timed_run.step.dependOn(&install_mock_mcp.step);
-    integration_timed_run.step.dependOn(&install_selfexe_probe.step);
-    integration_timed_run.step.dependOn(&install_update_unit_probe.step);
-    wireTinyKgTestInput(integration_timed_run, staged_tinykg);
-    wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
-    wireLeanKernelTestInputs(integration_timed_run, staged_lean_kernels);
-    wirePinnedRipgrepTestInput(b, integration_timed_run, ripgrep_bundle);
+    wireAggregateSuiteInputs(b, integration_timed_run, aggregate_suite_inputs);
     const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
     integration_times_step.dependOn(&integration_timed_run.step);
 
@@ -3348,7 +3525,7 @@ pub fn build(b: *std.Build) void {
     dispatcher_metadata_mod.addImport("metacodes-core", core_mod);
     dispatcher_metadata_mod.addImport("agentcore-abi", agentcore_abi_test_mod);
     addPlatform(b, dispatcher_metadata_mod);
-    const dispatcher_metadata_test = b.addTest(.{
+    const dispatcher_metadata_test = addRecordedTest(b, .{
         .name = "tool-dispatcher-metadata",
         .root_module = dispatcher_metadata_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3379,7 +3556,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "skill-runtime",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3394,7 +3571,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, skill_runtime_unit_mod);
-    const skill_runtime_unit = b.addTest(.{
+    const skill_runtime_unit = addRecordedTest(b, .{
         .name = "skill-runtime-unit",
         .root_module = skill_runtime_unit_mod,
         .filters = &.{
@@ -3423,12 +3600,12 @@ pub fn build(b: *std.Build) void {
         "tests/component/sealed_publication_test.zig",
         "tests/component/recovery_allowance_test.zig",
         "tests/component/agent_session_host_tools_test.zig",
-        "tests/component/plugin_runtime_test.zig",
-        "tests/component/plugin_process_test.zig",
+        "apps/cli/tests/component/plugin_runtime_test.zig",
+        "apps/cli/tests/component/plugin_process_test.zig",
         "tests/component/agent_session_ui_test.zig",
         "tests/component/http_error_test.zig",
         "tests/component/answer_queue_test.zig",
-        "tests/component/base_url_flag_test.zig",
+        "apps/cli/tests/component/base_url_flag_test.zig",
         "tests/component/task_error_test.zig",
         "tests/component/tool_loop_breaker_test.zig",
         "tests/component/rule_author_test.zig",
@@ -3437,7 +3614,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/agent_background_test.zig",
         "tests/component/skill_fileref_test.zig",
         "tests/component/transcript_roundtrip_test.zig",
-        "tests/component/headless_json_test.zig",
+        "apps/cli/tests/component/headless_json_test.zig",
         "tests/component/compound_perm_test.zig",
         "tests/component/protected_skill_inject_test.zig",
         "tests/component/read_state_test.zig",
@@ -3446,19 +3623,19 @@ pub fn build(b: *std.Build) void {
         "tests/component/cache_break_test.zig",
         "tests/component/microcompact_test.zig",
         "tests/component/kg_task_projection_test.zig",
-        "tests/component/goal_state_test.zig",
-        "tests/component/usage_report_test.zig",
-        "tests/component/auth_test.zig",
+        "apps/cli/tests/component/goal_state_test.zig",
+        "apps/cli/tests/component/usage_report_test.zig",
+        "apps/cli/tests/component/auth_test.zig",
         "tests/component/schema_validation_test.zig",
         "tests/component/tool_schema_coverage_test.zig",
         "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
         "tests/component/auto_compact_request_test.zig",
-        "tests/component/render_region_test.zig",
+        "apps/cli/tests/component/render_region_test.zig",
         "tests/component/stream_retry_test.zig",
-        "tests/component/ui_state_test.zig",
-        "tests/component/ui_render_test.zig",
-        "tests/component/ui_backend_test.zig",
+        "apps/cli/tests/component/ui_state_test.zig",
+        "apps/cli/tests/component/ui_render_test.zig",
+        "apps/cli/tests/component/ui_backend_test.zig",
         "tests/component/ui_multifrontend_test.zig",
         "tests/component/diagnostics_test.zig",
         "tests/component/provider_vtable_test.zig",
@@ -3468,7 +3645,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/background_main_test.zig",
         "tests/component/harnessmm_test.zig",
         "tests/component/suspend_resume_test.zig",
-        "tests/component/diff_highlight_test.zig",
+        "apps/cli/tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",
         "tests/component/weak_model_test.zig",
         "tests/component/task_batch_test.zig",
@@ -3476,7 +3653,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/swarm_tools_test.zig",
         "tests/component/swarm_dag_test.zig",
         "tests/component/swarm_security_test.zig",
-        "tests/component/swarm_process_test.zig",
+        "apps/cli/tests/component/swarm_process_test.zig",
         "tests/component/add_dir_test.zig",
         "tests/component/dialect_matrix_test.zig",
     };
@@ -3490,7 +3667,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod); // 共享模块(见 integ 循环前注释:perf)
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装(setEnv、clientRoundtrip)
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "new-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3510,7 +3687,7 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "agentdef-fields",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3536,7 +3713,7 @@ pub fn build(b: *std.Build) void {
             m.addImport("harness", test_harness_mod); // 共享模块(见 integ 循环前注释:perf)
             m.addImport("cc", test_cc_mod);
             addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装
-            const t = b.addTest(.{
+            const t = addRecordedTest(b, .{
                 .name = "mem-l2",
                 .root_module = m,
                 .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
@@ -3550,15 +3727,16 @@ pub fn build(b: *std.Build) void {
     const kg_governance_step = b.step("test:kg-governance", "Run TinyKG evidence/freshness governance L2 tests");
     {
         const m = b.createModule(.{
-            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .root_source_file = b.path("apps/cli/tests/component/kg_integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
+        m.addImport("tinykg_binary", test_tinykg_binary_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "kg-governance-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG governance:"},
@@ -3575,15 +3753,16 @@ pub fn build(b: *std.Build) void {
     const kg_ontology_feedback_step = b.step("test:kg-ontology-feedback", "Run host-execution to TinyKG ontology feedback L2");
     {
         const m = b.createModule(.{
-            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .root_source_file = b.path("apps/cli/tests/component/kg_integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
+        m.addImport("tinykg_binary", test_tinykg_binary_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "kg-ontology-feedback-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG ontology feedback:"},
@@ -3600,15 +3779,16 @@ pub fn build(b: *std.Build) void {
     const kg_experience_feedback_step = b.step("test:kg-experience-feedback", "Run TinyKG prior-execution decision feedback L2");
     {
         const m = b.createModule(.{
-            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .root_source_file = b.path("apps/cli/tests/component/kg_integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         m.addImport("harness", test_harness_mod);
         m.addImport("cc", test_cc_mod);
+        m.addImport("tinykg_binary", test_tinykg_binary_mod);
         addPlatform(b, m);
-        const t = b.addTest(.{
+        const t = addRecordedTest(b, .{
             .name = "kg-experience-feedback-l2",
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG experience feedback:"},
@@ -3697,7 +3877,91 @@ pub fn build(b: *std.Build) void {
     }
 
     _ = b.addFmt(.{
-        .paths = &.{"src/"},
+        .paths = &.{ "src/", "apps/", "packages/" },
         .exclude_paths = &.{},
     });
+
+    addLayerCheck(b, gate_static_step, units_test_step);
+}
+
+fn addLayerCheck(b: *std.Build, gate_static_step: *std.Build.Step, units_test_step: *std.Build.Step) void {
+    const wiring = b.addWriteFiles().add("layer_wiring.tsv", layerWiring(b));
+    const layer_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/layer_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const layer_exe = b.addExecutable(.{ .name = "layer-gate", .root_module = layer_mod });
+    const layer_run = b.addRunArtifact(layer_exe);
+    layer_run.setCwd(b.path("."));
+    layer_run.addArg(".");
+    layer_run.addFileArg(wiring);
+    if (b.option([]const u8, "layer-base", "Git ref whose layer_baseline.zon and kernel_budget layer:check may not exceed")) |base| {
+        layer_run.addArgs(&.{ "--base", base });
+    }
+    layer_run.addFileInput(b.path("layers.zon"));
+    layer_run.addFileInput(b.path("layer_baseline.zon"));
+    layer_run.has_side_effects = true;
+    const layer_unit = addRecordedTest(b, .{ .name = "layer-gate-unit", .root_module = layer_mod });
+    const layer_step = b.step("layer:check", "Enforce layers.zon: owned files, downward imports, no package cycles, module wiring, a shrinking baseline");
+    layer_step.dependOn(&layer_run.step);
+    layer_step.dependOn(&addTestRunArtifact(b, layer_unit).step);
+    gate_static_step.dependOn(&layer_run.step);
+    units_test_step.dependOn(layer_step);
+
+    const baseline_run = b.addRunArtifact(layer_exe);
+    baseline_run.setCwd(b.path("."));
+    baseline_run.addArg(".");
+    baseline_run.addFileArg(wiring);
+    baseline_run.addArg("--print-baseline");
+    baseline_run.has_side_effects = true;
+    b.step("layer:baseline", "Print the layer_baseline.zon that matches the tree").dependOn(&baseline_run.step);
+}
+
+fn layerWiring(b: *std.Build) []const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var seen_steps: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
+    var seen_modules: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    var pending: std.ArrayList(*std.Build.Step) = .empty;
+    for (b.top_level_steps.values()) |top| pending.append(b.allocator, &top.step) catch @panic("OOM");
+    for (b.modules.values()) |module| addModuleWiring(b, module, &seen_modules, &lines);
+    while (pending.pop()) |step| {
+        if ((seen_steps.getOrPut(b.allocator, step) catch @panic("OOM")).found_existing) continue;
+        pending.appendSlice(b.allocator, step.dependencies.items) catch @panic("OOM");
+        const compile = step.cast(std.Build.Step.Compile) orelse continue;
+        addModuleWiring(b, compile.root_module, &seen_modules, &lines);
+    }
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    return std.mem.join(b.allocator, "", lines.items) catch @panic("OOM");
+}
+
+fn addModuleWiring(
+    b: *std.Build,
+    module: *std.Build.Module,
+    seen: *std.AutoHashMapUnmanaged(*std.Build.Module, void),
+    lines: *std.ArrayList([]const u8),
+) void {
+    if ((seen.getOrPut(b.allocator, module) catch @panic("OOM")).found_existing) return;
+    const root = sourcePath(b, module);
+    if (root) |path| lines.append(b.allocator, b.fmt("module\t{s}\n", .{path})) catch @panic("OOM");
+    for (module.import_table.keys(), module.import_table.values()) |name, imported| {
+        if (root) |path| {
+            if (sourcePath(b, imported)) |target| {
+                lines.append(b.allocator, b.fmt("import\t{s}\t{s}\t{s}\n", .{ path, name, target })) catch @panic("OOM");
+            }
+        }
+        addModuleWiring(b, imported, seen, lines);
+    }
+}
+
+fn sourcePath(b: *std.Build, module: *std.Build.Module) ?[]const u8 {
+    const file = module.root_source_file orelse return null;
+    return switch (file) {
+        .src_path => |source| if (source.owner == b) std.mem.replaceOwned(u8, b.allocator, source.sub_path, "\\", "/") catch @panic("OOM") else null,
+        else => null,
+    };
 }

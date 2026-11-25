@@ -64,7 +64,7 @@ def child_process(spec, env):
     if spec.get("runner") == "workbuddy":
         from scripts.eval.harbor.suites import workbuddy
         return workbuddy.launch(spec, env)
-    return command(spec), None, env
+    return command(spec), None, {**env, "TZ": "UTC"}
 
 
 class LaunchRefused(ValueError):

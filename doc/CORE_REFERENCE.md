@@ -29,7 +29,7 @@ metacodes-core 是一个**无 UI、无 CLI** 的 LLM 编码-agent 引擎。它�
    `zig build subsystem:boundary`(`scripts/subsystem_boundary_gate.zig`)在源码层沿每条
    `@import`(含函数体与 test 块)检查这条规则;现存的几条边记在只减不增的 baseline 里,
    `src/core/` 没有 baseline。前端再多,core 不被污染,core 不依赖任何前端。
-   同一个 gate 也管反方向的一条(#445):`src/daemon/`、`src/web/` 下的文件不得直接
+   同一个 gate 也管反方向的一条(#445):`apps/cli/src/daemon/`、`apps/cli/src/web/` 下的文件不得直接
    import `src/core/agent_loop.zig`(宿主经 `core/session_host.zig` 驱动内核),现存的两条
    (`daemon/app_driver.zig`、`web/session.zig`)记在只减不增的 baseline 里。
 
@@ -55,22 +55,90 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 
 ## 2. 模块地图与依赖方向
 
-依赖**单向向下**,无循环、无层级倒置:
+目标是依赖**单向向下**、包之间无环。**现在还没做到**:除 `agentcore` 外,产品包都在同一个环里。
+分层以仓库根目录的 `layers.zon` 为准,从低到高:
 
-```
-   前端层 (NOT in core)         repl/ · tui/ · app.zig · main.zig
-        │  仅经 UiBackend + CoreEvent/UiEvent/UiRequest 通信
-        ▼
-   ┌─────────────────────────── metacodes-core ───────────────────────────┐
-   │  协议层   core/protocol/  ui_backend · ui_event · ui_request           │
-   │              (窄腰;前端只需实现/消费这几个)                              │
-   │  引擎层   core/  agent_loop · conversation · message · subagent         │
-   │              tool_exec · transcript · session_id · system_prompt        │
-   │  能力层   tools.zig + tools/* · permission* · agents/* · skills/*        │
-   │              mcp/* · sandbox/* · 各 registry(task/job/agent_job/cron)   │
-   │  基础层   client · api/stream · json · types · util/*                    │
-   └────────────────────────────────────────────────────────────────────────┘
-```
+| 包 | 现在的路径(按前缀归属,长前缀优先) | 可以 import 的包 |
+|----|------------------------------------|------------------|
+| `base` | `util/` · `platform/` · `symbols/` · `highlight/` · `code/` · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
+| `ai` | `api/`(`model_name` 除外) · `provider/` · `client` · `types` · `json` · `preview` · `core/` 里的 `auth` · `recorder` · `context_pressure` | base |
+| `kernel` | `core/` 里的 `conversation` · `message` · `session_id` · `result_budget` | base、ai |
+| `guard` | `permission*` · `sandbox/`(`filesystem` 除外) · `formal/`(`task_audit` 除外) · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据(`execution_effect` · `run_recovery` · `prompt_sections` · `tool_observation_journal` · `project_rule_spec` · `rule_impact_stats` · `rule_impact_evidence` · `rule_impact_receipt` · `rule_impact_aggregate_receipt`) · `protocol/` 里 `PermissionContext` 的字段用到的 `ui_event` · `ui_request` · `permission_choice`,以及 `ui_event` 载荷用到的 `goal` · `output_semantics` · `tools/` 里的 `common` · `observation` · `mcp/naming` · `skills/active` · `skills/runtime/policy_frame` | 以上各包 |
+| `coding` | `core/` 其余文件(含 `agent_loop` · `tool_exec` · `protocol/` 其余文件) · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `sandbox/filesystem` · `formal/task_audit` · `api/model_name_consumers_test` | 以上各包 |
+| `session` | `core/agent_session` · `core/session_host` | 以上各包 |
+| `teamwork` | `teamwork/` | 以上各包 |
+| `facade` | `lib.zig`(`metacodes-core` 的对外门面,汇总导出以上各包) · `internal.zig`(cli 访问下层的唯一入口,不对外) | 以上各包 |
+| `agentcore` | `agentcore/` | 以上各包 |
+| `cli`(前端,不在 core 里) | `repl/` · `web/` · `daemon/` · `app/` · `main` · `app` · `session_service` · `session_intent` | 以上各包 |
+| `testing` / `tests` | `tests/_harness/`、`tests/helpers/` / 其余 `tests/` | 产品包;`tests` 还可以用 `testing` |
+
+`zig build layer:check`(在 `gate:static` 里)检查:每个文件都有归属;每条 `@import`(包括 test 块里的,
+named module 按写下它的源文件算)和 `build.zig` 里每个 module 的 import 都在 `allowed_dependencies` 里;
+包之间无环;不深层 import 别的包的文件;module 根目录不覆盖它不能依赖的包。现状逐条文件边记在
+`layer_baseline.zon`,**只减不增**:新违规会失败,已经消失的条目也必须删掉;CI 还会和 PR 的合并基线比较
+(`-Dlayer-base=<ref>`),白名单变多、kernel 预算放宽或 `allowed_dependencies` 变宽都会失败。
+调整分层(拆包、改归属)的 PR 单独提。拆包后暴露出来的边,只有基线代码里本来就有、而且按基线清单两端在同一个包里,才不算新增;
+upward 条目必须在基线的 upward 里,deep 条目可以来自基线的 upward 或 deep。一个包可以新依赖基线里没有的包,
+前提是新包依赖的包它原来都能访问,新包的每个文件在基线代码里都已存在于同一路径、在基线清单里有归属,而且它原来就能访问那个包。
+从基线以来挪动过的文件(git 识别出的改名)按它在基线里的路径比较:upward 条目必须是基线里的 upward,
+deep 条目可以来自基线的 upward 或 deep,也可以是基线代码里两端同包的 import。
+`kernel_budget` 限定 kernel 的行数和它依赖的包。检查会打印「包 → 包」的违规数,作为迁移进度表。
+建立时(2026-11)的现状:
+
+| 违规 | 数量 |
+|------|------|
+| 越层 import(文件到文件) | 183:kernel → coding 90、guard → coding 34、session → teamwork 24、ai → coding 14、kernel → guard 7、base → ai 6,其余 8 |
+| 深层 import(文件到别的包的文件) | 2133 |
+| 包间环 | 1 个:base、ai、kernel、guard、coding、session、teamwork、cli |
+| module 接线 | 0 |
+| 根目录过宽的 module | 6:`lib.zig` 和 `provider`/`mcp`/`lsp` 的测试隔离根、`sandbox_helper_root`、`release_contract` |
+| kernel | 17852 行,依赖 base、ai、guard、coding |
+
+迁移 1.1 把 `lib.zig` 从 `session` 拆成 `facade` 后:越层 import 159(`session → teamwork` 24 条和
+`session → cli` 2 条消失,剩 `facade → cli` 2 条),深层 import 2159(`lib.zig` 对 teamwork 和 session 的 26 条导出)。
+
+迁移 1.2 清掉下层指向 `cli` 的 6 条边:`app/config.zig`、`app/doctor.zig` 移到 `core/file_config.zig`、`core/doctor.zig`
+(`lib.zig` 仍导出为 `config`、`doctor`);`version_info` 直接读 `release_contract.CONFIG_SCHEMA_VERSION`;
+`swarm/teammate_process` 和 `teamwork/command` 改用 cli 注入的窄接口(`teammate_process.Host`、`command.AppHost`)。
+越层 import 153,深层 import 2163,包间环缩成 base、ai、kernel、guard、coding。
+
+迁移 1.3a:cli 只经 named module `metacodes-internal` 访问下层。它的根文件 `src/internal.zig` 归 `facade`,
+按目录层级重新导出 cli 用到的 371 个下层文件(`@import("metacodes-internal").core.agent_loop`),不进
+`metacodes-core`,Zig API 快照不变。cli 里再写相对路径 import 下层文件,同一个文件会落进两个 module,编译不过,
+`layer:check` 也会报新的深层 import。下层的 named module(`platform`、`hl`、`code_runtime`)只接在这个 module 上,
+cli 用 `platform` 也写成 `@import("metacodes-internal").platform`。cli 的 844 条深层 import 清零,换成 `internal.zig` 的 371 条:越层 import 153,
+深层 import 1690,根目录过宽的 module 7 个(新增的 `internal.zig` 和 `lib.zig` 同包、同目录)。下层文件的测试改在
+`internal-test` 里跑(根是这个 module),`cc-test` 只跑 cli 自己的测试。
+
+迁移 2.2 清掉 `ai → coding`、`base → ai`、`base → coding`:`types.zig`、`json.zig`、`preview.zig`(消息、请求和
+provider 配置的类型)和 `core/auth.zig`、`core/recorder.zig`、`core/context_pressure.zig` 改归 `ai`,纯字符串的
+`api/model_name.zig` 改归 `base`,`api/model_name_consumers_test.zig` 改归 `coding`,路径都不变;`file_lock` 用的 stat、
+`codex_usage`/`openai_client` 用的日期和时区计算、`controller_git` 用的子进程捕获下沉到 `platform`
+(`fs.statFd`/`statPath`、`timezone.civilDate`/`formatOffset`/`boundedLocal`、`process.captureWithSpawnRetry`/`describeArgv`),
+`read_state`、`time_context`、`tools/common` 的公开声明不变,改为调用它们。越层 import 130,深层 import 1665,包间环缩成 kernel、guard、coding。
+
+迁移 2.1 清掉 `guard → coding` 的 34 条边,只改归属,不搬文件:一个文件的 import 闭包已经都在目标包或更低的包里,就把它
+单个归到那个包,路径和 `lib.zig`、`internal.zig` 的名字都不变,Zig API 快照和测试 ID 不变。归到 `guard` 的有
+`tools/common`、`mcp/naming`、`core/shell`、`core/answer_queue`、`core/shutdown`、`memory/memdir`、
+`skills/active` 和 `policy_frame`,以及 `project_harness_runtime` 读的工具观测与规则影响证据这 10 个文件;`tools/test_tmp`
+只给测试用,归到 `base`。反过来,以 `ToolContext` 为参数的工具实现 `sandbox/filesystem`、`formal/task_audit` 归到 `coding`,
+沙箱机制(`exec`、`config`、`filesystem_helper`)和 formal 检查器仍在 `guard`。代码改了两处:`ToolExecutionPolicy`
+挪到 `permission/category.zig`,`tools/context.zig` 用别名保留,`policy_frame` 不再 import `tools.zig`;`hashCwd` 的实现挪到
+`platform.paths`,`transcript.hashCwd` 签名不变、转调它,`memdir` 直接用它,`transcript` 留在 `coding`。越层 import 94
+(`guard → coding` 清零,`kernel` 对 `test_tmp` 的 2 条也随之消失),深层 import 1804(新增的 154 条都是基线代码里已有的 import:147 条原在同一个包里,7 条原是越层 import)。
+
+迁移 3.1 按 pi 的分法重新划定 kernel。pi 的 `pi-agent-core` 只有一个最小的 `agentLoop`,外设靠钩子接入,带全套外设的
+`AgentSession` 在 `pi-coding-agent` 里。metacodes 现在的 `agent_loop`(`Options` 带 kg、jev、telemetry、swarm、skills 等全部外设)
+和 `tool_exec`(直接调 apply_patch、read_artifact、kg、project_rule)就是这个「全套外设循环」,`protocol/` 是宿主协议,所以它们改归
+`coding`,对应 pi 的 `AgentSession`;最小内核循环在 3.2 抽进 kernel,`agent_loop` 再逐步改为调用它,`Options` 不变。kernel 现在只有
+`conversation`、`message`、`session_id`,加上 `conversation` 用来算单条工具结果上限的 `result_budget`(它对 artifact 读取上限的
+引用改成私有常量,`tools/read_artifact.zig` 里的测试保证两者相等)。`code/`(QuickJS 引擎的 Zig 包装,只依赖 std)改归 `base`。
+`protocol/` 里 `ui_event`、`ui_request`、`permission_choice` 是 `PermissionContext` 公开字段的类型,改归 `coding` 会让 `guard`
+新增越层边,所以归 `guard`;`AskQuestion`、`AskOption` 挪到 `ui_request.zig` 定义,`tools/context.zig` 用别名保留,`ui_request`
+不再依赖 `tools/context`;`ui_event` 载荷用到的 `goal`、`output_semantics` 的 import 闭包都在 guard 及以下,也归 `guard`。路径、Zig API 快照、测试 ID 都不变。越层 import 94 → 3,深层 import 1803,kernel 3264 行,依赖 base、ai、coding。
+包间环 kernel、guard、coding 还在,剩下的 3 条越层边都卡在 Zig API 快照里的公开类型上:`conversation → result_projection` 1 条
+(`Conversation` 的 microcompact、截断等公开方法要认得 artifact 信封),`ui_event → file_change`、`file_reference` 2 条(`CoreEvent` 的载荷类型,
+两者都以 `ToolContext` 为参数)。在 3.2 抽最小循环时一并处理。
 
 `lib.zig` 是唯一对外面,按命名空间 re-export。分组:引擎 / API·client·配置 / 工具 /
 权限 / agents·skills·mcp·sandbox / **协议** / 参考 backend / 工具库。
@@ -79,7 +147,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 
 | 模块 | 职责 | 关键导出 |
 |------|------|----------|
-| `agent_loop` | 一个 agent 回合的完整循环:流式请求→收 tool_use→执行→回灌→再循环 | `run()`, `Options`, `RunResult`, `StopReason`, `UsageSink`, `ProgressReporter` |
+| `agent_loop` | 一个 agent 回合的完整循环(带全套外设,属于 `coding`):流式请求→收 tool_use→执行→回灌→再循环 | `run()`, `Options`, `RunResult`, `StopReason`, `UsageSink`, `ProgressReporter` |
 | `conversation` / `message` | 对话状态(messages → blocks);压缩/microcompact | `Conversation`, `Message`, `Block`(text/tool_use/tool_result/thinking/image/reasoning_item) |
 | `subagent` | 父 agent spawn 子 agent(隔离 Conversation + TaskStore) | `spawnAgent`, `spawnAgentSink`, `SpawnOptions`, `SubagentResult` |
 | `tool_exec` | 工具批量执行(按并发安全分批;每 job 独立 arena + per-worker 值拷贝 ctx) | `executeSlots`, `Slot` |

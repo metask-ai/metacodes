@@ -288,7 +288,7 @@ pub const Config = struct {
     resume_response: ?[]const u8 = null,
     /// `--resume <id>`: the interactive REPL starts with this stored session
     /// of the working directory loaded (an id or an id prefix, as `/resume
-    /// <id>` takes). src/main.zig resolves it to `session_id` before
+    /// <id>` takes). apps/cli/src/main.zig resolves it to `session_id` before
     /// `App.init`, so the App starts as that session. null = a new session.
     resume_session: ?[]const u8 = null,
     /// `--settings <path>`:显式 settings 文件(CLI 层,优先级仅次于 managed)。
@@ -389,7 +389,7 @@ pub const Config = struct {
     /// above METACODES_HOME and the install's etc/metacodes/install.json.
     state_dir: ?[]const u8 = null,
     /// The resolved state root the host hands to every subsystem ("" = none,
-    /// as with a missing $HOME). Set by src/main.zig, never by core code.
+    /// as with a missing $HOME). Set by apps/cli/src/main.zig, never by core code.
     state_root: []const u8 = "",
     /// Fall back to the built-in System-One advisor service
     /// (`jev/runtime.zig` `BUILTIN_DEFAULT`, plain HTTP to a public address)
@@ -411,7 +411,7 @@ pub const Config = struct {
     /// Exact offer id (`--offer`), which pins one reproducible route.
     provider_offer: ?[]const u8 = null,
     /// A preset of config.json by name (`--preset`, #489). The host applies
-    /// it at start (`src/app/presets.zig`); nothing below the host reads it.
+    /// it at start (`apps/cli/src/app/presets.zig`); nothing below the host reads it.
     preset: ?[]const u8 = null,
     /// Offer id of the resolved startup route, rendered for display/logs.
     selected_offer_id: ?[]const u8 = null,
@@ -432,7 +432,7 @@ pub const Config = struct {
     metask_oauth_selected: bool = false,
     /// The host's layer below the process environment for the variables
     /// credentials are read from (#486): the CLI's `<state root>/.env`, as
-    /// `src/app/state_env.zig` accepted it at startup. A name the process
+    /// `apps/cli/src/app/state_env.zig` accepted it at startup. A name the process
     /// environment sets is never read here, nor a provider's alias while the
     /// environment sets another alias of that provider
     /// (`credential.ResolveInput.env_fallback`). Null for every host that

@@ -3,7 +3,6 @@
 const std = @import("std");
 const platform = @import("platform");
 const pfs = platform.fs;
-const App = @import("../app.zig").App;
 const app_types = @import("../types.zig");
 const config = @import("config.zig");
 const types = @import("types.zig");
@@ -21,6 +20,7 @@ const progress = @import("progress.zig");
 const lesson = @import("../kg/lesson.zig");
 const manager = @import("manager.zig");
 const claude_code = @import("drivers/claude_code.zig");
+const metacodes_driver = @import("drivers/metacodes.zig");
 
 pub const RunId = types.RunId;
 
@@ -143,7 +143,7 @@ pub const Prepared = struct {
 /// Approval is checked before file reads, git, App startup or run creation.
 pub fn prepare(arena: std.mem.Allocator, options: Options, state_root: []const u8, workspace: []const u8) !Prepared {
     if (!options.approve) return error.ApprovalRequired;
-    const preview = try @import("../app/config.zig").resolvePreview(arena, state_root, options.host_config.preview);
+    const preview = try @import("../core/file_config.zig").resolvePreview(arena, state_root, options.host_config.preview);
     if (!preview.features().teamwork) return error.PreviewDisabled;
     if (!runtime.platform_supported) return error.UnsupportedPlatform;
     if (options.action != .run and options.action != .@"resume" and options.action != .mcp) return error.UnknownCommand;
@@ -293,59 +293,88 @@ fn seatLayerOf(spec: types.SeatSpec) config.SeatLayer {
     return seat;
 }
 
+pub const AppHost = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const OwnedProvider = provider_factory.OwnedProvider;
+
+    pub const VTable = struct {
+        view: *const fn (ctx: *anyopaque) View,
+        publishMcpServers: *const fn (ctx: *anyopaque) anyerror!void,
+        makeBackgroundProvider: *const fn (ctx: *anyopaque) anyerror!OwnedProvider,
+        rememberObservation: *const fn (ctx: *anyopaque, text: []const u8, schema_type: []const u8) bool,
+    };
+
+    pub const View = struct {
+        allocator: std.mem.Allocator,
+        active_model: []const u8,
+        abort: *types.AbortSignal,
+        seat: metacodes_driver.Deps,
+    };
+
+    pub fn view(self: AppHost) View {
+        return self.vtable.view(self.ctx);
+    }
+};
+
 /// Stable host seam for CLI and the incoming MCP server. Heap allocated:
 /// runtime dependencies borrow `sandbox` and `auditor` at stable addresses.
 pub const Host = struct {
-    app: *App,
+    app: AppHost,
+    view: AppHost.View,
     sandbox: @import("../sandbox/config.zig").SandboxSettings,
     auditor: verifier.VerifierAuditor,
     parent_env: []const [:0]const u8,
     provider: @import("../api/provider.zig").Provider,
     anthropic_client: ?*@import("../client.zig").Client,
 
-    pub fn create(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled) !*Host {
-        return createWith(arena, app, cfg, app.provider(), app.anthropicClientOrNull());
+    pub fn create(arena: std.mem.Allocator, app: AppHost, cfg: config.Config.Enabled) !*Host {
+        return createWith(arena, app, cfg, null);
     }
 
-    pub fn createOwned(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled, owned: *provider_factory.OwnedProvider) !*Host {
-        return createWith(arena, app, cfg, owned.provider(), owned.anthropicClient());
+    pub fn createOwned(arena: std.mem.Allocator, app: AppHost, cfg: config.Config.Enabled, owned: *provider_factory.OwnedProvider) !*Host {
+        return createWith(arena, app, cfg, owned);
     }
 
     fn createWith(
         arena: std.mem.Allocator,
-        app: *App,
+        app: AppHost,
         cfg: config.Config.Enabled,
-        provider: @import("../api/provider.zig").Provider,
-        anthropic_client: ?*@import("../client.zig").Client,
+        owned: ?*provider_factory.OwnedProvider,
     ) !*Host {
-        if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
+        if (!app.view().seat.preview.teamwork) return error.PreviewDisabled;
         if (!runtime.platform_supported) return error.UnsupportedPlatform;
         try supported(cfg);
         if (!sandbox_exec.hostSupported()) return error.SandboxUnavailable;
         // Other embedders can supply an App with deferred MCP publication.
         // Never snapshot empty tool definitions into a paid seat's deps.
-        try app.publishMcpServers();
+        try app.vtable.publishMcpServers(app.ctx);
+        const view = app.view();
+        const provider = if (owned) |o| o.provider() else view.seat.provider;
+        const anthropic_client = if (owned) |o| o.anthropicClient() else view.seat.anthropic_client;
         const self = try arena.create(Host);
         self.* = .{
             .app = app,
-            .sandbox = scope.seatSandbox(app.sandboxPtr()),
+            .view = view,
+            .sandbox = scope.seatSandbox(view.seat.host_sandbox),
             .auditor = undefined,
             .parent_env = try platform.paths.environment(arena),
             .provider = provider,
             .anthropic_client = anthropic_client,
         };
-        const check: reviewer.CheckRunner = .{ .sandbox = &self.sandbox, .home = app.homeDir() };
+        const check: reviewer.CheckRunner = .{ .sandbox = &self.sandbox, .home = view.seat.home_dir };
         self.auditor = .{
             .deps = .{
                 .provider = provider,
                 .anthropic_client = anthropic_client,
-                .tool_defs = app.tool_defs,
-                .permission_ctx = &app.permission_ctx,
-                .session = app.session_id,
-                .state_root = app.stateRoot(),
-                .home_dir = app.homeDir(),
+                .tool_defs = view.seat.tool_defs,
+                .permission_ctx = view.seat.permission_ctx,
+                .session = view.seat.session,
+                .state_root = view.seat.state_root,
+                .home_dir = view.seat.home_dir,
                 .sandbox = &self.sandbox,
-                .artifact_root = app.sessionDir() orelse "",
+                .artifact_root = view.seat.artifact_root,
             },
             .check_runner = check,
             .model = cfg.seats.get(.verifier).model,
@@ -354,52 +383,42 @@ pub const Host = struct {
     }
 
     pub fn deps(self: *Host) runtime.Deps {
-        const app = self.app;
+        var seat = self.view.seat;
+        seat.provider = self.provider;
+        seat.anthropic_client = self.anthropic_client;
+        seat.host_sandbox = &self.sandbox;
         return .{
-            .preview = app.config.preview.features(),
+            .preview = seat.preview,
             .seats = .{ .harness = .{
-                .metacodes = .{
-                    .preview = app.config.preview.features(),
-                    .provider = self.provider,
-                    .anthropic_client = self.anthropic_client,
-                    .tool_defs = app.tool_defs,
-                    .permission_ctx = &app.permission_ctx,
-                    .host_sandbox = &self.sandbox,
-                    .home_dir = app.homeDir(),
-                    .state_root = app.stateRoot(),
-                    .artifact_root = app.sessionDir() orelse "",
-                    .session = app.session_id,
-                },
+                .metacodes = seat,
                 .claude_code = self.claudeCodeOptions(),
             } },
             .auditor = self.auditor.auditor(),
             .check_runner = self.auditor.check_runner,
-            .pitfalls = .{ .ctx = app, .rememberFn = rememberPitfall },
+            .pitfalls = .{ .ctx = self, .rememberFn = rememberPitfall },
         };
     }
 
     pub fn claudeCodeOptions(self: *Host) claude_code.Options {
-        return .{ .preview = self.app.config.preview.features(), .parent_env = self.parent_env, .home_dir = self.app.homeDir(), .sandbox = true, .host_sandbox = &self.sandbox };
+        return .{ .preview = self.view.seat.preview, .parent_env = self.parent_env, .home_dir = self.view.seat.home_dir, .sandbox = true, .host_sandbox = &self.sandbox };
     }
 
     fn rememberPitfall(ctx: *anyopaque, text: []const u8) bool {
-        const app: *App = @ptrCast(@alignCast(ctx));
-        const kg = if (app.kg) |*client| client else return false;
-        _ = kg.remember(.observation, text, lesson.SCHEMA_TYPE, false) catch return false;
-        return true;
+        const self: *Host = @ptrCast(@alignCast(ctx));
+        return self.app.vtable.rememberObservation(self.app.ctx, text, lesson.SCHEMA_TYPE);
     }
 
     /// Pin the effective inputs consulted by child tools and pinned checks.
     /// Hash data only, never allocator addresses, session IDs or live handles.
     fn policyFingerprint(self: *const Host, arena: std.mem.Allocator) ![32]u8 {
-        const permission = &self.app.permission_ctx;
+        const permission = self.view.seat.permission_ctx;
         var out: std.Io.Writer.Allocating = .init(arena);
         defer out.deinit();
         var s: std.json.Stringify = .{ .writer = &out.writer };
         try s.beginObject();
         try s.objectField("sandbox");
         try s.write(.{
-            .home = self.app.homeDir(),
+            .home = self.view.seat.home_dir,
             .allow_read = self.sandbox.allow_read,
             .deny_read = self.sandbox.deny_read,
             .deny_write = self.sandbox.deny_write,
@@ -435,17 +454,18 @@ pub const McpHost = struct {
     serveFn: *const fn (gpa: std.mem.Allocator, run: *runtime.Run) anyerror!void,
 };
 
-pub fn execute(arena: std.mem.Allocator, app: *App, prepared: Prepared) !u8 {
+pub fn execute(arena: std.mem.Allocator, app: AppHost, prepared: Prepared) !u8 {
     return executeWithMcp(arena, app, prepared, null);
 }
 
-pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, mcp: ?McpHost) !u8 {
-    if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
+pub fn executeWithMcp(arena: std.mem.Allocator, app: AppHost, prepared: Prepared, mcp: ?McpHost) !u8 {
+    const view = app.view();
+    if (!view.seat.preview.teamwork) return error.PreviewDisabled;
     if (prepared.action == .mcp and mcp == null) return error.McpHostUnavailable;
     var cfg = prepared.cfg;
-    if (prepared.action != .@"resume") pinInheritedModels(&cfg, app.activeModel());
+    if (prepared.action != .@"resume") pinInheritedModels(&cfg, view.active_model);
     const host = try Host.create(arena, app, cfg);
-    try checkClaudeState(arena, app, cfg, prepared.workspace);
+    try checkClaudeState(arena, host.view, cfg, prepared.workspace);
     var deps = host.deps();
     var approved = cfg;
     if (prepared.raised_cap_usd) |cap_usd| approved.budget_usd = cap_usd;
@@ -458,26 +478,26 @@ pub fn executeWithMcp(arena: std.mem.Allocator, app: *App, prepared: Prepared, m
     }
     // Run owns the OS lifetime lease, shared by CLI and MCP callers.
     const run = if (prepared.action != .@"resume")
-        try runtime.Run.start(app.allocator, deps, .{ .text = prepared.request, .source = prepared.source }, cfg, .{ .state_root = app.stateRoot(), .run_id = prepared.id, .workspace = prepared.workspace })
+        try runtime.Run.start(view.allocator, deps, .{ .text = prepared.request, .source = prepared.source }, cfg, .{ .state_root = view.seat.state_root, .run_id = prepared.id, .workspace = prepared.workspace })
     else if (prepared.raised_cap_usd) |cap_usd|
-        try runtime.Run.reopenWithCap(app.allocator, deps, cfg, app.stateRoot(), prepared.id, cap_usd)
+        try runtime.Run.reopenWithCap(view.allocator, deps, cfg, view.seat.state_root, prepared.id, cap_usd)
     else
-        try runtime.Run.reopen(app.allocator, deps, cfg, app.stateRoot(), prepared.id);
+        try runtime.Run.reopen(view.allocator, deps, cfg, view.seat.state_root, prepared.id);
     defer run.destroy();
     std.debug.print("teamwork run {s}; status: metacodes teamwork status {s}\n", .{ prepared.id.slice(), prepared.id.slice() });
     if (prepared.events) try lines.snapshot(arena, run.status());
     var stopped = std.atomic.Value(bool).init(false);
-    const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ &app.abort, &run.abort, &stopped });
+    const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ view.abort, &run.abort, &stopped });
     defer {
         stopped.store(true, .release);
         watcher.join();
     }
     if (prepared.action == .mcp) {
-        try mcp.?.serveFn(app.allocator, run);
+        try mcp.?.serveFn(view.allocator, run);
         return 0;
     }
     const state = try manager.drive(run, host.claudeCodeOptions());
-    try status(arena, app.stateRoot(), prepared.id);
+    try status(arena, view.seat.state_root, prepared.id);
     if (state == .budget_exhausted and state.budget_exhausted != null)
         std.debug.print("teamwork run {s} paused at its ${d} cap; the worktree is kept. Continue with: metacodes --preview teamwork resume {s} --approve --budget-usd <higher cap>\n", .{ prepared.id.slice(), run.ledger.cap_usd, prepared.id.slice() });
     return if (state == .done) 0 else 1;
@@ -511,14 +531,14 @@ fn pinModel(seat: *types.SeatSpec, model: []const u8) void {
     if (seat.harnessKind() == .metacodes and seat.model == null) seat.model = model;
 }
 
-fn checkClaudeState(arena: std.mem.Allocator, app: *App, cfg: config.Config.Enabled, workspace: []const u8) !void {
+fn checkClaudeState(arena: std.mem.Allocator, view: AppHost.View, cfg: config.Config.Enabled, workspace: []const u8) !void {
     for ([_]types.Role{ .interviewer, .implementer, .reviewer, .judge, .manager }) |role| {
         if (cfg.seats.get(role).harnessKind() == .claude_code)
-            return requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), workspace);
+            return requireSeparateClaudeState(arena, view.seat.home_dir, view.seat.state_root, workspace);
     }
     for (cfg.candidates.slice()) |spec| {
         if (spec.harnessKind() == .claude_code)
-            return requireSeparateClaudeState(arena, app.homeDir(), app.stateRoot(), workspace);
+            return requireSeparateClaudeState(arena, view.seat.home_dir, view.seat.state_root, workspace);
     }
 }
 
@@ -570,8 +590,9 @@ pub const Background = struct {
     }
 };
 
-pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prompter: interview.Prompter, board: *progress.Board) !Interactive {
-    if (!app.config.preview.features().teamwork) return error.PreviewDisabled;
+pub fn startInteractive(app: AppHost, workspace: []const u8, text: []const u8, prompter: interview.Prompter, board: *progress.Board) !Interactive {
+    const view = app.view();
+    if (!view.seat.preview.teamwork) return error.PreviewDisabled;
     if (!runtime.platform_supported) return error.UnsupportedPlatform;
     const generated = @import("../core/session_id.zig").gen();
     const job = try Background.create(try types.RunId.parse(generated.asSlice()));
@@ -582,23 +603,22 @@ pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prom
 
     const segments = try interview.parseSegments(arena, text);
     const repo = try merge_back.toplevel(arena, workspace, null);
-    var cfg = try validated(config.merge(try configuredLayer(arena, app.stateRoot(), repo), segments.seats));
-    try requireExternalState(arena, app.stateRoot(), repo);
-    pinInheritedModels(&cfg, app.activeModel());
-    const jobs = if (app.agent_jobs) |*registry| registry else return error.TeamworkBackgroundUnavailable;
-    job.owned = try jobs.makeProvider();
+    var cfg = try validated(config.merge(try configuredLayer(arena, view.seat.state_root, repo), segments.seats));
+    try requireExternalState(arena, view.seat.state_root, repo);
+    pinInheritedModels(&cfg, view.active_model);
+    job.owned = try app.vtable.makeBackgroundProvider(app.ctx);
     const host = try Host.createOwned(arena, app, cfg, &job.owned.?);
-    try checkClaudeState(arena, app, cfg, repo);
+    try checkClaudeState(arena, host.view, cfg, repo);
     var deps = host.deps();
     deps.cli_approval = .{ .config_json = try policyJson(arena, cfg), .host_sha256 = try host.policyFingerprint(arena) };
     deps.observer = board.observer();
-    const options: runtime.StartOptions = .{ .state_root = app.stateRoot(), .run_id = job.id, .workspace = repo };
+    const options: runtime.StartOptions = .{ .state_root = view.seat.state_root, .run_id = job.id, .workspace = repo };
 
     const terms = try approvalTerms(arena, cfg, repo);
     const verdict: ?interview.Approved = if (segments.skip_interview)
         try interview.approve(segments.request, .skip_interview, terms, prompter)
     else blk: {
-        var drafted = try draftInterruptibly(app, job, deps, cfg, options, segments.request);
+        var drafted = try draftInterruptibly(view.abort, job, deps, cfg, options, segments.request);
         defer drafted.deinit(gpa);
         switch (drafted) {
             .text => |proposal| {
@@ -621,13 +641,13 @@ pub fn startInteractive(app: *App, workspace: []const u8, text: []const u8, prom
     return .{ .started = job };
 }
 
-fn draftInterruptibly(app: *App, job: *Background, deps: runtime.Deps, cfg: config.Config.Enabled, options: runtime.StartOptions, request: []const u8) !interview.Draft {
+fn draftInterruptibly(abort: *types.AbortSignal, job: *Background, deps: runtime.Deps, cfg: config.Config.Enabled, options: runtime.StartOptions, request: []const u8) !interview.Draft {
     var stopped = std.atomic.Value(bool).init(false);
-    const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ &app.abort, &job.interview_abort, &stopped });
+    const watcher = try platform.thread.spawn(.waiter, forwardAbort, .{ abort, &job.interview_abort, &stopped });
     defer {
         stopped.store(true, .release);
         watcher.join();
-        app.abort.reset();
+        abort.reset();
     }
     return interview.draft(std.heap.c_allocator, deps, cfg, options, request, &job.interview_abort);
 }

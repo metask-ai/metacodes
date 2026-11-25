@@ -939,8 +939,7 @@ const OpenAIStream = struct {
         // 答复被当成断流。现在按服务端声明的失败上抛。
         if (util_json.topLevelObjectField(data, "error")) |err_obj| {
             self.done = true;
-            client_mod.reportServerError("openai", self.id, err_obj, self.credential);
-            return error.ApiError;
+            return client_mod.reportServerError("openai", self.id, err_obj, self.credential);
         }
         // usage 只在**值为 object** 时存在(见 chatUsageObject)。include_usage 下每个普通
         // chunk 都带 `"usage":null`——旧实现按 substring `"usage"` 判存在并立即 return,
@@ -1149,14 +1148,14 @@ const OpenAIStream = struct {
             return self.finishResponsesTerminal(data);
         }
         // 失败终止(response.failed)/流级 error 事件:服务端声明的失败 → ApiError(不是断连,
-        // agent_loop 不兜底重发;见 stream.zig midStreamReadError 的名字约定)。
+        // agent_loop 不兜底重发;见 stream.zig midStreamReadError 的名字约定);过载是
+        // ServiceUnavailable,见 client.reportServerError。
         if (std.mem.eql(u8, ev_type, "response.failed") or std.mem.eql(u8, ev_type, "error")) {
             const response = util_json.topLevelObjectField(data, "response") orelse data;
             const err_obj = util_json.topLevelObjectField(response, "error") orelse
                 util_json.topLevelObjectField(data, "error") orelse data;
             self.done = true;
-            client_mod.reportServerError("openai", self.id, err_obj, self.credential);
-            return error.ApiError;
+            return client_mod.reportServerError("openai", self.id, err_obj, self.credential);
         }
         return null; // 其它 typed 事件(created/in_progress/output_text.done 等):忽略
     }
@@ -1953,9 +1952,9 @@ fn noteCodexUsageRefusal(status: u16, body: []const u8) bool {
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const refusal = codex_usage.parse(fba.allocator(), status, body) orelse return false;
     const now = @import("../util/time.zig").nowUnix();
-    const zone = @import("../core/time_context.zig").systemZone(now);
+    const offset_minutes = if (@import("platform").timezone.boundedLocal(now)) |zone| zone.offset_minutes else 0;
     var detail_buffer: [256]u8 = undefined;
-    const summary = codex_usage.summarize(refusal, now, zone.offset_minutes, &detail_buffer);
+    const summary = codex_usage.summarize(refusal, now, offset_minutes, &detail_buffer);
     log.err("openai", "{s}: {s}", .{ summary.kind, summary.detail });
     last_error.recordNamed(summary.kind, summary.detail);
     if (codex_usage.waitMs(refusal, now)) |wait| model_error.noteRetryAfterInBody(wait);

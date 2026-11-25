@@ -6,8 +6,8 @@ leaves `⎿  Login interrupted · nothing was changed` under the echo. A provide
 name starts that provider's sign-in directly; a typo'd flag fails closed
 before anything starts. The provider flows need an authorization server: the
 kernel flows are covered against mock servers by
-tests/component/provider_oauth_login_test.zig, and the dialog's states by the
-unit tests in src/repl/dialogs.zig. ChatGPT (Codex)'s sign-in is followed here
+apps/cli/tests/component/provider_oauth_login_test.zig, and the dialog's states by the
+unit tests in apps/cli/src/repl/dialogs.zig. ChatGPT (Codex)'s sign-in is followed here
 up to the URL it would open: its registered port, its parameters and its
 notice; Esc ends it before anything is sent.
 """

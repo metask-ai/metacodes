@@ -16,7 +16,7 @@
 //! - **Lifecycle**: the one every HTTP provider client shares (issue #434):
 //!   `client.ConnectRetryFor` retries a transient connect failure, a 429 and a
 //!   5xx with the same request bytes; a non-2xx head is classified by the same
-//!   table (`httpFailureError` / `errorBodyInfo`: 401, 429, 500/502/503, an
+//!   table (`httpFailureError` / `errorBodyInfo`: 401, 429, 500/502/503/529, an
 //!   overflow is ContextWindowExceeded with its numbers); a cancel while the
 //!   head is awaited is `error.Aborted`.
 //!
@@ -974,7 +974,7 @@ const BedrockStream = struct {
             shown.append(self.allocator, '}') catch break :blk false;
             break :blk true;
         };
-        client_mod.reportServerError("bedrock", self.id, if (written) shown.items else "{\"type\":\"exception\"}", self.credential);
+        const failure = client_mod.reportServerError("bedrock", self.id, if (written) shown.items else "{\"type\":\"exception\"}", self.credential);
         // AWS documents an overflow only as "a validation error"; the wording
         // the shared classifier knows (Anthropic's "prompt is too long", …)
         // is what decides here.
@@ -982,7 +982,7 @@ const BedrockStream = struct {
             self.context_window_numbers = error_class.parseContextWindowNumbers(m);
             return error.ContextWindowExceeded;
         };
-        return error.ApiError;
+        return failure;
     }
 };
 

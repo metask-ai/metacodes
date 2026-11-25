@@ -28,20 +28,8 @@ pub const ReplayDeclaration = @import("../core/execution_effect.zig").ReplayDecl
 /// Shared recursion ceiling for every child-agent/fork mechanism.
 pub const MAX_AGENT_DEPTH: u8 = 3;
 
-/// AskUserQuestion 的结构化输入(解析+校验在 ask_user.zig 做,渲染在 dialog/ask_question.zig)。
-/// 放在中性的 context 层:所有工具已 import 它,避免 ask_user.zig ↔ tui dialog 的循环依赖。
-pub const AskOption = struct {
-    label: []const u8,
-    description: []const u8,
-    /// 单选 preview 内容(ASCII/markdown mockup),空=无。选中时右侧 side-by-side 框展示。
-    preview: []const u8 = "",
-};
-pub const AskQuestion = struct {
-    question: []const u8,
-    header: []const u8,
-    multi: bool,
-    options: []const AskOption,
-};
+pub const AskOption = @import("../core/protocol/ui_request.zig").AskOption;
+pub const AskQuestion = @import("../core/protocol/ui_request.zig").AskQuestion;
 
 /// L3 挂起:一个待异步前端处理的 custom UI 请求(工具填 ToolContext.pending_request,
 /// runJob → Slot.pending_payload,agent_loop emit ui_request_pending)。纯数据,可序列化落盘
@@ -346,33 +334,7 @@ pub const RequestTools = struct {
     }
 };
 
-/// Borrowed, immutable upper bound for one execution context. The owner must
-/// keep `ctx` alive until every synchronous tool execution has quiesced.
-///
-/// This interface deliberately does not grant permission. `true` only means
-/// that the ordinary Session permission pipeline may continue; `false` is a
-/// fail-closed denial before dispatch.
-pub const ToolExecutionPolicy = struct {
-    ctx: *const anyopaque,
-    allowsToolFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
-    allowsInvocationFn: *const fn (
-        ctx: *const anyopaque,
-        name: []const u8,
-        arguments_json: []const u8,
-    ) bool,
-
-    pub fn allowsTool(self: ToolExecutionPolicy, name: []const u8) bool {
-        return self.allowsToolFn(self.ctx, name);
-    }
-
-    pub fn allowsInvocation(
-        self: ToolExecutionPolicy,
-        name: []const u8,
-        arguments_json: []const u8,
-    ) bool {
-        return self.allowsInvocationFn(self.ctx, name, arguments_json);
-    }
-};
+pub const ToolExecutionPolicy = @import("../permission/category.zig").ToolExecutionPolicy;
 
 /// Name-level execution ceiling backed by the exact tool definitions selected
 /// for a child agent.  AgentDef filtering must constrain execution as well as

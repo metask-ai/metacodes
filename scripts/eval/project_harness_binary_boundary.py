@@ -445,7 +445,8 @@ def run_boundary(
     if production == shadow or _file_sha256(production) == _file_sha256(shadow):
         raise BoundaryError("production and shadow artifacts are not distinct")
     runtime_switch = b"METACODES_PROJECT_HARNESS_SHADOW"
-    if any(runtime_switch in path.read_bytes() for path in (repo / "src").rglob("*.zig")):
+    if any(runtime_switch in path.read_bytes() for root in (repo / "src", repo / "apps", repo / "packages") for path in root.rglob("*.zig")
+           if root.name == "src" or path.relative_to(root).parts[1:2] != ("tests",)):
         raise BoundaryError("production source exposes a runtime shadow environment switch")
 
     with tempfile.TemporaryDirectory(prefix="metacodes-project-harness-boundary-") as raw_root:

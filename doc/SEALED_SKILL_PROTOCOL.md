@@ -324,7 +324,7 @@ client MUST record them with the run (§8.3).
   "run_state": "<opaque>",
   "kind": "tool_calls",
   "calls": [
-    {"id": "call_1", "name": "Read", "input": {"file_path": "src/app.zig"},
+    {"id": "call_1", "name": "Read", "input": {"file_path": "apps/cli/src/app.zig"},
      "confirm": false, "deadline_ms": 30000, "credentials": [],
      "result_limit_bytes": 65536}
   ],

@@ -8,7 +8,7 @@
 //! import。真正的检查是 `zig build subsystem:boundary`(scripts/subsystem_boundary_gate.zig,
 //! #448):从本文件沿每条 `@import`(含函数体、test 块)走闭包,任何进入应用侧(repl/、web/、
 //! daemon/、app/、main.zig、app.zig、session_service.zig、session_intent.zig)的边都失败,
-//! 只有该脚本里只减不增的 baseline 例外(如下面 re-export 的 app/config.zig、app/doctor.zig);
+//! 只有该脚本里只减不增的 baseline 例外(现在为空);
 //! src/core/ 没有 baseline。
 //!
 //! 接入方式见 doc/LIB_API.md;最小示例见 example/main.zig。
@@ -176,11 +176,11 @@ pub const image_capability = @import("api/image_capability.zig"); // image input
 pub const model_tiers = @import("api/model_tiers.zig"); // provider 内 low/mid/high 模型档位表
 pub const json = @import("json.zig");
 pub const types = @import("types.zig");
-pub const config = @import("app/config.zig");
+pub const config = @import("core/file_config.zig");
 /// Build identity rendering for --version (#78); build.zig hands the app the values, the library only formats them.
 pub const version_info = @import("version_info.zig");
 /// metacodes doctor (#78): pure resolution report for the runtime binaries.
-pub const doctor = @import("app/doctor.zig");
+pub const doctor = @import("core/doctor.zig");
 
 // ── 工具 ─────────────────────────────────────────────────────────────────
 pub const tools = @import("tools.zig"); // registry + dispatch

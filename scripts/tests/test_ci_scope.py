@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -62,7 +63,7 @@ LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("gates-macos-
 # job whose legs or shards each one reports. Gates (macOS) and Gates (Windows)
 # report where the gates ran, a pool or the hosted legs: test_ci_pool_plan.py.
 RESULT_JOBS = {
-    "Gates (Linux)": "gates-linux",
+    "Gates (Linux)": ["gates-linux", "test-ids"],
     "Gates (macOS)": ["runner-plan", "gates-macos-watch", "gates-macos"],
     "Gates (Windows)": ["runner-plan", "windows-gates-watch", "windows-gates"],
     "TTY (Linux)": "tty-linux",
@@ -155,8 +156,8 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(ci_scope.document_checks("full", [], inputs), (True, True))
 
     def test_protocol_document_relocation_cannot_change_other_inputs(self) -> None:
-        before = {"implementation_paths": ["src/main.zig", "doc/A.md"], "budget": 0}
-        moved = {"implementation_paths": ["src/main.zig", "doc/B.md"], "budget": 0}
+        before = {"implementation_paths": ["apps/cli/src/main.zig", "doc/A.md"], "budget": 0}
+        moved = {"implementation_paths": ["apps/cli/src/main.zig", "doc/B.md"], "budget": 0}
         self.assertTrue(ci_scope.protocol_documents_only(before, moved))
         for after in ({**moved, "budget": 1}, {**moved, "budget": False},
                       {**moved, "implementation_paths": ["src/other.zig", "doc/B.md"]}):
@@ -175,9 +176,9 @@ class ClassifyTest(unittest.TestCase):
                 self.assertEqual(ci_scope.classify(paths)[0], "eval")
 
     def test_anything_else_is_the_full_scope_and_is_named(self) -> None:
-        scope, reason = ci_scope.classify(["scripts/eval/cli.py", "src/main.zig"])
+        scope, reason = ci_scope.classify(["scripts/eval/cli.py", "apps/cli/src/main.zig"])
         self.assertEqual(scope, "full")
-        self.assertIn("src/main.zig", reason)
+        self.assertIn("apps/cli/src/main.zig", reason)
         self.assertNotIn("scripts/eval/cli.py", reason)
         for path in ("build.zig", "scripts/release_cut.py", ".github/workflows/ci.yml", "tests/tty/tty_driver.py", "scripts/evaluate.py"):
             with self.subTest(path=path):
@@ -187,9 +188,15 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(ci_scope.classify([])[0], "full")
 
     def test_outputs_fail_open(self) -> None:
-        self.assertEqual(ci_scope.outputs("docs"), (False, False))
-        self.assertEqual(ci_scope.outputs("eval"), (True, False))
-        self.assertEqual(ci_scope.outputs("full"), (True, True))
+        def flags(scope):
+            chosen = ci_scope.select(scope)
+            return chosen.suites, chosen.tty, chosen.units, chosen.product, chosen.complete
+
+        self.assertEqual(flags("docs"), (False, False, False, False, False))
+        self.assertEqual(flags("eval"), (True, False, True, True, True))
+        self.assertEqual(flags("full"), (True, True, True, True, True))
+        # Without the layout a narrow scope cannot be planned: everything runs.
+        self.assertEqual(flags("packages"), (True, True, True, True, True))
 
 
 class DecideTest(unittest.TestCase):
@@ -290,7 +297,7 @@ class MainTest(unittest.TestCase):
     def test_summary_escapes_paths_and_does_not_truncate_the_decision(self) -> None:
         name = "doc/a|`<img>.md"
         destination = self.repo / "report.md"
-        changes = [("M", name)] + [("M", f"doc/{i}.md") for i in range(200)] + [("M", "src/main.zig")]
+        changes = [("M", name)] + [("M", f"doc/{i}.md") for i in range(200)] + [("M", "apps/cli/src/main.zig")]
         scope, reason = ci_scope.classify([path for _, path in changes])
         ci_scope.write_summary(str(destination), "pull_request", "base", "HEAD", scope, reason, changes)
         summary = destination.read_text(encoding="utf-8")
@@ -354,6 +361,402 @@ class MainTest(unittest.TestCase):
         got = self.run_main("merge_group", "0" * 40)
         self.assertEqual((got["scope"], got["suites"], got["tty"]), ("full", "true", "true"))
         self.assertIn("scope check failed", got["reason"])
+
+
+FIXTURE_LAYERS = """.{
+    .packages = .{
+        .{ .name = "low", .paths = .{ "src/low/", "src/low.zig" }, .allowed_dependencies = .{} },
+        .{ .name = "mid", .paths = .{"src/mid/"}, .allowed_dependencies = .{"low"} },
+        .{ .name = "side", .paths = .{"src/side/"}, .allowed_dependencies = .{"low"} },
+        .{ .name = "top", .paths = .{"src/top/"}, .allowed_dependencies = .{ "low", "mid" } },
+        .{ .name = "testing", .paths = .{"tests/helpers/"}, .allowed_dependencies = .{ "low", "mid", "side", "top" } },
+        .{ .name = "tests", .paths = .{"tests/"}, .allowed_dependencies = .{ "low", "mid", "side", "top", "testing" } },
+    },
+    .kernel_budget = .{ .package = "low", .max_lines = 10, .max_dependencies = .{} },
+}
+"""
+# One deep import charged to both side and low: low, and side, are not yet
+# trusted; mid and top are.
+FIXTURE_BASELINE = """.{
+    .upward = .{},
+    .deep = .{
+        .{ "src/side/a.zig", "src/low/inner.zig" },
+    },
+    .cycles = .{},
+    .wiring = .{},
+    .wide_roots = .{},
+}
+"""
+FIXTURE_BUILD = """const s = &.{ "python3", "-m", "unittest", "scripts.tests.test_everywhere" };
+const x = b.step("test:low", "");
+const y = b.step(
+    "test:mid",
+    "",
+);
+const z = b.step("test:top", "");
+"""
+
+
+def fixture_layout(baseline: str = FIXTURE_BASELINE, build: str = FIXTURE_BUILD) -> "ci_scope.Layout":
+    files = {ci_scope.LAYERS: FIXTURE_LAYERS, ci_scope.LAYER_BASELINE: baseline, ci_scope.BUILD: build}
+    return ci_scope.load_layout(files.__getitem__)
+
+
+class LayoutTest(unittest.TestCase):
+    """The packages scope: layers.zon's dependency closure, narrowed only
+    where layer_baseline.zon has nothing left for every affected package."""
+
+    def test_zon_subset(self) -> None:
+        self.assertEqual(ci_scope.parse_zon('.{ .a = .{ "x", "y\\"z" }, .b = 3, .c = .{}, // note\n }'),
+                         {"a": ["x", 'y"z'], "b": 3, "c": []})
+        for broken in ('.{ .a = 1 ', '.{ "x", .a = 1 }', '.{ @import("x") }', '.{} .{}'):
+            with self.subTest(text=broken), self.assertRaises((ValueError, IndexError)):
+                ci_scope.parse_zon(broken)
+
+    def test_the_real_layers_parse_and_every_product_package_is_a_dependent_of_base(self) -> None:
+        layout = ci_scope.load_layout(ci_scope.tree_reader(ROOT, None))
+        self.assertNotIn("tests", layout.products)
+        self.assertNotIn("testing", layout.products)
+        self.assertEqual(layout.affected(["base"]), layout.products)
+        # A change confined to the cli package, sources or tests, runs test:cli.
+        for path in ("apps/cli/src/repl/tui/widget/status_bar.zig", "apps/cli/tests/component/ui_render_test.zig"):
+            with self.subTest(path=path):
+                changes = [("M", path)]
+                scope, reason = ci_scope.classify([path], layout=layout)
+                self.assertEqual(scope, "packages", reason)
+                chosen = ci_scope.select(scope, changes, layout)
+                self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
+                self.assertTrue(chosen.product and chosen.tty)
+        self.assertEqual(layout.owner("src/core/conversation.zig"), "kernel")
+        self.assertEqual(layout.owner("src/core/agent_loop.zig"), "coding")
+        self.assertEqual(layout.owner("src/core/tools_extra.zig"), "coding")
+        self.assertEqual(layout.owner("tests/helpers/x.zig"), "testing")
+
+    def test_a_package_is_charged_for_each_baseline_entry_it_is_part_of(self) -> None:
+        layout = fixture_layout()
+        self.assertEqual(layout.violations, {"side": 1, "low": 1})
+        crowded = fixture_layout(FIXTURE_BASELINE.replace(".cycles = .{}", '.cycles = .{ .{ "mid", "top" } }')
+                                 .replace(".wide_roots = .{}", '.wide_roots = .{ "src/top/root.zig" }')
+                                 .replace(".wiring = .{}", '.wiring = .{ .{ "src/mid/root.zig", "top" } }'))
+        self.assertEqual(crowded.violations, {"side": 1, "low": 1, "mid": 2, "top": 2})
+        self.assertEqual(fixture_layout(".{}").violations, {})
+
+    def test_the_closure_is_the_changed_packages_and_their_dependents(self) -> None:
+        layout = fixture_layout()
+        self.assertEqual(layout.affected(["top"]), ("top",))
+        self.assertEqual(layout.affected(["mid"]), ("mid", "top"))
+        self.assertEqual(layout.affected(["low"]), ("low", "mid", "side", "top"))
+        self.assertEqual(layout.affected(["side", "mid"]), ("mid", "side", "top"))
+
+    def test_a_cleared_upper_package_runs_only_itself_and_its_dependents(self) -> None:
+        layout = fixture_layout()
+        scope, reason = ci_scope.classify(["src/mid/a.zig", "doc/A.md"], layout=layout)
+        self.assertEqual(scope, "packages")
+        self.assertIn("the affected packages are mid, top", reason)
+        chosen = ci_scope.select(scope, [("M", "src/mid/a.zig"), ("M", "doc/A.md")], layout)
+        self.assertEqual(chosen.packages, ("mid", "top"))
+        self.assertEqual(chosen.package_tests, ("test:mid", "test:top"))
+        self.assertEqual((chosen.suites, chosen.tty, chosen.units, chosen.product, chosen.complete),
+                         (True, True, True, True, False))
+
+    def test_a_package_left_in_the_baseline_is_the_full_scope(self) -> None:
+        layout = fixture_layout()
+        for paths, named in ((["src/side/a.zig"], "side (1)"), (["src/low.zig"], "low (1)"),
+                             (["src/mid/a.zig", "src/side/b.zig"], "side (1)")):
+            with self.subTest(paths=paths):
+                scope, reason = ci_scope.classify(paths, layout=layout)
+                self.assertEqual(scope, "full")
+                self.assertIn(named, reason)
+                self.assertEqual(ci_scope.select(scope, [("M", path) for path in paths], layout).packages,
+                                 layout.products)
+        # Cleared in the baseline, then narrowed: the scope opens up as the
+        # migration empties layer_baseline.zon.
+        self.assertEqual(ci_scope.classify(["src/side/a.zig"], layout=fixture_layout(".{}"))[0], "full")
+        self.assertIn("no test:<package> step", ci_scope.classify(["src/side/a.zig"], layout=fixture_layout(".{}"))[1])
+        self.assertEqual(ci_scope.classify(["src/low/x.zig"], layout=fixture_layout(".{}").cleared())[0], "packages")
+
+    def test_an_affected_package_without_its_test_step_is_the_full_scope(self) -> None:
+        layout = fixture_layout(build=FIXTURE_BUILD.replace('"test:top"', '"test:top-other"'))
+        scope, reason = ci_scope.classify(["src/mid/a.zig"], layout=layout)
+        self.assertEqual(scope, "full")
+        self.assertIn("top", reason)
+
+    def test_infrastructure_is_the_full_scope(self) -> None:
+        layout = fixture_layout()
+        for path in ("build.zig", "build.zig.zon", "layers.zon", "layer_baseline.zon", "tests/helpers/fake.zig",
+                     ".github/workflows/ci.yml", "vendor/tinykg/x.c", "scripts/ci_scope.py", "scripts/tests/fixture.json",
+                     "src/unowned.zig", "release/documents.json", "control-plane/lean/X.lean", "sdk/node/x.js"):
+            with self.subTest(path=path):
+                self.assertEqual(ci_scope.classify(["src/mid/a.zig", path], layout=layout)[0], "full")
+                self.assertEqual(ci_scope.classify(["tests/tty/cases/a.py", path], layout=layout)[0], "full")
+
+    def test_only_tests_run_only_their_suites(self) -> None:
+        layout = fixture_layout()
+
+        def chosen(changes):
+            scope, _ = ci_scope.classify([path for _, path in changes], layout=layout)
+            self.assertEqual(scope, "tests")
+            got = ci_scope.select(scope, changes, layout)
+            return got.tty, got.units, got.product, got.script_tests, got.complete
+
+        self.assertEqual(chosen([("M", "tests/tty/cases/a.py")]), (True, False, False, (), False))
+        self.assertEqual(chosen([("A", "scripts/tests/test_lint.py"), ("D", "scripts/tests/test_old.py")]),
+                         (False, False, False, ("scripts.tests.test_lint",), False))
+        # A shared fixture may feed the TTY cases too.
+        self.assertEqual(chosen([("M", "tests/fixtures/vterm/screen_parity.jsonl")]), (True, True, True, (), True))
+        self.assertEqual(chosen([("M", "tests/component/x_test.zig"), ("M", "scripts/eval/cli.py")]),
+                         (True, True, True, (), True))
+        # A suite build.zig runs (on every platform) keeps test:units; only
+        # the others run by name, and a complete run names none, so no test
+        # runs twice and records twice.
+        self.assertEqual(chosen([("M", "scripts/tests/test_everywhere.py"), ("M", "scripts/tests/test_lint.py")]),
+                         (False, True, False, ("scripts.tests.test_lint",), False))
+        self.assertEqual(chosen([("M", "tests/component/x_test.zig"), ("M", "scripts/tests/test_lint.py")]),
+                         (True, True, True, (), True))
+        # A suite test next to a package change keeps all of test:units.
+        both = ci_scope.select("packages", [("M", "src/top/a.zig"), ("M", "tests/component/x_test.zig")], layout)
+        self.assertEqual((both.packages, both.package_tests, both.complete), (("top",), (), True))
+        script = ci_scope.select("packages", [("M", "src/top/a.zig"), ("M", "scripts/tests/test_lint.py")], layout)
+        self.assertEqual((script.package_tests, script.script_tests), (("test:top",), ("scripts.tests.test_lint",)))
+
+    def test_a_package_outside_src_is_still_a_product_dependent(self) -> None:
+        moved = fixture_layout(".{}").cleared()
+        moved = ci_scope.replace(moved, paths=tuple(("apps/top/", owner) if owner == "top" else (entry, owner)
+                                                     for entry, owner in moved.paths))
+        self.assertEqual(moved.affected(["mid"]), ("mid", "top"))
+        self.assertEqual(ci_scope.classify(["apps/top/main.zig"], layout=moved)[0], "packages")
+        # A test kept inside a package directory selects that package.
+        layout = ci_scope.replace(moved, paths=moved.paths + (("apps/top/tests/", "tests"),))
+        self.assertEqual(layout.owner("apps/top/tests/component/a_test.zig"), "tests")
+        self.assertEqual(layout.package("apps/top/tests/component/a_test.zig"), "top")
+        self.assertIsNone(layout.package("tests/component/a_test.zig"))
+        self.assertIsNone(layout.package("tests/helpers/fake.zig"))
+        changes = [("M", "apps/top/tests/component/a_test.zig")]
+        scope, _ = ci_scope.classify([path for _, path in changes], layout=layout)
+        self.assertEqual(scope, "packages")
+        self.assertEqual(ci_scope.select(scope, changes, layout).package_tests, ("test:top",))
+        self.assertEqual(ci_scope.classify(["tests/component/a_test.zig"], layout=layout)[0], "tests")
+
+    def test_a_migration_pull_request_is_the_full_scope(self) -> None:
+        def diff(base, candidate):
+            return [("M", "doc/A.md")]
+
+        self.assertEqual(ci_scope.decide("pull_request", "HEAD^1", "HEAD", diff)[0], "docs")
+        scope, reason = ci_scope.decide("pull_request", "HEAD^1", "HEAD", diff, labels=["bug", "migration"])
+        self.assertEqual(scope, "full")
+        self.assertIn("migration", reason)
+
+    def test_local_commands_follow_the_selection(self) -> None:
+        layout = fixture_layout()
+        narrowed = ci_scope.select("packages", [("M", "src/mid/a.zig"), ("M", "scripts/tests/test_x.py")], layout)
+        commands = ci_scope.local_commands("packages", narrowed, "zig", scripts=("scripts.tests.test_x",))
+        self.assertEqual(commands[0], ["zig", "build", "test:mid", "test:top", "test:integration", "test:product", "test:contract"])
+        self.assertEqual(commands[1][1:], ["-m", "unittest", "scripts.tests.test_x"])
+        # CI runs a changed suite build.zig does not name on a checks-leg step,
+        # even on a complete run that leaves script_tests empty; so does the
+        # local run.
+        mixed = [("M", "tests/component/vterm_test.zig"), ("M", "scripts/tests/test_lint.py"), ("D", "scripts/tests/test_old.py")]
+        complete = ci_scope.select("tests", mixed, layout)
+        self.assertEqual((complete.complete, complete.script_tests), (True, ()))
+        self.assertEqual(ci_scope.script_suites(mixed), ("scripts.tests.test_lint",))
+        local = ci_scope.local_commands("tests", complete, "zig", scripts=ci_scope.script_suites(mixed))
+        self.assertIn([sys.executable, "-m", "unittest", "scripts.tests.test_lint"], local)
+        self.assertEqual(ci_scope.local_commands("full", ci_scope.select("full"), "zig", scripts=("scripts.tests.test_x",))[1][1:],
+                         ["-m", "unittest", "scripts.tests.test_x"])
+        self.assertIn(["zig", "build", "dev", "test:harness"], commands)
+        self.assertEqual(ci_scope.local_commands("full", ci_scope.select("full"), "zig"), [["zig", "build", "test"]])
+        self.assertEqual(ci_scope.local_commands("docs", ci_scope.select("docs"), "zig"), [])
+        tty = ci_scope.select("tests", [("M", "tests/tty/cases/a.py")], layout)
+        self.assertEqual(ci_scope.local_commands("tests", tty, "zig")[0], ["zig", "build", "test:contract"])
+        self.assertEqual(ci_scope.local_commands("tests", tty, "zig", windows=True)[1:],
+                         [["zig", "build", "windows:tty", "-Dtarget=x86_64-windows-gnu"]])
+
+    def test_the_local_run_never_reaches_a_real_model(self) -> None:
+        seen = []
+
+        def run(command, cwd, env, check):
+            seen.append(env.get("TTY_SKIP_MODEL"))
+            return subprocess.CompletedProcess(command, 0)
+
+        tty = ci_scope.select("tests", [("M", "tests/tty/cases/a.py")], fixture_layout())
+        with mock.patch.dict(os.environ, {"TTY_SKIP_MODEL": ""}), mock.patch.object(ci_scope.subprocess, "run", run), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(ci_scope.run_local(ROOT, "tests", tty, "zig"), 0)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"1"})
+
+
+class PackageScopeMainTest(unittest.TestCase):
+    """layers.zon, layer_baseline.zon and build.zig as committed in a fixture
+    repository, through main() and through the replay of main's commits."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        self.git("init", "-q")
+        self.git("config", "user.email", "ci@example.invalid")
+        self.git("config", "user.name", "ci")
+        (self.repo / ".gitignore").write_text("github-output\nsummary.md\n", encoding="utf-8")
+        (self.repo / "release").mkdir()
+        (self.repo / "README.md").write_text("readme\n", encoding="utf-8")
+        (self.repo / "build.zig.zon").write_text('.{ .version = "1.2.3-dev" }\n', encoding="utf-8")
+        (self.repo / "release/documents.json").write_text(json.dumps({
+            "schema": "metacodes.release-documents/v1", "files": [
+                {"source": "README.md", "destination": "share/doc/README.md"}]}), encoding="utf-8")
+        (self.repo / "evals/plugin-v1").mkdir(parents=True)
+        (self.repo / ci_scope.PROTOCOL).write_text(json.dumps({"implementation_paths": ["build.zig"]}), encoding="utf-8")
+        (self.repo / ci_scope.LAYERS).write_text(FIXTURE_LAYERS, encoding="utf-8")
+        (self.repo / ci_scope.LAYER_BASELINE).write_text(FIXTURE_BASELINE, encoding="utf-8")
+        (self.repo / ci_scope.BUILD).write_text(FIXTURE_BUILD, encoding="utf-8")
+        for path in ("src/mid/a.zig", "src/side/a.zig", "tests/tty/cases/a.py"):
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text("x\n", encoding="utf-8")
+        self.commit("base")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def git(self, *argv: str) -> str:
+        return subprocess.run(["git", *argv], cwd=str(self.repo), check=True, capture_output=True, text=True).stdout
+
+    def commit(self, message: str) -> None:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def edit(self, path: str) -> None:
+        with open(self.repo / path, "a", encoding="utf-8") as handle:
+            handle.write("y\n")
+
+    def run_main(self, *argv: str) -> dict:
+        out = self.repo / "github-output"
+        out.write_text("", encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            code = ci_scope.main([*argv, "--github-output", str(out), "--repo-root", str(self.repo),
+                                  "--github-summary", str(self.repo / "summary.md")])
+        self.assertEqual(code, 0)
+        return dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
+
+    def test_a_cleared_package_writes_its_closure_and_test_steps(self) -> None:
+        self.edit("src/mid/a.zig")
+        self.commit("mid (#7)")
+        got = self.run_main("--event", "pull_request", "--base", "HEAD^1")
+        self.assertEqual((got["scope"], got["packages"], got["package_tests"]), ("packages", "mid,top", "test:mid test:top"))
+        self.assertEqual((got["suites"], got["units"], got["product"], got["tty"], got["complete"]),
+                         ("true", "true", "true", "true", "false"))
+        summary = (self.repo / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("Packages: mid, top", summary)
+        self.assertIn("| M | src/mid/a.zig | packages |", summary)
+
+    def test_a_package_left_in_the_baseline_runs_in_full(self) -> None:
+        self.edit("src/side/a.zig")
+        self.commit("side")
+        got = self.run_main("--event", "pull_request", "--base", "HEAD^1")
+        self.assertEqual((got["scope"], got["package_tests"], got["complete"]), ("full", "", "true"))
+        self.assertEqual(got["packages"], "low,mid,side,top")
+        self.assertIn("side (1)", got["reason"])
+
+    def test_the_rules_come_from_the_candidate(self) -> None:
+        # The change that clears side's entry narrows its own run.
+        (self.repo / ci_scope.LAYER_BASELINE).write_text(".{}\n", encoding="utf-8")
+        (self.repo / ci_scope.BUILD).write_text(FIXTURE_BUILD + 'const s = b.step("test:side", "");\n', encoding="utf-8")
+        self.commit("clear side")
+        self.edit("src/side/a.zig")
+        self.commit("side")
+        self.assertEqual(self.run_main("--event", "pull_request", "--base", "HEAD^1")["scope"], "packages")
+        self.assertEqual(self.run_main("--event", "pull_request", "--base", "HEAD~2")["scope"], "full")
+
+    def test_a_migration_label_writes_the_full_scope_and_the_record(self) -> None:
+        self.edit("src/mid/a.zig")
+        self.commit("mid")
+        record = self.repo / "record.json"
+        got = self.run_main("--event", "pull_request", "--base", "HEAD^1", "--labels", "migration,ci", "--record", str(record))
+        self.assertEqual((got["scope"], got["complete"]), ("full", "true"))
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8"))["scope"], "full")
+        narrowed = self.run_main("--event", "pull_request", "--base", "HEAD^1", "--labels", "", "--record", str(record))
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")),
+                         {"scope": "packages", "packages": ["mid", "top"], "reason": narrowed["reason"], "fast_path": False})
+        self.run_main("--event", "pull_request", "--base", "HEAD^1", "--fast-path", "true", "--record", str(record))
+        self.assertTrue(json.loads(record.read_text(encoding="utf-8"))["fast_path"])
+
+    def test_the_nightly_report_reads_what_each_pull_request_recorded(self) -> None:
+        self.edit("src/mid/a.zig")
+        self.commit("mid (#7)")
+        self.edit("src/side/a.zig")
+        self.commit("side (#8)")
+        (self.repo / "build.zig.zon").write_text('.{ .version = "1.2.4" }\n', encoding="utf-8")
+        self.commit("release (#9)")
+        mid, side, release = (self.git("rev-parse", rev).strip() for rev in ("HEAD~2", "HEAD^1", "HEAD"))
+
+        def query(path):
+            if "/commits/" in path:
+                sha = path.split("/commits/")[1].split("/")[0]
+                return [{"merged_at": "x", "merge_commit_sha": sha, "head": {"sha": "h" + sha[:8]}}]
+            return {"workflow_runs": [{"id": 1, "created_at": "a"}, {"id": 2, "created_at": "b"}]}
+
+        # side's newest run recorded nothing: an older run's record (with
+        # other labels, say) is not its scope.
+        records = {("h" + mid[:8], 2): {"scope": "packages", "packages": ["mid", "top"], "reason": "r"},
+                   ("h" + side[:8], 1): {"scope": "docs", "packages": [], "reason": "old"},
+                   ("h" + release[:8], 2): {"scope": "full", "packages": [], "reason": "r", "fast_path": True}}
+        asked = []
+
+        def download(repository, run_id):
+            asked.append(run_id)
+            return records.get((asked_head[0], run_id))
+
+        asked_head = [""]
+
+        def tracking_query(path):
+            if "head_sha=" in path:
+                asked_head[0] = path.split("head_sha=")[1].split("&")[0]
+            return query(path)
+
+        rows = ci_scope.merged(self.repo, [release, side, mid], "o/r", tracking_query, download)
+        self.assertEqual([(scope, packages) for _, _, scope, packages, _ in rows],
+                         [("fast-path", ()), ("unknown", ()), ("packages", ("mid", "top"))])
+        self.assertEqual(asked, [2, 2, 2])
+        report = ci_scope.replay_report(rows, "Merged")
+        self.assertIn("| unknown | 1 | 33% |", report)
+        self.assertIn("| fast-path | 1 | 33% |", report)
+        self.assertIn("| #8 | unknown | - |", report)
+        self.assertIn("reused from the base", report)
+
+    def test_replay_keeps_a_documentation_only_protocol_edit_in_docs(self) -> None:
+        (self.repo / "doc").mkdir()
+        (self.repo / "doc/A.md").write_text("a\n", encoding="utf-8")
+        (self.repo / ci_scope.PROTOCOL).write_text(json.dumps({"implementation_paths": ["build.zig", "doc/A.md"]}),
+                                                   encoding="utf-8")
+        self.commit("pin a document")
+        self.git("mv", "doc/A.md", "doc/B.md")
+        (self.repo / ci_scope.PROTOCOL).write_text(json.dumps({"implementation_paths": ["build.zig", "doc/B.md"]}),
+                                                   encoding="utf-8")
+        self.commit("move it")
+        rows = ci_scope.replay(self.repo, [self.git("rev-parse", "HEAD").strip()], None, False)
+        self.assertEqual(rows[0][2], "docs")
+
+    def test_a_local_run_diffs_the_working_tree_against_the_merge_base(self) -> None:
+        self.git("branch", "main-copy")
+        self.edit("tests/tty/cases/a.py")
+        (self.repo / "tests/tty/cases/b.py").write_text("new\n", encoding="utf-8")
+        got = self.run_main("--event", "local", "--base", "main-copy", "--candidate", "")
+        self.assertEqual((got["scope"], got["tty"], got["units"]), ("tests", "true", "false"))
+        summary = (self.repo / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("| A | tests/tty/cases/b.py | tests |", summary)
+
+    def test_replay_reports_each_merge_with_its_scope(self) -> None:
+        self.edit("src/mid/a.zig")
+        self.commit("mid (#7)")
+        self.edit("src/side/a.zig")
+        self.commit("side (#8)")
+        rows = ci_scope.replay(self.repo, [self.git("rev-parse", rev).strip() for rev in ("HEAD", "HEAD^1")], None, False)
+        self.assertEqual([(scope, packages) for _, _, scope, packages, _ in rows],
+                         [("full", ()), ("packages", ("mid", "top"))])
+        report = ci_scope.replay_report(rows, "Scopes")
+        self.assertIn("| packages | 1 | 50% |", report)
+        self.assertIn("| #8 | full | - |", report)
+        self.assertIn("| #7 | packages | mid, top |", report)
+        cleared = ci_scope.replay(self.repo, [self.git("rev-parse", "HEAD").strip()], "HEAD", True)
+        self.assertEqual(cleared[0][2:4], ("packages", ("side",)))
 
 
 def load_workflow():
@@ -486,12 +889,30 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(spec["needs"], legs)
                 # Never skipped: a skipped job passes a required check.
                 self.assertEqual(spec["if"], "${{ always() }}")
-                if name not in ("Gates (macOS)", "Gates (Windows)"):
-                    self.assertEqual(spec["steps"], self.jobs["gates-linux-result"]["steps"])
+                if name not in ("Gates (Linux)", "Gates (macOS)", "Gates (Windows)"):
+                    self.assertEqual(spec["steps"], self.jobs["tty-linux-result"]["steps"])
+
+    @unittest.skipIf(os.name == "nt", "bash and jq")
+    def test_gates_linux_passes_only_when_its_legs_and_the_test_id_comparison_did(self) -> None:
+        step = self.jobs["gates-linux-result"]["steps"][0]
+        self.assertEqual(step["env"]["NEEDS"], "${{ toJSON(needs) }}")
+        for legs, test_ids, passes in (
+            ("success", "success", True),
+            ("success", "skipped", True),
+            ("success", "failure", False),
+            ("success", "cancelled", False),
+            ("failure", "skipped", False),
+            ("skipped", "skipped", False),
+        ):
+            needs = {"gates-linux": {"result": legs}, "test-ids": {"result": test_ids}}
+            with self.subTest(needs=needs):
+                proc = subprocess.run([*BASH, step["run"]], env=dict(os.environ, NEEDS=json.dumps(needs)),
+                                      capture_output=True, text=True)
+                self.assertEqual(proc.returncode == 0, passes, proc.stdout + proc.stderr)
 
     @unittest.skipIf(os.name == "nt", "bash and jq")
     def test_a_result_job_passes_only_when_every_leg_succeeded(self) -> None:
-        step = self.jobs["gates-linux-result"]["steps"][0]
+        step = self.jobs["tty-linux-result"]["steps"][0]
         self.assertEqual(step["env"]["NEEDS"], "${{ toJSON(needs) }}")
         cases = (
             ({"gates-linux": {"result": "success", "outputs": {}}}, True),
@@ -542,7 +963,8 @@ class WorkflowTest(unittest.TestCase):
                 uses = [step for step in spec["steps"] if "ZIG_BUILD_JOBS" in step.get("run", "")]
                 self.assertTrue(uses)
                 for step in uses:
-                    self.assertTrue(all("test:" in line for line in step["run"].splitlines() if "ZIG_BUILD_JOBS" in line))
+                    self.assertTrue(all("test:" in line or "PACKAGE_TESTS" in line
+                                        for line in step["run"].splitlines() if "ZIG_BUILD_JOBS" in line))
 
     def test_only_environment_setup_runs_on_every_leg(self) -> None:
         for job, setup in SETUP_STEPS.items():
@@ -614,6 +1036,95 @@ class WorkflowTest(unittest.TestCase):
                     self.assertTrue(step.get("if", "").endswith(" && env.SDK != 'false'"))  # CacheTest
                 else:
                     self.assertEqual(step.get("if"), "env.SDK != 'false'")
+
+    def test_the_selection_outputs_reach_the_suite_steps(self) -> None:
+        for name in ("units", "product", "packages", "package_tests", "script_tests", "complete"):
+            self.assertEqual(self.jobs["scope"]["outputs"][name], "${{ steps.decide.outputs.%s }}" % name)
+        for job, names in (("gates-linux", ("units", "product", "package_tests", "script_tests", "complete")),
+                           ("gates-macos", ("units", "product", "package_tests", "script_tests", "complete")),
+                           ("gates-macos-vm", ("units", "product", "package_tests", "script_tests", "complete")),
+                           ("windows-gates", ("units", "product", "package_tests")),
+                           ("windows-gates-vm", ("units", "product", "package_tests"))):
+            for name in names:
+                with self.subTest(job=job, output=name):
+                    self.assertEqual(self.jobs[job]["env"][name.upper()], "${{ needs.scope.outputs.%s }}" % name)
+
+    def test_a_narrowed_scope_skips_only_the_suites_it_does_not_select(self) -> None:
+        # Fail open: an empty output (the scope job failed) runs test:units,
+        # integration and product, never the package steps alone.
+        for job in ("gates-linux", "windows-gates"):
+            steps = {step_label(step): step for step in self.jobs[job]["steps"]}
+            with self.subTest(job=job):
+                units = "Offline test suite (units and integration)" if job == "gates-linux" else "Offline test suite (units)"
+                packages = ("Offline test suite (affected packages and integration)" if job == "gates-linux"
+                            else "Offline test suite (affected packages)")
+                self.assertTrue(steps[units]["if"].endswith("&& env.UNITS != 'false' && env.PACKAGE_TESTS == ''"))
+                self.assertTrue(steps[packages]["if"].endswith("&& env.UNITS != 'false' && env.PACKAGE_TESTS != ''"))
+                self.assertIn("PACKAGE_TESTS", steps[packages]["run"])
+                self.assertNotIn("test:units", steps[packages]["run"])
+                self.assertTrue(steps["Offline test suite (product)"]["if"].endswith("&& env.PRODUCT != 'false'"))
+                # The lower packages' other unit runs skip with test:units.
+                self.assertTrue(steps["Native platform modules"]["if"].endswith("&& env.PACKAGE_TESTS == ''"))
+        core = next(step for step in self.jobs["gates-linux"]["steps"] if step.get("name") == "ReleaseSafe core gate")
+        self.assertTrue(core["if"].endswith("&& env.PACKAGE_TESTS == ''"))
+        integration = next(step for step in self.jobs["windows-gates"]["steps"]
+                           if step.get("name") == "Offline test suite (integration)")
+        self.assertTrue(integration["if"].endswith("&& env.UNITS != 'false'"))
+        changed = next(step for step in self.jobs["gates-linux"]["steps"] if step.get("name") == "Changed script unit suites")
+        self.assertTrue(changed["if"].startswith("matrix.checks &&"))
+        self.assertTrue(changed["if"].endswith("&& env.SCRIPT_TESTS != ''"))
+        self.assertIn('python3 -m unittest "${modules[@]}" -v', changed["run"])
+
+    @unittest.skipIf(os.name == "nt", "bash")
+    def test_the_package_steps_split_the_selection_into_words(self) -> None:
+        step = next(step for step in self.jobs["gates-linux"]["steps"]
+                    if step.get("name") == "Offline test suite (affected packages and integration)")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "zig"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=f"{tmp}{os.pathsep}{os.environ['PATH']}",
+                       PACKAGE_TESTS="test:mid test:top", ZIG_BUILD_JOBS="4")
+            proc = subprocess.run([*BASH, step["run"]], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines()[:4], ["build", "test:mid", "test:top", "test:integration"])
+
+    def test_only_a_complete_run_records_and_keeps_its_test_ids(self) -> None:
+        steps = {step_label(step): step for step in self.jobs["gates-linux"]["steps"]}
+        for name in ("Record the executed test IDs", "Upload the executed test IDs"):
+            self.assertTrue(steps[name]["if"].endswith("&& env.COMPLETE != 'false'"), name)
+        job = self.jobs["test-ids"]
+        kept = [step for step in job["steps"] if step.get("uses", "").startswith(("actions/download-artifact@", "actions/upload-artifact@"))
+                or step.get("name") == "Collect the executed test IDs"]
+        self.assertEqual(len(kept), 3)
+        for step in kept:
+            self.assertEqual(step["if"], "needs.scope.outputs.complete != 'false'", step_label(step))
+        compare = next(step for step in job["steps"] if step.get("name") == "Compare with the base's test IDs")
+        self.assertEqual(compare["env"]["COMPLETE"], "${{ needs.scope.outputs.complete }}")
+        self.assertIn('--scope-complete "$COMPLETE"', compare["run"])
+
+    def test_the_nightly_run_lists_the_scopes_of_the_days_merges(self) -> None:
+        job = self.jobs["merged-scopes"]
+        self.assertEqual(job["if"], "${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}")
+        self.assertNotIn("needs", job)
+        self.assertEqual(job["steps"][0]["with"]["fetch-depth"], 0)
+        self.assertEqual(job["steps"][1]["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertIn('python3 scripts/ci_scope.py merged --since "24 hours ago" --repository "$GITHUB_REPOSITORY"',
+                      job["steps"][1]["run"])
+        decide = next(step for step in self.jobs["scope"]["steps"] if step.get("id") == "decide")
+        self.assertEqual(decide["env"]["PR_LABELS"], "${{ join(github.event.pull_request.labels.*.name, ',') }}")
+        self.assertIn('--labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json" --fast-path "$FAST_PATH"', decide["run"])
+        self.assertEqual(decide["env"]["FAST_PATH"], "${{ needs.release-fast-path.outputs.fast }}")
+        self.assertEqual((self.jobs["scope"]["needs"], self.jobs["scope"]["if"]), ("release-fast-path", "${{ !cancelled() }}"))
+        upload = self.jobs["scope"]["steps"][-1]
+        self.assertTrue(upload["uses"].startswith("actions/upload-artifact@"))
+        self.assertEqual((upload["with"]["name"], upload["with"]["path"]),
+                         (ci_scope.SCOPE_ARTIFACT, "${{ runner.temp }}/" + ci_scope.SCOPE_RECORD))
+        triggers = self.workflow.get("on", self.workflow.get(True))
+        self.assertIn("schedule", triggers)
+        self.assertIn("workflow_dispatch", triggers)
+        for result in ("gates-linux-result", "gates-macos-result", "gates-windows-result", "tty-linux-result", "full-pr-evidence"):
+            self.assertNotIn("merged-scopes", self.jobs[result]["needs"])
 
     def run_decide(self, job: str, event: str) -> tuple:
         step = next(s for s in self.jobs[job]["steps"] if s.get("name") == "Decide")
@@ -718,7 +1229,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, ["git fetch -q --depth=1 origin " + "m" * 40, "git diff --name-only %s HEAD" % ("m" * 40)])
         self.assertIn("relevant=false", output)
-        proc, _, output = self.run_step("merge_group", "src/agentcore/abi_v1.zig")
+        proc, _, output = self.run_step("merge_group", "packages/agentcore/abi_v1.zig")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("relevant=true", output)
 

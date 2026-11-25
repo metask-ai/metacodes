@@ -193,31 +193,32 @@ function compositionPanel(summary, scopeText) {
 
 // ------------------------------------------------------------ overview
 const PROFILE_STATUS = { queued: '排队中', running: '运行中', cancelling: '正在停止', finished: '空闲', cancelled: '已停止' };
-const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '跳过' };
+const ITEM_STATUS = { pending: '等待', running: '运行中', finished: '完成', failed: '执行失败', cancelled: '已停止', interrupted: '中断', skipped: '已取消' };
 const profileActive = (b) => ['queued', 'running', 'cancelling'].includes(b.status);
 const profileName = (b) => b.name || b.default_name || b.id;
 const profileHref = (b) => '#/profile/' + encodeURIComponent(b.id);
 const featuresText = (b) => (b.features || []).join(', ') || '未开启';
+const skippedFeatures = (b, item) => item.features ? (b.features || []).filter((name) => !item.features.includes(name)) : [];
 
 // Fills the run form for another run on profile `b` with one model (the
 // page's model filter, else the last run's): that model's suites and tasks
 // from the task rows (on the profile page) or the queued datasets, or only
-// the tasks whose latest attempts did not all pass.
-const unpassed = (t) => !t.attempts.length || t.passed < t.attempts.length;
+// the tasks whose latest attempts include an invalid one.
+const hasInvalid = (t) => t.attempts.some((a) => a.status === 'invalid');
 function runModel(b) {
   return b.tasks && state.profileModel && state.profileModel !== 'all' ? state.profileModel : b.items[b.items.length - 1]?.model;
 }
-function runAgain(b, onlyUnpassed) {
+function runAgain(b, onlyInvalid) {
   const last = b.items[b.items.length - 1] || {};
   const model = runModel(b);
   const lastOfModel = [...b.items].reverse().find((i) => i.model === model) || last;
   state.runDraft = { profile: b.id, from: profileName(b), label: b.metacodes?.label, features: b.features || [],
-    models: [model], attempts: lastOfModel.attempts, concurrency: lastOfModel.concurrency };
+    models: [model], attempts: lastOfModel.attempts, concurrency: b.concurrency };
   state.executor = lastOfModel.executor;
   const wanted = new Map();
   const add = (suite, task) => { if (!wanted.has(suite)) wanted.set(suite, []); if (!wanted.get(suite).includes(task)) wanted.get(suite).push(task); };
   if (b.tasks) {
-    for (const t of b.tasks.filter((x) => x.model === model)) if (!onlyUnpassed || unpassed(t)) add(t.suite, t.task);
+    for (const t of b.tasks.filter((x) => x.model === model)) if (!onlyInvalid || hasInvalid(t)) add(t.suite, t.task);
   } else {
     for (const item of b.items.filter((i) => i.model === model)) for (const task of item.tasks || []) add(item.suite, task);
   }
@@ -247,12 +248,33 @@ async function stopProfile(b, button) {
   try { await api('/api/profile/cancel', { id: b.id }); state.countdown = 1; }
   catch (error) { button.disabled = false; setConnection(false, error.message); }
 }
+const ITEM_ACTIONS = {
+  cancel: { label: '取消', ask: '取消这个评测集？它不再运行，队列里的其他评测集照常运行。' },
+  stop: { label: '停止', ask: '停止这个评测集？已经跑完的题保留结果，队列接着运行下一个评测集。' },
+  resume: { label: '继续', ask: null },
+  run: { label: '运行', ask: null },
+};
+function itemActions(b, index) {
+  const item = b.items[index];
+  const names = item.status === 'pending' ? ['cancel'] : item.status === 'running' ? ['stop']
+    : ['cancelled', 'interrupted', 'failed'].includes(item.status) && item.run ? ['resume', 'run'] : ['run'];
+  return names.map((name) => h('button', { type: 'button', class: 'button',
+    title: { resume: '只运行还没跑完的题', run: '把这个评测集的题全部再运行一次' }[name] || null,
+    onclick: async (event) => {
+      event.stopPropagation();
+      const button = event.currentTarget;
+      if (ITEM_ACTIONS[name].ask && !confirm(ITEM_ACTIONS[name].ask)) return;
+      button.disabled = true;
+      try { await api('/api/profile/item', { id: b.id, index, action: name }); state.countdown = 1; }
+      catch (error) { button.disabled = false; setConnection(false, error.message); }
+    } }, ITEM_ACTIONS[name].label));
+}
 function profileActions(b, compact) {
   const keep = (handler) => (event) => { event.stopPropagation(); handler(event.currentTarget); };
   return [
     h('button', { type: 'button', class: 'button', title: '在这个评测配置上再运行，题目和参数按上次填好', onclick: keep(() => runAgain(b, false)) }, compact ? '运行' : '再次运行'),
-    b.tasks && b.tasks.some((t) => t.model === runModel(b) && t.attempts.length && unpassed(t))
-      ? h('button', { type: 'button', class: 'button', title: '只选最新结果没有全部通过的题', onclick: keep(() => runAgain(b, true)) }, '重跑未通过的题') : null,
+    b.tasks && b.tasks.some((t) => t.model === runModel(b) && hasInvalid(t))
+      ? h('button', { type: 'button', class: 'button', title: '只选最新结果里有无效尝试的题（网络波动、环境故障等导致）', onclick: keep(() => runAgain(b, true)) }, '重跑无效的题') : null,
     profileActive(b)
       ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, compact ? '停止' : '停止队列')
       : h('button', { type: 'button', class: 'button', onclick: keep(async (button) => {
@@ -390,10 +412,10 @@ async function renderProfile(id) {
       state.editing = true; nameRow.hidden = true; renameForm.hidden = false; nameInput.focus(); nameInput.select();
     } }, '重命名') : null);
   const m = b.metacodes || {};
-  const liveItem = b.items.find((i) => i.status === 'running') || b.items.find((i) => i.status === 'pending');
   const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
     h('dt', { text: '名称' }), h('dd', {}, nameRow, renameForm),
-    liveItem ? h('dt', { text: '并发数' }) : null, liveItem ? h('dd', {}, concurrencyControl(b, liveItem)) : null,
+    h('dt', { text: '并发数' }), h('dd', {}, concurrencyControl(b)),
+    h('dt', { text: '自动重跑' }), h('dd', {}, autoRerunControl(b)),
     h('dt', { text: '编号' }), h('dd', { class: 'mono', text: b.id }),
     h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
     h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
@@ -403,25 +425,37 @@ async function renderProfile(id) {
     h('dt', { text: '模型' }), h('dd', { text: b.models.join('、') || '—' }),
     h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 最近运行 ${when(b.last_run_at)}` })));
 
-  const itemRows = [...b.items].reverse().map((item) => {
+  const itemRow = (item, index) => {
     const j = item.job; const js = j?.summary;
     return h('tr', { class: j ? 'link' : null, onclick: j ? () => { location.hash = '#/job/' + encodeURIComponent(j.name); } : null },
       h('td', {}, h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
         item.concurrency ? `并发 ${item.concurrency}` : null,
-        (b.features || []).length && item.features && !item.features.length ? '不带高级功能（WorkBuddy）' : null].filter(Boolean).join(' · ') })),
+        item.auto_rerun ? `自动重跑无效的题 第 ${item.auto_rerun} 轮` : null,
+        skippedFeatures(b, item).length ? `本次未开启 ${skippedFeatures(b, item).join(', ')}` : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
-      h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null),
+      h('td', {}, h('span', { text: ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null,
+        item.auto_rerun_error ? h('span', { class: 'sub flag', text: item.auto_rerun_error }) : null),
       h('td', { class: 'num', text: js ? `${js.trials - js.counts.running} / ${j.planned}` : `0 / ${item.tasks.length * (item.attempts || 1)}` }),
       h('td', {}, js ? outcomeBar(js.counts, js.trials) : dash()),
       h('td', { class: 'num', text: js ? pct(js.first_pass_rate) : '—' }),
       h('td', { class: 'num', text: js ? compact(js.total_tokens) : '—' }),
       h('td', { class: 'num', text: j ? dur(j.wall_s) : '—' }),
       h('td', { class: 'num', text: when(item.queued_at) }),
-      h('td', { class: 'mono', text: item.run || '—' }));
-  });
-  const items = panel('运行历史', `${b.items.length} 次`, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', '排队', '作业'].map((t, i) => h('th', { class: [3, 5, 6, 7, 8].includes(i) ? 'num' : null, text: t })))),
-    h('tbody', {}, itemRows))));
+      h('td', { class: 'mono', text: item.run || '—' }),
+      b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index))) : null);
+  };
+  const itemHeads = ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', '排队', '作业', ...(b.can_run ? ['操作'] : [])];
+  const itemTable = (rows, empty) => h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, itemHeads.map((t, i) => h('th', { class: [3, 5, 6, 7, 8].includes(i) ? 'num' : i === 10 ? 'pinned' : null, text: t })))),
+    h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: itemHeads.length, class: 'empty', text: empty })))));
+  const indexed = b.items.map((item, index) => [item, index]).reverse();
+  const live = indexed.filter(([item]) => ['pending', 'running'].includes(item.status));
+  const ended = indexed.filter(([item]) => !['pending', 'running'].includes(item.status));
+  const running = live.filter(([item]) => item.status === 'running').length;
+  const items = panel('正在运行的任务', `${running} 个运行中 · ${live.length - running} 个等待`,
+    itemTable(live.reverse().map(([item, index]) => itemRow(item, index)), '没有正在运行或等待的评测集'));
+  const endedItems = ended.length ? panel('已结束的任务', `${ended.length} 个`,
+    itemTable(ended.map(([item, index]) => itemRow(item, index)), '')) : null;
 
   // Per task: each (suite, model, task)'s latest attempts in order.
   const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
@@ -466,15 +500,19 @@ async function renderProfile(id) {
   const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
     h('div', { class: 'panel-body toolbar' }, firstFilter, search),
     h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
-  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, tasks, compositionPanel(s, '最新结果均值'));
+  return h('div', {}, metrics, panel('评测配置', PROFILE_STATUS[b.status] || b.status, info, b.can_run ? h('div', { class: 'header-actions' }, profileActions(b, false)) : null), modelsPanel(b), items, endedItems, tasks, compositionPanel(s, '最新结果均值'));
 }
 
-function concurrencyControl(b, item) {
-  if (!b.can_run || !profileActive(b)) return h('span', { class: 'mono', text: String(item.concurrency ?? '—') });
-  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, step: 1, required: true, value: item.concurrency ?? '',
+// The profile's concurrency, the only place it is set: every dataset
+// queued on the profile runs at it (capped by its suite's limit).
+function concurrencyControl(b) {
+  if (!b.can_run) return h('span', { class: 'mono', text: String(b.concurrency ?? '—') });
+  const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, step: 1, required: true, value: b.concurrency ?? '',
     'aria-label': '并发数', onfocus: () => { state.editing = true; },
-    onblur: () => { if (input.value === String(item.concurrency ?? '')) state.editing = false; } });
-  const feedback = h('span', { class: 'muted', role: 'status', text: '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中的评测集也按新值运行' });
+    onblur: () => { if (input.value === String(b.concurrency ?? '')) state.editing = false; } });
+  const feedback = h('span', { class: 'muted', role: 'status', text: profileActive(b)
+    ? '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中和之后运行的评测集也按新值运行'
+    : '之后在这个评测配置上运行的评测集都按这个并发运行' });
   const form = h('form', { class: 'rename' }, input, h('button', { type: 'submit', class: 'button primary' }, '应用'), feedback);
   form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { state.editing = false; render(); } });
   form.addEventListener('submit', async (event) => {
@@ -487,6 +525,21 @@ function concurrencyControl(b, item) {
     } catch (error) { feedback.textContent = error.message; }
   });
   return form;
+}
+
+function autoRerunControl(b) {
+  const text = '评测集跑完后，自动把有无效尝试的题再排队运行，每个评测集最多重跑 2 轮';
+  const input = h('input', { type: 'checkbox', checked: !!b.auto_rerun_invalid, disabled: !b.can_run, 'aria-label': '自动重跑无效的题' });
+  const feedback = h('span', { class: 'muted', role: 'status', text });
+  input.addEventListener('change', async () => {
+    input.disabled = true;
+    feedback.textContent = '正在保存…';
+    try {
+      await api('/api/profile/auto-rerun', { id: b.id, enabled: input.checked });
+      render();
+    } catch (error) { input.checked = !input.checked; input.disabled = false; feedback.textContent = error.message; }
+  });
+  return h('label', { class: 'check' }, input, h('span', { text: '自动重跑无效的题' }), feedback);
 }
 
 // The latest results of each model side by side, when the profile has several:
@@ -573,7 +626,7 @@ async function historyGroup(b, jobName, taskName) {
 
 // ------------------------------------------------------------ run workbench
 const SETUP_STATUS = { running: '进行中', ok: '已就绪', done: '已完成', planned: '将执行', manual: '需要你操作',
-  failed: '失败', skipped: '跳过' };
+  failed: '失败', skipped: '已取消' };
 const SETUP_RESULT = { running: '进行中', ready: '已就绪', planned: '预演完成', needs_user: '还有需要你操作的步骤',
   failed: '有步骤失败', interrupted: '已中断' };
 const RUN_STATUS = { queued: '等待启动', starting: '准备环境', running: '运行中',
@@ -647,10 +700,10 @@ async function renderNewRun() {
   });
   const model = h('div', { class: 'task-options', role: 'group', 'aria-label': '模型' }, modelChecks);
   const runDefaults = c.defaults || { attempts: 4, concurrency: 10 };
+  const concurrencyNote = fixed ? `并发数 ${draft.concurrency ?? '—'}，在评测配置页面修改`
+    : `并发数按评测配置设置（新配置默认 ${runDefaults.concurrency}），开始评测后可在评测配置页面修改`;
   const attempts = h('input', { name: 'attempts', type: 'number', inputmode: 'numeric', value: draft.attempts ?? runDefaults.attempts, min: 1, max: 5, step: 1, required: true,
     oninput: () => { draft.attempts = attempts.value; } });
-  const concurrency = h('input', { name: 'concurrency', type: 'number', inputmode: 'numeric', value: draft.concurrency ?? runDefaults.concurrency, min: 1, step: 1, required: true,
-    oninput: () => { draft.concurrency = concurrency.value; } });
   const featureBoxes = (c.features || []).map((f) => ({ id: f.id, group: f.group,
     input: h('input', { type: 'checkbox', name: 'features', value: f.id, disabled: fixed,
       checked: (draft.features || c.default_features || []).includes(f.id),
@@ -810,8 +863,8 @@ async function renderNewRun() {
       c.account_summary ? h('small', { text: `${c.account_summary.available_groups} / ${c.account_summary.groups} 个模型组可用 · ${c.account_summary.models} 个模型` }) : null,
       c.reasoning_effort ? h('small', { text: '推理强度：' + c.reasoning_effort }) : null),
     h('fieldset', {}, h('legend', { text: '评测集（可多选）' }), picker), boxes,
-    h('div', { class: 'form-row' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
-      h('label', { class: 'field' }, h('span', { text: '并发数' }), concurrency)),
+    h('div', { class: 'form-row' }, h('div', { class: 'field' }, h('label', { class: 'field' }, h('span', { text: '每题次数' }), attempts),
+      h('small', { text: concurrencyNote }))),
     h('div', { class: 'form-submit' }, submit, blocked, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -819,7 +872,7 @@ async function renderNewRun() {
     feedback.textContent = fixed ? '正在排队…' : '正在冻结 metacodes 版本并排队…';
     try {
       const picked = models.filter((m) => chosenModels.has(m.id)).map((m) => m.id);
-      const request = { ...(picked.length > 1 ? { models: picked } : { model: picked[0] }), attempts: Number(attempts.value), concurrency: Number(concurrency.value),
+      const request = { ...(picked.length > 1 ? { models: picked } : { model: picked[0] }), attempts: Number(attempts.value),
         items: [...state.suitePick.entries()].map(([id, entry]) => ({ suite: id, tasks: entry.tasks.filter((t) => entry.selected.has(t)) })) };
       if (fixed) request.profile = draft.profile;
       else {

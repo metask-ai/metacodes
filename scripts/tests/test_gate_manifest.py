@@ -104,8 +104,9 @@ class GateManifestTest(unittest.TestCase):
         parts = test_part_commands(ci)
         for expected in checklist_commands():
             words = normalized_words(expected)
-            if words[:3] == ["zig", "build", "test"]:
-                # Every part runs somewhere, with the checklist command's options.
+            if words[:2] == ["zig", "build"] and words[2:3] in (["test"], ["test:affected"]):
+                # `test:affected` runs the parts CI selects for the change; CI
+                # runs every part on a full run, with the checklist command's options.
                 for part in TEST_PARTS:
                     self.assertTrue(
                         any(part in steps and options[: len(words) - 3] == words[3:] for steps, options in parts),
@@ -131,10 +132,10 @@ class GateManifestTest(unittest.TestCase):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         self.assertIn('const gate_static_step = b.step("gate:static",', build)
         deps = set(re.findall(r"\bgate_static_step\.dependOn\(&?([\w.]+?)(?:\.step)?\)", build))
-        self.assertTrue({"gate_fmt", "http_status_gate_run", "subsystem_boundary_run", "gate_diff_check"} <= deps, deps)
+        self.assertTrue({"gate_fmt", "http_status_gate_run", "subsystem_boundary_run", "layer_run", "gate_diff_check"} <= deps, deps)
         # Source-only: the boundary gates' full steps carry their self-tests,
         # test binaries that build and install the fs-helper.
-        self.assertFalse(deps & {"http_status_gate_step", "subsystem_boundary_step"}, deps)
+        self.assertFalse(deps & {"http_status_gate_step", "subsystem_boundary_step", "layer_step"}, deps)
         scans = re.findall(r'const (\w+) = b\.addSystemCommand\(&\.\{[^}]*?"scripts\.tests\.test_\w+_discipline"', build, re.S)
         self.assertTrue(scans)
         for scan in scans:
@@ -156,6 +157,47 @@ class GateManifestTest(unittest.TestCase):
         for step in ("gate_static_step", "units_test_step", "contract_step"):
             self.assertIn("%s.dependOn(&zig_api_snapshot.step);" % step, build)
         self.assertIn("contract_step.dependOn(&contract_run.step);", build)
+
+    def test_the_linux_legs_record_the_tests_they_run(self):
+        lines = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines()
+        names = [line.strip() for line in lines if line.strip().startswith("- name: ")]
+        record = names.index("- name: Record the executed test IDs")
+        for suite in ("- name: Offline test suite (units and integration)", "- name: Offline test suite (product)",
+                      "- name: ReleaseSafe core gate", "- name: Gate manifest unit tests"):
+            self.assertLess(record, names.index(suite), suite)
+        self.assertGreater(names.index("- name: Upload the executed test IDs"), names.index("- name: Diff whitespace check"))
+        workflow = "\n".join(lines)
+        self.assertIn("name: Test IDs (Linux)\n    needs: [release-fast-path, scope, gates-linux]", workflow)
+        self.assertIn("python3 scripts/test_ids.py collect --raw", workflow)
+        self.assertIn("python3 scripts/test_ids.py ci-compare --head", workflow)
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn("gate_static_step.dependOn(&test_ids_check_cmd.step);", build)
+        self.assertIn("units_test_step.dependOn(&test_ids_test_cmd.step);", build)
+        self.assertIn('@import("test_id_record.zig")', (ROOT / "scripts" / "sharded_test_runner.zig").read_text(encoding="utf-8"))
+        self.assertIn('@import("test_id_record.zig")', (ROOT / "scripts" / "recording_test_runner.zig").read_text(encoding="utf-8"))
+        self.assertEqual(build.count("b.addTest("), 6, "a new test binary goes through addRecordedTest")
+        self.assertIn('recorded.test_runner = .{ .path = b.path("scripts/recording_test_runner.zig"), .mode = .server };', build,
+                      "server mode keeps --test-timeout")
+        self.assertIn("units_test_step.dependOn(&test_id_fixture_check.step);", build)
+        self.assertIn("run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform", workflow)
+        self.assertIn("  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled]\n", workflow)
+        self.assertIn('run.setEnvironmentVariable("METACODES_TEST_ROOT",', build)
+        self.assertIn("METACODES_TEST_ROOT: src/platform", workflow)
+        self.assertIn("needs: [gates-linux, test-ids]", workflow)
+
+    def test_the_checklist_runs_what_ci_selects(self):
+        """The checklist's suite is `test:affected`: scripts/ci_scope.py's
+        decision for the working tree against origin/main, run locally."""
+        self.assertIn("zig build test:affected", checklist_commands())
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn('b.step("test:affected",', build)
+        command = re.search(r"const affected_cmd = b\.addSystemCommand\(&\.\{(.*?)\}\);", build, re.S).group(1)
+        words = re.findall(r'"([^"]*)"', command)
+        self.assertEqual(words[words.index("scripts/ci_scope.py"):],
+                         ["scripts/ci_scope.py", "--event", "local", "--base", "affected-base",
+                          "test:affected: the revision whose merge base with HEAD the change is measured from",
+                          "origin/main", "--candidate", "", "--github-summary", "", "--run", "--zig"])
+        self.assertIn("gate_pr_step.dependOn(test_step);", build)
 
     def test_the_test_step_is_exactly_its_three_parts(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")

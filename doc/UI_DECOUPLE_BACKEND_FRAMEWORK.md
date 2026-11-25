@@ -164,11 +164,11 @@ pub const UiBackend = struct {
 - `src/core/protocol/ui_event.zig` —— CoreEvent / UiEvent / Phase(原 repl/ui_event.zig)
 - `src/core/protocol/ui_backend.zig` —— UiBackend vtable(原 repl/ui_backend.zig)
 - `src/core/protocol/ui_request.zig` —— UiRequest/UiResponse/UiRequestFn(原 repl/ui_request.zig)
-- `src/repl/tui/tui_backend.zig` —— TuiBackend(渲染 + 键盘 + tick)
+- `apps/cli/src/repl/tui/tui_backend.zig` —— TuiBackend(渲染 + 键盘 + tick)
 - `src/core/writer_backend.zig` —— WriterBackend(print-only sink)
 - `src/core/headless_backend.zig` —— HeadlessBackend(JSON 行)
 - `src/core/agent_loop.zig` —— `run(... backend: *const UiBackend ...)`,只发 CoreEvent
-- `src/repl/loop.zig` —— 编排:构造 backend、startInput/stopInput
+- `apps/cli/src/repl/loop.zig` —— 编排:构造 backend、startInput/stopInput
 
 
 ## 6. 可测试性(本框架最大收益之一)
@@ -177,7 +177,7 @@ CoreEvent/UiEvent/UiBackend 纯数据 + 函数指针,不碰 fd。因此:
 - **mock backend**(收 CoreEvent 进 ArrayList)→ 跑一轮真 agent_loop(MockServer cassette)→
   断言事件序列。**agent_loop 现在能不起终端、用 mock backend 纯测**。
 - **字节锁单测**:喂每个 CoreEvent 给 backend,断言输出 == legacy 串常量(重构时锁死字节精确)。
-- 见 `tests/component/ui_backend_test.zig`(字节锁)、`tests/component/ui_multifrontend_test.zig`
+- 见 `apps/cli/tests/component/ui_backend_test.zig`(字节锁)、`tests/component/ui_multifrontend_test.zig`
   (mock backend 跑 agent_loop + HeadlessBackend JSON 全链)。
 
 ## 7. 工程方法论沉淀(本次落地总结)

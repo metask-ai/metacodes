@@ -64,7 +64,7 @@ pub fn loadConfigFromEnv() ConfigLoad {
 /// `METACODES_PROJECT_KERNEL_TIMEOUT_MS` as the runtime applies it: the
 /// default when unset, null when set to anything but an integer in
 /// 100..30_000. Every configuration path (environment pair or adjacent pin)
-/// fails closed on null, and `app/doctor.zig` reports that refusal the same way.
+/// fails closed on null, and `core/doctor.zig` reports that refusal the same way.
 pub fn timeoutMsFromEnv() ?u64 {
     const raw = std.c.getenv("METACODES_PROJECT_KERNEL_TIMEOUT_MS") orelse return 5_000;
     const parsed = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch return null;

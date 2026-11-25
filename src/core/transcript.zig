@@ -24,6 +24,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
+const ppaths = @import("platform").paths;
 const msg_mod = @import("message.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const types = @import("../types.zig");
@@ -53,10 +54,7 @@ pub fn genSessionId() SessionId {
 
 /// 计算 cwd hash（xxhash64 lo 32 位 hex + hi 32 位 hex）。
 pub fn hashCwd(cwd: []const u8) [16]u8 {
-    const h = std.hash.XxHash64.hash(0, cwd);
-    var out: [16]u8 = undefined;
-    _ = std.fmt.bufPrint(&out, "{x:0>16}", .{h}) catch unreachable;
-    return out;
+    return ppaths.hashCwd(cwd);
 }
 
 /// `<state root>/projects/<hashCwd(cwd)>`, caller-owned: the sessions of one

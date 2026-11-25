@@ -41,7 +41,7 @@ const metacodes = b.dependency("metacodes", .{
     .optimize = optimize,
 });
 const app_mod = b.createModule(.{
-    .root_source_file = b.path("src/main.zig"),
+    .root_source_file = b.path("apps/cli/src/main.zig"),
     .target = target,
     .optimize = optimize,
 });

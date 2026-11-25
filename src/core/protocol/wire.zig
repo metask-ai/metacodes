@@ -28,7 +28,7 @@
 //! request, as before.
 //!
 //! Host events are what a session service adds around the kernel's events
-//! (core/session_host.zig, and the bundled `--web`/`serve` host in src/web):
+//! (core/session_host.zig, and the bundled `--web`/`serve` host in apps/cli/src/web):
 //! the submitted text, the end of a Run, the result of a configuration
 //! command, a message refused before it ran, a poisoned Session, a Run that
 //! resumes a suspended one. Their tags never collide with CoreEvent tags

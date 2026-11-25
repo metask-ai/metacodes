@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   # Migration compatibility only: after the main ruleset disables the queue,
   # no merge_group event is emitted. This lets the migration PR itself land
   # under the old rules (doc/CI_DESIGN.md §3).
@@ -98,12 +99,18 @@ jobs:
   # doc/CI_DESIGN.md §2. Only documentation changed: the gates run the
   # documentation, version-state and gate-manifest checks and nothing that
   # builds. Only documentation and the evaluation harness changed: the gates
-  # run in full and the TTY suites do not. The legs, shards and result jobs
-  # below still run and report under their own names; the legs' and shards'
-  # steps read SUITES / TTY, as they read FAST_PATH. A failed decision leaves
-  # both empty: everything runs.
+  # run in full and the TTY suites do not. Only tests changed, or only
+  # packages layers.zon trusts and their tests: the suites they touch run.
+  # The legs, shards and result jobs below still run and report under their
+  # own names; the legs' and shards' steps read SUITES / TTY / UNITS /
+  # PRODUCT / PACKAGE_TESTS, as they read FAST_PATH. A failed decision leaves
+  # them empty: everything runs.
+  # It waits for the release fast path only to record it next to the scope:
+  # a fast-path run reuses the base's suite results (`merged-scopes`).
   scope:
     name: Change scope
+    needs: release-fast-path
+    if: ${{ !cancelled() }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -115,14 +122,24 @@ jobs:
       reason: ${{ steps.decide.outputs.reason }}
       doc_references: ${{ steps.decide.outputs.doc_references }}
       release_docs: ${{ steps.decide.outputs.release_docs }}
+      units: ${{ steps.decide.outputs.units }}
+      product: ${{ steps.decide.outputs.product }}
+      packages: ${{ steps.decide.outputs.packages }}
+      package_tests: ${{ steps.decide.outputs.package_tests }}
+      script_tests: ${{ steps.decide.outputs.script_tests }}
+      complete: ${{ steps.decide.outputs.complete }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 2
+      # PR_LABELS: the labels in the event, which a `labeled` or
+      # `unlabeled` run carries current; a migration PR takes the full scope.
       - name: Decide
         id: decide
         env:
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
         run: |
           case "$GITHUB_EVENT_NAME" in
             pull_request) base=HEAD^1 ;;
@@ -132,7 +149,15 @@ jobs:
               ;;
             *) base="" ;;
           esac
-          python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT" --labels "$PR_LABELS" --record "$RUNNER_TEMP/change-scope.json" --fast-path "$FAST_PATH"
+      # What main's nightly run reports for this PR once it is merged
+      # (`merged-scopes`).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: change-scope
+          path: ${{ runner.temp }}/change-scope.json
+          if-no-files-found: warn
+          retention-days: 90
 
   # Where the macOS and Windows gates run (scripts/ci_pool_plan.py plan,
   # doc/CI_DESIGN.md §6): a platform's pool when .github/runner-pools.json
@@ -213,6 +238,15 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
       RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
+      # The suites a tests or packages scope selects (scripts/ci_scope.py):
+      # 'false' skips a suite step, PACKAGE_TESTS replaces test:units and
+      # skips the other whole-package unit runs (the ReleaseSafe core gate,
+      # the native platform modules).
+      UNITS: ${{ needs.scope.outputs.units }}
+      PRODUCT: ${{ needs.scope.outputs.product }}
+      PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
+      SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
+      COMPLETE: ${{ needs.scope.outputs.complete }}
       # The suite steps' build runner jobs; see "Offline test suite" below.
       ZIG_BUILD_JOBS: "8"
       # The release layout splits the Linux executable's debug symbols into
@@ -377,6 +411,11 @@ jobs:
       - name: Install Python development dependencies
         if: env.FAST_PATH != 'true'
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
+      # Only a run of every suite records them: a narrowed run's IDs would
+      # read as tests that disappeared (scripts/test_ids.py).
+      - name: Record the executed test IDs
+        if: runner.os == 'Linux' && (matrix.units || matrix.product || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.COMPLETE != 'false'
+        run: mkdir -p "$RUNNER_TEMP/test-ids" && echo "METACODES_TEST_IDS_DIR=$RUNNER_TEMP/test-ids" >> "$GITHUB_ENV"
       # A version without -dev is legal only on its tagged commit, the release
       # PR, or main's run of the release merge commit; in the latter two the
       # gate tags HEAD locally so the release-layout steps below can run the
@@ -461,11 +500,12 @@ jobs:
       # the spawn tests are kept out of the build runner (process.zig's
       # `procSpawnTestsEnabled`).
       - name: Native platform modules
-        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
-        run: zig test src/platform/platform.zig -lc
+          METACODES_TEST_ROOT: src/platform
+        run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform
       # The installed-adapter WorkBuddy suites (scripts/eval/tests/
       # test_workbuddy_adapter.py) run the overlay inside the real pinned
       # WorkBuddy-Bench, against its locked environment; without a checkout
@@ -503,17 +543,26 @@ jobs:
       # starting for four to seven minutes; twice that many keeps the cores
       # busy. Scheduling only: what runs is the same.
       - name: Offline test suite (units and integration)
-        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false' && env.PACKAGE_TESTS == ''
         env:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
         run: zig build test:units test:integration -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
+      # A packages scope: the affected packages' test:<package> steps in place
+      # of test:units (doc/CI_DESIGN.md §2).
+      - name: Offline test suite (affected packages and integration)
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false' && env.PACKAGE_TESTS != ''
+        env:
+          METACODES_TEST_REQUIRE_LEAN_SDK: "1"
+        run: |
+          read -r -a steps <<< "$PACKAGE_TESTS"
+          zig build "${steps[@]}" test:integration -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (product)
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false'
         env:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
         run: zig build test:product -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
       - name: ReleaseSafe core gate
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         run: zig build test:lib -Doptimize=ReleaseSafe
       - name: Contract snapshots
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
@@ -647,6 +696,17 @@ jobs:
             *) echo "no base to compare on a $GITHUB_EVENT_NAME run"; exit 0 ;;
           esac
           python3 scripts/check_changelog_sections.py --base "$base"
+      - name: Layer baseline only shrinks
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        env:
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            merge_group) base="$MERGE_GROUP_BASE_SHA" ;;
+            *) echo "no base to compare on a $GITHUB_EVENT_NAME run"; exit 0 ;;
+          esac
+          zig build layer:check -Dlayer-base="$base"
       - name: Changelog section check unit tests
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_changelog_sections -v
@@ -701,6 +761,12 @@ jobs:
       - name: Change scope unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_ci_scope -v
+      # A tests scope may skip test:units, which runs some of these suites.
+      - name: Changed script unit suites
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.SCRIPT_TESTS != ''
+        run: |
+          read -r -a modules <<< "$SCRIPT_TESTS"
+          python3 -m unittest "${modules[@]}" -v
       - name: CI evidence and policy unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_ci_evidence scripts.tests.test_pr_policy -v
@@ -716,6 +782,14 @@ jobs:
       - name: Diff whitespace check
         if: matrix.checks && env.FAST_PATH != 'true'
         run: git diff --check
+      - name: Upload the executed test IDs
+        if: runner.os == 'Linux' && (matrix.units || matrix.product || matrix.checks) && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.COMPLETE != 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-ids-raw-${{ matrix.leg }}
+          path: ${{ env.METACODES_TEST_IDS_DIR }}
+          if-no-files-found: error
+          retention-days: 3
       # main's warm run saves what this leg built from an empty cache, so the
       # entry holds only what the current tree needs and does not grow night
       # after night. A failed leg saves nothing and the previous night's entry
@@ -759,6 +833,11 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
       RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
+      UNITS: ${{ needs.scope.outputs.units }}
+      PRODUCT: ${{ needs.scope.outputs.product }}
+      PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
+      SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
+      COMPLETE: ${{ needs.scope.outputs.complete }}
       # Two per core, as on Linux, would overlap more LLVM builds than the
       # runner's 7 GB hold (the app and the drivers peak at 1 to 2 GB each).
       ZIG_BUILD_JOBS: "6"
@@ -793,6 +872,11 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       DOC_REFERENCES: ${{ needs.scope.outputs.doc_references }}
       RELEASE_DOCS: ${{ needs.scope.outputs.release_docs }}
+      UNITS: ${{ needs.scope.outputs.units }}
+      PRODUCT: ${{ needs.scope.outputs.product }}
+      PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
+      SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
+      COMPLETE: ${{ needs.scope.outputs.complete }}
       # .github/runner-pools.json, sized to the runner.
       ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.macos_zig_build_jobs }}
     steps: *gates-steps
@@ -1055,6 +1139,9 @@ jobs:
       # and the documentation checks of `gates-linux` cover it, so nothing runs
       # here.
       SUITES: ${{ needs.scope.outputs.suites }}
+      UNITS: ${{ needs.scope.outputs.units }}
+      PRODUCT: ${{ needs.scope.outputs.product }}
+      PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # As in `gates-linux`.
       ZIG_BUILD_JOBS: "8"
     steps: &windows-gates-steps
@@ -1124,7 +1211,7 @@ jobs:
       # the product leg here, the shortest suite leg on Windows, where this
       # step takes about two minutes.
       - name: Native platform modules
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         shell: cmd
         env:
           METACODES_PROC_TEST: "1"
@@ -1247,15 +1334,19 @@ jobs:
       # build runner watchdog between tests is max(--test-timeout, 60s), same
       # as the AgentCore gate. --summary all: see `gates-linux`.
       - name: Offline test suite (units)
-        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false' && env.PACKAGE_TESTS == ''
         shell: cmd
         run: zig build test:units -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Offline test suite (affected packages)
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false' && env.PACKAGE_TESTS != ''
+        shell: cmd
+        run: zig build %PACKAGE_TESTS% -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (integration)
-        if: matrix.integration && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.integration && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false'
         shell: cmd
         run: zig build test:integration -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (product)
-        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false'
         shell: cmd
         run: zig build test:product -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       # Evidence for the next line-ending incident: if the suite itself rewrites
@@ -1306,6 +1397,9 @@ jobs:
       POOL_JOB: "true"
       RELEASE_FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       SUITES: ${{ needs.scope.outputs.suites }}
+      UNITS: ${{ needs.scope.outputs.units }}
+      PRODUCT: ${{ needs.scope.outputs.product }}
+      PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # .github/runner-pools.json, sized to the runner.
       ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.windows_zig_build_jobs }}
     steps: *windows-gates-steps
@@ -1338,17 +1432,17 @@ jobs:
   # the same way so that it can become required.
   gates-linux-result:
     name: Gates (Linux)
-    needs: gates-linux
+    needs: [gates-linux, test-ids]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: &result-steps
-      - name: Every leg passed
+    steps:
+      - name: Every leg passed, and the test ID comparison where it ran
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -c 'map_values(.result)'
-          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
+          echo "$NEEDS" | jq -e '.["gates-linux"].result == "success" and (.["test-ids"].result == "success" or .["test-ids"].result == "skipped")' > /dev/null
 
   # Gates (macOS) and Gates (Windows) pass when the gates passed where they
   # ran: the pool job (through the watch), or the hosted legs
@@ -1385,7 +1479,13 @@ jobs:
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
-    steps: *result-steps
+    steps: &result-steps
+      - name: Every leg passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -c 'map_values(.result)'
+          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
 
   tty-windows-result:
     name: TTY (Windows)
@@ -1394,6 +1494,41 @@ jobs:
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps: *result-steps
+
+  test-ids:
+    name: Test IDs (Linux)
+    needs: [release-fast-path, scope, gates-linux]
+    if: ${{ !cancelled() && needs.gates-linux.result == 'success' && needs.release-fast-path.outputs.fast != 'true' && needs.scope.outputs.suites != 'false' }}
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+      # A narrowed scope records no IDs (the gate legs' Record step).
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.scope.outputs.complete != 'false'
+        with:
+          pattern: test-ids-raw-*
+          path: ${{ runner.temp }}/test-ids-raw
+      - name: Collect the executed test IDs
+        if: needs.scope.outputs.complete != 'false'
+        run: python3 scripts/test_ids.py collect --raw "$RUNNER_TEMP/test-ids-raw" --tty tests/tty/cases --output "$RUNNER_TEMP/test-ids/test-ids.tsv" --meta "$RUNNER_TEMP/test-ids/test-ids-meta.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.scope.outputs.complete != 'false'
+        with:
+          name: test-ids
+          path: ${{ runner.temp }}/test-ids
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+      - name: Compare with the base's test IDs
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMPLETE: ${{ needs.scope.outputs.complete }}
+        run: python3 scripts/test_ids.py ci-compare --head "$RUNNER_TEMP/test-ids/test-ids.tsv" --base HEAD^1 --repository "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --summary "$GITHUB_STEP_SUMMARY" --scope-complete "$COMPLETE"
 
   full-pr-evidence:
     name: Full PR evidence
@@ -1419,3 +1554,23 @@ jobs:
           path: ${{ runner.temp }}/pr-ci-evidence.json
           if-no-files-found: error
           retention-days: 90
+
+  # main's nightly run, which is a full run on every platform, also lists the
+  # commits merged in the day before it and the scope each one's pull request
+  # ran, as its CI run recorded it (the scope job's change-scope artifact;
+  # `unknown` without one). When the full run fails and the day's pull
+  # requests ran narrowed scopes, the list names the candidates that skipped
+  # the failing suite (doc/CI_DESIGN.md §2).
+  merged-scopes:
+    name: Scopes of the day's merges
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Report the change scope of the day's merges
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_scope.py merged --since "24 hours ago" --repository "$GITHUB_REPOSITORY"

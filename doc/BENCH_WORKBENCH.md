@@ -71,8 +71,9 @@ default sample. The catalog is `scripts/eval/harbor/suites/__init__.py`.
 
 Each task runs 1–5 times; concurrency has no upper limit (GAIA2 caps it at
 2 and ALFWorld at 10). The page starts at 4 runs
-per task and concurrency 10, capped by the chosen suite; the CLI defaults to
-1 and 1. Task ids must belong to the chosen
+per task; concurrency is the profile's (10 for a new profile, capped by the
+chosen suite) and is set only on the profile page. The CLI's `bench run`
+defaults to 1 and 1. Task ids must belong to the chosen
 suite, and the worker passes each as an exact Harbor `-i` pattern.
 
 Harbor 0.26 resolves `-d name@version` through its legacy registry (tasks
@@ -978,7 +979,9 @@ packages that trials and verifiers install (`apt-get install curl`, `pip`,
   "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda",
   "go": "https://goproxy.cn",
   "rustup": "https://rsproxy.cn",
-  "npm": "https://registry.npmmirror.com"
+  "npm": "https://registry.npmmirror.com",
+  "github": "https://gh-proxy.com/https://github.com",
+  "hf": "https://hf-mirror.com"
 }
 ```
 
@@ -990,6 +993,19 @@ packages that trials and verifiers install (`apt-get install curl`, `pip`,
 | `go` | `GOPROXY=<url>,direct` |
 | `rustup` | `RUSTUP_DIST_SERVER=<url>`, `RUSTUP_UPDATE_ROOT=<url>/rustup` (crates still come from crates.io) |
 | `npm` | `NPM_CONFIG_REGISTRY` |
+| `github` | `UV_INSTALLER_GITHUB_BASE_URL=<url>` and `UV_PYTHON_INSTALL_MIRROR=<url>/astral-sh/python-build-standalone/releases/download`: the uv binary that a verifier's `astral.sh/uv/<version>/install.sh` downloads and the Python that `uvx -p 3.13` downloads, both GitHub release assets. The value stands for `https://github.com`, so a prefix proxy is written with the origin in its path (`https://gh-proxy.com/https://github.com`) |
+| `hf` | `HF_ENDPOINT` |
+
+`github` covers release downloads only. It sets no git `insteadOf`: an
+agent's own `git clone` still goes to GitHub, because a third-party proxy
+that fails where GitHub answers would fail tasks that work today. The
+install script itself is fetched from `astral.sh` by a URL written in each
+task's `test.sh`, which no variable redirects. A per-project release mirror
+does not fit this key: `mirror.nju.edu.cn/github-release` keeps only recent
+python-build-standalone releases (its 20251014 assets answered 404 in
+November 2026), while a pinned uv asks for the release it was built with.
+Docker Hub images have no mirror of this kind; `docker_mirrors` is the
+separate daemon setting above.
 
 Each run uploads `<state_dir>/runs/<name>/mirrors.compose.json` and passes
 it to Harbor as `--extra-docker-compose`: an overlay of Harbor's `main`
@@ -1014,9 +1030,7 @@ name with `--restart unless-stopped`, published on
 packages, then checks that `/acng-report.html` answers. A running container
 already labeled with the same mirror is kept; another mirror replaces it.
 The volume survives that replacement. The cache answers containers on
-Harbor's compose networks the same way the egress forwarder does. Hugging
-Face is not mirrored: `hf-mirror.com` rate-limits (HTTP 429) where the
-executor reaches `huggingface.co` directly.
+Harbor's compose networks the same way the egress forwarder does.
 
 ### Colima on Apple Silicon
 
@@ -1110,8 +1124,10 @@ with a fixed set of advanced features. Every run belongs to a profile, and a
 profile is run on as often as wanted. The 评测 page picks the version (the
 configured Linux bundle by default, or any valid bundle under
 `<state root>/bench/bundles/`, including those `metacodes bench build --ref`
-builds), the advanced features, several suites with their tasks, the model,
-attempts and concurrency (no upper limit unless a suite sets `max_concurrency`). The profile's id is derived from
+builds), the advanced features, several suites with their tasks, the model
+and attempts. Concurrency is not on that page: it belongs to the profile
+(10 when the profile is created) and every dataset queued on it runs at it.
+The profile's id is derived from
 the bundle's content digest and the features, so the same version with the
 same features always lands on the same profile, and changing either is
 another profile. The first run on a profile validates every dataset, then
@@ -1135,13 +1151,21 @@ and the preview features `execute_code` (`--preview=execute_code`),
 `ADVANCED_FEATURES` in `scripts/eval/harbor/command.py` is the list. The
 profile and each of its runs record the chosen names (`features`), and the
 run passes them to the adapter as `--ak features=<names>`. An unknown name is
-refused. A WorkBuddy suite's overlay launches metacodes itself, so its
-datasets run without the profile's features: the queued dataset and its run
-record list none, and the profile page marks them; a direct launch that asks
-for features on a WorkBuddy suite is refused. The frozen bundle has to know the flags: a release older
+refused. A WorkBuddy suite's overlay launches metacodes itself and takes
+only the run gates: the workbench writes each one as a harness parameter of
+the WorkBuddy job (`FEATURE_PARAMS` in `scripts/eval/harbor/suites/workbuddy.py`,
+for example `METACODES_STALL_GATE: true`), and the overlay turns it into the
+same flag. Its datasets run without the profile's preview features: the
+queued dataset and its run record list only the gates, and the profile page
+names the features left out; a direct launch that asks for a preview feature
+on a WorkBuddy suite is refused. A WorkBuddy checkout whose installed overlay
+differs from this checkout's refuses a run with features until
+`install_overlay` reinstalls it. The paid launch gate (`scripts/eval/workbuddy/launch_gate.py`)
+refuses a job carrying `METACODES_TEST_INTEGRITY`, `METACODES_DELIVERY_CADENCE`
+or `METACODES_STALL_GATE`, which its receipt's `evaluation_treatment` does not record. The frozen bundle has to know the flags: a release older
 than a feature fails its trials with a usage error. An SSH executor's node
 loads the adapter from its own checkout, so the node protocol is 2 since
-features (4 since teamwork, 7 since model prices): an older node is refused until
+features (4 since teamwork, 7 since model prices, 9 since WorkBuddy gates): an older node is refused until
 `metacodes bench setup --executor <name>` updates it, instead of running the
 trials without the chosen flags.
 
@@ -1255,10 +1279,12 @@ of its queue. A dataset whose SSH executor does not answer when it is due
 stays pending, with the reason in its `waiting` field, and is retried until the executor
 answers. After 30 minutes it fails, and the queue moves on.
 
-While a profile runs, its concurrency can be changed (`POST /api/profile/concurrency`
-with `id` and `concurrency`, any positive integer; 并发数 on its page). A suite's
-`max_concurrency`, when set, caps it. The value applies to the running dataset
-at once and to the datasets still waiting in the queue. Lowering it lets the trials already running finish;
+A profile's concurrency is set on its page (并发数; `POST /api/profile/concurrency`
+with `id` and `concurrency`, any positive integer), running or not; `POST
+/api/profiles/run` does not take one. A suite's `max_concurrency`, when set,
+caps it. The value applies to the running dataset at once, to the datasets
+still waiting in the queue and to every one queued later, reruns included. A
+profile saved before it had a concurrency uses its latest dataset's. Lowering it lets the trials already running finish;
 raising it starts more within about a second. The workbench writes the value
 to `<jobs>/.bench-runs/<run>.concurrency`; on an SSH executor the worker sends
 it over the run's control channel and the node writes it beside the run's
@@ -1271,10 +1297,18 @@ A rerun replaces the earlier result: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the
 replaced runs as the task's history. A run that stopped (cancelled,
 interrupted or failed) with only invalid attempts of a task leaves that
-task's earlier result in place. 再次运行 and 重跑未通过的题 use one model: the
+task's earlier result in place. 再次运行 and 重跑无效的题 use one model: the
 page's model filter, else the last run's. The profile page's 再次运行 opens the 评测
 page on that profile with its datasets, tasks and last parameters, and
-重跑未通过的题 keeps only the tasks whose latest attempts did not all pass.
+重跑无效的题 keeps only the tasks whose latest attempts include an invalid one
+(an infrastructure failure such as a network error, not a failed answer).
+With 自动重跑 on (`POST /api/profile/auto-rerun` with `id` and `enabled`,
+the 自动重跑无效的题 checkbox on its page), a dataset that finishes with invalid
+trials is queued again at the end of the profile's queue with only those
+tasks, at most twice per dataset (the item's `auto_rerun` counts the round).
+A dataset that was stopped, cancelled or failed is not rerun automatically;
+when its results cannot be read, the item records why (`auto_rerun_error`)
+and the queue goes on.
 A profile can be renamed at any time (`POST /api/profile/rename` with `id`
 and `name`, 重命名 on its page; an empty name falls back to the id).
 Deleting a profile whose queue has ended (`POST /api/profile/delete`, 删除评测配置

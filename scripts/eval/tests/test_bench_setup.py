@@ -641,15 +641,18 @@ class ExecutorConfigTest(unittest.TestCase):
 
     def test_container_mirrors_are_validated_and_become_the_compose_overlay(self):
         base = {"name": "relay", "kind": "ssh", "host": "h"}
-        for bad in ({"apt": "https://mirrors.aliyun.com"}, {"hf": "https://hf-mirror.com"},
-                    {"pypi": "file:///simple"}, ["pypi"]):
+        for bad in ({"apt": "https://mirrors.aliyun.com"}, {"docker": "https://docker.m.daocloud.io"},
+                    {"pypi": "file:///simple"}, ["pypi"], {"pypi": "https://gh-proxy.com/https://pypi.org/simple"},
+                    {"github": "https://gh-proxy.com/https://github.com; rm -rf /"},
+                    {"github": "https://gh-proxy.com/ftp://github.com"}, {"hf": "hf-mirror.com"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 executors.parse({**base, "container_mirrors": bad})
         with self.assertRaises(ValueError):
             executors.parse({**base, "egress": "workbench", "container_mirrors": {"apt": "http://mirrors.aliyun.com"}})
         self.assertIsNone(executors.parse(base).compose_overlay())
         mirrors = {"pypi": "https://mirrors.aliyun.com/pypi/simple/", "conda": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/",
-                   "go": "https://goproxy.cn", "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com"}
+                   "go": "https://goproxy.cn", "rustup": "https://rsproxy.cn", "npm": "https://registry.npmmirror.com",
+                   "github": "https://gh-proxy.com/https://github.com/", "hf": "https://hf-mirror.com"}
         relay = executors.parse({**base, "egress": "workbench", "container_mirrors": mirrors})
         self.assertEqual(executors.parse(relay.spec()), relay)
         self.assertEqual(relay.compose_overlay(), {"services": {"main": {"environment": {
@@ -660,12 +663,16 @@ class ExecutorConfigTest(unittest.TestCase):
                                       "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r",
             "GOPROXY": "https://goproxy.cn,direct",
             "RUSTUP_DIST_SERVER": "https://rsproxy.cn", "RUSTUP_UPDATE_ROOT": "https://rsproxy.cn/rustup",
-            "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}}}})
+            "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com",
+            "UV_INSTALLER_GITHUB_BASE_URL": "https://gh-proxy.com/https://github.com",
+            "UV_PYTHON_INSTALL_MIRROR": "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone"
+                                        "/releases/download",
+            "HF_ENDPOINT": "https://hf-mirror.com"}}}})
 
     def test_mirror_settings_a_task_sets_itself_are_left_out(self):
         relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
             "apt": "http://mirrors.aliyun.com", "pypi": "https://mirrors.aliyun.com/pypi/simple/",
-            "go": "https://goproxy.cn"}})
+            "go": "https://goproxy.cn", "github": "https://github.example", "hf": "https://hf-mirror.com"}})
         mirrors = dict(relay.container_mirrors)
         with tempfile.TemporaryDirectory() as tmp:
             dataset = Path(tmp)
@@ -677,12 +684,19 @@ class ExecutorConfigTest(unittest.TestCase):
                 "FROM debian\nRUN echo 'Acquire::http::Proxy \"http://proxy\";' > /etc/apt/apt.conf.d/01p\n")
             (dataset / "plain/tests").mkdir(parents=True)
             (dataset / "plain/tests/test.sh").write_text("export PIP_INDEX_URL=https://example.invalid\n")
+            (dataset / "own-hub").mkdir()
+            (dataset / "own-hub/task.toml").write_text('[environment.env]\nHF_ENDPOINT = "https://hub.internal"\n')
+            (dataset / "own-python/environment").mkdir(parents=True)
+            (dataset / "own-python/environment/Dockerfile").write_text(
+                "FROM debian\nENV UV_PYTHON_INSTALL_MIRROR=https://python.internal\n")
             owned = executors.task_owned_settings(dataset, mirrors)
-        self.assertEqual(owned, ["Acquire::http::Proxy", "GOPROXY"])
+        self.assertEqual(owned, ["Acquire::http::Proxy", "GOPROXY", "HF_ENDPOINT", "UV_PYTHON_INSTALL_MIRROR"])
         self.assertEqual(relay.compose_overlay(owned), {"services": {"main": {"environment": {
             "PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple/",
-            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/"}}}})
-        self.assertIsNone(relay.compose_overlay(["Acquire::http::Proxy", "GOPROXY", "PIP_INDEX_URL", "UV_DEFAULT_INDEX"]))
+            "UV_DEFAULT_INDEX": "https://mirrors.aliyun.com/pypi/simple/",
+            "UV_INSTALLER_GITHUB_BASE_URL": "https://github.example"}}}})
+        self.assertIsNone(relay.compose_overlay(owned + ["PIP_INDEX_URL", "UV_DEFAULT_INDEX",
+                                                         "UV_INSTALLER_GITHUB_BASE_URL"]))
 
     def test_apt_is_left_out_of_a_run_whose_apt_cache_does_not_answer(self):
         relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h", "container_mirrors": {
@@ -969,7 +983,9 @@ class SshRunTest(SetupFixture):
         manager, client, _ = self.prepare_remote()
         cfg = self.cfg()
         entry = next(e for e in cfg["executors"] if e["name"] == "relay-4090")
-        entry["container_mirrors"] = {"apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn"}
+        entry["container_mirrors"] = {"apt": "http://mirrors.aliyun.com", "go": "https://goproxy.cn",
+                                      "github": "https://gh-proxy.com/https://github.com",
+                                      "hf": "https://hf-mirror.com"}
         atomic_json(self.config, cfg)
         run = client.request("api/runs", self.request())
         final = wait_run(manager, run["name"])
@@ -978,8 +994,12 @@ class SshRunTest(SetupFixture):
         overlay = self.remote_home / ".metacodes-bench/runs" / run["name"] / executors.COMPOSE_OVERLAY
         self.assertEqual(argv[argv.index("--extra-docker-compose") + 1], str(overlay.resolve()))
         # Nothing answers as the apt cache here: apt keeps the task's own sources.
-        self.assertEqual(json.loads(overlay.read_text()),
-                         {"services": {"main": {"environment": {"GOPROXY": "https://goproxy.cn,direct"}}}})
+        self.assertEqual(json.loads(overlay.read_text()), {"services": {"main": {"environment": {
+            "GOPROXY": "https://goproxy.cn,direct",
+            "UV_INSTALLER_GITHUB_BASE_URL": "https://gh-proxy.com/https://github.com",
+            "UV_PYTHON_INSTALL_MIRROR": "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone"
+                                        "/releases/download",
+            "HF_ENDPOINT": "https://hf-mirror.com"}}}})
         self.assertIn("apt 缓存 http://127.0.0.1:3142 没有响应", (manager.records / (run["name"] + ".log")).read_text())
 
     def test_refreshed_tokens_reach_the_remote_relay_over_stdin_only(self):
@@ -1682,6 +1702,10 @@ class SuiteOnExecutorTest(SetupFixture):
         local = manager.jobs_dir / run["name"]
         observed = json.loads((local / "observed.json").read_text())
         self.assertEqual(Path(observed["cwd"]).resolve(), repo.resolve())
+        self.assertEqual(final["features"], run["features"])
+        self.assertEqual({key: value for key, value in observed["job"]["harness_params_override"].items()
+                          if key != "METACODES_REASONING_EFFORT"},
+                         {wb_suite.FEATURE_PARAMS[name]: True for name in run["features"]})
         # WorkBuddy holds a placeholder and talks to the node's loopback relay.
         self.assertTrue(observed["key"].startswith("mcb-"), observed["key"])
         self.assertTrue(observed["base_url"].startswith("http://127.0.0.1:"), observed["base_url"])
@@ -1833,6 +1857,23 @@ class SuiteOnExecutorTest(SetupFixture):
         self.assertEqual(final["status"], "failed", final)
         self.assertIn("启动失败", final["error"])
         self.assertNotIn("SSH 连接中断", final["error"])
+        self.assertEqual(list((repo / "configs").rglob("metacodes-" + run["name"] + "*")), [])
+
+    def test_a_stale_node_overlay_refuses_a_workbuddy_run_with_gates(self):
+        from scripts.eval.harbor.suites import workbuddy as wb_suite
+        from scripts.eval.tests.test_bench_suites import workbuddy_checkout
+        manager, client, _ = self.prepare_remote()
+        uv = self.remote_home / ".local/bin/uv"
+        uv.write_text("#!/bin/sh\nexit 0\n")
+        uv.chmod(0o755)
+        repo = self.node_checkout(workbuddy_checkout)
+        (repo / wb_suite.AGENT).write_text("# an older overlay\n")
+        run = client.request("api/runs", {"suite": "workbuddy-code", "model": "metask/session-model",
+                                          "tasks": ["bug_fix-easy-alpha"], "executor": "relay-4090",
+                                          "features": ["stall_gate"]})
+        final = wait_run(manager, run["name"], timeout=60)
+        self.assertEqual(final["status"], "failed", final)
+        self.assertIn("install_overlay", final["error"])
         self.assertEqual(list((repo / "configs").rglob("metacodes-" + run["name"] + "*")), [])
 
     def test_registry_suite_runs_on_ssh_executor_into_the_store(self):
@@ -2402,6 +2443,7 @@ class EgressRunTest(SetupFixture):
         self.assertEqual([c for c in self.calls("ssh") if "-R" in c[1] and " node run " not in c[1][-1]], [])
         local = manager.jobs_dir / run["name"]
         harbor_env = json.loads((local / "harbor-env.json").read_text())
+        self.assertEqual(harbor_env["TZ"], "UTC")
         docker_config = Path(harbor_env["DOCKER_CONFIG"])
         self.assertEqual(docker_config.parent, (self.remote_home / ".metacodes-bench/runs" / run["name"]).resolve())
         self.assertFalse(docker_config.exists())  # removed after the run
@@ -2430,7 +2472,7 @@ class EgressRunTest(SetupFixture):
         manager, client, _ = self.prepare_remote(profile=True)
         self.harbor_local_suite()
         self.egress_executor(egress="workbench")
-        release = self.root / "release"
+        release = self.root / "harbor-release"
         os.environ.update(FAKE_EGRESS_FETCH="1", FAKE_LATE_TRAFFIC="1", FAKE_BENCH_RELEASE_FILE=str(release))
         run = client.request("api/runs", {"suite": "humaneval", "model": "metask/session-model",
                                           "tasks": ["humaneval-7"], "executor": "relay-4090"})

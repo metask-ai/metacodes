@@ -2,12 +2,12 @@
 
 Status: implemented contract. Normative for every Host that carries a Session
 across a process or network boundary: the bundled `--web`/`serve` HTTP
-surface (`src/web/`), `SessionHost` behind an embedder's transport
+surface (`apps/cli/src/web/`), `SessionHost` behind an embedder's transport
 (`src/core/session_host.zig`), and any Host in another language. The
 encoder and parser are `src/core/protocol/wire.zig`; routing by declared
 capabilities is `src/core/protocol/frontend_capabilities.zig`. Conformance
 vectors: `tests/fixtures/wire/v1`. Evidence that a declaration changes what a
-frontend is asked: `tests/component/frontend_capabilities_test.zig` (HTTP
+frontend is asked: `apps/cli/tests/component/frontend_capabilities_test.zig` (HTTP
 surface and `SessionHost`) and `tests/e2e/frontend_capabilities_e2e.py` (the
 installed `serve` with a second-process frontend).
 [API.md](API.md#wire-lines-for-out-of-process-hosts) summarizes the same
@@ -53,7 +53,7 @@ carries `by` only when the answer it closed on named someone (§1.5).
 A Host journals these lines and nothing else. The bundled `--web`/`serve`
 host writes every journal line through `wire.zig`, its host events and
 `session_lifecycle` included (#444). Two tests refuse any line that is not
-one of these: `tests/component/web_message_config_test.zig` reads a whole
+one of these: `apps/cli/tests/component/web_message_config_test.zig` reads a whole
 session journal of both drivers through a Run with a permission prompt, and
 the wire leg of `tests/e2e/daemon_serve_multi_e2e.sh` does the same for the
 installed `serve`'s SSE stream and UDS attachment.
@@ -486,7 +486,7 @@ UDS is a full UI frontend: it carries answers too. `{"op":"respond","session":
 `POST /respond` takes beside the routing fields (`{"ok":true}`; a stale or
 unknown id is `{"ok":false,"error":"no pending request with this id"}`, the 409
 of the HTTP surface), so a UDS-only frontend needs no HTTP side channel.
-Evidence: `tests/component/serve_sessions_test.zig` (the `uds respond` /
+Evidence: `apps/cli/tests/component/serve_sessions_test.zig` (the `uds respond` /
 `uds capabilities` cases) and the UDS leg of
 `tests/e2e/daemon_serve_multi_e2e.sh`.
 

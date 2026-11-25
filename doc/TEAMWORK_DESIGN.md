@@ -513,7 +513,7 @@ Windows 上 teamwork 不启动:`teamwork run`/`resume`/`mcp`、REPL `/teamwork` 
 `teamwork_runtime`、`teamwork_swe_loop`、`teamwork_audit`、`teamwork_merge_back`、
 `teamwork_verifier_auditor`、`teamwork_mcp_server`、`teamwork_progress`、`teamwork_interview` 与 `teamwork_judge`
 (与 swarm 子系统相同的方式);`stub_driver.zig` 与 `drivers/drivers_test.zig` 只由测试引用。单元测试同时进入
-`zig build test:units`(`src/main.zig` 的测试根)与 `zig build test:lib`。
+`zig build test:units`(`apps/cli/src/main.zig` 的测试根)与 `zig build test:lib`。
 
 ## 9. 不做
 

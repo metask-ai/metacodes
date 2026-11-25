@@ -38,12 +38,12 @@ These rules apply to the entire repository.
   `std.Thread.spawn`: std's 16 MiB default stack is a 16 MiB commit per thread
   on Windows. Pick the `Stack` class by what the thread runs; outside test
   blocks `zig build test:thread-stack` enforces it.
-- The REPL's SIGWINCH handler has no SA_RESTART either. In `src/repl/`, read
+- The REPL's SIGWINCH handler has no SA_RESTART either. In `apps/cli/src/repl/`, read
   keys through `input.readKey` or check `input.retryInterruptedRead` right
   after a raw read, and write to the terminal through `pfs.writeAll`; a call
   that cannot see EINTR says `// no EINTR: <reason>` on its line
   (`zig build test:terminal-io` enforces it).
-- The TUI's scrollback has no undo: in `src/repl/`, only the Renderer
+- The TUI's scrollback has no undo: in `apps/cli/src/repl/`, only the Renderer
   (`RenderRegion`) erases the screen or writes past the inline region. Erase
   with ED 0, reset the screen only through `RenderRegion.resetScreen`, climb
   with relative moves instead of saving the cursor, and send scrollback text
@@ -76,6 +76,61 @@ These rules apply to the entire repository.
   code they describe changes; then correct or delete them.
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
+- Packages depend downward only. `layers.zon` declares the packages from the
+  lowest (`base`) to the highest (`cli`, then `testing` and `tests`) and
+  assigns every `.zig` file under `src/` and `tests/` to one of them by path.
+  A package's `allowed_dependencies` lists the packages it may import, never
+  the ones that import it, and names only packages declared before it. A new
+  file belongs to a package before it lands. `zig build layer:check` holds
+  every `@import` to those lists from the file that writes it, test blocks
+  and named modules included, and every `build.zig` module import too, and
+  finds package cycles, deep imports into another package's files and module
+  roots wide enough to reach packages they may not depend on.
+  `layer_baseline.zon` records today's violations file edge by file edge and
+  only shrinks: a new violation fails, and so does an entry whose violation
+  is gone, so delete it in the change that removes it (`zig build
+  layer:baseline` prints the baseline that matches the tree). The kernel's
+  `kernel_budget` (lines and the packages it reaches) only goes down. CI
+  checks the PR against its base (`zig build layer:check -Dlayer-base=<ref>`)
+  and fails when the baseline or the budget grows or `allowed_dependencies`
+  widen. A change to the layering itself goes in its own PR. The base
+  comparison accepts an entry a package split exposes only when the base
+  tree already had that import between two files of one package; an upward
+  entry must already be upward in the base, while a deep one may come from
+  either list. A package may start depending on a package the base lacks
+  only when that package's dependencies and its files, each already in the
+  base tree at the same path, were already within the dependent's reach. A
+  file moved since the base (a rename git detects) is compared under its base
+  path: an upward entry must have been upward there, while a deep one may also
+  be an import the base tree had inside one package. `src/lib.zig`, the
+  `metacodes-core` facade that re-exports the lower packages, is its own
+  `facade` package between `teamwork` and `agentcore`.
+- `kernel` is the counterpart of pi's `pi-agent-core` and holds only
+  `core/conversation`, `core/message`, `core/session_id` and
+  `core/result_budget`. `core/agent_loop`, `core/tool_exec` and `core/protocol/`
+  are the loop with every peripheral attached, pi's `AgentSession`, and belong
+  to `coding`, except the three protocol files `PermissionContext` is typed
+  with (`ui_event`, `ui_request`, `permission_choice`), which belong to
+  `guard`. The minimal kernel loop is extracted in migration step 3.2; until
+  then `agent_loop.Options` keeps its public shape.
+- `cli` reaches the lower packages only through the `metacodes-internal`
+  module, rooted at `src/internal.zig` (also in `facade`, and not part of
+  `metacodes-core`). Every module rooted at a `cli` file imports it, and `cli`
+  files name the file they use, `@import("metacodes-internal").core.agent_loop`,
+  never a relative path into a lower package: such an import puts one file in
+  two modules, which does not compile, and is a new deep import for
+  `layer:check`. The lower named modules (`platform`, `hl`, `code_runtime`) are
+  wired to `metacodes-internal` only, so `cli` uses `platform` as
+  `@import("metacodes-internal").platform`. `src/internal.zig` mirrors the
+  directory tree (`tools.zig` and `permission.zig` are `tools_root` and
+  `permission_root`); exporting a file it does not have yet is a new deep
+  import like any other. The base comparison accepts a deep entry from an
+  entry module when a file that now imports that module by name had an entry
+  to the same target in the base and no longer imports it directly, and a new wide
+  module root beside a base wide root of the same package and directory.
+  `subsystem:boundary` reads each use as an import of the file or module it names, and
+  counts a use that names no file (an alias) as a violation. The lower files'
+  tests run in `internal-test` (`test:units`), whose root is that module.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
   journals, timestamps, and equivalent configuration churn must not enter prompts.
 - TinyKG is a separately built external binary dependency. The repository owns one
@@ -84,6 +139,12 @@ These rules apply to the entire repository.
   sibling-checkout discovery, or stale build-output fallback.
 
 ## Preview features
+
+Preview is for new harness capability: what the agent can do or what reaches
+the model or a host (tools, prompts, protocols, run gates, Teamwork). A
+user-experience change to the CLI or TUI, such as input, rendering, terminal
+integration or copy and paste, is not a preview feature: it ships enabled,
+without a switch.
 
 Every preview feature has its own switch; there is no umbrella flag to hide a
 new feature behind. Users pick features one by one with
@@ -108,11 +169,11 @@ all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
 - Prove independence with an L2 test: `--preview=<name>` enables it,
   `--preview=<another feature>` and `--no-preview=<name>` leave it off, and a
   saved `{"preview": {"<name>": true}}` enables it
-  (`tests/component/state_env_test.zig` shows the pattern for the CLI).
+  (`apps/cli/tests/component/state_env_test.zig` shows the pattern for the CLI).
 - Document it in the same change: the feature table in
   [doc/API.md](doc/API.md#preview-features), the feature list in
   [doc/LOCAL_CONFIG.md](doc/LOCAL_CONFIG.md#preview-features), the `--preview`
-  help text in `src/main.zig`, and `CHANGELOG.md`.
+  help text in `apps/cli/src/main.zig`, and `CHANGELOG.md`.
 - The AgentCore ABI has no per-feature selection: `RuntimeConfigV1.preview = 1`
   enables every feature. Adding one there is an ABI revision.
 
@@ -175,7 +236,7 @@ Before submitting:
 zig build gate:static
 python3 scripts/lint.py
 zig build test:lib -Doptimize=ReleaseSafe
-zig build test
+zig build test:affected
 scripts/test_coverage_audit.sh
 python3 scripts/check_doc_links.py
 python3 scripts/check_doc_facts.py
@@ -183,16 +244,21 @@ git diff --check
 ```
 
 `zig build gate:static` runs only the guards that read the source:
-`zig fmt --check build.zig src tests`, the scans of `http-status:gate` and
-`subsystem:boundary` (their self-tests run in `test:units`), the
+`zig fmt --check build.zig src apps tests`, the scans of `http-status:gate`,
+`subsystem:boundary` and `layer:check` (their self-tests run in `test:units`), the
 `scripts/tests/test_*_discipline.py` scans and `git diff --check`. It takes seconds, and it comes first because the build
 runner has no fail-fast: inside the full gate a failed guard is reported
 only when everything else has finished (#587). Every CI gate leg runs it
 first too.
 
-`zig build gate:pr` runs this list: the core suite always in ReleaseSafe, the
-full suite at `-Doptimize` (Debug by default). CI runs the same commands (the
-full suite in Debug, the core suite in ReleaseSafe;
+`zig build test:affected` runs the part of `zig build test` that CI selects
+for the change against `origin/main`, working tree included
+(`scripts/ci_scope.py`, `doc/CI_DESIGN.md` §2): all of it for most changes,
+less when only tests or packages `layers.zon` trusts changed. The full suite
+is left to CI's full runs and main's nightly run. `zig build gate:pr` runs
+this list with the full suite in place of `test:affected`: the core suite
+always in ReleaseSafe, the full suite at `-Doptimize` (Debug by default). CI
+runs the same commands (the full suite in Debug, the core suite in ReleaseSafe;
 `scripts/tests/test_gate_manifest.py` asserts every command above has a CI
 step), so this block is the single source. CI runs the full suite as its
 three parts, `zig build test:units`, `test:integration` and `test:product`, on
@@ -202,8 +268,9 @@ goes into one of them, and a new CI step names its leg (`doc/CI_DESIGN.md`
 reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
 whose complete CI coverage passed: it takes the CI fast path
 (`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,
-or to documentation and the evaluation harness, skips the CI suites it cannot
-affect (`scripts/ci_scope.py`). CI runs once per PR revision on Linux x86_64,
+to documentation and the evaluation harness, to tests, or to packages whose
+`layer_baseline.zon` entries are gone, skips the CI suites it cannot affect
+(`scripts/ci_scope.py`). CI runs once per PR revision, and again when its labels change, on Linux x86_64,
 macOS ARM64 and Windows x86_64; main pushes do not repeat it. Linux ARM64,
 Intel macOS and Windows ARM64 cross-build checks run in the release workflow
 (`doc/CI_DESIGN.md` §3); keep lightweight target-contract fixtures in PR CI.

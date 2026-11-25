@@ -1,11 +1,13 @@
 //! 流中途错误的名字约定 L2(api/stream.zig `midStreamReadError`):四条 wire 上
 //!   - `RequestFailed` **只**表示连接在流中途断了;
 //!   - 服务端在流里声明的失败一律是 `ApiError`(Anthropic 错误帧、OpenAI chat 兼容端与 Gemini 的
-//!     顶层 `error` 对象、Responses 的 `response.failed`),并写"API 错误帧"现场;
+//!     顶层 `error` 对象、Responses 的 `response.failed`),并写"API 错误帧"现场;过载除外,它是
+//!     `ServiceUnavailable`,与 HTTP 503/529 同名;
 //! 以及它对 agent_loop 每个请求自带的那次重发(`STREAM_RETRIES_PER_REQUEST`,#461)的后果,TUI 默认(不配重试):
 //!   ① 服务端报错、零可见输出 → 不重发,api_error(答复不能被重发盖掉);
 //!   ② 断连、零可见输出 → 句柄上是 RequestFailed;run 同轮重发一次 → end_turn;
 //!   ③ 断连、已流出可见文本 → 同样重发一次(半截以 discarded 撤回)→ end_turn。
+//!   ⑤ 过载、零可见输出 → 按 provider 的重试次数和退避重发,用完后 api_error,现场写明重试次数。
 //!
 //! 2026-10-24 之前:Responses 的 `response.failed` 也报 RequestFailed,与 Anthropic 的断连同名,
 //! 所以零产出重发只敢覆盖 stall 与没收尾的流;OpenAI chat / Gemini 的错误 chunk 被当空 chunk
@@ -364,5 +366,267 @@ test "L2 stream errors ④: an over-long SSE line is StreamTooLong, not RequestF
     const result = try runOneTurn(a, client_run.provider());
     try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 1), srv_run.requestCount());
+    clearLastError();
+}
+
+// ── ⑤ an overloaded frame: ServiceUnavailable, re-sent under the provider's retry policy ──
+
+const ANTHROPIC_OVERLOADED = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+const CHAT_OVERLOADED = "data: {\"error\":{\"message\":\"Provider overloaded\",\"code\":529}}\n\n";
+const RESPONSES_OVERLOADED =
+    "event: response.failed\n" ++
+    "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_2\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded.\"}}}\n\n";
+const GEMINI_OVERLOADED = "data: {\"error\":{\"code\":503,\"message\":\"The model is overloaded. Please try again later.\",\"status\":\"UNAVAILABLE\"}}\n\n";
+
+fn overloadedBeforeText(comptime wire: Wire) []const u8 {
+    return comptime opening(wire) ++ switch (wire) {
+        .anthropic => ANTHROPIC_OVERLOADED,
+        .openai_chat => CHAT_OVERLOADED,
+        .openai_responses => RESPONSES_OVERLOADED,
+        .gemini => GEMINI_OVERLOADED,
+    };
+}
+
+const MaxRetries = struct {
+    previous: ?[:0]u8,
+
+    fn set(value: [*:0]const u8) !MaxRetries {
+        const previous = if (std.c.getenv("CLAUDE_CODE_MAX_RETRIES")) |raw| try std.testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+        @import("platform").paths.setEnv("CLAUDE_CODE_MAX_RETRIES", value);
+        return .{ .previous = previous };
+    }
+
+    fn restore(self: *MaxRetries) void {
+        if (self.previous) |previous| {
+            @import("platform").paths.setEnv("CLAUDE_CODE_MAX_RETRIES", previous.ptr);
+            std.testing.allocator.free(previous);
+        } else {
+            @import("platform").paths.unsetEnv("CLAUDE_CODE_MAX_RETRIES");
+        }
+    }
+};
+
+const Overloaded = struct {
+    fn handle(_: std.mem.Allocator, provider: cc.api_provider.Provider) anyerror!void {
+        try std.testing.expectEqual(@as(?anyerror, error.ServiceUnavailable), try drainError(provider));
+        clearLastError();
+    }
+    fn recovers(a: std.mem.Allocator, provider: cc.api_provider.Provider) anyerror!void {
+        clearLastError();
+        const result = try runOneTurn(a, provider);
+        try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+        clearLastError();
+    }
+    fn exhausts(a: std.mem.Allocator, provider: cc.api_provider.Provider) anyerror!void {
+        clearLastError();
+        const result = try runOneTurn(a, provider);
+        try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+        var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+        const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+        try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+        try std.testing.expect(std.mem.indexOf(u8, detail, "overloaded") != null);
+    }
+};
+
+fn overloadedResent(comptime wire: Wire) !void {
+    const a = std.testing.allocator;
+    var retries = try MaxRetries.set("2");
+    defer retries.restore();
+    {
+        var srv = try harness.MockServer.startCassette(&[_][]const u8{overloadedBeforeText(wire)}, 0);
+        defer srv.stop();
+        const url = try srv.urlOwned(a);
+        defer a.free(url);
+        try withProvider(wire, a, url, Overloaded.handle);
+    }
+    {
+        const bodies = [_][]const u8{ overloadedBeforeText(wire), complete(wire) };
+        var srv = try harness.MockServer.startCassette(&bodies, 0);
+        defer srv.stop();
+        const url = try srv.urlOwned(a);
+        defer a.free(url);
+        try withProvider(wire, a, url, Overloaded.recovers);
+        try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    }
+    const bodies = [_][]const u8{ overloadedBeforeText(wire), overloadedBeforeText(wire), complete(wire) };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    try withProvider(wire, a, url, Overloaded.exhausts);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+}
+
+test "L2 stream errors ⑤: an overloaded frame is ServiceUnavailable on every wire, re-sent until the provider's attempts run out" {
+    inline for (ALL_WIRES) |wire| overloadedResent(wire) catch |err| {
+        std.debug.print("wire {s} failed\n", .{@tagName(wire)});
+        return err;
+    };
+}
+
+fn runOneTurnWith(a: std.mem.Allocator, provider: cc.api_provider.Provider, be: *const cc.ui_backend.UiBackend, max_stream_turn_retries: u8, abort: ?*cc.util_abort.AbortSignal) !cc.agent_loop.RunResult {
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    const defs: []const cc.json_mod.ToolDefinition = &.{};
+    return cc.agent_loop.run(&conv, provider, defs, &perm, .{
+        .max_turns = 1,
+        .auto_compact_threshold = std.math.maxInt(usize),
+        .max_stream_turn_retries = max_stream_turn_retries,
+        .abort = abort,
+    }, be, a);
+}
+
+const HEADLESS_STREAM_RETRIES = 2;
+
+const RetryNotices = struct {
+    delays: [8]u64 = undefined,
+    attempts: [8]u32 = undefined,
+    maxes: [8]u32 = undefined,
+    len: usize = 0,
+    abort_on_notice: ?*cc.util_abort.AbortSignal = null,
+
+    fn emit(ctx: *anyopaque, _: cc.session_id.SessionId, ev: cc.ui_event.CoreEvent) void {
+        const self: *RetryNotices = @ptrCast(@alignCast(ctx));
+        switch (ev) {
+            .retry_notice => |r| {
+                if (self.len < self.delays.len) {
+                    self.delays[self.len] = r.delay_ms;
+                    self.attempts[self.len] = r.attempt;
+                    self.maxes[self.len] = r.max;
+                    self.len += 1;
+                }
+                if (self.abort_on_notice) |signal| signal.abort(.user_interrupt);
+            },
+            else => {},
+        }
+    }
+
+    fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
+        return null;
+    }
+
+    fn backend(self: *RetryNotices) cc.ui_backend.UiBackend {
+        return .{ .ctx = @ptrCast(self), .emit = emit, .poll = poll };
+    }
+};
+
+fn anthropicRun(url: []const u8, notices: *RetryNotices, max_stream_turn_retries: u8, abort: ?*cc.util_abort.AbortSignal) !cc.agent_loop.RunResult {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
+    defer client.deinit();
+    const be = notices.backend();
+    return runOneTurnWith(a, client.provider(), &be, max_stream_turn_retries, abort);
+}
+
+test "L2 stream errors ⑤: exhausted overload retries do not fall through to the headless Run allowance" {
+    const a = std.testing.allocator;
+    var retries = try MaxRetries.set("2");
+    defer retries.restore();
+    const overloaded = overloadedBeforeText(.anthropic);
+    const bodies = [_][]const u8{ overloaded, overloaded, overloaded, overloaded, complete(.anthropic) };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, HEADLESS_STREAM_RETRIES, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+}
+
+test "L2 stream errors ⑤: an overload after a tool call started is not re-sent, even under the headless Run allowance" {
+    const a = std.testing.allocator;
+    const tool_then_overload = ANTHROPIC_START ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Glob\",\"input\":{}}}\n\n" ++
+        ANTHROPIC_OVERLOADED;
+    const bodies = [_][]const u8{ tool_then_overload, complete(.anthropic) };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, HEADLESS_STREAM_RETRIES, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    clearLastError();
+}
+
+test "L2 stream errors ⑤: an HTTP 529 and an in-stream overload share one attempt limit" {
+    const a = std.testing.allocator;
+    var retries = try MaxRetries.set("2");
+    defer retries.restore();
+    const bodies = [_][]const u8{
+        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+        overloadedBeforeText(.anthropic),
+        complete(.anthropic),
+    };
+    var srv = try harness.MockServer.startHttpCassette(&bodies, &.{ "HTTP/1.1 529 Overloaded", "HTTP/1.1 200 OK", "HTTP/1.1 200 OK" });
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, 0, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+}
+
+test "L2 stream errors ⑤: an in-stream overload waits the Retry-After of its response head" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{ overloadedBeforeText(.anthropic), complete(.anthropic) };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    srv.extra_response_headers = "retry-after: 30\r\n";
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var signal = cc.util_abort.AbortSignal.init();
+    var notices = RetryNotices{ .abort_on_notice = &signal };
+    const result = try anthropicRun(url, &notices, 0, &signal);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqual(@as(u64, 30_000), notices.delays[0]);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    clearLastError();
+}
+
+test "L2 stream errors ⑤: an HTTP 529 after an in-stream overload continues the attempt count and the backoff" {
+    const a = std.testing.allocator;
+    var retries = try MaxRetries.set("3");
+    defer retries.restore();
+    const bodies = [_][]const u8{
+        overloadedBeforeText(.anthropic),
+        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+        complete(.anthropic),
+    };
+    var srv = try harness.MockServer.startHttpCassette(&bodies, &.{ "HTTP/1.1 200 OK", "HTTP/1.1 529 Overloaded", "HTTP/1.1 200 OK" });
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    clearLastError();
+    var notices = RetryNotices{};
+    const result = try anthropicRun(url, &notices, 0, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), notices.len);
+    try std.testing.expectEqual(@as(u32, 1), notices.attempts[0]);
+    try std.testing.expectEqual(@as(u32, 3), notices.maxes[0]);
+    try std.testing.expect(notices.delays[0] >= 500 and notices.delays[0] <= 625);
+    try std.testing.expectEqual(@as(u32, 2), notices.attempts[1]);
+    try std.testing.expectEqual(@as(u32, 3), notices.maxes[1]);
+    try std.testing.expect(notices.delays[1] >= 1000 and notices.delays[1] <= 1250);
     clearLastError();
 }

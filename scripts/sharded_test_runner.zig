@@ -7,6 +7,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const test_id_record = @import("test_id_record.zig");
 
 const shard_count_env = "METACODES_TEST_SHARD_COUNT";
 const shard_index_env = "METACODES_TEST_SHARD_INDEX";
@@ -80,6 +81,15 @@ fn stableEnviron(environ: std.process.Environ) std.process.Environ {
     return .{ .block = .{ .slice = copy } };
 }
 
+fn openTestIds(record: *test_id_record.Record, buffer: []u8, io: std.Io, environ: std.process.Environ, args: std.process.Args, shard: ShardConfig) bool {
+    const dir_path = test_id_record.dirFromEnviron(environ) orelse return false;
+    const allocator = std.heap.page_allocator;
+    const argv = args.toSlice(allocator) catch @panic("cannot read the test binary path");
+    const suffix = std.fmt.allocPrint(allocator, "-{}of{}", .{ shard.index, shard.count }) catch @panic("OOM");
+    test_id_record.open(record, buffer, io, environ, dir_path, argv[0], suffix);
+    return true;
+}
+
 fn elapsedMs(elapsed_ns: u64) f64 {
     return @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
 }
@@ -99,6 +109,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), runner_io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
+    var test_ids: test_id_record.Record = undefined;
+    var test_ids_buffer: [4096]u8 = undefined;
+    const recording = openTestIds(&test_ids, &test_ids_buffer, runner_io, environ, init.args, shard);
 
     var selected_total: usize = 0;
     var all_fingerprint: Fingerprint = .{};
@@ -163,6 +176,11 @@ pub fn main(init: std.process.Init.Minimal) void {
             );
         }
 
+        if (recording) test_ids.write(if (result) |_| .pass else |err| switch (err) {
+            error.SkipZigTest => .skip,
+            else => .fail,
+        }, test_fn.name);
+
         if (result) |_| {
             passed = std.math.add(usize, passed, 1) catch
                 @panic("passed test count overflow");
@@ -192,6 +210,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .{ shard.index, shard.count, selected_total, passed, skipped, failed, leaked, elapsedMs(total_ns), partition, selected_fingerprint.xor, selected_fingerprint.sum },
     ) catch @panic("failed to write test shard summary");
     stdout.flush() catch @panic("failed to flush test shard summary");
+    if (recording) test_ids.close(runner_io);
     if (failed != 0 or leaked != 0) std.process.exit(1);
 }
 

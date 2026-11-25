@@ -10,7 +10,7 @@
 #   scripts/install.sh --dev --uninstall       # remove what --dev installed from this checkout
 #
 # The install itself is `bin/metacodes install` inside the release unit
-# (src/app/install.zig), the same code on every platform; this script only
+# (apps/cli/src/app/install.zig), the same code on every platform; this script only
 # obtains a unit — a published release, an archive or directory you name, or
 # one built from a checkout — and calls it (doc/INSTALL_DESIGN.md §4).
 #
@@ -82,7 +82,7 @@ json_version() { # <json file>
 
 # BEGIN version order
 # Whether version $1 precedes $2 in semantic-version order, as the installer
-# itself orders them (src/app/install.zig isOlder over std.SemanticVersion):
+# itself orders them (apps/cli/src/app/install.zig isOlder over std.SemanticVersion):
 # pre-releases before their release, build metadata ignored, and a version
 # that does not parse is never older. install.ps1 Test-OlderVersion mirrors
 # it; scripts/tests/test_install_scripts.py checks both against one table.

@@ -886,6 +886,10 @@ fn statusText(status: u16) []const u8 {
 
 const testing = std.testing;
 
+test {
+    _ = identity_mod;
+}
+
 test "KgdServer: identifiers and source keys reject what the daemon would" {
     try testing.expect(identifierValid("metacodes-kgd-1.2:3_4"));
     try testing.expect(!identifierValid(""));

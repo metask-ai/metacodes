@@ -142,8 +142,12 @@ def make_handler(workbench: Workbench, public_url=None):
                     self.send_json(workbench.queue_profile(payload), 202)
                 elif path == "/api/profile/cancel" and isinstance(payload, dict):
                     self.send_json(workbench.cancel_profile(payload.get("id")))
+                elif path == "/api/profile/item" and isinstance(payload, dict):
+                    self.send_json(workbench.profile_item(payload.get("id"), payload.get("index"), payload.get("action")))
                 elif path == "/api/profile/concurrency" and isinstance(payload, dict):
                     self.send_json(workbench.set_profile_concurrency(payload.get("id"), payload.get("concurrency")))
+                elif path == "/api/profile/auto-rerun" and isinstance(payload, dict):
+                    self.send_json(workbench.set_profile_auto_rerun(payload.get("id"), payload.get("enabled")))
                 elif path == "/api/profile/rename" and isinstance(payload, dict):
                     self.send_json(workbench.rename_profile(payload.get("id"), payload.get("name")))
                 elif path == "/api/profile/delete" and isinstance(payload, dict):
