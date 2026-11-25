@@ -26,7 +26,7 @@ Scopes, narrowest first:
 - `tests`: every changed path is documentation, the evaluation harness or
   a test: `scripts/tests/test_*.py` (a suite build.zig names runs in
   test:units, on Windows too; `script_tests` names the others),
-  `tests/tty/**` (`tty=true`), or another file of the `tests` package in
+  `tests/tty/cases/**` (`tty=true`), or another file of the `tests` package in
   layers.zon, which may be a fixture both suites read (`units`, `product`
   and `tty` run). The gate legs run their checks; a suite no changed test
   belongs to reports success without running.
@@ -62,6 +62,7 @@ import argparse
 import html
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -89,6 +90,9 @@ TEST_PACKAGES = ("testing", TESTS_PACKAGE)
 TEST_STEP = re.compile(r'\bb\.step\(\s*"(test:[\w-]+)"')
 BUILD_SCRIPT_SUITE = re.compile(r'"(scripts\.tests\.test_\w+)"')
 MIGRATION_LABEL = "migration"
+MODEL_EVAL_PATHS = ("src/core/", "src/provider/", "src/api/", "packages/kernel/", "packages/ai/")
+CORE_E2E_SUITE = "evals/suites/core-e2e.json"
+MODEL_EVAL_FILES = {"src/client.zig", "src/types.zig", "src/ai.zig", CORE_E2E_SUITE}
 SHOWN = 5
 
 
@@ -253,7 +257,7 @@ def path_kind(path: str, layout: Optional[Layout], release_sources: Sequence[str
     if layout.package(path) is not None:
         return "package"
     if layout.owner(path) == TESTS_PACKAGE:
-        return "tty-test" if path.startswith(TTY_TESTS) else "suite-test"
+        return "tty-test" if path.startswith(TTY_TESTS + "cases/") else "suite-test"
     return "full"
 
 
@@ -299,18 +303,19 @@ class Selection:
     packages: Tuple[str, ...] = ()
     package_tests: Tuple[str, ...] = ()
     script_tests: Tuple[str, ...] = ()
+    offline_eval: bool = True
 
     @property
     def complete(self) -> bool:
         """Every Zig and script suite of `zig build test` runs, so the run's
         test IDs are comparable with a full run's (scripts/test_ids.py)."""
-        return self.units and self.product and not self.package_tests
+        return self.units and self.product and self.offline_eval and not self.package_tests
 
 
 def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout] = None,
            release_sources: Sequence[str] = RELEASE_DOCS) -> Selection:
     if scope == "docs":
-        return Selection(suites=False, tty=False, units=False, product=False)
+        return Selection(suites=False, tty=False, units=False, product=False, offline_eval=False)
     if scope == "eval":
         return Selection(suites=True, tty=False, units=True, product=True)
     if scope not in ("tests", "packages") or layout is None:
@@ -330,12 +335,62 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
         affected = layout.affected(sorted({layout.package(path) for path, kind in kinds.items() if kind == "package"}))
         package_tests = () if units else tuple(f"test:{package}" for package in affected)
         chosen = Selection(suites=True, tty=True, units=True, product=True, packages=affected, package_tests=package_tests)
+    offline_eval = chosen.product and any(
+        kind not in ("docs", "script-test", "tty-test") and not path.startswith(("apps/cli/src/repl/tui/", "apps/cli/tests/"))
+        for path, kind in kinds.items()
+    )
+    chosen = replace(chosen, offline_eval=offline_eval)
     if chosen.complete:
         return chosen
     return replace(chosen, script_tests=tuple(sorted(modules - layout.build_suites)))
 
 
 Change = Tuple[str, str]  # (git status letter, path)
+
+
+def core_eval_inputs(root: Path, candidate: Optional[str]) -> set[str]:
+    read = tree_reader(root, candidate)
+    tasks = json.loads(read(CORE_E2E_SUITE))["tasks"]
+    if not tasks:
+        raise ValueError(f"{CORE_E2E_SUITE} has no tasks")
+    inputs = set()
+    configs = set()
+    for task in tasks:
+        scenario = PurePosixPath(task["scenario"])
+        if scenario.is_absolute() or ".." in scenario.parts:
+            raise ValueError(f"invalid scenario path: {scenario}")
+        inputs.add(scenario.as_posix())
+        configs.add(scenario.with_suffix(".conf").as_posix())
+        inputs.update(task["environment"].get("fixtures", []))
+        inputs.update(check["validator"] for check in task["success"]["checks"] if check["type"] == "validator")
+    inputs.update(configs)
+    if candidate is None:
+        existing = [path for path in configs if (root / path).is_file()]
+    else:
+        paths = git_bytes(root, "ls-tree", "-z", "--name-only", candidate, "--", *sorted(configs))
+        existing = paths.decode("utf-8").split("\0")[:-1]
+    for path in existing:
+        for line in read(path).splitlines():
+            key, _, value = line.partition("#")[0].partition("=")
+            if key.strip() in {"ANSWERS", "SETTINGS", "KG_SEED"} and value.strip():
+                inputs.add((PurePosixPath("tests/e2e") / value.strip()).as_posix())
+    return {posixpath.normpath(path) for path in inputs}
+
+
+def needs_model_eval(changes: Sequence[Change], labels: Sequence[str], root: Path, candidate: Optional[str]) -> bool:
+    paths = {path for _, path in changes}
+    if "model-eval" in labels or not paths or paths & MODEL_EVAL_FILES:
+        return True
+    for path in paths:
+        file = PurePosixPath(path)
+        if file.parent.as_posix() == "tests/e2e/fixtures/agents" and file.suffix == ".md":
+            return True
+        if path.startswith(MODEL_EVAL_PATHS) and not (
+            file.name == "README.md" or path.endswith("_test.zig")
+            or path.startswith(("packages/kernel/tests/", "packages/ai/tests/"))
+        ):
+            return True
+    return bool(paths & core_eval_inputs(root, candidate))
 
 
 @dataclass(frozen=True)
@@ -425,12 +480,14 @@ def decide(
 ) -> Tuple[str, str]:
     if event not in DIFF_EVENTS:
         return "full", f"full scope: {event or 'unknown'} run"
-    if MIGRATION_LABEL in labels:
-        return "full", f"full scope: a {MIGRATION_LABEL} pull request compares the complete set of executed test IDs"
     if not base:
         return "full", f"full scope: no base for the {event} run"
     try:
         found = list(changes(base, candidate))
+        if MIGRATION_LABEL in labels:
+            return "full", f"full scope: a {MIGRATION_LABEL} pull request compares the complete set of executed test IDs"
+        if "model-eval" in labels:
+            return "full", "full scope: the model-eval label requests offline and provider-backed evaluation"
         if any(status not in ("A", "M", "D") for status, _ in found):
             return "full", "full scope: a path changed type or has an unknown Git status"
         paths = [path for _, path in found]
@@ -449,6 +506,7 @@ def decide(
 def write_summary(destination: str, event: str, base: str, candidate: str,
                   scope: str, reason: str, changes: Sequence[Change], *,
                   selection: Optional[Selection] = None,
+                  model_eval: bool = False,
                   doc_references: bool = True, release_docs: bool = True,
                   release_sources: Sequence[str] = RELEASE_DOCS,
                   layout: Optional[Layout] = None) -> None:
@@ -474,6 +532,8 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
              f"| Build, unit, integration, product, release | {run(chosen.suites)} |",
              f"| Unit and integration suites | {units if chosen.suites else 'Skip'} |",
              f"| Product suite | {run(chosen.suites and chosen.product)} |",
+             f"| Offline evaluation | {run(chosen.offline_eval)} |",
+             f"| Provider-backed comparison before merge | {'Required' if model_eval else 'Skip'} |",
              f"| Changed script suites | {cell(' '.join(chosen.script_tests)) or 'None'} |",
              f"| TTY and SDK | {run(chosen.tty)} |"]
     lines.extend(["", "| Status | Changed path | Path scope |", "|---|---|---|"])
@@ -511,7 +571,7 @@ def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: 
         steps.extend(list(selection.package_tests) or ["test:units"])
         steps.append("test:integration")
     if selection.product:
-        steps.append("test:product")
+        steps.append("test:product" if selection.offline_eval else "test:product-runtime")
     steps.append("test:contract")
     commands = [[zig, "build", *steps], *unittest]
     if selection.tty and windows:
@@ -764,6 +824,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         selection = select(scope)
     reason = " ".join(reason.split())
     print(reason)
+    try:
+        model_eval = args.event in DIFF_EVENTS and needs_model_eval(observed, args.labels.split(","), root, candidate)
+    except Exception as exc:
+        print(f"Cannot attribute core evaluation inputs: {exc}")
+        model_eval = True
+    if model_eval:
+        print("Provider-backed comparison required before merge (evals/README.md).")
 
     def flag(value: bool) -> str:
         return "true" if value else "false"
@@ -773,6 +840,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             handle.write(
                 f"scope={scope}\nsuites={flag(selection.suites)}\ntty={flag(selection.tty)}\n"
                 f"units={flag(selection.units)}\nproduct={flag(selection.product)}\n"
+                f"offline_eval={flag(selection.offline_eval)}\nmodel_eval={flag(model_eval)}\n"
                 f"packages={','.join(selection.packages)}\npackage_tests={' '.join(selection.package_tests)}\n"
                 f"script_tests={' '.join(selection.script_tests)}\ncomplete={flag(selection.complete)}\n"
                 f"reason={reason}\n"
@@ -786,7 +854,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             handle.write("\n")
     if args.github_summary:
         write_summary(args.github_summary, args.event, base, args.candidate or "(working tree)", scope, reason, observed,
-                      selection=selection, doc_references=doc_references, release_docs=release_docs,
+                      selection=selection, model_eval=model_eval, doc_references=doc_references, release_docs=release_docs,
                       release_sources=inputs.release_sources, layout=layouts[-1] if layouts else None)
     if args.run:
         return run_local(root, scope, selection, args.zig, script_suites(observed))
