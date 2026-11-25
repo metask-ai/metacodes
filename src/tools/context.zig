@@ -28,20 +28,8 @@ pub const ReplayDeclaration = @import("../core/execution_effect.zig").ReplayDecl
 /// Shared recursion ceiling for every child-agent/fork mechanism.
 pub const MAX_AGENT_DEPTH: u8 = 3;
 
-/// AskUserQuestion 的结构化输入(解析+校验在 ask_user.zig 做,渲染在 dialog/ask_question.zig)。
-/// 放在中性的 context 层:所有工具已 import 它,避免 ask_user.zig ↔ tui dialog 的循环依赖。
-pub const AskOption = struct {
-    label: []const u8,
-    description: []const u8,
-    /// 单选 preview 内容(ASCII/markdown mockup),空=无。选中时右侧 side-by-side 框展示。
-    preview: []const u8 = "",
-};
-pub const AskQuestion = struct {
-    question: []const u8,
-    header: []const u8,
-    multi: bool,
-    options: []const AskOption,
-};
+pub const AskOption = @import("../core/protocol/ui_request.zig").AskOption;
+pub const AskQuestion = @import("../core/protocol/ui_request.zig").AskQuestion;
 
 /// L3 挂起:一个待异步前端处理的 custom UI 请求(工具填 ToolContext.pending_request,
 /// runJob → Slot.pending_payload,agent_loop emit ui_request_pending)。纯数据,可序列化落盘
