@@ -9,6 +9,7 @@ pub const PreviewFeature = enum {
     execute_code,
     teamwork,
     comment_guard,
+    background_watchdog,
     monitor_events,
 
     pub fn parse(name: []const u8) ?PreviewFeature {
@@ -20,8 +21,9 @@ pub const PreviewFeatures = packed struct(u8) {
     execute_code: bool = false,
     teamwork: bool = false,
     comment_guard: bool = false,
+    background_watchdog: bool = false,
     monitor_events: bool = false,
-    _unused: u4 = 0,
+    _unused: u3 = 0,
 
     comptime {
         for (@typeInfo(PreviewFeatures).@"struct".fields) |field| {

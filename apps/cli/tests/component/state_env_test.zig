@@ -271,6 +271,49 @@ test "preview: CLI flags and persisted config change the actual provider tool me
     }
 }
 
+test "preview: background_watchdog is selected by its own switch and reaches the Bash description" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const scenarios = [_]struct { saved: ?[]const u8 = null, flags: []const []const u8 = &.{}, watchdog: bool = false }{
+        .{},
+        .{ .flags = &.{"--preview=background_watchdog"}, .watchdog = true },
+        .{ .flags = &.{"--preview=execute_code"} },
+        .{ .flags = &.{"--preview=execute_code,teamwork,comment_guard"} },
+        .{ .flags = &.{ "--preview", "--no-preview=background_watchdog" } },
+        .{ .saved = "{\"preview\":{\"background_watchdog\":true}}", .watchdog = true },
+        .{ .saved = "{\"preview\":{\"background_watchdog\":true}}", .flags = &.{"--no-preview=background_watchdog"} },
+        .{ .saved = "{\"preview\":{\"comment_guard\":true}}" },
+    };
+    var baseline: ?[]const u8 = null;
+    defer if (baseline) |owned| testing.allocator.free(owned);
+    for (scenarios) |scenario| {
+        var case: Case = undefined;
+        try case.init();
+        defer case.deinit();
+        const arena = case.arena();
+        if (scenario.saved) |saved| try case.write("state/config.json", saved);
+        var server = try harness.MockServer.start(ANTHROPIC_SSE, 0);
+        defer server.stop();
+        const url = try server.urlOwned(arena);
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(arena, &.{ "--provider", "anthropic", "--api-key", "test-key", "--base-url", url, "--no-lsp", "-p", "say ok" });
+        try args.appendSlice(arena, scenario.flags);
+        const result = try case.run(&.{}, args.items);
+        errdefer std.debug.print("preview CLI exit {d}: {s}\n", .{ result.exit_code, result.stderr });
+        try testing.expectEqual(@as(i32, 0), result.exit_code);
+        try testing.expectEqual(@as(usize, 1), server.requestCount());
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, server.lastRequest().?.body(), .{});
+        const bash = for (parsed.value.object.get("tools").?.array.items) |tool| {
+            if (std.mem.eql(u8, tool.object.get("name").?.string, "Bash")) break tool;
+        } else return error.BashToolMissing;
+        const description = bash.object.get("description").?.string;
+        try testing.expectEqual(scenario.watchdog, std.mem.indexOf(u8, description, "background time limit") != null);
+        if (!scenario.watchdog) {
+            const schema = try std.json.Stringify.valueAlloc(arena, bash, .{});
+            if (baseline) |expected| try testing.expectEqualStrings(expected, schema) else baseline = try testing.allocator.dupe(u8, schema);
+        }
+    }
+}
+
 test "preview: monitor_events alone switches the Monitor tool to push events" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const scenarios = [_]struct { saved: ?[]const u8 = null, flags: []const []const u8 = &.{}, events: bool }{
