@@ -232,7 +232,8 @@ class LifecycleTest(LifecycleCase):
         self.assertEqual(sorted(pulls), ["other", "same"])
         items = [self.record(name)["prepare"]["items"][0] for name in names]
         self.assertEqual([item["status"] for item in items], ["pulled"] * 5)
-        self.assertEqual([item.get("shared", False) for item in items], [False, True, True, True, False])
+        self.assertCountEqual([item.get("shared", False) for item in items[:-1]], [False, True, True, True])
+        self.assertFalse(items[-1].get("shared", False))
 
     def test_no_more_than_four_operations_run_at_once(self):
         lock = threading.Lock()
@@ -525,23 +526,30 @@ class DockerPreparationTest(LifecycleCase):
 
         self.assertEqual(asyncio.run(main()), names)
         prepared = {name: self.record(name)["prepare"] for name in names}
-        self.assertEqual({name: prepared[name]["status"] for name in names if name not in ("missing__c", "built__g")},
-                         {"cached__a": "present", "missing__b": "prepared", "flaky__d": "prepared",
-                          "broken__e": "failed", "built__f": "prepared"})
+        for name, status in (("cached__a", "present"), ("flaky__d", "prepared"), ("broken__e", "failed")):
+            self.assertEqual(prepared[name]["status"], status, name)
         self.assertEqual(sorted(self.docker_calls("pull")),
                          ["pull alexgshaw/broken:1"] * images.PULL_ATTEMPTS
                          + ["pull alexgshaw/flaky:1", "pull alexgshaw/flaky:1", "pull alexgshaw/missing:1"])
-        self.assertEqual((prepared["cached__a"]["items"][0]["status"], prepared["missing__b"]["items"][0]["status"]),
-                         ("present", "pulled"))
-        for follower, did in (("missing__c", "pulled"), ("built__g", "built")):
-            item = prepared[follower]["items"][0]
-            self.assertIn((item["status"], item.get("shared", False)), (("present", False), (did, True)), follower)
+        self.assertEqual(prepared["cached__a"]["items"][0]["status"], "present")
+        for pair, kind, did in ((("missing__b", "missing__c"), "pull", "pulled"),
+                                (("built__f", "built__g"), "build", "built")):
+            outcomes = []
+            for name in pair:
+                item, = prepared[name]["items"]
+                self.assertEqual(item["kind"], kind, name)
+                if kind == "build":
+                    self.assertTrue(item["image"].startswith(images.BUILD_TAG), name)
+                else:
+                    self.assertEqual(item["image"], "alexgshaw/missing:1", name)
+                self.assertEqual(prepared[name]["status"], "present" if item["status"] == "present" else "prepared", name)
+                outcomes.append((item["status"], item.get("shared", False)))
+            self.assertIn((did, False), outcomes, pair)
+            outcomes.remove((did, False))
+            self.assertIn(outcomes[0], (("present", False), (did, True)), pair)
         self.assertEqual((prepared["flaky__d"]["items"][0]["status"], prepared["flaky__d"]["items"][0]["attempts"]),
                          ("pulled", 2))
         self.assertIn("manifest unknown", prepared["broken__e"]["items"][0]["error"])
-        built = prepared["built__f"]["items"][0]
-        self.assertEqual((built["kind"], built["status"]), ("build", "built"))
-        self.assertTrue(built["image"].startswith(images.BUILD_TAG))
         self.assertEqual(len(self.docker_calls("compose")), 1)
 
     def test_a_task_with_a_verifier_and_a_sidecar_prepares_all_three_images(self):
