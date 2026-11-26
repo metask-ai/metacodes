@@ -192,12 +192,10 @@ all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
 ## PR review and repair workflow
 
 Submit PRs to **metask-ai/metacodes**, including when `origin` is a fork.
-Keep the branch current with main and request independent review after each
-push. Resolve blocking findings and repeat review and CI after repairs.
+Request independent review after each push. Resolve blocking findings and repeat review and CI after repairs.
 Merge only the reviewed head once all required checks and upstream reviews
 pass. Use the [direct merge commands](doc/CI_DESIGN.md#3-pr-only-validation-and-merge-policy)
-to verify effective upstream rules and bind the merge to the reviewed commit.
-Pause on a failed preflight.
+to bind the merge to the reviewed commit.
 
 ## Definition of done
 
