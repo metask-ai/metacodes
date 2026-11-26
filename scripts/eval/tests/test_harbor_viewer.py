@@ -210,6 +210,16 @@ class LibraryTest(unittest.TestCase):
         self.assertLess(len(observation["content"]), 4200)
         self.assertIn("more chars", observation["content"])
 
+    def test_skill_counts_use_invocation_names_before_display_clipping(self):
+        job = self.root / "glm-pilot"
+        calls = [{"function_name": "Skill", "arguments": args} for args in (
+            {"values": ["x" * 4000], "name": "review"}, {"name": "review"}, {"name": "audit"}, {})]
+        calls.append({"function_name": "Read", "arguments": {"name": "review"}})
+        trial = _trial(job, "skills__abc", steps=[{"tool_calls": calls}])
+        self.assertEqual(data.trial_detail(trial)["skills"], [("review", 2), (None, 1), ("audit", 1)])
+        self.assertEqual(data.trial_detail(job / "kv-store__aaa")["skills"], [])
+        self.assertIsNone(data.trial_detail(job / "running__eee")["skills"])
+
     def test_names_outside_the_jobs_cannot_be_addressed(self):
         for job, trial in (("..", "x"), ("glm-pilot", ".."), ("glm-pilot", "../qwen-pilot"),
                            ("/etc", "passwd"), ("not-a-job", "x"), ("glm-pilot", "missing__zzz")):

@@ -35,7 +35,7 @@ except ImportError:
     fcntl = None
 
 from scripts.eval.harbor.bench import executors
-from scripts.eval.harbor.command import check_bundle
+from scripts.eval.harbor.command import BundleError, check_bundle
 
 DEFAULT_REPO = "https://github.com/metask-ai/metacodes.git"
 TARGET = "x86_64-linux-gnu"
@@ -181,7 +181,10 @@ def selectable(path, repo=None):
     info = build_info(unit)
     if not info or unit != unit_path(unit.parent.parent, info["commit"] or ""):
         return False
-    source = check_bundle(unit).get("source")
+    try:
+        source = check_bundle(unit).get("source")
+    except BundleError:
+        return False
     if not isinstance(source, dict) or source.get("commit") != info["commit"]:
         return False
     return _verified_by(info, info["commit"], repo or DEFAULT_REPO)
