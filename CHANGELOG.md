@@ -459,6 +459,13 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **Calls in one reply show each result under its own call.** When one
+  reply called several MCP tools, or several of ApplyPatch, ScheduleWakeup,
+  CodeMap, FindSymbol, ReadArtifact, TeamCreate, TeamDelete, SendMessage
+  and ExecuteCode, their call lines came first and their results after
+  them. Each call now shows while it runs and goes into the scrollback
+  together with its result, as Bash and Read do.
+
 - **Hints name Ctrl+X Ctrl+O as the transcript key.** The dim line a long
   resumed conversation starts with and the transcript's footer said
   Ctrl+O, which opens `/model`.

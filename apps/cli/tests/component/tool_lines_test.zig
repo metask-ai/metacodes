@@ -29,6 +29,26 @@ fn toolUseSse(a: std.mem.Allocator, name: []const u8, input_json: []const u8) ![
     );
 }
 
+fn twoToolUsesSse(a: std.mem.Allocator, name: []const u8, first_json: []const u8, second_json: []const u8) ![]u8 {
+    const first = try std.json.Stringify.valueAlloc(a, first_json, .{});
+    defer a.free(first);
+    const second = try std.json.Stringify.valueAlloc(a, second_json, .{});
+    defer a.free(second);
+    return std.fmt.allocPrint(
+        a,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_one\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_two\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{ name, first, name, second },
+    );
+}
+
 const EnvGuard = struct {
     name: [*:0]const u8,
     previous: ?[:0]u8,
@@ -178,6 +198,28 @@ test "L2 an ApplyPatch call reaches the TUI as a tool line naming the file, then
     const tool_row = std.mem.indexOf(u8, screen, "⏺ ApplyPatch").?;
     const reply_row = std.mem.indexOf(u8, screen, "all done") orelse return error.TestExpectedEqual;
     try std.testing.expect(tool_row < reply_row);
+}
+
+test "L2 two ScheduleWakeup calls in one reply each show their own result before the next call's line" {
+    const call = try twoToolUsesSse(gpa, "ScheduleWakeup", "{\"delaySeconds\":300,\"prompt\":\"first wake\",\"reason\":\"REASON-ONE\",\"noop\":false}", "{\"delaySeconds\":600,\"prompt\":\"second wake\",\"reason\":\"REASON-TWO\",\"noop\":false}");
+    defer gpa.free(call);
+    const bodies = [_][]const u8{ call, FINAL_SSE };
+
+    var fx: Fixture = undefined;
+    try fx.init(&bodies);
+    defer fx.deinit();
+    const screen = try fx.drawnTurn();
+    defer gpa.free(screen);
+
+    try std.testing.expectEqual(@as(usize, 1), fx.app.cron_registry.count());
+    const first_call = std.mem.indexOf(u8, screen, "⏺ ScheduleWakeup(delaySeconds: 300") orelse return error.TestExpectedEqual;
+    const first_result = std.mem.indexOf(u8, screen, "reason: REASON-ONE") orelse return error.TestExpectedEqual;
+    const second_call = std.mem.indexOf(u8, screen, "⏺ ScheduleWakeup(delaySeconds: 600") orelse return error.TestExpectedEqual;
+    const second_result = std.mem.indexOf(u8, screen, "reason: REASON-TWO") orelse return error.TestExpectedEqual;
+    if (!(first_call < first_result and first_result < second_call and second_call < second_result)) {
+        std.debug.print("each result should follow its own call:\n{s}\n", .{screen});
+        return error.TestExpectedEqual;
+    }
 }
 
 test "L2 a ScheduleWakeup call reaches the TUI as a tool line with its arguments, then its result one field per line" {

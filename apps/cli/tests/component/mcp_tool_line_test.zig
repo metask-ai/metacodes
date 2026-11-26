@@ -28,6 +28,17 @@ const FINAL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const PAIR_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_one\",\"name\":\"" ++ MCP_TOOL ++ "\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"message\\\":\\\"first call\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_two\",\"name\":\"" ++ MCP_TOOL ++ "\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"message\\\":\\\"second call\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const Server = enum { echo, failing };
 
 const FAILING_SERVER =
@@ -190,6 +201,67 @@ test "L2 an MCP tool call reaches the TUI as a tool line: the tool and its argum
     const tool_row = std.mem.indexOf(u8, screen, "⏺ " ++ MCP_TOOL).?;
     const reply_row = std.mem.indexOf(u8, screen, "speed set") orelse return error.TestExpectedEqual;
     try std.testing.expect(tool_row < reply_row);
+}
+
+fn expectRowsInOrder(screen: []const u8, rows: []const []const u8) !void {
+    var lines = std.mem.splitScalar(u8, screen, '\n');
+    var next: usize = 0;
+    var previous_matched = false;
+    while (lines.next()) |line| {
+        if (next == rows.len) return;
+        const row = std.mem.trimEnd(u8, line, " ");
+        if (std.mem.eql(u8, row, rows[next])) {
+            next += 1;
+            previous_matched = true;
+        } else if (previous_matched) break;
+    }
+    if (next == rows.len) return;
+    std.debug.print("rows not found one after another, stopped before {s}\nscreen:\n{s}\n", .{ rows[next], screen });
+    return error.TestExpectedEqual;
+}
+
+test "L2 two MCP calls in one reply each reach the TUI as their call line with their own result right under it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!pfs.exists(MOCK_MCP)) return error.SkipZigTest;
+    var home: Home = undefined;
+    try home.init(.echo);
+    defer home.deinit();
+
+    const bodies = [_][]const u8{ PAIR_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(gpa);
+    defer gpa.free(url);
+    var session: Session = undefined;
+    try session.init(url);
+    defer session.deinit();
+    const app = session.app;
+    _ = app.dyn_registry.find(MCP_TOOL) orelse return error.McpToolNotRegistered;
+
+    const t = try region_harness.Term.create(gpa, .{ .rows = 24, .cols = 100 });
+    defer t.destroy();
+    t.region.enterGenerating(app, null);
+    var tui = cc.tui_backend.TuiBackend.init(&t.region);
+    tui.theme = &t.region.theme;
+    tui.alloc = gpa;
+    const backend = tui.backend();
+
+    try app.conversation.appendText(.user, "echo two things");
+    var options = cc.session_service.buildRunOptions(app, null);
+    options.max_turns = 3;
+    const result = try cc.agent_loop.run(&app.conversation, app.provider(), app.tool_defs, &app.permission_ctx, options, &backend, app.allocator);
+    t.region.leaveGenerating(app);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+
+    const screen = try t.transcriptAlloc(.{});
+    defer gpa.free(screen);
+    try expectRowsInOrder(screen, &.{
+        "⏺ " ++ MCP_TOOL ++ "(message: \"first call\")",
+        "  ⎿  first call",
+        "⏺ " ++ MCP_TOOL ++ "(message: \"second call\")",
+        "  ⎿  second call",
+    });
 }
 
 test "L2 an MCP call the server marks as failed shows its first line of text in the TUI, not the server's JSON" {

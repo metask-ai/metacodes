@@ -143,10 +143,16 @@ pub fn hasProgressCard(tool_name: []const u8) bool {
 
 /// 类A(查询/执行类):执行期整张卡活在底部动态重绘区(自然语言进行时标题),
 /// 完成后 **commit 进 scrollback**(过去式标题)。对齐 cc 2.1.165 工具卡两态。
+/// MCP、ApplyPatch 和通用卡工具也走这里:完成时把调用行和结果一起 commit。
 /// 与 hasProgressCard(WebSearch:完成只移除,结果走助手文本)互斥。
 pub fn usesLiveCard(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Read") or
-        std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob");
+        std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob") or
+        commitsCallWithResult(tool_name);
+}
+
+fn commitsCallWithResult(tool_name: []const u8) bool {
+    return isMcpTool(tool_name) or isGenericCardTool(tool_name) or std.mem.eql(u8, tool_name, "ApplyPatch");
 }
 
 /// tool_start 时是否占用动态区那张卡(addToolCard)。两类(WebSearch progress + 类A live)统称。
@@ -384,11 +390,19 @@ pub fn renderLiveDone(
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
+    if (commitsCallWithResult(tool_name)) {
+        const head = try renderStart(alloc, th, tool_name, input);
+        defer alloc.free(head);
+        const body = try renderResult(alloc, th, tool_name, input, content, kind, elapsed_ms, opts);
+        defer alloc.free(body);
+        try out.appendSlice(alloc, head);
+        try out.appendSlice(alloc, body);
+        return try out.toOwnedSlice(alloc);
+    }
+
     // 行1:⏺ <done title>。**不显右对齐耗时**——对齐 cc 2.1.165:committed scrollback 卡
     // 只有 `⏺ Ran 1 shell command` 标题,无 `✓ 0.1s`(耗时仅在运行中动态卡/spinner 上,
     // 不进历史)。kind 的成功/失败由 ⎿ body 体现(错误结果走 renderResultBody 红字)。
-    _ = kind;
-    _ = elapsed_ms;
     const title = try toolDoneTitle(alloc, tool_name, input, content);
     defer alloc.free(title);
     try out.appendSlice(alloc, th.accent);
@@ -1463,6 +1477,7 @@ pub fn toolPreviewPub(alloc: std.mem.Allocator, tool_name: []const u8, args: []c
 /// 根据工具名和参数 JSON 生成单行预览("$ cmd" / "📄 path" / 等)。caller free。
 /// 不识别的工具 → 返回空 slice(预览行省略)。
 fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
+    if (commitsCallWithResult(tool_name)) return headerArg(alloc, tool_name, args);
     if (std.mem.eql(u8, tool_name, "Bash")) {
         if (extractField(args, "command")) |cmd| {
             // command 含 shell 操作符(&&、>、换行),JSON 里被转义成 && 等;
@@ -2862,6 +2877,34 @@ test "an MCP error, wrapped as the tool error the pipeline reports, shows the se
     const structured = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", "{\"error\":{\"code\":\"other\",\"detail\":\"server went away\"}}", .err, 0, .{});
     defer a.free(structured);
     try capture.expectContains(structured, "server went away");
+}
+
+test "MCP calls, ApplyPatch and the generic-card tools run as a live card and commit their call line with their own result" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "mcp__plc__echo", "ApplyPatch", "ScheduleWakeup", "ReadArtifact", "ExecuteCode" }) |name| {
+        try testing.expect(usesLiveCard(name));
+        try testing.expect(usesDynamicCard(name));
+    }
+    try testing.expect(!usesLiveCard("Edit"));
+    try testing.expect(!usesLiveCard("Write"));
+
+    const input = "{\"message\":\"hi\"}";
+    const preview = try toolPreviewPub(a, "mcp__plc__echo", input);
+    defer a.free(preview);
+    try testing.expectEqualStrings("message: \"hi\"", preview);
+
+    const output = "{\"content\":[{\"type\":\"text\",\"text\":\"hi back\"}]}";
+    for ([_]ResultKind{ .ok, .err }) |kind| {
+        const done = try renderLiveDone(a, theme_mod.monochrome, "mcp__plc__echo", input, output, kind, 0, .{});
+        defer a.free(done);
+        const start = try renderStart(a, theme_mod.monochrome, "mcp__plc__echo", input);
+        defer a.free(start);
+        const body = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", input, output, kind, 0, .{});
+        defer a.free(body);
+        try testing.expect(body.len > 0);
+        try testing.expect(std.mem.startsWith(u8, done, start));
+        try testing.expectEqualStrings(body, done[start.len..]);
+    }
 }
 
 test "ApplyPatch gets a start line naming the files it touches, and its result shows the counts and the diff" {

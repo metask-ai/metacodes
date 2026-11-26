@@ -421,7 +421,7 @@ pub const TuiBackend = struct {
         const th = self.theme orelse return;
         const a = self.alloc orelse return;
         const kind: tool_card.ResultKind = if (r.is_error) .err else .ok;
-        const card = tool_card.renderLiveDone(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, .{ .cols = self.region.cols }) catch return;
+        const card = tool_card.renderLiveDone(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, self.cardResultOptsFor(r.id)) catch return;
         defer a.free(card);
         self.region.clearToolCard(r.id); // 先移除动态卡
         self.region.writeGenText(card); // 再 commit 进 scrollback
