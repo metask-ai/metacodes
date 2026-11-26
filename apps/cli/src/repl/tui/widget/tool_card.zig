@@ -1734,8 +1734,8 @@ fn renderMcpResult(
     opts: RenderOpts,
     kind: ResultKind,
 ) !void {
+    if (kind == .err) return renderMcpError(alloc, th, output_text, out, opts);
     const text = (try mcpResultText(alloc, output_text)) orelse {
-        if (kind == .err) return renderErrorBody(alloc, th, output_text, out, opts);
         const trimmed = std.mem.trim(u8, output_text, " \t\r\n");
         if (trimmed.len == 0 or trimmed[0] == '{' or trimmed[0] == '[') return;
         var plain: std.ArrayList(u8) = .empty;
@@ -1744,12 +1744,89 @@ fn renderMcpResult(
         return renderFoldedText(alloc, th, plain.items, out, opts);
     };
     defer alloc.free(text);
-    if (kind == .err) {
-        const line = firstLine(text);
-        if (line.len == 0) return renderErrorBody(alloc, th, output_text, out, opts);
-        return appendLine(alloc, out, th.danger, line, th.reset);
-    }
     return renderFoldedText(alloc, th, text, out, opts);
+}
+
+fn renderMcpError(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    const text = (try mcpErrorText(alloc, output_text)) orelse return renderErrorBody(alloc, th, output_text, out, opts);
+    defer alloc.free(text);
+    const line = firstLine(text);
+    if (line.len == 0) return renderErrorBody(alloc, th, output_text, out, opts);
+    return appendLine(alloc, out, th.danger, line, th.reset);
+}
+
+const MCP_TRUNCATION_NOTE = "\n[MCP error truncated: original_bytes=";
+
+fn mcpErrorText(alloc: std.mem.Allocator, output_text: []const u8) !?[]u8 {
+    if (try mcpResultText(alloc, output_text)) |direct| return direct;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, output_text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const failure = parsed.value.object.get("error") orelse return null;
+    if (failure != .object) return null;
+    const detail_value = failure.object.get("detail") orelse return null;
+    if (detail_value != .string) return null;
+    var detail = detail_value.string;
+    if (std.mem.lastIndexOf(u8, detail, MCP_TRUNCATION_NOTE)) |at| detail = detail[0..at];
+    if (try mcpResultText(alloc, detail)) |text| return text;
+    return mcpFirstTextOfCutResult(alloc, detail);
+}
+
+fn mcpFirstTextOfCutResult(alloc: std.mem.Allocator, detail: []const u8) !?[]u8 {
+    if (!std.mem.startsWith(u8, std.mem.trimStart(u8, detail, " \t\r\n"), "{")) return null;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, detail, search, "\"text\"")) |at| {
+        search = at + "\"text\"".len;
+        var p = search;
+        while (p < detail.len and (detail[p] == ' ' or detail[p] == '\t')) p += 1;
+        if (p >= detail.len or detail[p] != ':') continue;
+        p += 1;
+        while (p < detail.len and (detail[p] == ' ' or detail[p] == '\t')) p += 1;
+        if (p >= detail.len or detail[p] != '"') continue;
+        return try jsonStringFirstLine(alloc, detail[p + 1 ..]);
+    }
+    return null;
+}
+
+fn jsonStringFirstLine(alloc: std.mem.Allocator, escaped: []const u8) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    var i: usize = 0;
+    while (i < escaped.len) {
+        const c = escaped[i];
+        if (c == '"') break;
+        if (c != '\\') {
+            try raw.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= escaped.len) break;
+        const e = escaped[i + 1];
+        i += 2;
+        switch (e) {
+            'n' => break,
+            'r' => try raw.append(alloc, '\r'),
+            't' => try raw.append(alloc, '\t'),
+            'b' => try raw.append(alloc, 0x08),
+            'f' => try raw.append(alloc, 0x0c),
+            'u' => {
+                if (i + 4 > escaped.len) break;
+                const cp = std.fmt.parseInt(u21, escaped[i .. i + 4], 16) catch break;
+                i += 4;
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch {
+                    try raw.appendSlice(alloc, REPLACEMENT_CHAR);
+                    continue;
+                };
+                try raw.appendSlice(alloc, buf[0..n]);
+            },
+            else => try raw.append(alloc, e),
+        }
+    }
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    try appendPrintable(alloc, &text, raw.items);
+    return text.toOwnedSlice(alloc);
 }
 
 const GENERIC_CARD_TOOLS = [_][]const u8{
@@ -2733,14 +2810,32 @@ test "an MCP result never writes the server's control characters to the terminal
     try capture.expectContains(s, "next" ++ REPLACEMENT_CHAR ++ "2J");
 }
 
-test "an MCP error shows the server's first line of text, not its JSON" {
+test "an MCP error, wrapped as the tool error the pipeline reports, shows the server's first line of text, not its JSON" {
     const a = testing.allocator;
-    const content = "{\"content\":[{\"type\":\"text\",\"text\":\"line 3 is locked\\ncall the operator\"}],\"isError\":true}";
-    const s = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", content, .err, 0, .{});
+    const result = "{\"content\":[{\"type\":\"text\",\"text\":\"line 3 is locked\\ncall the operator\"}],\"isError\":true}";
+    const wrapped = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = result, .recoverable = true } }, .{});
+    defer a.free(wrapped);
+    const s = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", wrapped, .err, 0, .{});
     defer a.free(s);
     try capture.expectContains(s, "line 3 is locked");
     try testing.expect(std.mem.indexOf(u8, s, "call the operator") == null);
     try testing.expect(std.mem.indexOf(u8, s, "isError") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "content") == null);
+
+    const cut_detail = "{\"content\":[{\"type\":\"text\",\"text\":\"disk \\u001b[2J full\\nfirst block goes on and o" ++ "\n[MCP error truncated: original_bytes=70000]";
+    const cut = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = cut_detail, .recoverable = true } }, .{});
+    defer a.free(cut);
+    const truncated = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", cut, .err, 0, .{});
+    defer a.free(truncated);
+    try capture.expectContains(truncated, "disk " ++ REPLACEMENT_CHAR ++ "[2J full");
+    try testing.expect(std.mem.indexOfScalar(u8, truncated, 0x1b) == null);
+    try testing.expect(std.mem.indexOf(u8, truncated, "first block") == null);
+    try testing.expect(std.mem.indexOf(u8, truncated, "truncated") == null);
+
+    const direct = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", result, .err, 0, .{});
+    defer a.free(direct);
+    try capture.expectContains(direct, "line 3 is locked");
+    try testing.expect(std.mem.indexOf(u8, direct, "call the operator") == null);
 
     const structured = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", "{\"error\":{\"code\":\"other\",\"detail\":\"server went away\"}}", .err, 0, .{});
     defer a.free(structured);
