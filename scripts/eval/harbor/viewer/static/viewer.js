@@ -21,7 +21,7 @@ function timeTitle(r) {
 }
 const REFRESH_S = 10;
 
-const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, live: false,
+const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, overviewDirty: false, live: false,
   jobFilter: 'all', jobSearch: '', suite: null, comparisons: new Map(), sort: { key: 'task', dir: 1 }, selected: new Set(),
   suitePick: null, profileSuite: 'all', taskFilter: 'all', taskSearch: '', boardModel: {}, boardExpanded: {} };
 
@@ -198,7 +198,7 @@ async function render() {
     setConnection(false, '读取失败：' + e.message + '（保留上一次的数据）');
   } finally {
     state.busy = false;
-    if (hash !== location.hash) render();
+    if (hash !== location.hash || (state.overviewDirty && r.view === 'overview')) render();
   }
 }
 
@@ -266,7 +266,13 @@ function deleteProfileButton(b) {
   return h('button', { type: 'button', class: 'button', onclick: async (event) => {
     event.stopPropagation();
     if (!await deleteProfile(b, event.currentTarget)) return;
-    if (route().view === 'overview') render(); else location.hash = '#/';
+    const current = route();
+    if (current.view === 'overview') {
+      state.overviewDirty = true;
+      render();
+    } else if (current.view === 'profile' && current.profile === b.id) {
+      location.hash = '#/';
+    }
   } }, '删除 Profile');
 }
 async function deleteJob(j, button) {
@@ -376,6 +382,7 @@ function comparisonPicker(profiles, crossProfile) {
 }
 
 async function renderOverview() {
+  state.overviewDirty = false;
   navCurrent('overview');
   $('#title').textContent = 'Profiles';
   crumbs([]);
