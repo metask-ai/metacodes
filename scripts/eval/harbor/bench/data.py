@@ -401,6 +401,7 @@ def classify(result: Optional[Dict[str, Any]], stop_reason: Optional[str]) -> Tu
         return "running", None
     exception = result.get("exception_info") or {}
     exc = exception.get("exception_type") if isinstance(exception, dict) else None
+    message = exception.get("exception_message") if isinstance(exception, dict) else None
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     reward = number(rewards.get("reward")) if isinstance(rewards, dict) else None
 
@@ -409,6 +410,11 @@ def classify(result: Optional[Dict[str, Any]], stop_reason: Optional[str]) -> Tu
             return "invalid", f"verifier: {exc}"
         if exc in PROVIDER_EXCEPTIONS or stop_reason == "api_error":
             return "invalid", f"provider: {exc}"
+        if isinstance(message, str):
+            if "all predefined address pools have been fully subnetted" in message:
+                return "invalid", "environment: docker address pool exhausted"
+            if message.startswith("Docker compose command failed"):
+                return "invalid", f"environment: docker compose ({exc})"
         if "Environment" in exc or "Docker" in exc or "Build" in exc:
             return "invalid", f"environment: {exc}"
         return "invalid", exc

@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import getopt
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -878,6 +879,23 @@ DEFAULT_PYPI_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 DEFAULT_DOCKER_MIRRORS = ["https://docker.m.daocloud.io", "https://dockerproxy.net"]
 DEFAULT_GHCR_MIRROR = "ghcr.nju.edu.cn"
 DAEMON_JSON = "/etc/docker/daemon.json"
+DEFAULT_DOCKER_BIP = "172.17.0.1/16"
+DEFAULT_DOCKER_ADDRESS_POOLS = (
+    {"base": "172.18.0.0/15", "size": 24},
+    {"base": "172.20.0.0/14", "size": 24},
+    {"base": "172.24.0.0/13", "size": 24},
+)
+FALLBACK_DOCKER_ADDRESS_POOL = {"base": "10.200.0.0/15", "size": 24}
+MIN_DOCKER_SUBNETS = 128
+SYSCTL_CONF = "/etc/sysctl.d/99-metacodes-bench.conf"
+HOST_SYSCTL_MINIMUMS = (
+    ("fs.inotify.max_user_instances", 8192),
+    ("fs.inotify.max_user_watches", 524288),
+    ("vm.max_map_count", 262144),
+    ("net.ipv4.neigh.default.gc_thresh1", 1024),
+    ("net.ipv4.neigh.default.gc_thresh2", 4096),
+    ("net.ipv4.neigh.default.gc_thresh3", 8192),
+)
 NETWORK_PROBE = r'''
 import json, sys, time, urllib.error, urllib.request
 targets, timeout = json.loads(sys.argv[1]), float(sys.argv[2])
@@ -947,6 +965,194 @@ def step_network(s: Setup):
     detail = "；".join(f"{why}：{key} = {json.dumps(value, ensure_ascii=False)}" for key, value, why in proposals)
     blocked = "、".join(NETWORK_LABELS.get(k, k) for k in sorted(bad))
     return ("planned" if s.dry_run else "done"), f"{blocked} 较慢或不可达，" + ("建议" if s.dry_run else "已设置") + detail
+
+
+def docker_pool_capacity(pools) -> int:
+    if not isinstance(pools, list):
+        return 0
+    total = 0
+    for item in pools:
+        if not isinstance(item, dict):
+            continue
+        base, size = item.get("base"), item.get("size")
+        if not isinstance(base, str) or type(size) is not int:
+            continue
+        try:
+            network = ipaddress.ip_network(base, strict=False)
+        except ValueError:
+            continue
+        if network.version == 4 and network.prefixlen <= size <= 30:
+            total += 1 << (size - network.prefixlen)
+    return total
+
+
+def host_route_networks(route_text: str):
+    networks = []
+    for line in route_text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] == "default":
+            continue
+        device = parts[parts.index("dev") + 1] if "dev" in parts and parts.index("dev") + 1 < len(parts) else ""
+        if device == "docker0" or device.startswith("br-"):
+            continue
+        try:
+            network = ipaddress.ip_network(parts[0], strict=False)
+        except ValueError:
+            continue
+        if network.version == 4 and not network.is_link_local:
+            networks.append(network)
+    return networks
+
+
+def resolve_docker_bip(s: Setup, current: Dict) -> str:
+    existing = current.get("bip")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    inspected = s.out(
+        "docker network inspect bridge --format "
+        + shlex.quote("{{(index .IPAM.Config 0).Gateway}} {{(index .IPAM.Config 0).Subnet}}")
+        + " 2>/dev/null"
+    )
+    parts = inspected.split()
+    if len(parts) == 2:
+        try:
+            gateway = ipaddress.ip_address(parts[0])
+            subnet = ipaddress.ip_network(parts[1], strict=False)
+            if gateway.version == 4 and subnet.version == 4:
+                return f"{gateway}/{subnet.prefixlen}"
+        except ValueError:
+            pass
+    bind = s.executor.metrics_bind if s.remote else s.cfg.get("metrics_bind", "172.17.0.1")
+    if isinstance(bind, str):
+        try:
+            addr = ipaddress.ip_address(bind)
+            if addr.version == 4 and not addr.is_loopback:
+                return f"{addr}/16"
+        except ValueError:
+            pass
+    return DEFAULT_DOCKER_BIP
+
+
+def select_docker_address_pools(route_text: str, bip: str):
+    occupied = host_route_networks(route_text)
+    try:
+        occupied.append(ipaddress.ip_interface(bip).network)
+    except ValueError:
+        pass
+    selected = []
+    for candidate in DEFAULT_DOCKER_ADDRESS_POOLS:
+        net = ipaddress.ip_network(candidate["base"], strict=False)
+        if not any(net.overlaps(used) for used in occupied):
+            selected.append(dict(candidate))
+    if docker_pool_capacity(selected) < MIN_DOCKER_SUBNETS:
+        fallback = ipaddress.ip_network(FALLBACK_DOCKER_ADDRESS_POOL["base"], strict=False)
+        if not any(fallback.overlaps(used) for used in occupied):
+            selected.append(dict(FALLBACK_DOCKER_ADDRESS_POOL))
+    return selected
+
+
+def running_trial_containers(s: Setup):
+    names = s.out("docker ps --format '{{.Names}}' 2>/dev/null").splitlines()
+    return [name.strip() for name in names if "__env-" in name]
+
+
+def step_docker_pools(s: Setup):
+    s.require_shell()
+    text = s.out("cat " + shlex.quote(DAEMON_JSON) + " 2>/dev/null")
+    try:
+        current = json.loads(text) if text else {}
+    except ValueError:
+        raise Failed(DAEMON_JSON + " 不是有效 JSON，请手动修复后重试") from None
+    if not isinstance(current, dict):
+        raise Failed(DAEMON_JSON + " 不是 JSON 对象，请手动修复后重试")
+    existing_capacity = docker_pool_capacity(current.get("default-address-pools"))
+    if existing_capacity >= MIN_DOCKER_SUBNETS:
+        return "ok", f"已配置 {existing_capacity} 个子网"
+    bip = resolve_docker_bip(s, current)
+    route_text = s.out("ip -4 route show 2>/dev/null") if s.found("ip") else ""
+    pools = select_docker_address_pools(route_text, bip)
+    capacity = docker_pool_capacity(pools)
+    if capacity < MIN_DOCKER_SUBNETS:
+        raise Failed(f"找不到与宿主机路由不冲突的 Docker 子网地址池，请手动在 {DAEMON_JSON} 中配置 default-address-pools")
+    merged = {**current, "bip": bip, "default-address-pools": pools}
+    content = json.dumps(merged, indent=2) + "\n"
+    parent = str(PurePosixPath(DAEMON_JSON).parent)
+    temporary = DAEMON_JSON + ".metacodes-bench.tmp"
+    manual = (
+        f"sudo mkdir -p {shlex.quote(parent)} && "
+        f"printf '%s\\n' {shlex.quote(content.strip())} | sudo tee {shlex.quote(DAEMON_JSON)} >/dev/null"
+        " && sudo systemctl restart docker"
+    )
+    active = running_trial_containers(s)
+    if active:
+        raise Manual(
+            f"当前有 {len(active)} 个运行中的评测容器，未自动重启 Docker；请在评测结束后运行下面的命令扩容子网地址池",
+            manual,
+        )
+    if not sudo_available(s):
+        raise Manual(f"写入 {DAEMON_JSON} 并重启 Docker 需要 root（无免密 sudo）；运行下面的命令扩容子网地址池", manual)
+    write = f"mkdir -p {shlex.quote(parent)} && cat > {shlex.quote(temporary)} && mv {shlex.quote(temporary)} {shlex.quote(DAEMON_JSON)}"
+    s.sh("sudo -n sh -c " + shlex.quote(write), mutate=True, input=content, check=True)
+    s.sh("sudo -n systemctl restart docker", mutate=True, check=True)
+    if s.dry_run:
+        return "planned", f"将配置 {capacity} 个 Docker 子网（bip={bip}）并重启 Docker"
+    after = s.out("cat " + shlex.quote(DAEMON_JSON) + " 2>/dev/null")
+    try:
+        written = docker_pool_capacity(json.loads(after).get("default-address-pools"))
+    except (ValueError, AttributeError):
+        written = 0
+    if written < MIN_DOCKER_SUBNETS:
+        raise Failed(DAEMON_JSON + " 写入后验证失败")
+    if s.sh("docker info >/dev/null 2>&1").returncode != 0:
+        raise Failed("重启 Docker 后 daemon 不可达")
+    return "done", f"已配置 {written} 个 Docker 子网（bip={bip}）并重启 Docker"
+
+
+def read_host_sysctls(s: Setup) -> Dict[str, int]:
+    keys = " ".join(shlex.quote(key) for key, _ in HOST_SYSCTL_MINIMUMS)
+    script = f'for k in {keys}; do printf "%s=%s\\n" "$k" "$(sysctl -n "$k" 2>/dev/null || true)"; done'
+    values: Dict[str, int] = {}
+    for line in s.out(script).splitlines():
+        if "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        raw = raw.strip()
+        if raw.isdigit():
+            values[key.strip()] = int(raw)
+    return values
+
+
+def step_host_limits(s: Setup):
+    s.require_shell()
+    current = read_host_sysctls(s)
+    if not current:
+        raise Skip("当前环境不支持读取 Linux sysctl 参数")
+    below = [(key, current[key], minimum) for key, minimum in HOST_SYSCTL_MINIMUMS
+             if key in current and current[key] < minimum]
+    if not below:
+        return "ok", "内核参数已满足高并发要求"
+    lines = [f"{key} = {max(current[key], minimum)}" for key, minimum in HOST_SYSCTL_MINIMUMS if key in current]
+    content = "\n".join(lines) + "\n"
+    parent = str(PurePosixPath(SYSCTL_CONF).parent)
+    temporary = SYSCTL_CONF + ".tmp"
+    manual = (
+        f"sudo mkdir -p {shlex.quote(parent)} && "
+        f"printf '%s\\n' {shlex.quote(content.strip())} | sudo tee {shlex.quote(SYSCTL_CONF)} >/dev/null"
+        f" && sudo sysctl -p {shlex.quote(SYSCTL_CONF)}"
+    )
+    summary = "、".join(f"{key} {cur}→{target}" for key, cur, target in below)
+    if not sudo_available(s):
+        raise Manual(f"调高高并发内核参数需要 root（无免密 sudo）：{summary}", manual)
+    write = f"mkdir -p {shlex.quote(parent)} && cat > {shlex.quote(temporary)} && mv {shlex.quote(temporary)} {shlex.quote(SYSCTL_CONF)}"
+    s.sh("sudo -n sh -c " + shlex.quote(write), mutate=True, input=content, check=True)
+    s.sh("sudo -n sysctl -p " + shlex.quote(SYSCTL_CONF), mutate=True, check=True)
+    if s.dry_run:
+        return "planned", "将调高：" + summary
+    after = read_host_sysctls(s)
+    remaining = [key for key, _, minimum in below if after.get(key, 0) < minimum]
+    if remaining:
+        raise Failed("sysctl 生效验证失败：" + "、".join(remaining))
+    return "done", "已调高：" + summary
 
 
 def step_docker_mirrors(s: Setup):
@@ -1208,7 +1414,9 @@ def plan(s: Setup):
     steps += [("uv", "uv", step_uv), ("harbor", "Harbor " + HARBOR_VERSION, step_harbor),
               ("docker", "Docker" + ("" if s.remote else "（macOS: Colima）"), step_docker)]
     if s.remote:
-        steps += [("docker_mirrors", "Docker 镜像加速", step_docker_mirrors),
+        steps += [("docker_pools", "Docker 子网地址池", step_docker_pools),
+                  ("host_limits", "高并发内核参数", step_host_limits),
+                  ("docker_mirrors", "Docker 镜像加速", step_docker_mirrors),
                   ("apt_cache", "apt 缓存（任务容器）", step_apt_cache),
                   ("download_cache", "下载缓存（任务容器）", step_download_cache)]
     steps += [("openssl", "OpenSSL", step_openssl), ("bundle", "Linux 发行包", step_bundle)]

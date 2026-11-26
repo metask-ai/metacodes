@@ -81,11 +81,14 @@ def _job(root: Path, name: str, model: str, planned: int, finished: bool = True)
 
 class ClassifyTest(unittest.TestCase):
     def test_every_outcome_class(self):
-        def result(reward=None, exc=None, finished=True):
+        def result(reward=None, exc=None, finished=True, message=None):
+            info = {"exception_type": exc} if exc else None
+            if info and message is not None:
+                info["exception_message"] = message
             return {
                 "finished_at": "2026-11-16T08:00:00Z" if finished else None,
                 "verifier_result": {"rewards": {"reward": reward}} if reward is not None else None,
-                "exception_info": {"exception_type": exc} if exc else None,
+                "exception_info": info,
             }
 
         cases = [
@@ -99,6 +102,17 @@ class ClassifyTest(unittest.TestCase):
             (result(0.0, "NonZeroAgentExitCodeError"), "api_error", ("invalid", "provider: NonZeroAgentExitCodeError")),
             (result(None, "ApiRateLimitError"), None, ("invalid", "provider: ApiRateLimitError")),
             (result(None, "EnvironmentStartError"), None, ("invalid", "environment: EnvironmentStartError")),
+            (
+                result(None, "RuntimeError", message="Docker compose command failed: all predefined address pools have been fully subnetted"),
+                None,
+                ("invalid", "environment: docker address pool exhausted"),
+            ),
+            (
+                result(None, "RuntimeError", message="Docker compose command failed for environment foo."),
+                None,
+                ("invalid", "environment: docker compose (RuntimeError)"),
+            ),
+            (result(None, "RuntimeError", message="unexpected crash"), None, ("invalid", "RuntimeError")),
             (result(None), "end_turn", ("invalid", "no reward")),
             (result(None, finished=False), None, ("running", None)),
             (None, None, ("running", None)),

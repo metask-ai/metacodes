@@ -65,9 +65,11 @@ carries `metacodes.offset`; otherwise the whole file. Every member carries
 """
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -96,6 +98,8 @@ LIMIT_FILE = "concurrency"
 # The handoff exchange between two drivers; a driver refuses any other.
 HANDOFF = 1
 HANDOFF_TIMEOUT = 30
+ORPHAN_DOCKER_AGE_SECONDS = 600
+DOCKER_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$")
 
 
 EMIT_LOCK = threading.Lock()
@@ -841,6 +845,92 @@ def supervise(spec, argv, env, credential, stop, hung_up, egress=None, cwd=None,
         control.close()
 
 
+def _parse_docker_time(value):
+    if not isinstance(value, str):
+        return None
+    matched = DOCKER_TIMESTAMP_RE.match(value.strip())
+    if not matched:
+        return None
+    base, frac, offset = matched.groups()
+    micro = (frac[:6].ljust(6, "0")) if frac else ""
+    iso = f"{base}.{micro}" if micro else base
+    iso += "+00:00" if offset == "Z" else offset
+    try:
+        parsed = dt.datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return parsed if parsed.year > 1 else None
+
+
+def prune_orphan_trial_docker(min_age_seconds=ORPHAN_DOCKER_AGE_SECONDS, now_utc=None, run_cmd=subprocess.run):
+    cutoff = (now_utc or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(seconds=min_age_seconds)
+    removed_containers = 0
+    removed_networks = 0
+    try:
+        listed = run_cmd(
+            ["docker", "ps", "-a", "--filter", "status=exited", "--filter", "status=dead",
+             "--format", "{{.ID}} {{.Names}}"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+        )
+        if listed.returncode == 0:
+            candidate_ids = [
+                parts[0] for line in (listed.stdout or "").splitlines()
+                for parts in [line.split(None, 1)]
+                if len(parts) == 2 and "__env-" in parts[1]
+            ]
+            if candidate_ids:
+                inspected = run_cmd(
+                    ["docker", "inspect", "--format", "{{.Id}} {{.State.Running}} {{.State.FinishedAt}}"]
+                    + candidate_ids,
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                )
+                if inspected.returncode == 0:
+                    for line in (inspected.stdout or "").splitlines():
+                        parts = line.split()
+                        if len(parts) != 3 or parts[1] != "false":
+                            continue
+                        finished = _parse_docker_time(parts[2])
+                        if finished is not None and finished <= cutoff:
+                            done = run_cmd(
+                                ["docker", "rm", parts[0]],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                            )
+                            if done.returncode == 0:
+                                removed_containers += 1
+        nets = run_cmd(
+            ["docker", "network", "ls", "--filter", "driver=bridge", "--format", "{{.ID}} {{.Name}}"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+        )
+        if nets.returncode == 0:
+            net_ids = [
+                parts[0] for line in (nets.stdout or "").splitlines()
+                for parts in [line.split(None, 1)]
+                if len(parts) == 2 and parts[1].endswith("__env_default")
+            ]
+            if net_ids:
+                inspected = run_cmd(
+                    ["docker", "network", "inspect", "--format", "{{.Id}} {{len .Containers}} {{.Created}}"]
+                    + net_ids,
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                )
+                if inspected.returncode == 0:
+                    for line in (inspected.stdout or "").splitlines():
+                        parts = line.split()
+                        if len(parts) != 3 or parts[1] != "0":
+                            continue
+                        created = _parse_docker_time(parts[2])
+                        if created is not None and created <= cutoff:
+                            done = run_cmd(
+                                ["docker", "network", "rm", parts[0]],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                            )
+                            if done.returncode == 0:
+                                removed_networks += 1
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return removed_containers, removed_networks
+
+
 def run_harbor(spec, argv, env, stop, hung_up, egress, cwd, prepare, finish, run_dir, control, handoff):
 
     def finishing():
@@ -849,6 +939,9 @@ def run_harbor(spec, argv, env, stop, hung_up, egress, cwd, prepare, finish, run
                 beating("finish", stop, finish)
             except Exception as exc:  # the run's outcome is reported regardless
                 print(f"清理失败：{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        pruned_c, pruned_n = prune_orphan_trial_docker()
+        if pruned_c or pruned_n:
+            emit("docker_prune", containers=pruned_c, networks=pruned_n)
 
     if prepare is not None:
         try:
@@ -872,6 +965,9 @@ def run_harbor(spec, argv, env, stop, hung_up, egress, cwd, prepare, finish, run
             if stop.is_set():  # cancelled (or no session came back) while pulling
                 finishing()
                 return cancelled_exit(run_dir)
+    pruned_c, pruned_n = prune_orphan_trial_docker()
+    if pruned_c or pruned_n:
+        emit("docker_prune", containers=pruned_c, networks=pruned_n)
     directory = run_dir or Path(tempfile.mkdtemp(prefix="metacodes-bench-harbor-"))
     try:
         try:
