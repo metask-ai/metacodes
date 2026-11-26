@@ -293,7 +293,7 @@ function itemActions(b, index) {
       const button = event.currentTarget;
       if (ITEM_ACTIONS[name].ask && !confirm(ITEM_ACTIONS[name].ask)) return;
       button.disabled = true;
-      try { await api('/api/profile/item', { id: b.id, index, action: name }); await render(); }
+      try { await api('/api/profile/item', { id: b.id, index: item.index ?? index, action: name }); await render(); }
       catch (error) { button.disabled = false; setConnection(false, error.message); }
     } }, ITEM_ACTIONS[name].label));
 }
@@ -491,20 +491,22 @@ async function renderProfile(id) {
   const groups = groupedItems(b);
   const submissions = panel('作业', groups.length + ' 个', h('div', {}, groups.map((group) => {
     const active = group.entries.some(({ item }) => ['pending', 'running'].includes(item.status));
-    const action = active ? 'cancel' : 'run';
-    const button = b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
-      if (active && !confirm('取消' + group.label + '里的所有等待中和运行中评测？')) return;
+    const controlFor = (action, label, question) => h('button', { type: 'button', class: 'button', onclick: async (event) => {
+      if (question && !confirm(question)) return;
       const control = event.currentTarget;
       control.disabled = true;
       try {
         await api('/api/profile/submission', { id: b.id, submission: group.id, action });
         await render();
       } catch (error) { control.disabled = false; setConnection(false, error.message); }
-    } }, active ? '取消作业' : '重新运行作业') : null;
+    } }, label);
+    const controls = b.can_run ? h('div', { class: 'row-actions' }, active
+      ? controlFor('cancel', '取消作业', '取消' + group.label + '里的所有等待中和运行中评测？')
+      : [controlFor('run', '重新运行作业'), controlFor('delete', '删除作业', '从 Profile 删除' + group.label + '及其全部评测记录？已有运行结果将保留。')]) : null;
     const first = group.entries[0].item;
     return h('article', { class: 'submission' }, h('div', { class: 'panel-heading' },
       h('h3', {}, group.label, h('small', { class: 'muted', text: [when(first.queued_at), first.executor, group.entries.length + ' 项评测'].filter(Boolean).join(' · ') })),
-      button), itemTable(group.entries.map(({ item, index }) => itemRow(item, index)), ''));
+      controls), itemTable(group.entries.map(({ item, index }) => itemRow(item, index)), ''));
   })), b.can_run ? h('button', { class: 'button primary', onclick: () => runAgain(b, false) }, '创建作业') : null);
   // Per task: each (suite, model, task)'s latest attempts in order.
   const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
