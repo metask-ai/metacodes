@@ -360,6 +360,8 @@ The rules that keep the split from dropping coverage:
   Incomplete head scope or baseline evidence fails the migration check. Adding or removing the label runs CI again
   ([tests/README.md](../tests/README.md)).
 
+The [baseline replay for migration PR #809](history/TEST_ID_BASELINE_REPLAY.md) measures the Linux work needed to reconstruct a missing base.
+
 What it costs:
 
 - **Duplicate compilation.** Each leg compiles what its steps need, so the
