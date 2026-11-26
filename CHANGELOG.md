@@ -450,6 +450,14 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **`/login metask` without the TUI moves the session to the new
+  sign-in.** With standard input not a terminal, `/login metask` stored a
+  second Metask sign-in and revoked the first (#561), but the session went
+  on sending the first sign-in's token, which Metask then refused. When the
+  new sign-in is for the gateway the session runs on, the session now lets
+  go of the sign-in it held and the next turn sends the new one; when it is
+  for another gateway, `/login` says so and points to `/model` or a restart.
+
 - **Choosing a model for every future session in `/model` makes it this
   session's current route too.** The route the session started on stayed
   recorded as the session's own choice, which outranks the default, so

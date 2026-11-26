@@ -2244,6 +2244,25 @@ pub const App = struct {
         return true;
     }
 
+    pub const MetaskLoginAdoption = enum { not_on_metask, adopted, other_gateway };
+
+    pub fn adoptMetaskLogin(app: *App) MetaskLoginAdoption {
+        const live = app.liveRoute() orelse return .not_on_metask;
+        if (!live.oauth or !live.provider.eqlText("metask")) return .not_on_metask;
+        const running = std.mem.trimEnd(u8, MetaskKeyRoute.gatewayOriginOf(app.api_client.base_url) orelse return .not_on_metask, "/");
+        var stored = provider_oauth_mod.Session.initHome(app.allocator, app.stateRoot(), provider_ids_mod.Slug.lit("metask")) catch return .other_gateway;
+        defer stored.deinit();
+        if (!(stored.load() catch false)) return .other_gateway;
+        const tokens = stored.tokens orelse return .other_gateway;
+        if (!std.mem.eql(u8, std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/"), running)) return .other_gateway;
+        if (app.oauth_session_provider) |id| if (id.eqlText("metask")) {
+            if (app.oauth_session) |*held| held.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        return .adopted;
+    }
+
     /// Drop the Metask material this process holds, for `/logout`: the
     /// device session, the key route and the account's key list, the key
     /// picked in `/models`, and `--api-key` when it was Metask's. From here

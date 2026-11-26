@@ -647,6 +647,50 @@ fn commitIn(app: *App, provider: []const u8, model: []const u8, credential: ?[]c
     if (outcome != .committed) return error.CommitRefused;
 }
 
+test "L2 credential scope: a Metask sign-in stored for the session's gateway is the next turn's token once /login adopts it" {
+    var metask = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer metask.stop();
+    var relay = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(setup.allocator(), .{});
+    defer io_runtime.deinit();
+    var case: Case = undefined;
+    try case.init(try deviceSessionConfig(setup.allocator(), try originOf(setup.allocator(), relay)));
+    defer case.deinit();
+    const metask_origin = try originOf(setup.allocator(), metask);
+    const app = try deviceSessionApp(&case, metask_origin, io_runtime.io());
+    defer app.deinit();
+    _ = try app.providerHost();
+    try std.testing.expect(!(try app.refreshRouteCredential()));
+    try std.testing.expect(app.oauth_session != null);
+    try std.testing.expectEqualStrings(METASK_ACCESS, app.api_key);
+
+    const now = cc.util_time.nowUnix();
+    try case.storeOAuthLogin("metask", .{
+        .access_token = "fake-metask-access-0010",
+        .refresh_token = "fake-metask-refresh-0010",
+        .expires_in_seconds = 3600,
+        .gateway_url = UNREACHABLE_ORIGIN,
+    }, now);
+    try std.testing.expectEqual(App.MetaskLoginAdoption.other_gateway, app.adoptMetaskLogin());
+    try std.testing.expect(!(try app.refreshRouteCredential()));
+    try std.testing.expectEqualStrings(METASK_ACCESS, app.api_key);
+
+    try case.storeOAuthLogin("metask", .{
+        .access_token = "fake-metask-access-0011",
+        .refresh_token = "fake-metask-refresh-0011",
+        .expires_in_seconds = 3600,
+        .gateway_url = metask_origin,
+    }, now);
+    try std.testing.expectEqual(App.MetaskLoginAdoption.adopted, app.adoptMetaskLogin());
+    try std.testing.expect(app.oauth_session == null);
+    try std.testing.expect(try app.refreshRouteCredential());
+    try std.testing.expectEqualStrings("fake-metask-access-0011", app.api_key);
+}
+
 fn expectCurrentRoute(app: *App, offer: cc.provider_ids.OfferId) !void {
     const host = try app.providerHost();
     try std.testing.expect(host.kernel.sessionSelection() == null);

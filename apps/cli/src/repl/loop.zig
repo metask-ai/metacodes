@@ -3803,6 +3803,9 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
     };
     // A session on this provider sends what was just stored (#566).
     _ = app.adoptProviderLogin(outcome.provider_id);
+    if (outcome.provider_id.eqlText("metask") and app.adoptMetaskLogin() == .other_gateway) {
+        cmd_output.print("{s}This session runs on another Metask gateway than the new sign-in: /model moves it onto the new one, or restart metacodes.{s}\n", .{ app.theme.warn, app.theme.reset });
+    }
 }
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
