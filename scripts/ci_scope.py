@@ -62,7 +62,6 @@ import argparse
 import html
 import json
 import os
-import posixpath
 import re
 import subprocess
 import sys
@@ -90,9 +89,6 @@ TEST_PACKAGES = ("testing", TESTS_PACKAGE)
 TEST_STEP = re.compile(r'\bb\.step\(\s*"(test:[\w-]+)"')
 BUILD_SCRIPT_SUITE = re.compile(r'"(scripts\.tests\.test_\w+)"')
 MIGRATION_LABEL = "migration"
-MODEL_EVAL_PATHS = ("src/core/", "src/provider/", "src/api/", "packages/kernel/", "packages/ai/")
-CORE_E2E_SUITE = "evals/suites/core-e2e.json"
-MODEL_EVAL_FILES = {"src/client.zig", "src/types.zig", "src/ai.zig", CORE_E2E_SUITE}
 SHOWN = 5
 
 
@@ -348,51 +344,6 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
 Change = Tuple[str, str]  # (git status letter, path)
 
 
-def core_eval_inputs(root: Path, candidate: Optional[str]) -> set[str]:
-    read = tree_reader(root, candidate)
-    tasks = json.loads(read(CORE_E2E_SUITE))["tasks"]
-    if not tasks:
-        raise ValueError(f"{CORE_E2E_SUITE} has no tasks")
-    inputs = set()
-    configs = set()
-    for task in tasks:
-        scenario = PurePosixPath(task["scenario"])
-        if scenario.is_absolute() or ".." in scenario.parts:
-            raise ValueError(f"invalid scenario path: {scenario}")
-        inputs.add(scenario.as_posix())
-        configs.add(scenario.with_suffix(".conf").as_posix())
-        inputs.update(task["environment"].get("fixtures", []))
-        inputs.update(check["validator"] for check in task["success"]["checks"] if check["type"] == "validator")
-    inputs.update(configs)
-    if candidate is None:
-        existing = [path for path in configs if (root / path).is_file()]
-    else:
-        paths = git_bytes(root, "ls-tree", "-z", "--name-only", candidate, "--", *sorted(configs))
-        existing = paths.decode("utf-8").split("\0")[:-1]
-    for path in existing:
-        for line in read(path).splitlines():
-            key, _, value = line.partition("#")[0].partition("=")
-            if key.strip() in {"ANSWERS", "SETTINGS", "KG_SEED"} and value.strip():
-                inputs.add((PurePosixPath("tests/e2e") / value.strip()).as_posix())
-    return {posixpath.normpath(path) for path in inputs}
-
-
-def needs_model_eval(changes: Sequence[Change], labels: Sequence[str], root: Path, candidate: Optional[str]) -> bool:
-    paths = {path for _, path in changes}
-    if "model-eval" in labels or not paths or paths & MODEL_EVAL_FILES:
-        return True
-    for path in paths:
-        file = PurePosixPath(path)
-        if file.parent.as_posix() == "tests/e2e/fixtures/agents" and file.suffix == ".md":
-            return True
-        if path.startswith(MODEL_EVAL_PATHS) and not (
-            file.name == "README.md" or path.endswith("_test.zig")
-            or path.startswith(("packages/kernel/tests/", "packages/ai/tests/"))
-        ):
-            return True
-    return bool(paths & core_eval_inputs(root, candidate))
-
-
 @dataclass(frozen=True)
 class DocumentInputs:
     release_sources: frozenset[str]
@@ -487,7 +438,7 @@ def decide(
         if MIGRATION_LABEL in labels:
             return "full", f"full scope: a {MIGRATION_LABEL} pull request compares the complete set of executed test IDs"
         if "model-eval" in labels:
-            return "full", "full scope: the model-eval label requests offline and provider-backed evaluation"
+            return "full", "full scope: the model-eval label requests full offline evaluation"
         if any(status not in ("A", "M", "D") for status, _ in found):
             return "full", "full scope: a path changed type or has an unknown Git status"
         paths = [path for _, path in found]
@@ -506,7 +457,6 @@ def decide(
 def write_summary(destination: str, event: str, base: str, candidate: str,
                   scope: str, reason: str, changes: Sequence[Change], *,
                   selection: Optional[Selection] = None,
-                  model_eval: bool = False,
                   doc_references: bool = True, release_docs: bool = True,
                   release_sources: Sequence[str] = RELEASE_DOCS,
                   layout: Optional[Layout] = None) -> None:
@@ -533,7 +483,6 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
              f"| Unit and integration suites | {units if chosen.suites else 'Skip'} |",
              f"| Product suite | {run(chosen.suites and chosen.product)} |",
              f"| Offline evaluation | {run(chosen.offline_eval)} |",
-             f"| Provider-backed comparison before merge | {'Required' if model_eval else 'Skip'} |",
              f"| Changed script suites | {cell(' '.join(chosen.script_tests)) or 'None'} |",
              f"| TTY and SDK | {run(chosen.tty)} |"]
     lines.extend(["", "| Status | Changed path | Path scope |", "|---|---|---|"])
@@ -824,13 +773,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         selection = select(scope)
     reason = " ".join(reason.split())
     print(reason)
-    try:
-        model_eval = args.event in DIFF_EVENTS and needs_model_eval(observed, args.labels.split(","), root, candidate)
-    except Exception as exc:
-        print(f"Cannot attribute core evaluation inputs: {exc}")
-        model_eval = True
-    if model_eval:
-        print("Provider-backed comparison required before merge (evals/README.md).")
 
     def flag(value: bool) -> str:
         return "true" if value else "false"
@@ -840,7 +782,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             handle.write(
                 f"scope={scope}\nsuites={flag(selection.suites)}\ntty={flag(selection.tty)}\n"
                 f"units={flag(selection.units)}\nproduct={flag(selection.product)}\n"
-                f"offline_eval={flag(selection.offline_eval)}\nmodel_eval={flag(model_eval)}\n"
+                f"offline_eval={flag(selection.offline_eval)}\n"
                 f"packages={','.join(selection.packages)}\npackage_tests={' '.join(selection.package_tests)}\n"
                 f"script_tests={' '.join(selection.script_tests)}\ncomplete={flag(selection.complete)}\n"
                 f"reason={reason}\n"
@@ -854,7 +796,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             handle.write("\n")
     if args.github_summary:
         write_summary(args.github_summary, args.event, base, args.candidate or "(working tree)", scope, reason, observed,
-                      selection=selection, model_eval=model_eval, doc_references=doc_references, release_docs=release_docs,
+                      selection=selection, doc_references=doc_references, release_docs=release_docs,
                       release_sources=inputs.release_sources, layout=layouts[-1] if layouts else None)
     if args.run:
         return run_local(root, scope, selection, args.zig, script_suites(observed))

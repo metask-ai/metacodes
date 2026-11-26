@@ -266,9 +266,6 @@ workflows) and fails when one is missing.
 The native bundled TinyKG is wired into tests by default. Supply
 `-Dtinykg-bin` and `-Dtinykg-sha256` together only to audit an explicit override.
 Do not run paid or provider-backed benchmarks without explicit user authorization.
-For a provider-backed comparison marked required by the CI change scope, obtain
-that authorization for the current base/head pair. Follow the paired evaluation
-and report attestation procedure in [evals/README.md](evals/README.md) before merging.
 
 Judge a build by its exit code and `Build Summary`, never by the presence of
 `failed command:`. The Zig 0.16 build runner routes every step that wrote to

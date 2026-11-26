@@ -74,11 +74,6 @@ the interactive Bench smoke. Changes to the evaluation harness, shared inputs or
 core runtime keep the complete offline evaluation. The nightly run and a migration
 test-ID comparison include it too.
 
-The change summary also reports whether merging requires a provider-backed
-base/head comparison. The existing **Gates (Linux)** check verifies the latest
-maintainer-attested result for that pair. The assessment runs with per-run approval
-outside PR CI. [Evaluation procedure](../evals/README.md)
-
 `layers.zon` assigns every path under `src/`, `apps/`, `packages/` and
 `tests/` to a package and
 lists what each may import (`allowed_dependencies`); `layer:check` holds the
