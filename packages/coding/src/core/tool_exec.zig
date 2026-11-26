@@ -25,6 +25,7 @@ const project_rule_signal = @import("../tools/project_rule_signal.zig");
 const file_reference = @import("file_reference.zig");
 const file_change = @import("metacodes-guard").core.file_change;
 const tool_result = @import("tool_result.zig");
+const kernel = @import("metacodes-kernel");
 const result_budget = @import("metacodes-kernel").result_budget;
 const tool_error = @import("tool_error.zig");
 const tool_catalog = @import("tool_catalog.zig");
@@ -1540,55 +1541,39 @@ pub fn executeSlots(
     parent_allocator: std.mem.Allocator,
     rid: log.RequestId,
 ) error{ HostToolFatal, OutOfMemory }!void {
-    var i: usize = 0;
-    while (i < slots.len) {
-        // denied(已填错误)或 prefetched(结果已由流式预取填好)→ 跳过,不执行。
-        if (slots[i].decision == .denied or slots[i].decision == .deferred or slots[i].prefetched) {
-            // Prefetch execution is only knowledge-bearing after the main
-            // permission path accepts the slot. Denied prefetched work is
-            // deliberately invisible to the ledger.
-            if (slots[i].decision == .run and slots[i].prefetched)
-                observeSuccessfulExecutions(slots[i .. i + 1], base_ctx);
-            i += 1;
-            continue;
+    const dispatch = SlotDispatch{ .ctx = base_ctx, .allocator = parent_allocator, .rid = rid };
+    try kernel.executor.dispatchBatches(slots, dispatch, SlotDispatch.mode, SlotDispatch.execute, true);
+}
+
+const SlotDispatch = struct {
+    ctx: *const ToolContext,
+    allocator: std.mem.Allocator,
+    rid: log.RequestId,
+
+    fn mode(self: SlotDispatch, slot: Slot) ?kernel.ExecutionMode {
+        if (slot.decision != .run or slot.prefetched) return null;
+        return if (slotSafe(self.ctx, slot)) .parallel else .sequential;
+    }
+
+    fn execute(self: SlotDispatch, batch: []Slot, execution_mode: ?kernel.ExecutionMode) error{ HostToolFatal, OutOfMemory }!void {
+        if (execution_mode == null) {
+            if (batch[0].decision == .run and batch[0].prefetched)
+                observeSuccessfulExecutions(batch, self.ctx);
+            return;
         }
-        // 收集从 i 起连续的同安全性 run-slot 为一批。per-input 判定(Bash 看 command;
-        // Task 同步 spawn 仅当有 agent_jobs 可造 per-call client 时算 safe,见 slotSafe)。
-        const safe = slotSafe(base_ctx, slots[i]);
-        var j = i;
-        while (j < slots.len and slots[j].decision == .run and !slots[j].prefetched and slotSafe(base_ctx, slots[j]) == safe) : (j += 1) {}
-        // slots[i..j] 是一批(同安全性)。
-        if (safe and (j - i) > 1) {
-            try runConcurrentBatch(slots[i..j], base_ctx, parent_allocator, rid);
+        if (execution_mode == .parallel and batch.len > 1) {
+            try runConcurrentBatch(batch, self.ctx, self.allocator, self.rid);
         } else {
-            // 单个 或 unsafe → 串行(复用并发 job 逻辑跑单个,保持错误处理一致)。
-            for (slots[i..j]) |*s| {
-                if (s.decision != .run) continue;
-                var job = Job{ .slot = s, .ctx = base_ctx, .parent_allocator = parent_allocator, .rid = rid };
+            for (batch) |*slot| {
+                var job = Job{ .slot = slot, .ctx = self.ctx, .parent_allocator = self.allocator, .rid = self.rid };
                 runJob(&job);
                 if (job.fatal) return error.HostToolFatal;
                 if (job.out_of_memory) return error.OutOfMemory;
             }
         }
-        // Commit host-observed facts after this execution batch succeeds, not
-        // at turn end. A later fatal batch must not erase already established
-        // successful work, while errors in this batch remain excluded.
-        observeSuccessfulExecutions(slots[i..j], base_ctx);
-        i = j;
+        observeSuccessfulExecutions(batch, self.ctx);
     }
-
-    // Result persistence is intentionally not an execution concern. The agent
-    // loop lets PostToolUse hooks and UI consume the executed result, then
-    // makes one deterministic projection immediately before Conversation
-    // append.
-    //
-    // "The executed result" is not always raw bytes, and saying "raw" here was
-    // misleading: a byte-zero tool whose capture exceeds the per-result budget
-    // publishes at the tool layer, so what hooks observe is that tool's own
-    // bounded envelope with its streaming preview - projection later regrows
-    // the preview to the budget. Inline results and structured errors reach
-    // hooks verbatim; artifact-backed ones do not.
-}
+};
 
 fn observeSuccessfulExecutions(slots: []const Slot, base_ctx: *const ToolContext) void {
     const kg = base_ctx.kg orelse return;
@@ -1855,6 +1840,10 @@ fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_alloca
 
 const SpawnJobFn = *const fn (job: *Job) std.Thread.SpawnError!std.Thread;
 
+fn jobFailed(job: *const Job) bool {
+    return job.fatal or job.out_of_memory;
+}
+
 fn spawnJob(job: *Job) std.Thread.SpawnError!std.Thread {
     return @import("platform").thread.spawn(.full, runJob, .{job});
 }
@@ -1898,24 +1887,8 @@ fn runConcurrentBatchWithSpawner(
     var started: usize = 0;
     while (started < jobs.len) {
         const window_end = @min(started + MAX_TOOL_CONCURRENCY, jobs.len);
-        var k = started;
-        while (k < window_end) {
-            threads[k] = spawn_job(&jobs[k]) catch null;
-            if (threads[k] == null) {
-                // spawn 失败 → 当场串行跑。若它观察到 fatal，立刻停止
-                // 启动窗口内剩余 job；之前已启动的线程仍在下方全部 join。
-                runJob(&jobs[k]);
-                k += 1;
-                if (jobs[k - 1].fatal or jobs[k - 1].out_of_memory) break;
-            } else {
-                k += 1;
-            }
-        }
-        const launched_end = k;
-        k = started;
-        while (k < launched_end) : (k += 1) {
-            if (threads[k]) |thread| thread.join();
-        }
+        const launched = kernel.executor.runWindow(jobs[started..window_end], threads[started..window_end], spawn_job, runJob, jobFailed);
+        const launched_end = started + launched;
         // Sealed handles must not outlive `worker_allocator`: re-home them into
         // the caller's allocator before the fatal check releases anything.
         var rehome_failed = false;
