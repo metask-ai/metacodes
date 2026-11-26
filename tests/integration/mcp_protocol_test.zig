@@ -3,7 +3,7 @@
 //! discovery, Classic handshake fallback, restart after a fatal probe),
 //! server pings, stale answers, pagination, MRTR, cancellation, and
 //! configuration reaching the child process. The same client's behaviour with
-//! no process in the way, under both entry-point profiles, is src/mcp/conformance.zig.
+//! no process in the way, under both entry-point profiles, is packages/coding/src/mcp/conformance.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");

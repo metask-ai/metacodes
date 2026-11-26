@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from . import _native as n
 
 DEFAULT_TOOLS = ("Read", "Glob", "Grep")
-# The CLI agent loop's own default (src/core/agent_loop.zig Options.max_turns).
+# The CLI agent loop's own default (packages/coding/src/core/agent_loop.zig Options.max_turns).
 DEFAULT_MAX_TURNS = 400
 
 # The AgentCore handles of the Sessions whose callbacks (event, UI request,

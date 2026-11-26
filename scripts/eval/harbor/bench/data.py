@@ -539,6 +539,7 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
     calls_by_id = tool_events(trial_dir)
     steps = []
     tools: Dict[str, int] = {}
+    skills: Dict[Optional[str], int] = {}
     for step in trajectory.get("steps") or []:
         if not isinstance(step, dict):
             continue
@@ -548,6 +549,12 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
                 continue
             name = str(call.get("function_name") or "?")
             tools[name] = tools.get(name, 0) + 1
+            if name == "Skill":
+                arguments = call.get("arguments")
+                skill = arguments.get("name") if isinstance(arguments, dict) else None
+                if not isinstance(skill, str) or not skill.strip():
+                    skill = None
+                skills[skill] = skills.get(skill, 0) + 1
             calls.append(
                 {
                     "id": call.get("tool_call_id"),
@@ -587,6 +594,7 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
         if isinstance(exception, dict)
         else "",
         "steps": steps,
+        "skills": sorted(skills.items(), key=lambda item: (-item[1], item[0] or "")) if steps else None,
         "tools": sorted(tools.items(), key=lambda item: (-item[1], item[0])),
         "tests": test_summary(trial_dir / "verifier"),
         "verifier_output": tail(trial_dir / "verifier" / "test-stdout.txt"),

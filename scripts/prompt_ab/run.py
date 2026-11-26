@@ -6,7 +6,7 @@
   python3 scripts/prompt_ab/run.py --experiment codemap --variants baseline,current
   python3 scripts/prompt_ab/run.py --experiment codemap --trials 1   # 冒烟
 
-提示词 variant 经 base64 env 注入同一个二进制(src/core/prompt_override.zig),无需重编译。
+提示词 variant 经 base64 env 注入同一个二进制(packages/coding/src/core/prompt_override.zig),无需重编译。
 """
 import os
 import sys

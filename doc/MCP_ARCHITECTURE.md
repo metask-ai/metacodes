@@ -1,6 +1,6 @@
 # MCP architecture
 
-There is one MCP protocol client, `McpClient` in `src/mcp/client.zig`. The CLI,
+There is one MCP protocol client, `McpClient` in `packages/coding/src/mcp/client.zig`. The CLI,
 source-level library consumers and the AgentCore public facade all run it. A fix
 to shared protocol behaviour changes that one implementation and is verified
 across its consumers. The migration that produced this layout is issue #405; the
@@ -10,16 +10,16 @@ inventory below is the record that nothing was dropped on the way.
 
 | Layer | Files | Owns |
 |---|---|---|
-| Shared MCP module | `src/mcp/canonical.zig`, `json_admission.zig`, `wire.zig`, `era_modern.zig`, `era_classic.zig`, `negotiation.zig`, `schema.zig`, `result_stream.zig`, `protocol.zig`, `client.zig` | Protocol models, version negotiation, response validation, request correlation, cancellation, error classification, tool and resource requests, input continuation, result projection |
+| Shared MCP module | `packages/coding/src/mcp/canonical.zig`, `json_admission.zig`, `wire.zig`, `era_modern.zig`, `era_classic.zig`, `negotiation.zig`, `schema.zig`, `result_stream.zig`, `protocol.zig`, `client.zig` | Protocol models, version negotiation, response validation, request correlation, cancellation, error classification, tool and resource requests, input continuation, result projection |
 | Transport adapters | `transport.zig`, `transport_stdio.zig`, `transport_http.zig`, `transport_sse.zig`, `host_transport.zig`, `oauth.zig`, `url.zig` | stdio, Streamable HTTP, HTTP+SSE, a Host connection. One message-stream interface |
 | Connection and catalog management | `runtime.zig`, `instance_pool.zig`, `catalog.zig` | A connected server with its canonical catalog, leases, immutable generations, refresh, expiry, declarative apply |
 | Shared runtime integration | `core/tool_exec` (the kernel), `tool_invocation.zig`, `agentcore/mcp_session.zig`, `registry_bridge.zig` | Tool selection, permission, budget, result admission. Every call ends in `McpClient.invokeTool` under the same kernel |
-| CLI/App | `apps/cli/src/app.zig`, `apps/cli/src/app/mcp_startup.zig`, `apps/cli/src/app/mcp_cli.zig`, `src/mcp/config.zig`, `launch.zig`, `naming.zig`, `param_headers.zig` | Configuration imports, startup policy, status presentation |
+| CLI/App | `apps/cli/src/app.zig`, `apps/cli/src/app/mcp_startup.zig`, `apps/cli/src/app/mcp_cli.zig`, `packages/coding/src/mcp/config.zig`, `launch.zig`, `naming.zig`, `param_headers.zig` | Configuration imports, startup policy, status presentation |
 | AgentCore facade | `packages/agentcore/abi_v1.zig`, `mcp_session.zig`, `mcp_checkpoint.zig` | Public contracts, handles, ABI conversion, callback bridging, Session selection, checkpoints |
 
 `zig build test:mcp` builds and runs the shared module alone, and
 `zig build subsystem:boundary` enforces its import closure: it cannot reach the
-AgentLoop, the App, the REPL or AgentCore. `src/mcp/conformance.zig` is the shared
+AgentLoop, the App, the REPL or AgentCore. `packages/coding/src/mcp/conformance.zig` is the shared
 protocol suite: an in-memory peer behind the Host adapter, under both profiles.
 
 ## Entry-point differences
@@ -66,7 +66,7 @@ keep the existing retry.
 
 ## Capability inventory
 
-The migration's starting point: `src/mcp/client.zig` (CLI) and
+The migration's starting point: `packages/coding/src/mcp/client.zig` (CLI) and
 `packages/agentcore/mcp_*.zig` (AgentCore) at the base of #405. Disposition: **kept**
 (behaviour unchanged, one implementation now), **policy** (a retained difference
 above), **corrected** (see "Behaviour changes"), **evolve** (out of scope, separate).
@@ -92,7 +92,7 @@ above), **corrected** (see "Behaviour changes"), **evolve** (out of scope, separ
 | Connection retirement | None | On a connector contract failure | | runtime test | In the client, for every transport. **kept** |
 | Result projection, sealing | Two paths split at 1 MiB | `project` always | Commit boundary | result_stream, mcp_e2e_test | `project` for both, after frame classification. **corrected** |
 | Resource limits | Line and frame caps | `canonical.Limits` | ABI limits struct | runtime test | `Profile.limits`. **policy** |
-| Connection and catalog ownership | `McpSession`, App | `instance_pool`, `catalog.Manager` | | catalog, pool tests | Moved to `src/mcp`. CLI publishes at startup. **policy** |
+| Connection and catalog ownership | `McpSession`, App | `instance_pool`, `catalog.Manager` | | catalog, pool tests | Moved to `packages/coding/src/mcp`. CLI publishes at startup. **policy** |
 | Refresh, expiry, immutable snapshots, apply | None | `catalog.Manager` | `metask_agentcore` MCP table | catalog tests; ABI L2 | **kept** |
 | Identity and permission binding | Name-based rules | `permissionBinding`, fingerprints (#389) | | ABI L2 | **kept** |
 | Auth context | Headers, per-server OAuth store | Host-owned connector | | mcp_sse_oauth_test; ABI L2 | **kept**; new: catalog "two servers keep separate…" |

@@ -1,0 +1,10174 @@
+//! Agent 主循环：user → API stream → tool_use(s) → tool_result(s) → API stream → ...
+//!
+//! M0.5 把 main.zig 的 runRepl 里嵌在 while 里的业务逻辑抽到这里。
+//! M1.5 加入 AbortSignal 检查点：每轮开头、每 stream 事件前检查，触发时返回 .aborted。
+//!
+//! 核心：用 Conversation 的 Block tagged union 正确保存 tool_use / tool_result，
+//! 不再像旧版那样把所有东西扁平化成 text。
+
+const std = @import("std");
+const tt = @import("metacodes-base").tools.test_tmp; // 测试 fixture 唯一路径(并发隔离)
+const pfs = @import("platform").fs;
+const types = @import("metacodes-ai").types;
+const client_mod = @import("metacodes-ai").client;
+const last_error = @import("metacodes-ai").api.last_error;
+const provider_mod = @import("metacodes-ai").api.provider;
+const model_error = @import("metacodes-ai").api.model_error;
+const dialect_mod = @import("metacodes-ai").api.dialect;
+const request_gate_mod = @import("request_gate.zig");
+const execution_effect = @import("metacodes-guard").core.execution_effect;
+const response_candidate = @import("response_candidate.zig");
+const json_mod = @import("metacodes-ai").json;
+const tools_mod = @import("../tools.zig");
+const tools_common = @import("metacodes-guard").tools.common;
+const permission_mod = @import("metacodes-guard").permission_root;
+const message_repair_mod = @import("message_repair.zig");
+const hooks_mod = @import("metacodes-guard").permission.hooks;
+const msg = @import("metacodes-kernel").message;
+const conversation_mod = @import("metacodes-kernel").conversation;
+const Conversation = conversation_mod.Conversation;
+const AbortSignal = @import("metacodes-base").util.abort.AbortSignal;
+const ReadState = @import("read_state.zig").ReadState;
+const api_stream = @import("metacodes-ai").api.stream;
+const tool_error = @import("tool_error.zig");
+const context_pressure_mod = @import("metacodes-ai").core.context_pressure;
+const context_caps = @import("context_caps.zig");
+const error_class = @import("metacodes-ai").api.error_class;
+const compact_kernel = @import("compact_kernel.zig");
+const compaction_control = @import("compaction_control.zig");
+const result_projection = @import("result_projection.zig");
+const result_budget_mod = @import("metacodes-kernel").result_budget;
+const verification_progress_mod = @import("verification_progress.zig");
+const requirement_ledger_mod = @import("requirement_ledger.zig");
+const delivery_cadence_mod = @import("delivery_cadence.zig");
+const progress_updates_mod = @import("progress_updates.zig");
+const check_gate_mod = @import("check_gate.zig");
+const isolated_verifier_mod = @import("isolated_verifier.zig");
+const test_integrity_mod = @import("test_integrity.zig");
+const stall_gate_mod = @import("stall_gate.zig");
+const learning_turn_mod = @import("learning_turn.zig");
+const lesson_mod = @import("../kg/lesson.zig");
+const util_time = @import("metacodes-base").util.time;
+const util_json = @import("metacodes-base").util.json;
+const log = @import("metacodes-base").util.log;
+const output_semantics = @import("metacodes-guard").core.output_semantics;
+const telemetry = @import("../telemetry/telemetry.zig");
+const file_change_mod = @import("metacodes-guard").core.file_change;
+const tool_exec_mod = @import("tool_exec.zig");
+const ui_backend = @import("protocol/ui_backend.zig");
+const ui_event = @import("metacodes-guard").core.protocol.ui_event;
+const UiBackend = ui_backend.UiBackend;
+const CoreEvent = ui_event.CoreEvent;
+const job_notification_mod = @import("job_notification.zig");
+const run_input_mod = @import("run_input.zig");
+const harnessmm_mod = @import("harnessmm.zig");
+
+/// `stalled`: the stall gate stopped a run whose tool rounds kept returning
+/// nothing new (stall_gate.zig). A controlled stop like `tool_loop`, with its
+/// own cause so the host can say what happened and how to continue.
+pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget, max_tokens_exhausted, stalled };
+
+/// 环境故障熔断阈值:一个 run 内累计 N 条 `system_error` + `recoverable:false` 的工具结果后
+/// 以 `.tool_loop` 收口。这类故障(工作目录没了、shell 起不来)换命令重试不可能修好——
+/// 2026-09-22 事故里模型在 exit 127 里试了 383 次直到 400 轮上限。每次出现都发
+/// `environment_fault` 事件告知用户;第 N 次后停,把处置交还给唯一持全局意图的人。
+/// 与 max_turns 不冲突:那是预算,这是按故障分类停止,不数模型行为。
+pub const MAX_ENVIRONMENT_FAULTS: u32 = 3;
+
+/// Same-turn re-issues every model request gets by default (#461), whatever
+/// `Options` say: after a connection that gave no answer
+/// (`isSilentRetryFailure`), as long as the failed attempt never started a
+/// tool call. The count is the request's, not the Run's, so an earlier turn
+/// cannot use it up. A reasoning model streams thinking first, so a gateway
+/// stream that drops has almost always shown something; that output is
+/// discarded with the attempt (it never reaches the Conversation) and the
+/// identical request goes out again. A started tool call, even one whose
+/// arguments were still streaming, rules the re-issue out: the call may have
+/// begun to run (stream prefetch), and a gateway that re-generates it gives no
+/// promise to name it the same way. 2026-10-24: a connection silent for 30
+/// minutes after `message_start` ended a Run with `api_error`; the user's
+/// manual /retry finished the same request in 18.7 s.
+pub const STREAM_RETRIES_PER_REQUEST: u8 = 1;
+
+pub const CONTINUE_AFTER_TRUNCATION = "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.";
+pub const RESPOND_AFTER_SILENT_TRUNCATION = "Your previous response reached the output token limit before producing any visible output. Stop deliberating: give a brief response or make a tool call right away.";
+pub const RESTART_AFTER_STREAM_CUT = "Your previous response was cut off mid-stream and none of it was kept. Answer again from the start and get to the point: reason briefly, then give the response or make a tool call.";
+
+/// How long a re-issue of an attempt that showed output waits after its
+/// `retry_notice` (#461). Short: the connection already died once, and the
+/// wait is there so a gateway that is restarting is not hit at once. The wait
+/// is a cancellation point; an abort during it ends the Run `aborted` and
+/// sends nothing.
+pub const STREAM_RETRY_BACKOFF_MS: u32 = 500;
+
+/// 哪些流内失败算"连接没给出答复",可以在零可见输出时兜底重发:监视线程判的 stall(进展沉默或
+/// 连接已死)、没报告停止原因就结束的流、以及流中途断连(`RequestFailed`——三个 provider client
+/// 只用它表示断连,见 api/stream.zig `midStreamReadError` 的名字约定)。服务端**主动**报的错误
+/// (`ApiError`:错误帧 / 顶层 `error` 对象 / `response.failed`)是一个答复,重发只会重复它或把它
+/// 盖掉;本地或解析类失败(`StreamTooLong`、`InvalidJson`…)重发也不会变,都不在内。
+fn isSilentRetryFailure(failure: ?anyerror) bool {
+    const err = failure orelse return false;
+    return err == error.StreamStalled or err == error.StreamIncomplete or err == error.RequestFailed;
+}
+
+/// 一条工具结果是否是环境故障:结构化错误信封(`{"error":{…}}`)里 `category` 为
+/// `system_error` 且 `recoverable` 明确为 false。任何别的形状(普通输出、user_error、
+/// 可重试的 system_error、safety 拒绝)都不算。
+pub fn isEnvironmentFault(content: []const u8) bool {
+    if (!std.mem.startsWith(u8, content, "{\"error\":")) return false;
+    const category = util_json.extractStringField(content, "category") orelse return false;
+    if (!std.mem.eql(u8, category, "system_error")) return false;
+    const recoverable = util_json.extractBoolField(content, "recoverable") orelse return false;
+    return !recoverable;
+}
+
+test "isEnvironmentFault: 只认 system_error + recoverable:false 的结构化错误" {
+    try std.testing.expect(isEnvironmentFault("{\"error\":{\"code\":\"working_dir_unavailable\",\"category\":\"system_error\",\"detail\":\"gone\",\"recoverable\":false}}"));
+    // 可重试的 system_error(如 Timeout)不是环境故障。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"timeout\",\"category\":\"system_error\",\"detail\":\"x\",\"recoverable\":true}}"));
+    // user_error / safety 是模型或规则的事,不算。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"not_read\",\"category\":\"user_error\",\"detail\":\"x\",\"recoverable\":true}}"));
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"permission_denied\",\"category\":\"safety\",\"detail\":\"x\",\"recoverable\":false}}"));
+    // 用户/宿主中断(Esc/Ctrl+C)不是环境故障:tool_error 把 Aborted 归为 interrupted。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"aborted\",\"category\":\"interrupted\",\"detail\":\"Bash failed with Aborted\",\"recoverable\":true}}"));
+    // 普通输出里哪怕带这些词也不算:必须是错误信封。
+    try std.testing.expect(!isEnvironmentFault("{\"stdout\":\"category system_error recoverable false\",\"exit_code\":0}"));
+    // 缺 recoverable 字段 → 不算(不猜)。
+    try std.testing.expect(!isEnvironmentFault("{\"error\":{\"code\":\"other\",\"category\":\"system_error\",\"detail\":\"x\"}}"));
+}
+
+/// Event capture is independent of execution depth. The default preserves the
+/// existing CLI/UI card behavior. Both AgentCore modes emit the complete raw
+/// semantic stream into the facade's private projector without pretending that
+/// a real child is depth zero; that projector alone decides which events become
+/// public. In particular, model-tool boundaries must remain observable there
+/// for final-text reconstruction even though they are hidden from the Host.
+pub const EventProjection = enum {
+    legacy,
+    run_root,
+    model_tool,
+
+    fn emitToolStart(self: EventProjection, emit_tool_cards: bool, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => emit_tool_cards and agent_depth == 0,
+            .run_root, .model_tool => true,
+        };
+    }
+
+    fn emitToolResult(self: EventProjection, emit_tool_cards: bool) bool {
+        return switch (self) {
+            .legacy => emit_tool_cards,
+            .run_root, .model_tool => true,
+        };
+    }
+
+    fn emitToolProgress(self: EventProjection, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => agent_depth == 0,
+            .run_root, .model_tool => true,
+        };
+    }
+
+    fn allowUiRequests(self: EventProjection, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => agent_depth == 0,
+            .run_root, .model_tool => true,
+        };
+    }
+
+    /// Progress-update nudges (#114) go to a run whose commentary a person can
+    /// read: the legacy root only (a subagent's narration is its parent's tool
+    /// result), the AgentCore external run root, never a model-tool child.
+    fn admitsProgressNudge(self: EventProjection, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => agent_depth == 0,
+            .run_root => true,
+            .model_tool => false,
+        };
+    }
+};
+
+test "EventProjection is orthogonal to true agent depth and preserves legacy defaults" {
+    try std.testing.expect(EventProjection.legacy.emitToolStart(true, 0));
+    try std.testing.expect(!EventProjection.legacy.emitToolStart(true, 1));
+    try std.testing.expect(EventProjection.legacy.emitToolResult(true));
+    try std.testing.expect(!EventProjection.legacy.emitToolResult(false));
+
+    try std.testing.expect(EventProjection.run_root.emitToolStart(false, 7));
+    try std.testing.expect(EventProjection.run_root.emitToolResult(false));
+    try std.testing.expect(EventProjection.run_root.emitToolProgress(7));
+    try std.testing.expect(EventProjection.run_root.allowUiRequests(7));
+    try std.testing.expect(EventProjection.model_tool.emitToolStart(false, 7));
+    try std.testing.expect(EventProjection.model_tool.emitToolResult(false));
+    try std.testing.expect(EventProjection.model_tool.emitToolProgress(7));
+    try std.testing.expect(EventProjection.model_tool.allowUiRequests(7));
+}
+
+/// 工具进度 trampoline:把工具的 progress 回调(WebSearch query/results)转成 CoreEvent,
+/// 经 backend 路由到归属 session 的 UI。per-run 实例(backend + session),progress_state 指它。
+///
+/// **生命周期 invariant**:progress_state 指向的 ProgressTramp 栈变量(agent_loop while-turn
+/// 块内)必须活过 `executeSlots`——progress_fn 只在 executeSlots 同步执行期间被工具回调,
+/// 那时存储仍在帧上。**若将来把工具执行改成异步/跨 turn 持有 ctx,必须把它移到更长寿的存储**
+/// (否则 progress_fn 在栈回收后触发 = UAF)。
+const ProgressTramp = struct {
+    be: *const UiBackend,
+    session: @import("metacodes-kernel").session_id.SessionId,
+    fn cb(state: *anyopaque, id: []const u8, phase: tools_mod.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
+        const self: *@This() = @ptrCast(@alignCast(state));
+        var buf: [192]u8 = undefined;
+        const line: []const u8 = switch (phase) {
+            // 对齐 cc UI.tsx:query_update→"Searching: q";results_received→"Found N results…".
+            .query_update => std.fmt.bufPrint(&buf, "Searching: {s}", .{text}) catch text,
+            .results_received => std.fmt.bufPrint(&buf, "Found {d} results for \"{s}\"", .{ count, text }) catch text,
+        };
+        // line 是栈 borrow,emit 同步消费(TuiBackend.setToolProgress 立即拷进定长卡)。
+        self.be.emitEvent(self.session, .{ .tool_progress = .{ .id = id, .text = line } });
+    }
+};
+
+/// **U6 A2:工具→父 backend 通知 trampoline**。Task 生 subagent / TaskUpdate 改 DAG 时,工具经
+/// ctx.event_reporter 把 agent_lifecycle / tasks_changed 转发到父 backend.emitEvent。生命周期同
+/// ProgressTramp(栈变量活过 executeSlots;若工具执行改异步跨 turn 持有 ctx,须移到更长寿存储)。
+const EventTramp = struct {
+    be: *const UiBackend,
+    session: @import("metacodes-kernel").session_id.SessionId,
+    fn agentCb(state: *anyopaque, ev: @import("metacodes-guard").core.protocol.ui_event.AgentLifecycle) void {
+        const self: *@This() = @ptrCast(@alignCast(state));
+        self.be.emitEvent(self.session, .{ .agent_lifecycle = ev });
+    }
+    fn tasksCb(state: *anyopaque, ev: @import("metacodes-guard").core.protocol.ui_event.TasksChanged) void {
+        const self: *@This() = @ptrCast(@alignCast(state));
+        self.be.emitEvent(self.session, .{ .tasks_changed = ev });
+    }
+};
+
+/// Auto-compact 阈值下限:避免 catalog 返回异常小值(测试 mock、未知模型)导致每 turn 都 compact。
+/// 低于这个值不做压缩。设为 32K——正常对话/工具调研远小于此,只有真逼近 context window 才触发。
+pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
+pub const COMPACT_MIN_SAVED_PERCENT: usize = 5;
+
+/// Evaluation runs allow two bounded retries during connection setup/header
+/// receipt, before any response stream is consumed. They remain one semantic
+/// request under the same native budget and emit explicit retry telemetry;
+/// after three physical attempts the rollout still fails closed.
+pub fn providerAttemptLimit(evaluation_gated: bool) u32 {
+    return if (evaluation_gated) 3 else client_mod.defaultMaxRetries();
+}
+
+/// 强制 auto-compact 阈值(测试/power-user 旋钮)。设 `METACODES_FORCE_COMPACT_AT=<tokens>` 后,
+/// **直接**把 auto/micro 阈值钉到该值,绕过 formula(≈window-reserve)和 32K 下限——让真模型 e2e
+/// 能在短对话里触发真实压缩+投影(否则 glm 262K 窗口下要灌 ~200K token 才够)。
+/// 生产默认不设此 env → null → 走正常 formula+floor,行为不变。非法/0/空 → null(坏 env 不改行为)。
+pub fn forcedAutoCompactThreshold() ?usize {
+    const raw = std.c.getenv("METACODES_FORCE_COMPACT_AT") orelse return null;
+    return parseForcedAutoCompactThreshold(std.mem.span(raw));
+}
+
+/// 纯解析(可单测,不碰 env):非法/0/空 → null。
+fn parseForcedAutoCompactThreshold(raw: []const u8) ?usize {
+    const v = std.fmt.parseInt(usize, raw, 10) catch return null;
+    if (v == 0) return null;
+    return v;
+}
+
+/// 强制 keep_recent(测试旋钮):`METACODES_FORCE_COMPACT_KEEP=<n>`。默认 keep_recent=10 需要 >10 条
+/// 消息才有可丢的;调小它让"大的早期消息 + 几轮小追问"就能触发真实 summary 压缩(e2e 用)。
+/// 生产默认不设 → null → 用正常 keep_recent。非法/0/空 → null。
+pub fn forcedAutoCompactKeep() ?usize {
+    const raw = std.c.getenv("METACODES_FORCE_COMPACT_KEEP") orelse return null;
+    return parseForcedAutoCompactThreshold(std.mem.span(raw)); // 同款解析:非法/0/空 → null
+}
+
+/// L3 挂起信息:stop_reason==.suspended 时非空,带出挂起点供调用方落盘 + 恢复。
+/// owned by run() 的 allocator;调用方用后 free(deinit)。
+///
+/// **API 配对约束(关键)**:Anthropic 要求 assistant 的每个 tool_use 在紧接 user 消息里都有
+/// 对应 tool_result——不能拆成两次 user 消息。故挂起时**不**提交任何 partial user 消息;
+/// 已完成工具(非 pending)的结果 stash 进 completed_results,resume 时与 pending 工具的迟来
+/// 结果**一起**作为单条 user 消息补齐(A+B 同 turn),满足配对。
+pub const SuspendInfo = struct {
+    /// 待补迟来结果的 pending tool_use id(owned)。
+    tool_use_id: []const u8,
+    kind: []const u8, // custom UI 类型(owned)
+    payload_json: []const u8, // 渲染规格(owned)
+    /// 同轮已完成工具的结果(owned)。resume 时与 pending 的迟来结果一起补成单条 user 消息。
+    completed_results: []CompletedResult,
+    /// Every *other* pending tool use of the batch when
+    /// `Options.suspend_all_pending` is set: a batch whose tools all execute
+    /// elsewhere (a sealed Skill's client) is answered as a whole through
+    /// `resumeRunWithResults`. Empty under the default single-suspend rule,
+    /// where siblings become `ConcurrentSuspendUnsupported` placeholders.
+    pending_siblings: []PendingSibling = &.{},
+    allocator: std.mem.Allocator,
+    pub const CompletedResult = struct {
+        tool_use_id: []const u8, // owned
+        content: []const u8, // owned
+        is_error: bool,
+    };
+    pub const PendingSibling = struct {
+        tool_use_id: []const u8, // owned
+        kind: []const u8, // owned
+        payload_json: []const u8, // owned
+    };
+    pub fn deinit(self: SuspendInfo) void {
+        self.allocator.free(self.tool_use_id);
+        self.allocator.free(self.kind);
+        self.allocator.free(self.payload_json);
+        for (self.completed_results) |cr| {
+            self.allocator.free(cr.tool_use_id);
+            self.allocator.free(cr.content);
+        }
+        self.allocator.free(self.completed_results);
+        for (self.pending_siblings) |sibling| {
+            self.allocator.free(sibling.tool_use_id);
+            self.allocator.free(sibling.kind);
+            self.allocator.free(sibling.payload_json);
+        }
+        self.allocator.free(self.pending_siblings);
+    }
+};
+
+/// Whether every successful provider response in a Run supplied readable usage.
+/// `unknown` is intentionally separate from zero counters: a provider may
+/// explicitly report four zero counters, while an omitted or unreadable usage
+/// object must not be presented as a free run to consumers.
+pub const UsageStatus = enum {
+    known,
+    unknown,
+};
+
+pub const RunResult = struct {
+    stop_reason: StopReason,
+    turns: u32,
+    tool_calls: u32,
+    usage_status: UsageStatus = .known,
+    /// L3:仅 stop_reason==.suspended 时非空。调用方据此落盘 suspend.json + 投递 UI 请求,
+    /// 响应到达后 resumeRun 注入。用后 deinit。
+    suspend_info: ?SuspendInfo = null,
+    /// Non-null exactly when stop_reason == .stalled: what the stall gate saw
+    /// (value type, nothing to free). Hosts render it with
+    /// `stall_gate.renderStopNotice`.
+    stall: ?stall_gate_mod.Report = null,
+    /// How many times this call to `run` asked the model to continue an answer
+    /// the provider cut at its output-token limit (`max_tokens`), in total.
+    /// `MAX_CONTINUATIONS` bounds consecutive continuations only, so this can
+    /// exceed it when the model recovers between cuts. The visible text of a continued answer is one
+    /// seamless concatenation, so this is the only trace a host that reads
+    /// only the result has of it (issue #269).
+    continuations: u32 = 0,
+    /// Non-null when a learning turn was armed and the run reached its
+    /// terminal boundary (`learning_turn.zig`). `stop_reason` stays the
+    /// attempt's own; this says what the learning turn did after it.
+    learning: ?learning_turn_mod.Report = null,
+};
+
+/// Probe supplied by an interactive host so a queued user message can end the
+/// background-job wait without consuming the still-pending exit event.
+pub const PendingInputProbe = struct {
+    ctx: *anyopaque,
+    hasPendingFn: *const fn (*anyopaque) bool,
+
+    pub fn hasPending(self: PendingInputProbe) bool {
+        return self.hasPendingFn(self.ctx);
+    }
+};
+
+pub const JobWaitOptions = struct {
+    max_wakeups: u32 = 20,
+    timeout_ms: ?u64 = null,
+    poll_slice_ms: u64 = 200,
+};
+
+pub const Options = struct {
+    preview: @import("metacodes-ai").preview.Features = .none,
+    /// Where to leave the structured detail of this Run's model failure (issue
+    /// #408), owned by the caller. Set to a value exactly when the Run stops
+    /// with `api_error` or `max_tokens_exhausted`, and to null otherwise, so a
+    /// failure that a retry recovered from leaves nothing here. Children do not
+    /// inherit it: a subagent's failure is the parent's tool result, not the
+    /// parent's own.
+    model_error_out: ?*?model_error.Detail = null,
+    /// **唯一兜底 backstop**(对齐 codex:无主动熔断,只靠 max_turns + 用户中断)。
+    /// 轮数不度量任何真实风险,只防真失控。长任务靠 pre-sampling auto-compact 压缩续接。
+    max_turns: u32 = 400,
+    /// **成本次闸**(度量真实"烧钱"维度,与轮数正交)。本 run 累计成本(USD)达此值 → 停
+    /// (.budget),交互层询问用户是否继续(不自动续)。null = 不设预算(默认)。
+    cost_budget_usd: ?f64 = null,
+    /// Checked at every provider side-effect boundary, including compact
+    /// summaries and same-turn context-recovery retries. A denial happens
+    /// before network I/O and returns stop_reason=budget.
+    request_gate: ?request_gate_mod.Gate = null,
+    /// Optional execution-effect boundary. Null preserves the direct embedded
+    /// path; durable Hosts and deterministic tests install an explicit adapter.
+    execution_boundary: ?execution_effect.Boundary = null,
+    /// Optional candidate-response boundary (issue #34).
+    ///
+    /// The observer sees each Provider response as this loop assembles it and
+    /// may refuse one before it becomes Conversation state. Null is the whole
+    /// existing behavior, unobserved and unvetoable; a durable Host installs
+    /// one so it can admit content incrementally without letting a response it
+    /// cannot checkpoint reach the Conversation.
+    ///
+    /// Deliberately **not** passed to a subagent. A child Run commits to its
+    /// own Conversation; what reaches this one is a tool result, already
+    /// governed by the tool-result side of whatever policy installed this.
+    response_observer: ?response_candidate.Observer = null,
+    /// Optional durable-state compaction control (issue #430).
+    ///
+    /// Installed by an embedding layer that owns durable state (AgentCore's
+    /// checkpoint budget). Every compaction this loop runs then reports to it,
+    /// commits only if it allows the replacement, and may also be started by
+    /// its capacity pressure; the context-window recovery never falls back to
+    /// trimming history. Null keeps the loop exactly as before.
+    ///
+    /// Like `response_observer`, never passed to a subagent: a child compacts
+    /// its own discarded Conversation, which is not durable state.
+    compaction_control: ?compaction_control.Control = null,
+    /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
+    /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
+    session: @import("metacodes-kernel").session_id.SessionId = @import("metacodes-kernel").session_id.SessionId.single,
+    system_prompt: ?[]const u8 = null,
+    /// Frozen, host-owned procedural skill. Requires preview and RSI; fresh
+    /// children do not inherit this selection implicitly.
+    rsi_policy: ?*const @import("../skills/rsi.zig").Policy = null,
+    rsi: bool = false,
+    /// EDG / GDR / CCS selection, effective only when preview is also enabled.
+    harnessmm: bool = false,
+    /// 首条 user-context message(对齐 cc prependUserContext):CLAUDE.md 链 + AutoMem +
+    /// currentDate,`<system-reminder>` 包裹。仅主 session 传(subagent 走 preload 自己的链)。
+    /// null → 不 prepend(headless/subagent/无记忆)。由 user_context.build 生成,owned-by-caller,
+    /// 生命周期须覆盖整个 run。
+    inject_user_context: ?[]const u8 = null,
+    /// Issue #276: the CLI session's date bookkeeping. The first turn of a Run
+    /// on a later local date than the model can see gets one notice, appended
+    /// after the Run's input so it enters history with this turn. Null (the
+    /// default) adds nothing - AgentCore puts the date in each Run's context.
+    time_announcer: ?*@import("time_context.zig").Announcer = null,
+    /// Issue #277: the Session's goal accounting. Each provider response's
+    /// non-cached input plus output tokens is charged to the goal the Run
+    /// began on (if it was active), and the Run's wall time when it ends -
+    /// however it ends. A budget used up mid-Run asks the model, once, at the
+    /// next turn boundary to wrap up; the Run is not cut off. Null charges
+    /// nothing.
+    goal_meter: ?*@import("metacodes-guard").core.goal.Meter = null,
+    /// One-shot user-role steering item appended to the first API request only.
+    /// This is intentionally not written to Conversation/transcript; extensions such
+    /// as /loop use it to continue work without fabricating a persisted user turn.
+    synthetic_user_input: ?[]const u8 = null,
+    verbose: bool = false,
+    abort: ?*const AbortSignal = null,
+    /// 转后台请求信号(Ctrl+B 生成期置位)。run() 每轮**开头**(turn 边界,conversation 干净时)
+    /// load 一次,命中则返回 stop_reason=.backgrounded(不中断当前未完成的 turn)。调用方据此把
+    /// 主对话深拷贝转后台续跑。与 abort 分开:abort 是用户中断(对话留前台),background 是转后台续跑。
+    /// null → 不支持转后台(headless/子 agent)。
+    background_request: ?*const std.atomic.Value(bool) = null,
+    /// 传给 Write/Edit 做 must-read-first 校验。null → 单测/headless 简化路径（不校验）
+    read_state: ?*ReadState = null,
+    /// Edit/Write 旁路高亮缓存(diff 工具卡 tree-sitter 着色用)。null → 不缓存。
+    edit_hl_cache: ?*@import("edit_hl_cache.zig").EditHlCache = null,
+    /// LSP 服务(CLI 默认开,`--no-lsp` 关)。透传进 ToolContext 供 Edit/Write finalizeWrite +
+    /// CodeMap/FindSymbol/Read-outline 用。
+    ///
+    /// **不透传进 subagent(登记的已知局限)**:`core/subagent.zig` 刻意不把它放进子 loop 的
+    /// Options,所以 subagent 里这四项能力一律报 `lsp_disabled`。原因不是疏忽——`lsp/client.zig`
+    /// 的线程模型白纸黑字要求 `sendRequest`/`sendNotification` 由**单一 caller 线程**串行调用,
+    /// 而 subagent 跑在后台线程上;直接透传会让两个线程交错写同一个 server 的 stdin。要放开得先
+    /// 给 Client 加发送侧串行化,那是 LSP 子系统的改动,不是加一行 `.lsp = opts.lsp`。
+    lsp: ?*@import("../lsp/service.zig").Service = null,
+    /// 自动 compact 的 token 阈值。null → 按 input context window 扣输出保留区后动态算。
+    auto_compact_threshold: ?usize = null,
+    /// Wire-size safety net for image results (they bypass the byte budgets):
+    /// before each request the oldest *delivered* image results are stubbed
+    /// until the active history's image bytes fit under this cap. Defaults to
+    /// types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST; tests lower it.
+    image_request_bytes_cap: usize = types.MAX_IMAGE_RESULT_BYTES_PER_REQUEST,
+    /// 自动 compact 保留的消息数（最新的 N 条）
+    auto_compact_keep_recent: usize = 10,
+    /// Bash 后台作业注册表（给 ToolContext 用，工具侧 Bash/BashOutput/KillShell 用）
+    jobs: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Optional turn-boundary exit delivery. Null keeps existing embedders
+    /// unchanged; ownership is the spawning tool context's agent identity.
+    job_notifications: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Interactive input ends the in-core wait while leaving exits for the next
+    /// turn boundary; this prevents the 2026-09-19 polling incident from
+    /// competing with a user's already queued message.
+    pending_input: ?PendingInputProbe = null,
+    /// Host input submitted while this Run is active (#270). Adopted at the
+    /// same turn boundary as `UiEvent.queue_message` (see `adoptRunInputs`).
+    /// Only the root loop of a Session Run gets one; child agents never do.
+    run_inputs: ?*run_input_mod.Queue = null,
+    job_wait: JobWaitOptions = .{},
+    /// 后台 subagent 作业注册表（Task run_in_background + TaskOutput + TaskStop agent_ 分流用）
+    agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
+    /// Swarm 会话状态（TeamCreate/TeamDelete/SendMessage + Task name+team_name spawn）。
+    /// null = 非 lead 上下文（subagent/headless）。透传进 base_ctx.swarm。
+    swarm: ?*@import("../swarm/context.zig").SwarmContext = null,
+    /// 模型 Task 清单（TaskCreate/Get/List/Update/Stop 共享）
+    tasks: ?*@import("task_store.zig").TaskStore = null,
+    kg: ?*@import("../kg/client.zig").KgClient = null,
+    /// System-One advisor for memory-plane judgments (enumeration intent here,
+    /// memory relations in KgRemember via ToolContext). null = baseline only.
+    jev: ?*@import("../jev/advisor.zig").Advisor = null,
+    kg_projects_dir: []const u8 = "",
+    /// 本 agent loop 的对外身份(KG claim 租约)。null = 沿用 session(主 loop:
+    /// App.session_id 跨进程唯一且跨 turn 稳定)。subagent spawn 时必须显式 gen——
+    /// 每个独立 agent loop 一个全局唯一 id,进程内并发 subagent 才互相有防撞。
+    agent_ident: ?@import("metacodes-kernel").session_id.SessionId = null,
+    /// Optional TinyKG-specific lease identity. Main sessions inherit
+    /// `agent_ident`; swarm injects `name@team` so claim/release/close use one
+    /// exact holder string throughout the task lifecycle.
+    kg_agent_ident: ?[]const u8 = null,
+    /// AutoMem memdir 绝对路径(B/C 合并 markdown 自动入图)。
+    memdir_abs: []const u8 = "",
+    /// Anthropic 具体 *Client(仅 web_search server tool 用;非 Anthropic provider → null)。
+    /// **职责边界**:P0.5 后 subagent **构造** per-call client 已走 provider_factory.makeProvider
+    /// (provider-neutral),此字段只剩 web_search 这个 Anthropic 专有 server tool 的入口——它必须
+    /// 是 Anthropic 具体 client 才能发 server-tool 请求,故保持 *Client 而非 Provider。
+    api_client: ?*@import("metacodes-ai").client.Client = null,
+    /// Optional explicit per-call provider factory. Normal App runs derive this
+    /// from agent_jobs; embedders such as AgentSession provide their own.
+    provider_factory: ?@import("metacodes-ai").api.provider_factory.Factory = null,
+    tool_defs: ?[]const @import("metacodes-ai").json.ToolDefinition = null,
+    /// 本次 run 对应的 agent 嵌套深度（父=0，子=1…）
+    agent_depth: u8 = 0,
+    /// 运行时工具（Skill/MCP）注册表。null = 仅静态工具。
+    dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
+    /// Embedding Sessions set this to route execution through the same
+    /// immutable selection that produced `tool_defs`. Null preserves the App's
+    /// existing process registry behavior.
+    tool_dispatcher: ?tools_mod.ToolDispatcher = null,
+    /// Suspend on a batch with several pending tool uses by carrying all of
+    /// them in `SuspendInfo.pending_siblings` instead of answering the extra
+    /// ones with `ConcurrentSuspendUnsupported`. For a dispatcher whose every
+    /// tool executes elsewhere and answers through `resumeRunWithResults`.
+    suspend_all_pending: bool = false,
+    /// Host tool 执行身份(admission 处固定,AgentSession.runLoop 显式传值)。
+    /// 可选 + null 默认:非 Host-tool 消费者零感知(共享基础设施扩展规则)。
+    host_run: ?tools_mod.HostRunIdentity = null,
+    /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)。透传到 ToolContext。
+    /// 见 ToolContext.HostServices。
+    host_services: ?tools_mod.HostServices = null,
+    /// 本轮的 Skill 工具调用是否为"用户显式 /name 触发"。
+    /// 当前 Stage C 总是 false(只支持模型自主);Stage D 加 /<skill-name> 命令后置 true。
+    explicit_invocation: bool = false,
+    /// session id + project root + shell-exec policy(对接 Skill 渲染)。
+    session_id: []const u8 = "",
+    project_dir: []const u8 = "",
+    disable_shell_execution: bool = false,
+    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包平台沙箱(sandbox-exec / bwrap)。
+    sandbox: ?*const @import("metacodes-guard").sandbox.config.SandboxSettings = null,
+    /// cwd 绝对路径 + HOME(sandbox profile 用)。
+    cwd_abs: []const u8 = "",
+    /// 相对工具路径是否以 cwd_abs 为基准解析。默认 false 保持 CLI 既有输出/路径语义；
+    /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
+    resolve_relative_paths: bool = false,
+    path_aliases: []const tools_common.PathAlias = &.{},
+    home_dir: []const u8 = "",
+    /// Host-injected state root (util/state_root.zig), propagated to every ToolContext.
+    state_root: []const u8 = "",
+    /// Session directory that owns recoverable tool-result artifacts. The
+    /// artifact envelope never exposes this path to the model.
+    artifact_root: []const u8 = "",
+    /// When set to a Metask protocol name, each accepted gateway stream emits
+    /// one billing-ledger record at completion. Null keeps synthetic/providers
+    /// and legacy API-key sessions unchanged.
+    metask_ledger_protocol: ?[]const u8 = null,
+    tool_result_metrics: ?*@import("tool_result_metrics.zig").Metrics = null,
+    /// **Run 输出语义账本**(见 core/output_semantics.zig)。挂上后 run() 把每个可见输出段
+    /// 连同它的定性(commentary/final/continued/partial/discarded)记进来,并把最终结果
+    /// 组装好——调用方直接 `ledger.finalText()`,不必再从 Conversation 尾部猜"什么算 final"。
+    /// null → 只发 output_segment_* 事件,不留账本。**不传给 subagent**:子 agent 的输出是
+    /// 父 Run 的工具结果,不是父 Run 的最终答案。
+    output_ledger: ?*@import("metacodes-guard").core.output_semantics.Ledger = null,
+    /// **文件修改结果账本**(见 core/file_change.zig)。挂上后本 Run 及其子执行
+    /// (Agent/Skill/TaskBatch)产生的每条文件修改都记进来,上层无需解析 tool_result 里的
+    /// 工具私有 `gitDiff` 字段。null → 只发 file_changes 事件,不留账本。
+    file_change_journal: ?*@import("metacodes-guard").core.file_change.Journal = null,
+    /// 额外工作目录(--add-dir / additionalDirectories,绝对路径;sandbox 可写白名单)。
+    additional_dirs: []const []const u8 = &.{},
+    /// 子 agent 定义集合(Task 工具据此找 subagent_type)。
+    agents: ?*const @import("../agents/set.zig").AgentSet = null,
+    /// 当前会话用的 model 名(供 subagent inherit 解析)。
+    parent_model: []const u8 = "",
+    /// 当前 provider 的模型档位表(透传进 ToolContext 供 Task/skill 档位解析)。
+    model_tiers: ?*const @import("metacodes-ai").api.model_tiers.ProviderTiers = null,
+    /// per-call model override(subagent 用 AgentDef.model 覆盖父 client.model)。
+    /// null = 用 api_client.model;非 null = 本次 turn 循环的所有请求都用此 model。
+    model_override: ?[]const u8 = null,
+    /// /model 从大上下文窗口切到小窗口后，下一次采样前先用旧模型做一次 inline compact。
+    /// 新模型可能已经装不下旧历史+compact prompt，旧模型仍可完成摘要。
+    model_switch_compact: ?ModelSwitchCompact = null,
+    /// Skill 集合(Task 工具 subagent preload_skills 字段用)。
+    skills_set: ?*const @import("../skills/skill.zig").SkillSet = null,
+    /// ToolSearch 激活的 deferred 工具名集。非 null 时:deferred 且不在此集的工具
+    /// 不进 API tools 数组(降低弱后端工具菜单稀释)。null = 不过滤 deferred(全暴露)。
+    activated_tools: ?*const std.StringHashMap(void) = null,
+    /// Borrowed immutable upper bound for this execution context. The owner
+    /// keeps it alive until this synchronous Run and all tool workers quiesce.
+    execution_policy: ?tools_mod.ToolExecutionPolicy = null,
+    /// UI-independent actual-dispatch observation capability. Unlike
+    /// `emit_tool_cards`/EventProjection this remains active at every depth.
+    tool_observer: ?tools_mod.ToolObservationSink = null,
+    /// Project-specific Lean gate propagated to every ToolContext and depth.
+    project_rule_gate: ?tools_mod.ProjectRuleGate = null,
+    /// Opt-in experiment: after a host-reobserved file mutation, append one
+    /// late checkpoint when a conservative test command succeeds. This never
+    /// changes the stable system prompt or tool definitions.
+    verification_checkpoint: bool = false,
+    /// Session-end verification obligation: a premature final answer after an
+    /// unverified mutation receives a bounded nudge (task-agnostic process
+    /// rule; carries no benchmark or task content).
+    verification_final_gate: bool = false,
+    /// Record the session-end verification obligation outcome without ever
+    /// nudging. Measurement-only: conversation and control flow untouched.
+    /// Gives control arms the same outcome record the gate arms get.
+    verification_final_observe: bool = false,
+    /// Session-end requirement-ledger closure obligation: decompose the task
+    /// statement into the task list and close every item before finishing.
+    requirement_ledger: bool = false,
+    /// Record-only twin for measurement symmetry in control arms.
+    requirement_ledger_observe: bool = false,
+    /// Delivery-cadence obligation (task-agnostic process rule): a run that
+    /// keeps exploring — read-only tool calls only, no file created or
+    /// changed — receives a bounded nudge at the turn boundary to put a first
+    /// version of its deliverable on disk. Never a denial; disarmed for the
+    /// rest of the run by the first mutation. Formal model:
+    /// control-plane/lean/MetaCodesControl/DeliveryCadence.lean.
+    delivery_cadence: bool = false,
+    /// Record-only twin for measurement symmetry in control arms: the same
+    /// counters and threshold crossings, never an injection.
+    delivery_cadence_observe: bool = false,
+    /// Crossing points in exploration-only tool calls (first / second nudge).
+    delivery_cadence_thresholds: delivery_cadence_mod.Thresholds = .{},
+    /// Progress-update obligation (#114, task-agnostic process rule): a run
+    /// whose tool rounds stay silent — no visible model text, round after
+    /// round, for longer than a few seconds — receives a bounded nudge at the
+    /// turn boundary asking for a short progress note (stage, findings, next
+    /// step). Host-contract field like the sibling gates: off here, switched
+    /// on by hosts with a reader (interactive REPL, web session, --stream-json
+    /// print mode); canonical buildRunOptions leaves it off, so macro runs,
+    /// skill runs and embedders are not nudged. Only a run whose commentary a
+    /// person can read is nudged (`event_projection`). Never a denial; the
+    /// reply is ordinary commentary (or the final answer if the model ends the
+    /// turn). Formal shape: same as delivery cadence (bounded, meter-counted,
+    /// boundary-only; ProgressUpdates.lean).
+    progress_updates: bool = false,
+    /// Record the gate's decisions (terminal `progress_updates` observation
+    /// record) without injecting: the control arm of an evaluation.
+    progress_updates_observe: bool = false,
+    /// Silent tool rounds and wall-clock silence both required before a nudge
+    /// (the stretch restarts after each decision and on any visible text).
+    progress_update_thresholds: progress_updates_mod.Thresholds = .{},
+    /// Host check gate (outcome-guided continuation, CheckGate.lean): when the
+    /// model ends its turn after a delivery-capable action, the host runs the
+    /// pinned check command itself. Enforce mode continues the run with the
+    /// verdict on a clean failure, at most `max_continuations` times; observe
+    /// mode runs the same checks and only records them. Its budget is separate
+    /// from the host-injection meter (a verdict, not advice). Host-contract
+    /// field like the process gates: canonical buildRunOptions leaves it null,
+    /// so macro runs and embedders never run a check; the terminal
+    /// `check_gate` observation record is emitted once per run when armed.
+    check_gate: ?check_gate_mod.Options = null,
+    /// Isolated verifier (doc/ISOLATED_VERIFIER_DESIGN.md): when the check
+    /// gate's pinned check passes at depth 0, the host spawns a fresh,
+    /// read-only verifier on a git snapshot of the workspace. Enforce mode
+    /// turns a reproduced FAIL into a `failed` verdict with source `verifier`
+    /// (a continuation under the check gate's own budget) and answers an
+    /// UNVERIFIED with one read-only leads round; observe mode only records.
+    /// It can only demote: PASS, UNVERIFIED and `unavailable` leave the
+    /// pinned verdict as it was. Needs `check_gate`; root run only; canonical
+    /// buildRunOptions leaves it null; one terminal `isolated_verifier`
+    /// observation record per armed run.
+    isolated_verifier: ?isolated_verifier_mod.Options = null,
+    /// Learning turn (doc/LEARNING_TURN_DESIGN.md): after the check gate's
+    /// verdict ends the run, the same conversation distills conditioned
+    /// lessons (`KgRemember` kind `lesson`) and reconciles them with the
+    /// stored ones, in at most two bounded passes during which only read
+    /// tools and KgRemember run. Needs `check_gate` for its verdict; without
+    /// a check at the terminal boundary it records `none_unchecked`. Observe
+    /// mode decides the same and injects nothing. Root run only; canonical
+    /// buildRunOptions leaves it null; one terminal `learning_turn`
+    /// observation record per armed run.
+    learning_turn: ?learning_turn_mod.Options = null,
+    /// Test integrity obligation (TestIntegrity.lean): tests that existed when
+    /// the run started are compared with that baseline at end-of-turn
+    /// boundaries; enforce mode sends one message when the model stops with
+    /// them rewritten, deleted or disabled (restore, or quote the request),
+    /// observe mode only records. Budget 1, outside the host-injection meter.
+    /// The final state goes to `report` for the user either way, and one
+    /// terminal `test_integrity` observation record is emitted per run. Host-
+    /// contract field like `check_gate`: canonical buildRunOptions leaves it
+    /// null. The check gate reads the same sensor whenever it is armed.
+    test_integrity: ?test_integrity_mod.Options = null,
+    /// Stall gate (StallGate.lean, doc/STALL_GATE_DESIGN.md): tool rounds that
+    /// keep returning nothing new — the same call answered with the same
+    /// bytes, or only answers the model has already seen — end the run with
+    /// `.stalled` (enforce) or are only recorded (observe). Stronger than a
+    /// nudge on purpose: soft reminders go unanswered in exactly this regime.
+    /// At most one decision per run, no host injection (outside the meter),
+    /// provider-visible bytes unchanged. Host-contract field like the sibling
+    /// gates: canonical buildRunOptions leaves it null, interactive hosts
+    /// enforce by default (a person resumes with one message), headless only
+    /// on request. One terminal `stall_gate` observation record per run when
+    /// armed.
+    stall_gate: ?stall_gate_mod.Mode = null,
+    stall_gate_thresholds: stall_gate_mod.Thresholds = .{},
+    /// 任务范围收尾义务(运行期 author 学得的环境规则,ledger 同款有界
+    /// nudge 哲学)。null = 无义务/关闭。
+    obligations: ?*@import("obligation_gate.zig").Runtime = null,
+    /// Bounded same-turn retries after a mid-stream provider failure, on top
+    /// of the request's own `STREAM_RETRIES_PER_REQUEST`. The stream-error
+    /// path already discards the partial turn (nothing was committed to the
+    /// conversation), so re-issuing the identical request is semantically
+    /// clean. Unlike the per-request allowance this counts every stream
+    /// failure, a server-declared error included, and the count is the Run's.
+    /// Headless evaluation enables 2, where one transient otherwise destroys
+    /// an entire paired arm's evidence. Default 0.
+    max_stream_turn_retries: u8 = 0,
+    /// Same-turn re-issues a host grants on top of the request's own
+    /// `STREAM_RETRIES_PER_REQUEST` (#452; AgentCore
+    /// `RunOptionsV1.stream_retry_budget`). This Run may re-issue a request
+    /// whose accepted stream failed without an answer (`isSilentRetryFailure`:
+    /// a stall, a stream that ended before its stop report, a dropped
+    /// connection) up to this many more times, after visible output and a
+    /// started tool call too. Unlike `max_stream_turn_retries`, a
+    /// server-declared error (`ApiError`) or a local decode failure is never
+    /// re-issued under it. The count is the Run's, shared with
+    /// `max_stream_turn_retries`; each re-issue has its own connection retries
+    /// (`providerAttemptLimit`). 0, the default, leaves the per-request
+    /// allowance alone.
+    ///
+    /// Every re-issue of an attempt that showed something is announced, under
+    /// any allowance: the attempt's segment closes `discarded` (as on any
+    /// stream error), its thinking is withdrawn with `thinking_discarded`,
+    /// `retry_notice` follows, and the next attempt waits
+    /// `stream_retry_backoff_ms`. An attempt that showed nothing is re-issued
+    /// silently and at once.
+    retractable_stream_retries: u8 = 0,
+    /// The wait before re-issuing an attempt that showed output (#461). Tests
+    /// shorten or lengthen it; every product path keeps the default.
+    stream_retry_backoff_ms: u32 = STREAM_RETRY_BACKOFF_MS,
+    /// 统一 UI 请求回调(替代旧 ask_question 等多套;ctx 指 *TuiBackend)。
+    /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
+    ui_requester: ?@import("metacodes-guard").core.protocol.ui_request.UiRequester = null,
+    /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
+    mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
+    mcp_unavailable: []const @import("mcp_session.zig").McpUnavailable = &.{},
+    mcp_late: ?@import("mcp_session.zig").McpLateProbe = null,
+    tool_changes: ?@import("tool_changes.zig").Hook = null,
+    /// Cron registry(CronCreate/Delete/List 用)。
+    cron_registry: ?*@import("cron_registry.zig").CronRegistry = null,
+    /// 是否给每个工具执行 emit tool_start/tool_result 事件(REPL=true)。
+    /// 由 backend(TuiBackend)经 renderResult 渲染(Edit diff 着色 / 搜索摘要 / Read 摘要)。
+    /// false(headless/单测)→ 不 emit 工具卡事件,保持纯净输出。
+    /// (原 tool_render_theme: ?*const Theme,只当存在标志用;为解 core→UI 类型依赖降为 bool。)
+    emit_tool_cards: bool = false,
+    /// Raw semantic-event capture for forked executions. `.legacy` keeps all
+    /// existing callers byte-for-byte compatible; AgentCore's private adapter
+    /// performs the actual public projection.
+    event_projection: EventProjection = .legacy,
+    /// 子进程长命令"仍在运行"心跳回调(per-session,传给 ToolContext.spawn_tick_fn → spawn 层)。
+    /// 重构前是 tools/common.zig 进程全局 g_progress_cb。REPL tty 下 loop.zig 设;headless=null。
+    spawn_tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null,
+    /// 是否给 assistant 流式文本加 ANSI 着色(\x1b[32m…)。前台交互 REPL = true;
+    /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
+    /// 会混入 \x1b[32m 等控制码。
+    colorize: bool = true,
+    /// OpenTelemetry span recording (`telemetry/telemetry.zig`). Non-null:
+    /// this Run's events are recorded as a GenAI span tree into the session
+    /// store and/or the process OTLP exporter. Recording observes only: it
+    /// never changes a provider request and never fails the Run. Canonical
+    /// `buildRunOptions` sets it from the session; null records nothing.
+    telemetry: ?telemetry.RunTelemetry = null,
+};
+
+pub const ModelSwitchCompact = struct {
+    previous_model: []const u8,
+    previous_context_window: u32,
+    current_context_window: u32,
+};
+
+/// 内部:发一次进度事件(turn 1-based;tool_name/tool_input 空 = 仅更新轮次)。
+/// tool_calls = 截至此刻累计工具调用数(单调)。L1 重构:轮/工具级进度从扁平回调
+/// (旧 ProgressReporter → JobEntry)收编进 CoreEvent.progress 事件——单向通知=事件。
+/// 顶层 TUI 后端忽略它;JobEntry 后端(subagent 进度树)消费它更新 turn/工具/token 行。
+fn emitProgress(backend: *const UiBackend, sess: @import("metacodes-kernel").session_id.SessionId, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
+    backend.emitEvent(sess, .{ .progress = .{ .turn = turn, .tool_name = tool_name, .tool_input = tool_input, .tool_calls = tool_calls } });
+}
+
+const EffectiveToolSet = struct {
+    policy_filtered: ?[]json_mod.ToolDefinition = null,
+    filtered_pool: ?[]json_mod.ToolDefinition = null,
+    discovery_filtered: ?[]json_mod.ToolDefinition = null,
+    deferred_filtered: ?[]json_mod.ToolDefinition = null,
+    cap_filtered: ?[]json_mod.ToolDefinition = null,
+    defs: []const json_mod.ToolDefinition = &.{},
+
+    fn deinit(self: *EffectiveToolSet, allocator: std.mem.Allocator) void {
+        if (self.policy_filtered) |pf| allocator.free(pf);
+        if (self.filtered_pool) |fp| allocator.free(fp);
+        if (self.discovery_filtered) |df| allocator.free(df);
+        if (self.deferred_filtered) |df| allocator.free(df);
+        if (self.cap_filtered) |cf| allocator.free(cf);
+        self.* = .{};
+    }
+};
+
+/// Provider tool_choice is advisory at compatibility gateways. Keep the
+/// required-first contract provider-neutral by checking the full native
+/// Conversation as well: only the exact call plus a successful paired result
+/// releases the gate. This also survives request serialization differences.
+fn conversationHasSuccessfulRequiredFirst(
+    conversation: *const Conversation,
+    route: dialect_mod.VisibleCapabilities.RequiredFirst,
+) bool {
+    for (conversation.messages.items, 0..) |message, message_index| {
+        for (message.blocks) |block| {
+            const tool_use = switch (block) {
+                .tool_use => |value| value,
+                else => continue,
+            };
+            if (!dialect_mod.matchesRequiredFirst(route, tool_use.name, tool_use.input))
+                continue;
+            for (conversation.messages.items[message_index + 1 ..]) |later| {
+                for (later.blocks) |later_block| switch (later_block) {
+                    .tool_result => |result| {
+                        if (std.mem.eql(u8, result.tool_use_id, tool_use.id) and
+                            !result.is_error) return true;
+                    },
+                    else => {},
+                };
+            }
+        }
+    }
+    return false;
+}
+
+const MAX_REQUIRED_FIRST_REPAIRS: u8 = 2;
+/// 验证终局闸每 run 的 nudge 上限(VerificationGate.lean nudges_bounded)。
+const MAX_VERIFICATION_NUDGES: u8 = 2;
+
+comptime {
+    // 元规则①(host_injection_meter.zig):cap = Σ 各门预算,计量器才是"零行为变化"的显式上界。
+    // 加门、改某门预算而不改 cap(或反过来)在这里编译不过——计量器头注释里的账目不再靠人对齐。
+    std.debug.assert(@import("host_injection_meter.zig").MAX_HOST_INJECTIONS_PER_RUN ==
+        MAX_REQUIRED_FIRST_REPAIRS + MAX_VERIFICATION_NUDGES +
+            requirement_ledger_mod.MAX_LEDGER_NUDGES + @import("obligation_gate.zig").MAX_OBLIGATION_NUDGES +
+            delivery_cadence_mod.MAX_CADENCE_NUDGES + progress_updates_mod.MAX_PROGRESS_NUDGES);
+}
+
+fn requiredFirstRepairText(
+    allocator: std.mem.Allocator,
+    route: dialect_mod.VisibleCapabilities.RequiredFirst,
+) ![]u8 {
+    if (route.argument_name) |argument_name| {
+        if (route.argument_value) |argument_value| return std.fmt.allocPrint(
+            allocator,
+            "Required-first activation is still pending. Before any answer or other tool, call `{s}` exactly with {{\"{s}\":\"{s}\"}}. Do not repeat the previous answer.",
+            .{ route.tool_name, argument_name, argument_value },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "Required-first activation is still pending. Before any answer or other tool, call `{s}`. Do not repeat the previous answer.",
+        .{route.tool_name},
+    );
+}
+
+fn buildEffectiveToolSet(
+    allocator: std.mem.Allocator,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    activated_tools: ?*const std.StringHashMap(void),
+    execution_policy: ?tools_mod.ToolExecutionPolicy,
+    provider: provider_mod.Provider,
+) error{OutOfMemory}!EffectiveToolSet {
+    var out = EffectiveToolSet{ .defs = tool_defs };
+
+    const policy_filtered = blk: {
+        const policy = execution_policy orelse break :blk tool_defs;
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        errdefer keep.deinit(allocator);
+        for (tool_defs) |definition| {
+            if (!policy.allowsTool(definition.name)) continue;
+            try keep.append(allocator, definition);
+        }
+        out.policy_filtered = try keep.toOwnedSlice(allocator);
+        break :blk out.policy_filtered.?;
+    };
+    out.defs = policy_filtered;
+
+    const pool_filter = @import("../skills/tool_pool_filter.zig");
+    out.filtered_pool = pool_filter.filterToolDefs(allocator, policy_filtered, permission_ctx.active_skill) catch null;
+    const skill_filtered = if (out.filtered_pool) |fp| fp else policy_filtered;
+    out.defs = skill_filtered;
+
+    // ToolSearch is useful only while at least one deferred schema remains in
+    // the policy/Skill-visible catalog. Reapply the same invariant used by
+    // tools.toToolDefinitionsFull after later runtime filtering, otherwise the
+    // model receives a discovery tool that can only return NoToolMatch.
+    const discovery_filtered = blk: {
+        var has_deferred = false;
+        var has_tool_search = false;
+        for (skill_filtered) |definition| {
+            has_deferred = has_deferred or definition.deferred;
+            has_tool_search = has_tool_search or std.mem.eql(u8, definition.name, "ToolSearch");
+        }
+        if (has_deferred or !has_tool_search) break :blk skill_filtered;
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        errdefer keep.deinit(allocator);
+        for (skill_filtered) |definition| {
+            if (std.mem.eql(u8, definition.name, "ToolSearch")) continue;
+            try keep.append(allocator, definition);
+        }
+        out.discovery_filtered = try keep.toOwnedSlice(allocator);
+        break :blk out.discovery_filtered.?;
+    };
+    out.defs = discovery_filtered;
+
+    const effective_tool_defs = blk: {
+        const acts = activated_tools orelse break :blk discovery_filtered;
+        var has_deferred = false;
+        for (discovery_filtered) |d| {
+            if (d.deferred) {
+                has_deferred = true;
+                break;
+            }
+        }
+        if (!has_deferred) break :blk discovery_filtered;
+
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        for (discovery_filtered) |d| {
+            if (d.deferred and !acts.contains(d.name)) continue;
+            keep.append(allocator, d) catch {
+                keep.deinit(allocator);
+                break :blk discovery_filtered;
+            };
+        }
+        out.deferred_filtered = keep.toOwnedSlice(allocator) catch {
+            keep.deinit(allocator);
+            break :blk discovery_filtered;
+        };
+        break :blk out.deferred_filtered.?;
+    };
+    out.defs = effective_tool_defs;
+
+    const capability = @import("metacodes-ai").api.capability;
+    const gated_tool_defs = blk: {
+        var any_dropped = false;
+        for (effective_tool_defs) |d| {
+            if (capability.requiredCapability(d.name)) |cap| {
+                if (!provider.supports(cap)) {
+                    any_dropped = true;
+                    break;
+                }
+            }
+        }
+        if (!any_dropped) break :blk effective_tool_defs;
+
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        for (effective_tool_defs) |d| {
+            if (capability.requiredCapability(d.name)) |cap| {
+                if (!provider.supports(cap)) continue;
+            }
+            keep.append(allocator, d) catch {
+                keep.deinit(allocator);
+                break :blk effective_tool_defs;
+            };
+        }
+        out.cap_filtered = keep.toOwnedSlice(allocator) catch {
+            keep.deinit(allocator);
+            break :blk effective_tool_defs;
+        };
+        break :blk out.cap_filtered.?;
+    };
+    out.defs = gated_tool_defs;
+    return out;
+}
+
+/// L4:run 出口统一收口——发 diag_run_end 诊断事件后返回 result。每个 `return <result>` 改成
+/// `return finishRun(backend, sess, trace_id, depth, <result>)`,保证所有出口(abort/api_error/
+/// end_turn/tool_error/max_turns)都 emit run span 终点,无遗漏(对齐"诊断不沉默")。
+///
+/// **span 平衡契约**:正常完成的 turn(有工具→循环 / 无工具→end_turn)都发 diag_turn_end,
+/// 每个 turn_begin 配一个 turn_end。异常终止(abort/api_error/tool_error)**不**发
+/// turn_end——该 turn 未完成,由 run_end 的 stop_reason 标明死因。消费者:turn span 未闭合 +
+/// run_end 非 end_turn/max_turns = 该 turn 被中断,正确语义,非 bug。
+/// (tool_loop 保留为 ABI dead variant,不再生产;对齐 codex 无主动熔断。)
+fn finishRun(backend: *const UiBackend, sess: @import("metacodes-kernel").session_id.SessionId, trace_id: [12]u8, depth: u8, result: RunResult) RunResult {
+    backend.emitEvent(sess, .{ .diag_run_end = .{
+        .trace_id = trace_id,
+        .depth = depth,
+        .turns = result.turns,
+        .tool_calls = result.tool_calls,
+        .stop_reason_name = @tagName(result.stop_reason),
+    } });
+    return result;
+}
+
+/// Run 级输出语义通道:开/关一个可见输出段,并把定性同时投到事件流与账本。
+///
+/// 关键不变式由 `output_semantics.Tracker` 保证:同一时刻至多一个段打开,每段恰关闭一次
+/// (重复关闭是 no-op,不会造出配不上对的 `output_segment_end`)。因此调用点可以无条件
+/// 调 `close`,不用先判断"现在到底开着没"。反向的配对由 `begin` 兜底:若某个循环出口
+/// 漏了收段,下一轮 `begin` 先把悬开段以 .partial 收口再开新段,消费者永远不会看到
+/// 无配对的 `output_segment_begin`(漏关仍是 bug——正文进不了 Ledger,故留 warn 日志)。
+/// KgRemember calls of kind `lesson` that ran and were refused (bad envelope,
+/// wrong header, budget spent): the learning record's `lessons_refused`.
+fn countRefusedLessons(slots: []const @import("tool_exec.zig").Slot) u32 {
+    var refused: u32 = 0;
+    for (slots) |slot| {
+        if (slot.decision != .run or !slot.is_error) continue;
+        if (!std.mem.eql(u8, slot.name, "KgRemember")) continue;
+        const kind = util_json.extractStringField(slot.input, "kind") orelse continue;
+        if (std.ascii.eqlIgnoreCase(kind, lesson_mod.SCHEMA_TYPE)) refused +|= 1;
+    }
+    return refused;
+}
+
+const OutputChannel = struct {
+    backend: *const UiBackend,
+    session: @import("metacodes-kernel").session_id.SessionId,
+    ledger: ?*output_semantics.Ledger,
+    tracker: output_semantics.Tracker = .{},
+    /// 本段已流出的可见字节数。**权威计数**:兜底关闭时 assistant_text 缓冲已随 turn 作用域
+    /// 释放,拿不到文本,但字节数仍必须如实上报。
+    pending_bytes: u64 = 0,
+    /// Set when a learning turn starts: the answer is already final, so any
+    /// later close that would make text part of the result (an abort inside a
+    /// learning pass closes `.final`) is recorded as commentary instead.
+    final_sealed: bool = false,
+    /// The segment the latest `close` ended, so a re-issue can name the
+    /// attempt it withdraws (`thinking_discarded`).
+    last_closed: ?output_semantics.Segment = null,
+
+    fn begin(self: *OutputChannel, turn: u32) void {
+        // 配对兜底(见顶注):漏关的段在这里以 .partial 收口,end 事件照发。
+        // Tracker.begin 直接覆盖 self.open,不经此处收口的话,那个 begin 事件
+        // 永远等不到配对的 end,Ledger 也不记这段。
+        if (self.tracker.isOpen()) {
+            log.warn("agent", "output segment leaked open across turns; closing as partial (missing close at a loop exit)", .{});
+            self.close(.partial, "");
+        }
+        const seg = self.tracker.begin(turn);
+        self.pending_bytes = 0;
+        self.last_closed = null;
+        self.backend.emitEvent(self.session, .{ .output_segment_begin = .{
+            .index = seg.index,
+            .turn = seg.turn,
+            .group = seg.group,
+        } });
+    }
+
+    fn note(self: *OutputChannel, bytes: usize) void {
+        self.pending_bytes +|= bytes;
+    }
+
+    /// `text` 是本段已流出的可见字节(借用;record 内立即拷贝需要保留的部分)。段的 bytes
+    /// 取自权威计数器而非 text.len——兜底路径传 "" 但字节数照报。
+    fn close(self: *OutputChannel, requested: output_semantics.Disposition, text: []const u8) void {
+        const disposition: output_semantics.Disposition = if (self.final_sealed and requested.contributesToFinal())
+            .commentary
+        else
+            requested;
+        const seg = self.tracker.close(disposition, self.pending_bytes) orelse return;
+        self.pending_bytes = 0;
+        self.last_closed = seg;
+        self.backend.emitEvent(self.session, .{ .output_segment_end = .{
+            .index = seg.index,
+            .turn = seg.turn,
+            .group = seg.group,
+            .disposition = seg.disposition,
+            .bytes = seg.bytes,
+        } });
+        if (self.ledger) |l| l.record(seg, text);
+    }
+};
+
+/// 把本轮所有 slot 的文件修改证据一次性投出去(事件 + Run 级账本),并交出所有权。
+///
+/// **必须在工具阶段任何可能提前返回的分支之前调**——挂起(UiPending)、host fatal、
+/// result_blocks 为空都发生在**盘可能已经真的改过**之后。让 `Slot.deinit` 静默回收这些
+/// 记录,等于对上层谎报"这一轮没动文件"。
+///
+/// **幂等**:靠 slot 上的 `file_changes_drained` 标记,不靠 `file_changes == null`——被拒的
+/// slot 本来就是 null,只看 null 会在第二次调用时重新缝合并重复上报。
+fn drainFileChanges(
+    slots: []tool_exec_mod.Slot,
+    base_ctx: *const @import("../tools/context.zig").ToolContext,
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    journal: ?*file_change_mod.Journal,
+    allocator: std.mem.Allocator,
+) void {
+    for (slots) |*s| {
+        if (s.file_changes_drained) continue;
+        s.file_changes_drained = true;
+        // 权限/策略在 dispatch **之前**拒掉的文件工具:executeOne 从没跑过,没人替它说话。
+        // 沉默会被读成"没涉及文件",所以在这里补一条 rejected。
+        if (s.decision == .denied and s.file_changes == null) {
+            const rejected = tool_exec_mod.rejectedFileChanges(allocator, base_ctx, s.name, s.id, s.input);
+            s.file_changes = rejected.records;
+            s.file_changes_overflow = rejected.overflow;
+            s.file_changes_lost = rejected.lost;
+        }
+        const changes = s.file_changes orelse {
+            // No record survived, yet the report says it is incomplete: a copy
+            // failed, or a command's effects could not be observed (Bash).
+            // That is still news — dropping it here would let silence read as
+            // "this call changed nothing".
+            if (s.file_changes_overflow or s.file_changes_lost) {
+                backend.emitEvent(sess, .{ .file_changes = .{
+                    .id = s.id,
+                    .name = s.name,
+                    .changes = &.{},
+                    .overflow = s.file_changes_overflow,
+                    .lost = s.file_changes_lost,
+                } });
+                if (journal) |j| j.noteTruncated();
+            }
+            continue;
+        };
+        backend.emitEvent(sess, .{ .file_changes = .{
+            .id = s.id,
+            .name = s.name,
+            .changes = changes,
+            .overflow = s.file_changes_overflow,
+            .lost = s.file_changes_lost,
+        } });
+        if (journal) |j| {
+            j.recordAll(changes);
+            if (s.file_changes_overflow or s.file_changes_lost) j.noteTruncated();
+        }
+        // 投递完即释放:账本收的是克隆,事件是同步消费的借用,留着只是占内存到 turn 末。
+        // 置 null 是与外层 `Slot.deinit` 的交接——两边都释放就是双重释放。
+        file_change_mod.freeRecords(allocator, changes);
+        s.file_changes = null;
+    }
+}
+
+/// L2 用:证明 drain 的幂等性(重复调不重复上报)。生产路径每轮只调一次,但幂等是这个
+/// 收口点的正确性前提之一,得能被测到。
+pub fn drainFileChangesForTest(
+    slots: []tool_exec_mod.Slot,
+    base_ctx: *const @import("../tools/context.zig").ToolContext,
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    journal: ?*file_change_mod.Journal,
+    allocator: std.mem.Allocator,
+) void {
+    drainFileChanges(slots, base_ctx, backend, sess, journal, allocator);
+}
+
+/// One mapping for every way a Run can be stopped from outside: only the
+/// evaluation budget is a `budget` stop, everything else is `aborted`.
+fn hasServerTool(defs: []const json_mod.ToolDefinition) bool {
+    for (defs) |def| if (def.server_type != null) return true;
+    return false;
+}
+
+/// Every entry point checks before it changes anything: `run` before any
+/// request, `resumeRun` and `resumeRunWithResults` before they append the
+/// resumed tool results.
+fn refuseServerTools(tool_defs: []const json_mod.ToolDefinition, opts: Options) error{ServerToolsUnsupported}!void {
+    if (hasServerTool(tool_defs) or (if (opts.tool_defs) |defs| hasServerTool(defs) else false))
+        return error.ServerToolsUnsupported;
+}
+
+test "run refuses provider server tools it cannot represent" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "search the web");
+    var state = TestProviderState{};
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const Null = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Null.emit, .poll = Null.poll };
+    const server_tool = [_]json_mod.ToolDefinition{.{
+        .name = "web_search",
+        .description = "",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .server_type = "web_search_20250305",
+    }};
+    // Through either seam, before any provider request (this provider fails
+    // the Run on any request) and without touching the Conversation.
+    try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &server_tool, &perm, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &.{}, &perm, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+    // resumeRun refuses before it appends the resumed tool result.
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &server_tool, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &.{}, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    // So does resumeRunWithResults (the sealed gateway's seam).
+    const results = [_]SuspendInfo.CompletedResult{.{ .tool_use_id = "tu_1", .content = "{}", .is_error = false }};
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRunWithResults(&c, testProvider(&state), &server_tool, &perm, &results, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRunWithResults(&c, testProvider(&state), &.{}, &perm, &results, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+}
+
+fn stopReasonForReason(reason: @import("metacodes-base").util.abort.Reason) StopReason {
+    return if (reason == .evaluation_budget) .budget else .aborted;
+}
+
+fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
+    return if (abort) |signal| stopReasonForReason(signal.reason()) else .aborted;
+}
+
+pub const JobWaitPoll = struct {
+    events: []@import("job_registry.zig").JobExitEvent,
+    any_running: bool,
+};
+
+pub fn pollJobWait(registry: anytype, owner: @import("metacodes-kernel").session_id.SessionId, allocator: std.mem.Allocator) !JobWaitPoll {
+    const any_running = registry.hasPendingNotifyJobs(owner);
+    return .{ .events = try registry.takeUnannouncedExits(owner, allocator), .any_running = any_running };
+}
+
+pub fn takeMonitorNotifications(registry: anytype, owner: @import("metacodes-kernel").session_id.SessionId, allocator: std.mem.Allocator) !?[]u8 {
+    const monitor_stream = @import("monitor_stream.zig");
+    const notices = try registry.takeMonitorEvents(owner, allocator, util_time.nowMs());
+    defer monitor_stream.freeNotices(allocator, notices);
+    if (notices.len == 0) return null;
+    return try job_notification_mod.renderMonitor(allocator, notices);
+}
+
+/// UI → core input (#115). Drains `UiBackend.poll` at a turn boundary — the
+/// previous turn's tool_results are already appended and the next provider
+/// request has not been built yet — so a message the user queued during the
+/// previous stream rides the very next request of the same Run instead of
+/// waiting for the Run to finish. Returns the interrupt reason when the
+/// backend asked to stop, null after everything queued was consumed.
+///
+/// * `queue_message`: appended as a user record (blank text is dropped). The
+///   protocol transfers ownership of the slice to the poll caller; it is freed
+///   with the Run's allocator, so an in-process backend must allocate it with
+///   that allocator (TuiBackend's MsgQueue and the REPL's `run()` share one).
+///   The producer decides what is steerable: TuiBackend hands over plain
+///   prompts only and keeps `/commands`, `!shell` and `exit` queued for the
+///   REPL, which dispatches them after the Run as before.
+/// * `interrupt`: returned immediately; any further queued events stay on the
+///   backend for the host to decide about. This does not replace AbortSignal
+///   (mid-stream interruption still only goes through it, see
+///   doc/UI_DECOUPLE_BACKEND_FRAMEWORK.md §3.4); with `opts.abort` set the
+///   loop-top abort check wins first, so this arm serves a backend that has
+///   no shared signal.
+///
+/// Never called while a provider stream is being consumed, and skipped at a
+/// max_tokens continuation boundary (the group must stay one answer).
+fn drainUiEvents(
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    conversation: *Conversation,
+    allocator: std.mem.Allocator,
+    turn: u32,
+) !?@import("metacodes-base").util.abort.Reason {
+    while (backend.pollEvent(sess)) |event| {
+        switch (event) {
+            .interrupt => |reason| return reason,
+            .queue_message => |text| {
+                defer allocator.free(text);
+                const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                try conversation.appendText(.user, trimmed);
+                log.info("agent", "queued user message consumed at turn {d} boundary bytes={d}", .{ turn, trimmed.len });
+            },
+        }
+    }
+    return null;
+}
+
+/// Host input → Conversation (#270). Appends every input pending in
+/// `queue` as its own user record, in acceptance order, and emits
+/// `input_adopted` after each append. Runs at the same boundary as
+/// `drainUiEvents` and is skipped with it at a max_tokens continuation
+/// boundary. The text is appended verbatim: the Host chose those bytes, and
+/// the queue already refused blank text.
+///
+/// The append comes before `adopt`, and `adopt` before the event, so the
+/// queue's adopted count never claims a record the Conversation lacks; an
+/// append failure leaves the input unadopted and fails the Run. A Host that
+/// misses the event (callback failure) still reconciles from the counts.
+/// Nothing is adopted once the Run is aborting — a user abort, or a Host
+/// callback failure, which aborts the Run (possibly the very `input_adopted`
+/// just emitted): the rest stays pending and the caller ends the Run.
+fn adoptRunInputs(
+    queue: *run_input_mod.Queue,
+    conversation: *Conversation,
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    turn: u32,
+    abort: ?*const AbortSignal,
+) !void {
+    while (queue.next()) |pending| {
+        if (abort) |signal| if (signal.isAborted()) return;
+        try conversation.appendText(.user, pending.text);
+        queue.adopt(pending.sequence);
+        log.info("agent", "host input adopted at turn {d} boundary sequence={d} bytes={d}", .{ turn, pending.sequence, pending.text.len });
+        backend.emitEvent(sess, .{ .input_adopted = .{
+            .input_id = pending.input_id,
+            .sequence = pending.sequence,
+            .turn = turn,
+        } });
+    }
+}
+
+const ArgsAdmission = union(enum) {
+    /// Canonical arguments, owned by the admitted slot.
+    admitted: []u8,
+    /// The invalid_args tool result for the model (owned by the caller).
+    rejected: []u8,
+};
+
+/// Admit one tool call's arguments (issue #494) through
+/// `tools/common.canonicalizeArgs`. The bytes the provider sent stay in the
+/// Conversation unchanged; only what the hook, the permission check and the
+/// executor read is canonical.
+fn admitToolArgs(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    path_aliases: []const tools_common.PathAlias,
+) !ArgsAdmission {
+    const canonical = tools_common.canonicalizeArgsWithAliases(allocator, input, path_aliases) catch |err| return .{ .rejected = switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateArgumentKey => try tool_error.errorToJson(
+            "DuplicateArgumentKey",
+            "the arguments name the same key more than once; send the call again with each key once",
+            .{},
+            allocator,
+        ),
+        error.InvalidArgumentsJson => try tool_error.errorToJson(
+            "InvalidArgumentsJson",
+            "the arguments are not one well-formed JSON object; send the call again with a JSON object of the tool's parameters",
+            .{},
+            allocator,
+        ),
+    } };
+    return .{ .admitted = canonical };
+}
+
+/// The tool result for a permission prompt that ended with nobody's answer
+/// (doc/WIRE_PROTOCOL.md §1.4). It never says the user declined; `code`
+/// stays `permission_denied` and the call never runs. A timeout or a
+/// cancellation is recoverable: asking again may get an answer. No Host
+/// setting (such as the timeout's length) enters the text, so these bytes do
+/// not change with configuration.
+fn unansweredPromptJson(cause: permission_mod.PromptUnanswered, tool: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    return switch (cause) {
+        error.PromptUnrenderable => tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: the frontend connected to this session cannot render permission prompts (it declared that it does not render permission requests). This is not the user's decision; the user never saw the request.", .{tool}, allocator),
+        error.PromptTimedOut => tool_error.errorToJson("PermissionPromptUnanswered", "'{s}' did not run: nobody answered its permission request in time. The user did not decline it; you may offer to ask again.", .{tool}, allocator),
+        error.PromptCancelled => tool_error.errorToJson("PermissionPromptUnanswered", "'{s}' did not run: an interrupt or a close cancelled its permission request before anyone answered. The user did not decline it; you may offer to ask again.", .{tool}, allocator),
+        error.PromptAnswerUnreadable => tool_error.errorToJson("PermissionDenied", "'{s}' was denied: an answer to its permission request arrived but could not be read. This is not the user's decision.", .{tool}, allocator),
+        error.PromptNobodyToAsk => tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: this session has no way to ask for permission and wait for the answer. This is not the user's decision; the user never saw the request.", .{tool}, allocator),
+        error.PromptRequestFailed => tool_error.errorToJson("PermissionDenied", "'{s}' was denied: its permission request failed before anyone answered. This is not the user's decision.", .{tool}, allocator),
+    };
+}
+
+/// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
+/// 收集事件到 assistant message 里（text 和 tool_use blocks），
+/// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
+/// 直到没有 tool_use、turns 达到 max_turns、或 abort 触发。
+///
+/// 每轮的 assistant 响应文字也通过 backend 实时输出（便于 REPL 看流）。
+/// backend 是显式 vtable 契约(UiBackend):agent_loop 只发语义 CoreEvent,所有表达
+/// (ANSI 颜色 / 工具卡渲染)由 backend 实现(TuiBackend / WriterBackend)完成。
+/// Shared admission for model-authored calls and JavaScript host requests.
+/// Permissions and PreToolUse execute exactly once, on the calling loop thread.
+const ToolAdmission = struct {
+    opts: Options,
+    permission_ctx: *const permission_mod.PermissionContext,
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    rid: log.RequestId,
+    learning_pass: bool,
+    verifier_leads: bool,
+
+    fn admit(self: *const ToolAdmission, tu: msg.ToolUse, allocator: std.mem.Allocator) !tool_exec_mod.Slot {
+        const opts = self.opts;
+        const permission_ctx = self.permission_ctx;
+        const backend = self.backend;
+        const sess = self.sess;
+        const trace_id = self.trace_id;
+        const depth = self.depth;
+        const rid = self.rid;
+        const hookset = permission_ctx.hooks;
+        var pc_nohooks = permission_ctx.scopedDerive(null);
+        pc_nohooks.hooks = null;
+        const tool_exec = tool_exec_mod;
+        // 权限侧真名(review round 2 / R2-3):hook 匹配、分类、规则与 ask 记忆都必须
+        // 看**将被执行的名字**。dispatcher 宇宙 exact-name 不修;遗留分支用与 executeOne
+        // 同一把 P0.6 归一化("bash"→"Bash")——否则 "Bash" 匹配的 block-hook / session
+        // "always deny" 对 case-variant 名一律失配,而 dispatch 仍会修名真执行。
+        // 真未知名保持原名(read 兜底 + UnknownTool 引导)。Slot 仍带 raw 名
+        // (证据契约:requested vs dispatched 归属不糊);PostToolUse 观测 hook 仍按
+        // raw 名匹配(存量,不在本修范围——Pre 侧是安全向,先闭合)。
+        var name_probe_ctx = tools_mod.ToolContext{ .allocator = allocator, .dyn_registry = opts.dyn_registry };
+        const canonical_name = if (opts.tool_dispatcher != null)
+            tu.name // dispatcher universe: exact-name policy, no repair
+        else
+            tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
+        if (self.verifier_leads and !isolated_verifier_mod.allowedDuringLeads(canonical_name)) {
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = tu.id,
+                .tool = tu.name,
+                .decision = "deny",
+                .source = "isolated_verifier",
+                .allowed = false,
+            } });
+            return .{
+                .decision = .denied,
+                .name = tu.name,
+                .id = tu.id,
+                .input = tu.input,
+                .content = try tool_error.errorToJson(
+                    "VerifierLeadsToolUnavailable",
+                    "tool '{s}' does not run in a verifier leads round: only Read, Grep and Glob do, and files cannot change",
+                    .{tu.name},
+                    allocator,
+                ),
+                .is_error = true,
+            };
+        }
+        // Learning pass: only read tools and KgRemember run, so the workspace
+        // the check judged is the workspace the run hands back.
+        if (self.learning_pass and !learning_turn_mod.allowedDuringPass(canonical_name)) {
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = tu.id,
+                .tool = tu.name,
+                .decision = "deny",
+                .source = "learning_turn",
+                .allowed = false,
+            } });
+            var lslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
+            lslot.content = try tool_error.errorToJson(
+                "LearningTurnToolUnavailable",
+                "tool '{s}' does not run in a learning turn: only Read, Grep, Glob, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
+                .{tu.name},
+                allocator,
+            );
+            lslot.is_error = true;
+            return lslot;
+        }
+        // Model calls and JS host requests share argument admission (#494).
+        // The slot owns the canonical bytes seen by hooks, permissions and dispatch.
+        var eff_input = switch (try admitToolArgs(allocator, tu.input, opts.path_aliases)) {
+            .admitted => |canonical| canonical,
+            .rejected => |content| return .{
+                .decision = .denied,
+                .name = tu.name,
+                .id = tu.id,
+                .input = tu.input,
+                .content = content,
+                .is_error = true,
+            },
+        };
+        errdefer allocator.free(eff_input);
+        // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
+        if (hookset) |hs| if (hs.hasPre()) {
+            const pre = hooks_mod.runPreToolUseFull(hs, allocator, canonical_name, eff_input, opts.abort);
+            if (pre.modified_input) |mi| {
+                allocator.free(eff_input);
+                eff_input = mi;
+                switch (try admitToolArgs(allocator, mi, opts.path_aliases)) {
+                    .admitted => |canonical| {
+                        allocator.free(eff_input);
+                        eff_input = canonical;
+                    },
+                    .rejected => |content| return .{
+                        .decision = .denied,
+                        .name = tu.name,
+                        .id = tu.id,
+                        .input = eff_input,
+                        .admitted_input = eff_input,
+                        .content = content,
+                        .is_error = true,
+                    },
+                }
+            }
+            if (pre.decision == .block) {
+                log.warnId("permission", rid, "PreToolUse hook blocked tool={s}", .{tu.name});
+                backend.emitEvent(sess, .{ .policy_decision = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .id = tu.id,
+                    .tool = tu.name,
+                    .decision = "deny",
+                    .source = "pre_tool_use_hook",
+                    .allowed = false,
+                } });
+                var dslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = eff_input };
+                dslot.content = try tool_error.errorToJson("PreToolUseBlocked", "tool '{s}' blocked by PreToolUse hook", .{tu.name}, allocator);
+                dslot.is_error = true;
+                dslot.admitted_input = eff_input;
+                return dslot;
+            }
+        };
+        // With a Session dispatcher present, the directory is the only
+        // classification authority. A name it cannot resolve is not a
+        // known-read tool — default it to `.execute` (deny in dont_ask,
+        // ask in default) instead of the legacy name-based read fallback.
+        // Dispatch of such a name still fails as UnknownTool; note the
+        // deny happens before dispatch, so the UnknownTool "did you
+        // mean X" guidance does not fire on the denied path. The legacy
+        // branch classifies canonical_name (resolved above, same
+        // normalizer as executeOne) so classification can never look at
+        // a different name than what dispatch will actually run.
+        const offered_category = if (opts.tool_dispatcher) |dispatcher| dispatcher.category(tu.name) else null;
+        const not_offered = opts.tool_dispatcher != null and offered_category == null;
+        const classified = if (opts.tool_dispatcher != null)
+            offered_category orelse .execute
+        else if (opts.dyn_registry) |registry|
+            registry.category(canonical_name)
+        else
+            null;
+        var perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, canonical_name, eff_input, classified);
+        // A confirmation demanded from outside the chain (sealed `confirm:
+        // true`) only tightens: an allow becomes an ask whose prompt skips
+        // "allow always" memory; deny and ask are untouched.
+        const forced_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, canonical_name) else false;
+        if (forced_confirm and perm_result == .allow) perm_result = .ask;
+        log.infoId("permission", rid, "tool={s} decision={s}{s}", .{ tu.name, @tagName(perm_result), if (forced_confirm) " (confirm required)" else "" });
+        var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
+        var policy_allowed = perm_result == .allow;
+        switch (perm_result) {
+            .deny => {
+                log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
+                slot.decision = .denied;
+                slot.content = if (not_offered)
+                    try tool_error.errorToJson("UnknownTool", "tool '{s}' is not offered in this session; call only the tools this request lists", .{tu.name}, allocator)
+                else
+                    try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or permission mode", .{tu.name}, allocator);
+                slot.is_error = true;
+            },
+            .ask => {
+                // ctx constCast:promptUser 写 session 记忆(有副作用)——agent_loop 持 *const
+                // 但权限交互本就改 per-session 状态(base_ctx.permission_ctx 同理)。
+                // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
+                // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
+                // 查不到,session deny 被 settings allow 越过。
+                // Preserve the unanswered-prompt causes from the ordinary
+                // model tool path (doc/WIRE_PROTOCOL.md §1.4).
+                var unanswered: ?permission_mod.PromptUnanswered = null;
+                const prompted = if (forced_confirm)
+                    permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input)
+                else
+                    permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input);
+                const allowed = prompted catch |err| blk: {
+                    unanswered = err;
+                    break :blk false;
+                };
+                policy_allowed = allowed;
+                log.infoId("permission", rid, "prompt tool={s} user_allowed={} unanswered={s}", .{ tu.name, allowed, if (unanswered) |cause| @errorName(cause) else "-" });
+                if (!allowed) {
+                    slot.decision = .denied;
+                    slot.content = if (unanswered) |cause|
+                        try unansweredPromptJson(cause, tu.name, allocator)
+                    else
+                        try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
+                    slot.is_error = true;
+                }
+            },
+            .allow => {},
+        }
+        backend.emitEvent(sess, .{ .policy_decision = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .id = tu.id,
+            .tool = tu.name,
+            .decision = @tagName(perm_result),
+            .source = if (perm_result == .ask) "user_prompt" else "permission_chain",
+            .allowed = policy_allowed,
+        } });
+        slot.admitted_input = eff_input;
+        // 任务义务观察:获准执行的 Bash 命令喂给义务运行时(needle 子串
+        // 命中即 met)。denied 的调用不算——义务要的是"真的跑过"。
+        // R3-4:按 canonical 名判——"bash" 会被 P0.6 修名真执行,raw 名判失配
+        // 会让真跑过的义务停在 unmet(有界误提醒,同 R2-3 键分裂族)。
+        if (opts.obligations) |obligation_runtime| {
+            if (slot.decision == .run and std.mem.eql(u8, canonical_name, "Bash")) {
+                if (@import("metacodes-base").util.json.extractStringField(slot.input, "command")) |command|
+                    obligation_runtime.observeDispatch(slot.id, command);
+            }
+        }
+        return slot;
+    }
+};
+
+/// One turn's JS bridge. Slot evidence outlives the interpreter call so all
+/// existing run-local sensors see inner mutations and checks, even on failure.
+const CodeBridge = struct {
+    gpa: std.mem.Allocator,
+    scratch: std.heap.ArenaAllocator,
+    conversation: *Conversation,
+    admission: ToolAdmission,
+    start_backend: ?*const UiBackend,
+    result_backend: ?*const UiBackend,
+    total_tool_calls: *u32,
+    slots: std.ArrayList(tool_exec_mod.Slot) = .empty,
+    post_context: std.ArrayList(u8) = .empty,
+    recovery_charged: usize = 0,
+
+    fn deinit(self: *CodeBridge) void {
+        for (self.slots.items) |*slot| slot.deinit(self.gpa);
+        self.slots.deinit(self.gpa);
+        self.post_context.deinit(self.gpa);
+        self.scratch.deinit();
+    }
+
+    const Invocation = struct {
+        bridge: *CodeBridge,
+        tool_ctx: *const tools_mod.ToolContext,
+        deadline_ms: i64,
+
+        fn interrupt(raw: ?*anyopaque) callconv(.c) c_int {
+            const self: *Invocation = @ptrCast(@alignCast(raw.?));
+            if (self.tool_ctx.abort) |abort| if (abort.isAborted()) return 1;
+            return @intFromBool(util_time.nowMs() >= self.deadline_ms);
+        }
+
+        fn call(raw: *anyopaque, name: []const u8, args: []const u8) error{ OutOfMemory, HostToolFatal, Aborted }!@import("code_runtime").HostResult {
+            return callInner(raw, name, args) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Aborted => error.Aborted,
+                else => error.HostToolFatal,
+            };
+        }
+
+        fn callInner(raw: *anyopaque, name: []const u8, args: []const u8) !@import("code_runtime").HostResult {
+            const self: *Invocation = @ptrCast(@alignCast(raw));
+            if (interrupt(raw) != 0) return error.Aborted;
+            const bridge = self.bridge;
+            const scratch = bridge.scratch.allocator();
+            const tu = msg.ToolUse{
+                .id = try std.fmt.allocPrint(scratch, "{s}/js/{d}", .{ self.tool_ctx.progress_tool_id, bridge.slots.items.len }),
+                .name = try scratch.dupe(u8, name),
+                .input = try scratch.dupe(u8, args),
+            };
+            bridge.total_tool_calls.* +|= 1;
+            // The current request's selected menu is a capability ceiling.
+            // A saved JS closure never retains authority from a previous Run.
+            var available = false;
+            if (self.tool_ctx.request_tools) |menu| for (menu.advertised) |definition| {
+                if (std.mem.eql(u8, name, definition.name)) {
+                    available = true;
+                    break;
+                }
+            };
+            var slot = if (!available or std.mem.eql(u8, name, "ExecuteCode") or std.mem.eql(u8, name, "AskUserQuestion"))
+                tool_exec_mod.Slot{
+                    .name = tu.name,
+                    .id = tu.id,
+                    .input = tu.input,
+                    .decision = .denied,
+                    .is_error = true,
+                    .content = try tool_error.errorToJson("CodeToolUnavailable", "tool '{s}' is unavailable inside this script; use the current tools list and call interactive tools outside ExecuteCode", .{name}, bridge.gpa),
+                }
+            else
+                try bridge.admission.admit(tu, bridge.gpa);
+            const index = bridge.slots.items.len;
+            bridge.slots.append(bridge.gpa, slot) catch {
+                slot.deinit(bridge.gpa);
+                return error.OutOfMemory;
+            };
+            const batch = bridge.slots.items[index .. index + 1];
+            const sess = bridge.admission.sess;
+            if (bridge.start_backend) |backend|
+                backend.emitEvent(sess, .{ .tool_start = .{ .id = tu.id, .name = tu.name, .input = batch[0].input } });
+            // ReadArtifact's turn allowance is shared with ordinary calls.
+            if (batch[0].decision == .run and std.mem.eql(u8, name, "ReadArtifact")) {
+                const cost = result_budget_mod.recoveryReadCost(self.tool_ctx.result_budget);
+                const allowance = result_budget_mod.recoveryAllowanceBytes(self.tool_ctx.result_budget);
+                if (bridge.recovery_charged +| cost > allowance) {
+                    batch[0].decision = .deferred;
+                    batch[0].is_error = true;
+                    batch[0].content = try tool_exec_mod.renderRecoveryDeferral(bridge.gpa, batch[0].input, .{
+                        .allowance_bytes = allowance,
+                        .cost_bytes = cost,
+                        .charged_bytes = bridge.recovery_charged,
+                        .deferred_count = 1,
+                    }, bridge.recovery_charged);
+                } else bridge.recovery_charged += cost;
+            }
+            try tool_exec_mod.executeSlots(batch, self.tool_ctx, bridge.gpa, bridge.admission.rid);
+            // The JS heap becomes the reference owner at this commit boundary.
+            try tool_exec_mod.publishSealedResults(batch, bridge.gpa, bridge.admission.rid);
+            const result_slot = &batch[0];
+            if (result_slot.pending) {
+                result_slot.is_error = true;
+                result_slot.content = try tool_error.errorToJson("CodeSuspendUnsupported", "tool '{s}' requested asynchronous UI; call it outside ExecuteCode", .{name}, bridge.gpa);
+            }
+            const content = result_slot.content orelse return error.HostToolFatal;
+            if (bridge.admission.opts.obligations) |obligations| {
+                if (result_slot.decision == .run)
+                    obligations.observeResult(result_slot.id, !result_slot.is_error and std.mem.indexOf(u8, content, "\"exit_code\":0}") != null);
+            }
+            if (result_slot.decision == .run) if (bridge.admission.permission_ctx.hooks) |hooks| if (hooks.hasPost()) {
+                if (hooks_mod.runPostToolUse(hooks, bridge.gpa, result_slot.name, result_slot.input, content, self.tool_ctx.abort)) |context| {
+                    defer bridge.gpa.free(context);
+                    if (bridge.post_context.items.len > 0) try bridge.post_context.append(bridge.gpa, '\n');
+                    try bridge.post_context.appendSlice(bridge.gpa, context);
+                }
+            };
+            if (bridge.result_backend) |backend| backend.emitEvent(sess, .{ .tool_result = .{
+                .id = tu.id,
+                .name = tu.name,
+                .input = result_slot.input,
+                .content = content,
+                .is_error = result_slot.is_error,
+                .elapsed_ms = result_slot.elapsed_ms,
+                .file_refs = result_slot.file_refs,
+            } });
+            return .{ .bytes = content, .is_error = result_slot.is_error };
+        }
+    };
+
+    fn execute(raw: *anyopaque, ctx: *const tools_mod.ToolContext, source: []const u8, timeout_ms: u32) anyerror![]u8 {
+        const self: *CodeBridge = @ptrCast(@alignCast(raw));
+        var nested_ctx = ctx.*;
+        nested_ctx.code_executor = null;
+        // A JS continuation cannot be serialized into suspend.json.
+        nested_ctx.ui_requester = null;
+        var invocation = Invocation{ .bridge = self, .tool_ctx = &nested_ctx, .deadline_ms = util_time.nowMs() + timeout_ms };
+        const runtime = try self.conversation.codeRuntime();
+        const outcome = runtime.evaluate(ctx.allocator, source, .{
+            .ctx = &invocation,
+            .callFn = Invocation.call,
+            .interruptFn = Invocation.interrupt,
+        }) catch |err| {
+            if (err == error.Aborted and (ctx.abort == null or !ctx.abort.?.isAborted())) return error.CodeTimeout;
+            return err;
+        };
+        if (Invocation.interrupt(&invocation) != 0) {
+            switch (outcome) {
+                .ok => |bytes| ctx.allocator.free(bytes),
+                .exception => |detail| ctx.allocator.free(detail),
+            }
+            runtime.healthy = false;
+            if (ctx.abort) |abort| if (abort.isAborted()) return error.Aborted;
+            return error.CodeTimeout;
+        }
+        return switch (outcome) {
+            .ok => |bytes| bytes,
+            .exception => |detail| blk: {
+                if (ctx.error_detail) |slot| slot.* = detail else ctx.allocator.free(detail);
+                break :blk error.JavaScriptError;
+            },
+        };
+    }
+};
+
+pub fn run(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+) !RunResult {
+    // This Run's failure detail is this Run's alone: its provider calls write
+    // here through a thread-local scope (see api/model_error.zig). It is read
+    // only below, and only for a stop that is a model failure.
+    var failure_capture: model_error.Capture = .{};
+    const failure_scope = model_error.Scope.enter(&failure_capture);
+    defer failure_scope.exit();
+    if (opts.model_error_out) |out| out.* = null;
+    const result = try runCaptured(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator);
+    if (opts.model_error_out) |out| switch (result.stop_reason) {
+        .api_error => {
+            out.* = model_error.Detail{};
+            failure_capture.finish(&out.*.?);
+        },
+        .max_tokens_exhausted => {
+            out.* = model_error.Detail{};
+            model_error.Detail.outputLimit(&out.*.?);
+        },
+        else => {},
+    };
+    return result;
+}
+
+fn injectProceduralSkill(conversation: *Conversation, opts: Options, model: []const u8, gpa: std.mem.Allocator) !void {
+    if (!opts.rsi) return;
+    const policy = opts.rsi_policy orelse return error.SkillPolicyRequired;
+    const rsi = @import("../skills/rsi.zig");
+    // One persisted host note per participant task. Retrying/resuming does not
+    // append another note or rewrite any earlier provider-visible bytes.
+    var i = conversation.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const message = conversation.messages.items[i];
+        if (conversation_mod.isUserPrompt(message)) break;
+        if (message.origin == .host) for (message.blocks) |block| {
+            if (block == .text and std.mem.startsWith(u8, block.text, rsi.PREFIX)) return;
+        };
+    }
+    const decision = policy.decide(.{ .evolution = true, .routing = true }, model, latestUserText(conversation));
+    switch (decision) {
+        .apply => |instruction| {
+            const note = try std.mem.concat(gpa, u8, &.{ rsi.PREFIX, instruction, rsi.SUFFIX });
+            defer gpa.free(note);
+            try conversation.appendHostText(note);
+        },
+        else => log.debug("skill.rsi", "instruction abstained: {s}", .{@tagName(decision)}),
+    }
+}
+
+fn runCaptured(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+) !RunResult {
+    // Provider server tools (`server_type`, e.g. Anthropic web_search) are not
+    // representable in this loop: their server_tool_use / result blocks are
+    // not kept in the Conversation, and a turn the server pauses (`pause_turn`)
+    // could only be resumed by sending those blocks back verbatim. Refuse them
+    // here rather than truncate such turns silently. AgentSession's tool
+    // catalog already rejects them; WebSearch keeps its server tool inside its
+    // own isolated sub-request.
+    try refuseServerTools(tool_defs, opts);
+    try injectProceduralSkill(conversation, opts, opts.model_override orelse provider.model(), allocator);
+    // Run-wide counters that every return path reports. They live here rather
+    // than in each of the loop's many result literals, so no exit can forget one.
+    var counters: RunCounters = .{};
+    if (opts.goal_meter) |meter| meter.beginRun();
+    defer if (opts.goal_meter) |meter| if (meter.endRun()) |settled| backend.emitEvent(opts.session, .{ .goal_updated = settled });
+    // Span recording: the recorder sees every event the frontend sees (tee),
+    // plus the tool lifecycle events a frontend opted out of (`span_sink`).
+    var tracing: telemetry.RunTracing = undefined;
+    var tee: @import("tee_backend.zig").TeeBackend = undefined;
+    var traced_be: UiBackend = undefined;
+    var span_sink_be: UiBackend = undefined;
+    var effective_be = backend;
+    var span_sink: ?*const UiBackend = null;
+    if (opts.telemetry) |t| {
+        tracing.start(allocator, t, .{
+            .session_id = opts.session.asSlice(),
+            .model = opts.model_override orelse provider.model(),
+            .provider = if (provider.route()) |r| @tagName(r.kind) else "",
+            .input = latestUserText(conversation),
+        });
+        span_sink_be = tracing.recorder.backend();
+        tee = .{ .primary = backend, .secondary = &span_sink_be };
+        traced_be = tee.backend();
+        effective_be = &traced_be;
+        span_sink = &span_sink_be;
+    }
+    defer if (opts.telemetry != null) tracing.deinit();
+    var result = runCounted(conversation, provider, tool_defs, permission_ctx, opts, effective_be, span_sink, allocator, &counters) catch |err| {
+        if (opts.telemetry != null) tracing.recorder.finish(.{ .failed = err });
+        return err;
+    };
+    result.continuations = counters.continuations;
+    result.learning = counters.learning;
+    result.usage_status = if (counters.saw_successful_provider_response and !counters.usage_unknown)
+        .known
+    else
+        .unknown;
+    return result;
+}
+
+const RunCounters = struct {
+    /// max_tokens 续写总次数(整个 Run 累计,不重置);RunResult.continuations 的来源。
+    /// 上限 MAX_CONTINUATIONS 只约束连续续写(见 runCounted 的 continuation_streak)。
+    continuations: u32 = 0,
+    /// The learning turn's report once it decided (RunResult.learning), set by a
+    /// defer in runCounted so an abort inside a pass still reports it.
+    learning: ?learning_turn_mod.Report = null,
+    /// A successful provider response without a readable usage sample makes
+    /// the whole Run's consumer-facing usage status unknown. Failed attempts
+    /// are already journaled independently and do not change a later
+    /// successful response's result status.
+    saw_successful_provider_response: bool = false,
+    usage_unknown: bool = false,
+};
+
+// Run-end records of the host gates and sensors, one function each, called by
+// the matching `defer` in `runCounted`. Zig copies a `defer` body into every
+// exit of its scope, and `runCounted` has about 250 of them (`try`, `return`,
+// `break`, `continue`), so written inline these records were some 270 KB of
+// the Linux ReleaseSmall binary (doc/PERF_MEMORY_PRINCIPLES.md §2).
+// `noinline` keeps each one a single copy. A `defer` evaluates its arguments
+// when it runs, so each record still reads the Run's final state.
+
+noinline fn recordProgressUpdates(opts: *const Options, state: *const progress_updates_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .progress_updates = .{
+            .enforced = opts.progress_updates,
+            .silent_rounds_threshold = opts.progress_update_thresholds.rounds,
+            .min_silent_ms = opts.progress_update_thresholds.min_silent_ms,
+            .max_silent_rounds = state.max_silent_rounds,
+            .decisions = state.decisions,
+            .nudges = state.nudges,
+            .max_nudges = progress_updates_mod.MAX_PROGRESS_NUDGES,
+        } });
+    }
+    if (state.decisions > 0) {
+        log.info("agent", "progress update decisions={d} nudges={d} max_silent_rounds={d}", .{ state.decisions, state.nudges, state.max_silent_rounds });
+    }
+}
+
+noinline fn recordStallGate(opts: *const Options, mode: stall_gate_mod.Mode, state: *const stall_gate_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .stall_gate = .{
+            .enforced = mode == .enforce,
+            .repeat_rounds_threshold = opts.stall_gate_thresholds.repeat_rounds,
+            .repeat_calls_threshold = opts.stall_gate_thresholds.repeat_calls,
+            .stale_rounds_threshold = opts.stall_gate_thresholds.stale_rounds,
+            .rounds = state.rounds,
+            .progress_rounds = state.progress_rounds,
+            .max_stale_rounds = state.max_stale_rounds,
+            .max_repeats = state.max_repeats,
+            .forgotten = state.forgotten,
+            .decisions = state.decisions,
+            .max_decisions = stall_gate_mod.MAX_STALL_DECISIONS,
+            .cause = if (state.decided) |report| switch (report.cause) {
+                .repeating => .repeating,
+                .stale => .stale,
+            } else .none,
+            .decided_round = if (state.decided) |report| report.round else 0,
+        } });
+    }
+    if (state.decisions > 0) {
+        log.info("agent", "stall gate decisions={d} rounds={d} max_stale_rounds={d} max_repeats={d}", .{ state.decisions, state.rounds, state.max_stale_rounds, state.max_repeats });
+    }
+}
+
+noinline fn recordDeliveryCadence(opts: *const Options, state: *const delivery_cadence_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .delivery_cadence = .{
+            .enforced = opts.delivery_cadence,
+            .exploration_calls = state.exploration_calls,
+            .mutations_occurred = state.mutation_seen,
+            .levels_reached = state.level,
+            .nudges = state.nudges,
+            .max_nudges = delivery_cadence_mod.MAX_CADENCE_NUDGES,
+            .first_threshold = opts.delivery_cadence_thresholds.first,
+            .second_threshold = opts.delivery_cadence_thresholds.second,
+        } });
+    }
+}
+
+noinline fn recordLearningReport(counters: *RunCounters, state: *const learning_turn_mod.State, mode: learning_turn_mod.Mode) void {
+    counters.learning = state.report(mode);
+}
+
+noinline fn recordLearningTurn(opts: *const Options, state: *const learning_turn_mod.State, mode: learning_turn_mod.Mode) void {
+    if (opts.tool_observer) |observer| {
+        const report = state.report(mode);
+        _ = observer.emit(.{ .learning_turn = .{
+            .enforced = report.enforced,
+            .grounding = switch (report.grounding) {
+                .unchecked => .unchecked,
+                .passed => .passed,
+                .failed => .failed,
+                .tainted => .tainted,
+                .unavailable => .unavailable,
+            },
+            .decision = switch (report.decision) {
+                .none_unfinished => .none_unfinished,
+                .none_unchecked => .none_unchecked,
+                .none_unavailable => .none_unavailable,
+                .none_tainted => .none_tainted,
+                .none_unstorable => .none_unstorable,
+                .distill => .distill,
+            },
+            .passes = report.passes,
+            .distill_turns = report.distill_turns,
+            .reconcile_turns = report.reconcile_turns,
+            .lessons_accepted = report.lessons_accepted,
+            .lessons_refused = report.lessons_refused,
+            .reconciled = report.reconciled,
+            .truncated = report.truncated,
+        } });
+    }
+}
+
+noinline fn recordTestIntegrity(
+    opts: *const Options,
+    integrity: test_integrity_mod.Options,
+    state: *test_integrity_mod.State,
+    allocator: std.mem.Allocator,
+) void {
+    state.settle(allocator);
+    const totals = state.totals();
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .test_integrity = .{
+            .enforced = integrity.mode == .enforce,
+            .coverage = switch (state.baseline.coverage) {
+                .git => .git,
+                .no_git => .no_git,
+                .git_failed => .git_failed,
+            },
+            .scans = state.scans,
+            .nudges = state.nudges,
+            .max_nudges = test_integrity_mod.MAX_NUDGES,
+            .outcome = switch (state.outcome(integrity.mode)) {
+                .clean => .clean,
+                .restored => .restored,
+                .kept_cited => .kept_cited,
+                .kept_silent => .kept_silent,
+                .observed => .observed,
+            },
+            .files_weakened = state.weakenedNow(),
+            .files_weakened_peak = state.peak,
+            .removed_lines = totals.removed_lines,
+            .removed_assert_lines = totals.removed_assert_lines,
+            .skip_markers_added = totals.skip_markers_added,
+            .deleted_files = totals.deleted_files,
+            .support_files_changed = totals.support_files_changed,
+            .post_nudge_new_files = state.post_nudge_new_files,
+            .unverified_files = state.unverified,
+            .overflow = state.overflow(),
+        } });
+    }
+    if (integrity.report) |report| state.fillReport(report, integrity.mode) catch |err| {
+        log.warn("agent", "test integrity report not filled: {s}", .{@errorName(err)});
+    };
+}
+
+noinline fn recordCheckGate(opts: *const Options, gate: check_gate_mod.Options, state: *const check_gate_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .check_gate = .{
+            .enforced = gate.mode == .enforce,
+            .command_sha256 = tools_mod.tool_observation.sha256Hex(gate.command),
+            .checks = state.checks,
+            .continuations = state.continuations,
+            .max_continuations = gate.max_continuations,
+            .final_verdict = if (state.last_verdict) |v| switch (v) {
+                .passed => .passed,
+                .failed => .failed,
+                .tainted => .tainted,
+                .unavailable => .unavailable,
+            } else .not_run,
+            .final_passed = state.last_passed,
+            .final_total = state.last_total,
+            .unchecked_changes = state.dirty,
+            .stop_hook_blocks = state.stop_hook_blocks,
+        } });
+    }
+}
+
+noinline fn recordIsolatedVerifier(opts: *const Options, verifier: isolated_verifier_mod.Options, gate: *const isolated_verifier_mod.Gate) void {
+    const observer = opts.tool_observer orelse return;
+    const obs = tools_mod.tool_observation;
+    var verdicts: [2]obs.VerifierVerdict = .{ .not_run, .not_run };
+    var reasons: [2]obs.VerifierReason = .{ .none, .none };
+    var trees: [2][16]u8 = .{ [_]u8{'0'} ** 16, [_]u8{'0'} ** 16 };
+    for (gate.results, 0..) |maybe, i| {
+        const r = maybe orelse continue;
+        verdicts[i] = switch (r.verdict) {
+            .pass => .pass,
+            .fail => .fail,
+            .unverified => .unverified,
+            .unavailable => .unavailable,
+        };
+        reasons[i] = if (r.unavailable) |reason| switch (reason) {
+            inline else => |tag| @field(obs.VerifierReason, @tagName(tag)),
+        } else if (r.downgrade) |downgrade| switch (downgrade) {
+            inline else => |tag| @field(obs.VerifierReason, @tagName(tag)),
+        } else .none;
+        @memcpy(trees[i][0..r.tree_len], r.tree_sha_prefix[0..r.tree_len]);
+    }
+    _ = observer.emit(.{ .isolated_verifier = .{
+        .enforced = verifier.mode == .enforce,
+        .boundaries = gate.boundaries,
+        .spawns = gate.spawns,
+        .leads_rounds = gate.leads_rounds,
+        .verdict_1 = verdicts[0],
+        .reason_1 = reasons[0],
+        .tree_1 = trees[0],
+        .verdict_2 = verdicts[1],
+        .reason_2 = reasons[1],
+        .tree_2 = trees[1],
+        .charter_sha256 = isolated_verifier_mod.charterSha256Hex(),
+        .same_model = gate.same_model,
+        .turns = gate.turns,
+        .cost_microusd = gate.cost_microusd,
+        .wall_ms = gate.wall_ms,
+        .probes_cited = gate.probes_cited,
+        .probes_matched = gate.probes_matched,
+        .lead_probes = gate.lead_probes,
+        .cleanup_complete = gate.cleanup_complete,
+    } });
+}
+
+/// What the agent loop does after a verifier boundary's final spawn.
+const VerifierAction = union(enum) {
+    /// The verdict stands as the pinned check left it.
+    stand,
+    /// Enforce mode, a reproduced FAIL with budget left: continue the run
+    /// with this message (owned).
+    continue_run: []u8,
+    /// Enforce mode, a reproduced FAIL with no budget left: the run ends
+    /// `failed` (source verifier).
+    exhausted,
+};
+
+/// The verifier's dependencies, taken from the run's own options.
+fn verifierDeps(
+    opts: *const Options,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+) isolated_verifier_mod.Deps {
+    return .{
+        .provider = provider,
+        .anthropic_client = opts.api_client,
+        .tool_defs = tool_defs,
+        .permission_ctx = permission_ctx,
+        .abort = opts.abort,
+        .session = sess,
+        .state_root = opts.state_root,
+        .home_dir = opts.home_dir,
+        .sandbox = opts.sandbox,
+        .model_tiers = opts.model_tiers,
+        .artifact_root = opts.artifact_root,
+    };
+}
+
+/// One verifier spawn at the check gate's boundary, on the gate's snapshot
+/// (built here on the boundary's first spawn). Bounded by the run budget.
+fn verifierSpawn(
+    allocator: std.mem.Allocator,
+    gate: *isolated_verifier_mod.Gate,
+    verifier: isolated_verifier_mod.Options,
+    deps: isolated_verifier_mod.Deps,
+    root: []const u8,
+    pinned: isolated_verifier_mod.PinnedCheck,
+    leads: ?[]const u8,
+) !isolated_verifier_mod.VerifyResult {
+    if (!gate.budgetAllowsSpawn()) return isolated_verifier_mod.unavailableResult(allocator, .run_budget);
+    if (gate.snapshot == null) {
+        gate.snapshot = @import("../agents/isolation.zig").Snapshot.create(allocator, deps.state_root, root, gate.base_head, deps.abort) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            log.warn("verifier", "snapshot unavailable: {s}", .{@errorName(err)});
+            return isolated_verifier_mod.unavailableResult(allocator, .snapshot_failed);
+        };
+    }
+    const result = try isolated_verifier_mod.verify(allocator, deps, .{
+        .task_statement = gate.task_statement,
+        .workspace = .{ .snapshot = &gate.snapshot.? },
+        .pinned_check = pinned,
+        .model = verifier.model,
+        .prior_failing_probes = @ptrCast(gate.prior_probes.items),
+        .leads = leads,
+    });
+    gate.noteSpawn(&result);
+    return result;
+}
+
+/// Close a verifier boundary: record it, drop the snapshot, and turn a
+/// reproduced FAIL in enforce mode into the check gate's `failed` verdict.
+fn verifierConclude(
+    allocator: std.mem.Allocator,
+    gate: *isolated_verifier_mod.Gate,
+    verifier: isolated_verifier_mod.Options,
+    check: check_gate_mod.Options,
+    check_state: *check_gate_mod.State,
+    result: *const isolated_verifier_mod.VerifyResult,
+) !VerifierAction {
+    const index = gate.boundaries -| 1;
+    try gate.finishBoundary(allocator, index, result.outcome, result.record.tree);
+    gate.dropSnapshot();
+    if (verifier.mode != .enforce) return .stand;
+    const evidence = switch (result.outcome) {
+        .fail => |report| report.evidence,
+        else => return .stand,
+    };
+    check_state.noteVerifierFail(isolated_verifier_mod.failureFingerprint(evidence));
+    const decision = check_gate_mod.decide(.enforce, check.max_continuations, check_state.continuations, .failed);
+    check_state.noteDecision(decision);
+    if (decision != .continue_run) return .exhausted;
+    const left = check.max_continuations -| check_state.continuations;
+    return .{ .continue_run = try isolated_verifier_mod.renderFailContinuation(allocator, evidence, left) };
+}
+
+/// The second spawn of a boundary, after a leads round: a fresh verifier on
+/// the same snapshot T, with the round's reply as leads (at most
+/// `LEADS_MAX_BYTES`). Its verdict is final for the boundary.
+fn verifierAfterLeads(
+    allocator: std.mem.Allocator,
+    opts: *const Options,
+    gate: *isolated_verifier_mod.Gate,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    check_state: *check_gate_mod.State,
+    leads_text: []const u8,
+) !VerifierAction {
+    const verifier = opts.isolated_verifier.?;
+    const check = opts.check_gate.?;
+    var result = if (gate.snapshot == null)
+        isolated_verifier_mod.unavailableResult(allocator, .snapshot_failed)
+    else
+        try verifierSpawn(allocator, gate, verifier, verifierDeps(opts, provider, tool_defs, permission_ctx, sess), gate.snapshot.?.repo, .{
+            .command = check.command,
+            .passed = check_state.last_passed,
+            .total = check_state.last_total,
+        }, leads_text);
+    defer result.deinit();
+    log.info("agent", "isolated verifier after leads result={s}", .{@tagName(result.outcome)});
+    return verifierConclude(allocator, gate, verifier, check, check_state, &result);
+}
+
+noinline fn recordRequirementLedger(
+    opts: *const Options,
+    state: *const requirement_ledger_mod.State,
+    verification: *const verification_progress_mod.State,
+) void {
+    if (opts.tool_observer) |observer| {
+        const counts = if (opts.tasks) |store|
+            store.ledgerCounts()
+        else
+            @import("task_store.zig").LedgerCounts{ .open = 0, .total = 0 };
+        _ = observer.emit(.{ .requirement_ledger = .{
+            .enforced = opts.requirement_ledger,
+            .prompt_emitted = state.prompt_emitted,
+            .items_total = @intCast(@min(counts.total, std.math.maxInt(u32))),
+            .items_open_at_final = @intCast(@min(counts.open, std.math.maxInt(u32))),
+            .mutations_occurred = verification.mutation_seen,
+            .nudges = state.nudges,
+            .max_nudges = requirement_ledger_mod.MAX_LEDGER_NUDGES,
+        } });
+    }
+}
+
+noinline fn recordVerificationFinalGate(opts: *const Options, verification: *const verification_progress_mod.State, nudges: u8) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .verification_final_gate = .{
+            .enforced = opts.verification_final_gate,
+            .mutations_occurred = verification.mutation_seen,
+            .obligation_met = !verification.unverified_mutation,
+            .nudges = nudges,
+            .max_nudges = MAX_VERIFICATION_NUDGES,
+            .tier1_verifications = verification.tier1_verifications,
+            .tier2_verifications = verification.tier2_verifications,
+            .redundant_verifications = verification.redundant_verifications,
+            .final_closure_tier = verification.final_closure_tier,
+            .reopened_after_verification = verification.reopened_after_verification,
+            .known_failing = verification.known_failing,
+        } });
+    }
+}
+
+// Cleanup of the per-turn buffers, out of line for the same reason: their
+// `defer`s run at each exit of the turn loop's body.
+
+noinline fn freeOwnedSlice(comptime T: type, allocator: std.mem.Allocator, owned: ?[]T) void {
+    if (owned) |slice| allocator.free(slice);
+}
+
+noinline fn freeBlockList(allocator: std.mem.Allocator, blocks: *std.ArrayList(msg.Block)) void {
+    for (blocks.items) |b| b.deinit(allocator);
+    blocks.deinit(allocator);
+}
+
+noinline fn freeItemList(allocator: std.mem.Allocator, items: *std.ArrayList([]u8)) void {
+    for (items.items) |item| allocator.free(item);
+    items.deinit(allocator);
+}
+
+fn runCounted(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    initial_tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    initial_opts: Options,
+    backend: *const UiBackend,
+    /// The span recorder alone (already inside `backend` through a tee), for
+    /// events the frontend did not ask for but a trace needs. Null: no recording.
+    span_sink: ?*const UiBackend,
+    allocator: std.mem.Allocator,
+    counters: *RunCounters,
+) !RunResult {
+    var tool_defs = initial_tool_defs;
+    var opts = initial_opts;
+    const tool_changes_hook = if (opts.agent_depth == 0) opts.tool_changes else null;
+    const harnessmm_enabled = opts.harnessmm;
+    const comment_guidance = @import("system_prompt.zig").COMMENT_GUIDANCE;
+    const base_prompt = opts.system_prompt orelse "";
+    const preview_prompt = if (opts.preview.comment_guard and std.mem.indexOf(u8, base_prompt, comment_guidance) == null)
+        try std.mem.concat(allocator, u8, &.{ base_prompt, if (base_prompt.len > 0) "\n\n" else "", comment_guidance })
+    else
+        null;
+    defer if (preview_prompt) |owned| allocator.free(owned);
+    const run_prompt = preview_prompt orelse opts.system_prompt;
+    var harnessmm = harnessmm_mod.State.init(allocator);
+    defer harnessmm.deinit();
+    var harnessmm_journal: ?harnessmm_mod.Journal = if (harnessmm_enabled)
+        try harnessmm_mod.Journal.open(allocator, opts.artifact_root)
+    else
+        null;
+    defer if (harnessmm_journal) |*journal| journal.deinit();
+    if (harnessmm_enabled) {
+        var present = false;
+        var index = conversation.messages.items.len;
+        while (index > 0) {
+            index -= 1;
+            const message = conversation.messages.items[index];
+            if (conversation_mod.isUserPrompt(message)) break;
+            if (message.origin == .host) for (message.blocks) |block| {
+                if (block == .text and std.mem.startsWith(u8, block.text, harnessmm_mod.AUTHOR_MARKER)) present = true;
+            };
+        }
+        if (!present) try conversation.appendHostText(harnessmm_mod.AUTHOR_PROMPT);
+    }
+    // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
+    const sess = opts.session;
+    // 声明本 run 认领任务的身份,与工具 kgAgentIdent 同源(kg_agent_ident orelse agent_ident):
+    // 认领记进任务行,任务锚/关闭提示/溯源据此只看本 agent 的行。失败只是少了过滤(旧行为)。
+    if (opts.tasks) |store| {
+        const claim_session = opts.agent_ident orelse sess;
+        store.setClaimer(opts.kg_agent_ident orelse claim_session.asSlice()) catch {};
+    }
+    if (opts.time_announcer) |announcer| {
+        if (try announcer.noticeFor(allocator, conversation.activeMessages())) |notice| {
+            defer allocator.free(notice);
+            try conversation.appendHostText(notice);
+        }
+    }
+    // L4:run 级 trace_id(整个 run 一个,跨所有 turn);诊断事件内联携带,DiagnosticsBackend
+    // 据 trace_id+depth 重建 span 树。depth = agent 嵌套深度(父 0 子 1)。
+    const trace_id = log.genRequestId().bytes;
+    const depth = opts.agent_depth;
+    var turns: u32 = 0;
+    var job_wakeups: u32 = 0;
+    var verification_progress = verification_progress_mod.State{};
+    var total_tool_calls: u32 = 0;
+    // 环境故障计数(本 run 累计,不重置):见 MAX_ENVIRONMENT_FAULTS。
+    var environment_faults: u32 = 0;
+    // max_tokens 续写总数:放在 run() 持有的 counters 里,任何返回路径都会把它带进
+    // RunResult。它只用于报告,不用于封顶。
+    const continuations = &counters.continuations;
+    // 连续续写计数:防止模型一直撞上限导致无限续写,上限 MAX_CONTINUATIONS 次。
+    // 一旦某轮不再以 max_tokens 收尾,或这轮带了 tool_use(模型已恢复并在行动),
+    // 就归零。按整个 Run 累计封顶会把"偶尔一轮想太长、续写后就恢复"的长任务在
+    // 第 4 次截断时直接判为 max_tokens_exhausted。
+    var continuation_streak: u32 = 0;
+    // 上一轮以 max_tokens 续写提示收尾 → 下一个 turn 边界不消费 UI 队列(见 drainUiEvents)。
+    var continuation_pending = false;
+    // 输出语义通道:每个 provider stream 一个可见输出段,定性在 loop **真正知道**时才发。
+    // defer 是兜底——任何忘记定性的退出路径把仍打开的段记为 partial(诚实读法:Run 结束了,
+    // 但从没判定这段是答案)。显式定性发生在前,兜底只在遗漏时生效。
+    var output_channel = OutputChannel{ .backend = backend, .session = sess, .ledger = opts.output_ledger };
+    defer output_channel.close(.partial, "");
+    var verification_nudges: u8 = 0;
+    var required_first_repairs: u8 = 0;
+    // Re-issues under `max_stream_turn_retries` / `retractable_stream_retries`:
+    // the Run's count. The per-request allowance is counted per turn below.
+    var stream_turn_retries: u8 = 0;
+    var requirement_ledger_state = requirement_ledger_mod.State{};
+    var delivery_cadence_state = delivery_cadence_mod.State{};
+    // 进度更新义务(#114):沉默段 = 连续"只调工具不说话"的轮数 + 距上一次可见文本的时长;任何可见
+    // 文本或一次决策归零。终局记录与交付节奏门同款(评测 trace 据此归因 host 注入)。
+    var progress_state = progress_updates_mod.State.init(util_time.nowNs());
+    defer if (opts.progress_updates or opts.progress_updates_observe) recordProgressUpdates(&opts, &progress_state);
+    // Stall gate: allocated only when armed (the novelty memory is tens of KB,
+    // too much for this frame on every run). Destroyed after the record below.
+    const stall_state: ?*stall_gate_mod.State = if (opts.stall_gate != null) blk: {
+        const state = try allocator.create(stall_gate_mod.State);
+        state.* = .{};
+        break :blk state;
+    } else null;
+    defer if (stall_state) |state| allocator.destroy(state);
+    defer if (opts.stall_gate) |mode| if (stall_state) |state| recordStallGate(&opts, mode, state);
+    defer if (opts.delivery_cadence or opts.delivery_cadence_observe) recordDeliveryCadence(&opts, &delivery_cadence_state);
+    // 宿主检查门 + Stop hook 拦截(CheckGate.lean):各自有界的续跑预算,不走注入计量器
+    // (续跑由外部裁决驱动,不是咨询性 nudge)。终局记录只在检查门武装时落一条。
+    var check_gate_state = check_gate_mod.State{};
+    // Learning turn (learning_turn.zig): decided once at the terminal
+    // boundary; its passes borrow turns past max_turns like the KG repair.
+    var learning_state = learning_turn_mod.State{};
+    defer learning_state.deinit(allocator);
+    defer if (opts.learning_turn) |learning| if (learning_state.decision != null) recordLearningReport(counters, &learning_state, learning.mode);
+    var learning_borrowed_turns: u32 = 0;
+    defer if (opts.learning_turn) |learning| if (depth == 0) recordLearningTurn(&opts, &learning_state, learning.mode);
+    // Test-integrity sensor (TestIntegrity.lean): the suite as it was when the
+    // run started. The check gate reads it too, to taint a pass over weakened
+    // tests; only an armed obligation messages, records and reports.
+    var test_integrity_state = test_integrity_mod.State{};
+    defer test_integrity_state.deinit(allocator);
+    if ((opts.test_integrity != null or opts.check_gate != null) and depth == 0) {
+        try test_integrity_state.arm(allocator, if (opts.cwd_abs.len > 0) opts.cwd_abs else null, opts.abort);
+    }
+    // A run that ended without a scan after its last tool (turn cap, abort,
+    // error) is scanned once more there, so the report shows the end state.
+    defer if (opts.test_integrity) |integrity| if (depth == 0) recordTestIntegrity(&opts, integrity, &test_integrity_state, allocator);
+    var stop_hook_active = false;
+    defer if (opts.check_gate) |gate| recordCheckGate(&opts, gate, &check_gate_state);
+    // Isolated verifier (isolated_verifier.zig): armed beside the check gate
+    // at depth 0. The task statement and the run-start HEAD are fixed here,
+    // before any work; the record is emitted once per armed run.
+    const verifier_armed = opts.isolated_verifier != null and opts.check_gate != null and depth == 0;
+    var verifier_gate = isolated_verifier_mod.Gate{};
+    defer verifier_gate.deinit(allocator);
+    defer if (verifier_armed) recordIsolatedVerifier(&opts, opts.isolated_verifier.?, &verifier_gate);
+    var verifier_borrowed_turns: u32 = 0;
+    if (verifier_armed) {
+        verifier_gate.task_statement = try allocator.dupe(u8, latestUserText(conversation));
+        verifier_gate.base_head = @import("../agents/isolation.zig").headOf(allocator, opts.cwd_abs, opts.abort);
+    }
+    // 元规则①:全部 host 注入共享一个计量器——各门自证有界不蕴含合成
+    // 有界(Lean HostInjectionMeter.consumed_never_exceeds_cap 对任意门
+    // 序列量化)。
+    var host_injection_meter = @import("host_injection_meter.zig").Meter{};
+    defer if (opts.requirement_ledger or opts.requirement_ledger_observe) recordRequirementLedger(&opts, &requirement_ledger_state, &verification_progress);
+    defer if (opts.verification_final_gate or opts.verification_final_observe) recordVerificationFinalGate(&opts, &verification_progress, verification_nudges);
+    // At most this many max_tokens continuations in a row; the streak resets
+    // whenever a turn ends without the cut or carries a tool call.
+    const MAX_CONTINUATIONS: u32 = 3;
+
+    // Governed lexical recall is run-scoped: the model proposes aliases and
+    // variants, while this bounded host ledger remembers only node ids that
+    // were actually returned. It is shared by every turn/tool context in this
+    // run and never persisted into the canonical TinyKG store.
+    var kg_lexical_ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
+    const kg_retrieval_protocol = @import("../kg/retrieval_protocol.zig");
+    const kg_enumeration_query_hint = kg_retrieval_protocol.queryRequiresEnumerationCoverage(latestUserText(conversation)) or
+        (if (opts.synthetic_user_input) |synthetic|
+            kg_retrieval_protocol.queryRequiresEnumerationCoverage(synthetic)
+        else
+            false);
+    // System-One enumeration sensor: consulted lazily, at most once per run,
+    // only after a governed recall committed while no deterministic hint armed
+    // the coverage gate. In advisory mode a positive answer arms the reminders
+    // only; the rejecting repair below stays bound to the deterministic hints,
+    // so a judge false positive can cost one reminder but never end a run.
+    const kg_enumeration_text: ?[]u8 = if (opts.jev != null) try allocator.dupe(u8, latestUserText(conversation)) else null;
+    defer freeOwnedSlice(u8, allocator, kg_enumeration_text);
+    var kg_enumeration_judged = false;
+    var kg_enumeration_soft_hint = false;
+    var kg_coverage_reminder_emitted = false;
+    var kg_context_reminder_emitted = false;
+    var kg_coverage_repair_attempts: u8 = 0;
+    var kg_context_repair_attempts: u8 = 0;
+    var kg_coverage_borrowed_turns: u32 = 0;
+    // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
+    const cost_rates = @import("metacodes-base").util.pricing.effectiveRates(opts.model_override orelse provider.model());
+    var run_cost_usd: f64 = 0;
+
+    // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
+    var cache_detector = @import("cache_break.zig").CacheBreakDetector{};
+    var context_warning_emitted = false;
+    // Paid no-savings summaries feed their measured overhead back into the
+    // next optimistic preview. This is run-scoped on purpose: it suppresses
+    // immediate retry storms without persisting model-specific estimates into
+    // the transcript or across process revisions.
+    var compact_summary_reserve_tokens: usize = 0;
+
+    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns +| learning_borrowed_turns +| verifier_borrowed_turns) : (turns += 1) {
+        // 开头检查 abort
+        if (opts.abort) |a| if (a.isAborted()) {
+            log.warn("agent", "aborted before turn {d}", .{turns + 1});
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+        };
+        // 成本次闸:本 run 累计成本达预算 → 停,交互层询问是否继续(不自动续)。
+        if (opts.cost_budget_usd) |budget| {
+            if (run_cost_usd >= budget) {
+                log.warn("agent", "cost budget reached: ${d:.4} >= ${d:.4}", .{ run_cost_usd, budget });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+            }
+        }
+        // Learning pass turn cap: a pass that keeps calling tools ends here;
+        // the attempt's answer stands and the record says the pass was cut.
+        if (learning_state.active() and !learning_state.beginPassTurn()) {
+            learning_state.truncated = true;
+            log.info("agent", "learning turn {s} pass cut at {d} turns", .{ @tagName(learning_state.phase), learning_turn_mod.PASS_MAX_TURNS });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls });
+        }
+        // The one predicate for "this round is a learning pass, not the
+        // attempt". A pass is the tail of a finished attempt: queued input,
+        // backgrounding, job notifications, advisory nudges, process sensors
+        // and the fault breaker all skip it, and a new turn-boundary or
+        // post-execution gate must check it too. The phase only changes in
+        // the end-turn branch, which leaves the iteration, so the value holds
+        // for the whole iteration.
+        // A verifier leads round (isolated_verifier.zig §6) is a host pass
+        // too: read-only, outside the attempt, so the same skips apply.
+        if (verifier_gate.leads == .active) {
+            verifier_gate.leads_turns += 1;
+            if (verifier_gate.leads_turns > isolated_verifier_mod.LEADS_MAX_TURNS) {
+                // The round kept calling tools: the second verifier gets no
+                // leads, and the boundary's verdict is final either way.
+                log.info("agent", "verifier leads round cut at {d} turns", .{isolated_verifier_mod.LEADS_MAX_TURNS});
+                verifier_gate.leads = .idle;
+                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, "")) {
+                    .continue_run => |text| {
+                        defer allocator.free(text);
+                        output_channel.final_sealed = false;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    },
+                    .stand, .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls }),
+                }
+            }
+        }
+        const in_learning_pass = learning_state.active() or verifier_gate.leads == .active;
+
+        // 转后台请求(Ctrl+B):turn 边界检查——此刻 conversation 干净(上轮 tool_result 已 append),
+        // 返回 .backgrounded 让调用方深拷贝转后台续跑。**只在 turn 开头查**(run 是同步循环,无中途
+        // 暂停点;唯一安全转后台点是 turn 边界)。与 abort 分开:这不是中断,是把完整对话搬去后台。
+        if (!in_learning_pass) if (opts.background_request) |bg| if (bg.load(.acquire)) {
+            log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
+        };
+
+        // UI → core 输入(#115):生成期入队的用户消息在这里进对话,本 Run 的下一次请求就带上它;
+        // backend 的 interrupt 在边界结束本 Run。见 drainUiEvents 注。max_tokens 续写边界跳过:
+        // 刚追加的"接着写"提示与转向指令并排会让模型换题,而 Ledger 仍把下一段当同一答案的续写。
+        if (continuation_pending) {
+            continuation_pending = false;
+        } else if (!in_learning_pass) {
+            if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
+                log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
+                return finishRun(backend, sess, trace_id, depth, .{
+                    .stop_reason = stopReasonForReason(reason),
+                    .turns = turns,
+                    .tool_calls = total_tool_calls,
+                });
+            }
+            // Host input submitted through the Session (#270): same boundary, same skip.
+            if (opts.run_inputs) |queue| {
+                try adoptRunInputs(queue, conversation, backend, sess, turns + 1, opts.abort);
+                // An adoption event the Host rejected aborts the Run: end it here
+                // rather than build and send another request.
+                if (opts.abort) |a| if (a.isAborted()) {
+                    log.warn("agent", "aborted while adopting host input before turn {d}", .{turns + 1});
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                };
+            }
+            // Issue #277: the goal's budget ran out during the last turn.
+            if (opts.goal_meter) |meter| if (meter.takeBudgetNotice()) |notice| {
+                log.info("agent", "goal budget used up; wrap-up notice before turn {d}", .{turns + 1});
+                try conversation.appendHostText(notice);
+            };
+        }
+
+        // 2026-09-19 polling incident: deliver metadata at the boundary so
+        // the model need not poll, while keeping child bytes behind BashOutput
+        // and preserving owner/duplicate/role invariants.
+        if (!in_learning_pass) if (opts.job_notifications) |registry| {
+            notification_delivery: {
+                const owner = opts.agent_ident orelse opts.session;
+                const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
+                    log.warn("agent", "job notification skipped: {s}", .{@errorName(err)});
+                    break :notification_delivery;
+                };
+                defer @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                if (events.len > 0) {
+                    // Build every fallible piece before appending the user message;
+                    // notification delivery is best-effort and must not fail a run.
+                    var ids = std.ArrayList(u8).empty;
+                    defer ids.deinit(allocator);
+                    for (events, 0..) |event, index| {
+                        if (index != 0) ids.append(allocator, ',') catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break :notification_delivery;
+                        };
+                        ids.appendSlice(allocator, event.id[0..]) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break :notification_delivery;
+                        };
+                    }
+                    if (ids.items.len == 0) break :notification_delivery;
+                    const text = job_notification_mod.render(allocator, events) catch |err| {
+                        log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                        break :notification_delivery;
+                    };
+                    defer allocator.free(text);
+                    conversation.appendHostText(text) catch |err| {
+                        log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                        break :notification_delivery;
+                    };
+                    log.info("agent", "job notification delivered ids={s} turn={d}", .{ ids.items, turns + 1 });
+                }
+            }
+            if (opts.preview.monitor_events) monitor_delivery: {
+                const owner = opts.agent_ident orelse opts.session;
+                const text = (takeMonitorNotifications(registry, owner, allocator) catch |err| {
+                    log.warn("agent", "monitor notification skipped: {s}", .{@errorName(err)});
+                    break :monitor_delivery;
+                }) orelse break :monitor_delivery;
+                defer allocator.free(text);
+                conversation.appendHostText(text) catch |err| {
+                    log.warn("agent", "monitor notification skipped: {s} (events dropped)", .{@errorName(err)});
+                    break :monitor_delivery;
+                };
+                log.info("agent", "monitor notification delivered turn={d}", .{turns + 1});
+            }
+        };
+
+        // Delivery-cadence obligation: the run is still exploring and nothing
+        // is on disk. Decided at the turn boundary (the conversation is clean:
+        // last turn's tool_results are already appended), bounded through the
+        // shared meter, and never a denial. Observe mode advances the level
+        // without injecting so control arms record the same crossings.
+        // Formal model: DeliveryCadence.lean.
+        if (!in_learning_pass and (opts.delivery_cadence or opts.delivery_cadence_observe) and
+            (!opts.delivery_cadence or host_injection_meter.remaining() > 0))
+        {
+            const decision = delivery_cadence_state.decide(opts.delivery_cadence_thresholds);
+            if (decision != .none) {
+                delivery_cadence_state.noteDecided();
+                if (opts.delivery_cadence) {
+                    _ = host_injection_meter.tryConsume();
+                    delivery_cadence_state.nudges += 1;
+                    const nudge = if (decision == .first)
+                        try std.fmt.allocPrint(allocator, delivery_cadence_mod.FIRST_NUDGE_FMT, .{delivery_cadence_state.exploration_calls})
+                    else
+                        try std.fmt.allocPrint(allocator, delivery_cadence_mod.SECOND_NUDGE_FMT, .{delivery_cadence_state.exploration_calls});
+                    defer allocator.free(nudge);
+                    try conversation.appendHostText(nudge);
+                    log.info("agent", "delivery cadence nudge {d}/{d} exploration_calls={d}", .{ delivery_cadence_state.nudges, delivery_cadence_mod.MAX_CADENCE_NUDGES, delivery_cadence_state.exploration_calls });
+                } else {
+                    log.info("agent", "delivery cadence observe level={d} exploration_calls={d}", .{ delivery_cadence_state.level, delivery_cadence_state.exploration_calls });
+                }
+            }
+        }
+
+        // Progress-update obligation (#114): a silent stretch long enough in rounds
+        // and in time earns a bounded nudge asking for a short progress note. Same
+        // shape as the cadence gate above — turn boundary, shared meter, never a
+        // denial; observe mode counts the decision without injecting. Only a run
+        // whose commentary a person reads (event_projection). Formal model:
+        // ProgressUpdates.lean.
+        if (!in_learning_pass and (opts.progress_updates or opts.progress_updates_observe) and
+            opts.event_projection.admitsProgressNudge(opts.agent_depth))
+        {
+            const now_ns = util_time.nowNs();
+            if (progress_state.decide(opts.progress_update_thresholds, now_ns)) {
+                if (!opts.progress_updates) {
+                    progress_state.noteDecided(false, now_ns);
+                    log.info("agent", "progress update observe decision {d}/{d} silent_rounds={d}", .{ progress_state.decisions, progress_updates_mod.MAX_PROGRESS_NUDGES, progress_state.silent_rounds });
+                } else if (host_injection_meter.tryConsume()) {
+                    const nudge = try std.fmt.allocPrint(allocator, progress_updates_mod.NUDGE_FMT, .{progress_state.silent_rounds});
+                    defer allocator.free(nudge);
+                    progress_state.noteDecided(true, now_ns);
+                    try conversation.appendHostText(nudge);
+                    log.info("agent", "progress update nudge {d}/{d}", .{ progress_state.nudges, progress_updates_mod.MAX_PROGRESS_NUDGES });
+                }
+            }
+        }
+
+        // 进度事件:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
+        // (JobEntry 后端据空名跳过工具更新,对齐 cc 持续显示最近动作)。
+        emitProgress(backend, sess, turns + 1, "", "", total_tool_calls);
+        // L4 诊断:turn span 起点。
+        backend.emitEvent(sess, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1 } });
+
+        var refresh: @import("tool_changes.zig").Refresh = .{};
+        defer if (tool_changes_hook != null) refresh.deinit(allocator);
+        if (tool_changes_hook) |hook| {
+            refresh = hook.refresh(allocator, opts.abort);
+            if (refresh.tool_defs) |defs| {
+                tool_defs = defs;
+                opts.tool_defs = defs;
+            }
+            if (refresh.unavailable) |unavailable| opts.mcp_unavailable = unavailable;
+            if (refresh.skills) |skills| opts.skills_set = skills;
+        }
+
+        // 工具池过滤必须在 prompt 投影和 compact 判断之前完成。App 初始化时构造的
+        // prompt 不知道 per-run execution policy；先算真实 pool，才能避免 prompt 广告
+        // provider schema 已隐藏的 deferred tool。
+        var effective_tools = try buildEffectiveToolSet(
+            allocator,
+            tool_defs,
+            permission_ctx,
+            opts.activated_tools,
+            opts.execution_policy,
+            provider,
+        );
+        defer effective_tools.deinit(allocator);
+        // Deferred catalog sees policy + active-skill filtering, but intentionally
+        // precedes activation filtering: unactivated deferred tools are exactly
+        // the tools the catalog exists to advertise.
+        const deferred_catalog_defs = if (effective_tools.discovery_filtered) |defs|
+            defs
+        else if (effective_tools.filtered_pool) |defs|
+            defs
+        else if (effective_tools.policy_filtered) |defs|
+            defs
+        else
+            tool_defs;
+        if (tool_changes_hook != null) {
+            if (try @import("tool_changes.zig").notice(allocator, run_prompt, conversation.activeMessages(), deferred_catalog_defs, refresh.events)) |text| {
+                defer allocator.free(text);
+                try conversation.appendHostText(text);
+            }
+            if (opts.skills_set) |skills| {
+                if (try @import("skill_changes.zig").notice(allocator, run_prompt, conversation.activeMessages(), deferred_catalog_defs, skills, refresh.changed_skills)) |text| {
+                    defer allocator.free(text);
+                    try conversation.appendHostText(text);
+                }
+            }
+        }
+        // 对齐 codex:无 breaker_finalization gate,gated_tool_defs 即 effective_tools.defs。
+        // 保留别名减少下游改动,为将来可选 gate 预留。
+        const gated_tool_defs: []const json_mod.ToolDefinition = effective_tools.defs;
+        const visible_capabilities = dialect_mod.visibleCapabilities(
+            @as(?[]const json_mod.ToolDefinition, gated_tool_defs),
+        );
+        const required_first_route = visible_capabilities.required_first;
+        const required_first_pending = if (required_first_route) |route|
+            !conversationHasSuccessfulRequiredFirst(conversation, route)
+        else
+            false;
+        // A retained decision may only cross an ordinary native receipt
+        // boundary. New input, notices and required activations need the actor.
+        // Provider-response observers admit actual Provider responses; hosts
+        // with that extra boundary conservatively retain the slow callback.
+        const hooks_allow_reuse = if (permission_ctx.hooks) |hooks| !hooks.hasPre() else true;
+        const fast_action: ?msg.ToolUse = if (harnessmm_enabled and hooks_allow_reuse and
+            opts.response_observer == null and !required_first_pending and
+            !in_learning_pass and verifier_gate.leads != .active and conversation.messages.items.len > 0)
+        blk: {
+            const action = harnessmm.next(conversation.messages.items[conversation.messages.items.len - 1], gated_tool_defs) orelse break :blk null;
+            // A repeated actor root ID must not reuse a historical native
+            // call ID, even if it authors the same graph again.
+            for (conversation.messages.items) |message| for (message.blocks) |block| {
+                if (block == .tool_use and std.mem.eql(u8, block.tool_use.id, action.id)) {
+                    harnessmm.clear();
+                    break :blk null;
+                }
+            };
+            break :blk action;
+        } else blk: {
+            harnessmm.clear();
+            break :blk null;
+        };
+        // The full native Conversation deliberately outlives its compacted
+        // provider window. Preserve that Host fact in a turn-local shallow
+        // copy so serializers do not re-force activation after the paired
+        // call/result has moved behind the compact boundary. `satisfied` is
+        // host-only metadata: serialized tool schemas and capability prompt
+        // bytes remain identical, which keeps the provider cache prefix stable.
+        var provider_tool_defs_owned: ?[]json_mod.ToolDefinition = null;
+        defer freeOwnedSlice(json_mod.ToolDefinition, allocator, provider_tool_defs_owned);
+        const provider_tool_defs: []const json_mod.ToolDefinition = blk: {
+            const route = required_first_route orelse break :blk gated_tool_defs;
+            if (required_first_pending) break :blk gated_tool_defs;
+            const copied = try allocator.dupe(json_mod.ToolDefinition, gated_tool_defs);
+            provider_tool_defs_owned = copied;
+            for (copied) |*definition| {
+                if (!std.mem.eql(u8, definition.name, route.tool_name)) continue;
+                var activation = definition.model_activation orelse continue;
+                if (activation.mode != .required_first) continue;
+                activation.satisfied = true;
+                definition.model_activation = activation;
+            }
+            break :blk copied;
+        };
+
+        // swarm 纪律:有 team 时每轮把 addendum 追加到 system prompt(裸文本对 teammate 不可见,
+        // 必须用 SendMessage;对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
+        // turn 作用域 alloc,用后 free;无 team 直接用 opts.system_prompt(零开销)。
+        var sys_prompt_owned: ?[]u8 = null;
+        defer freeOwnedSlice(u8, allocator, sys_prompt_owned);
+        const augmented_system_prompt: ?[]const u8 = blk: {
+            const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
+            if (!in_swarm) break :blk run_prompt;
+            const base = run_prompt orelse "";
+            const swarm_seg = "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM;
+            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, swarm_seg }) catch null;
+            break :blk if (sys_prompt_owned) |p| p else run_prompt;
+        };
+        var projected_guidance_owned: ?[]u8 = null;
+        defer freeOwnedSlice(u8, allocator, projected_guidance_owned);
+        var projected_deferred_owned: ?[]u8 = null;
+        defer freeOwnedSlice(u8, allocator, projected_deferred_owned);
+        var projected_capabilities_owned: ?[]u8 = null;
+        defer freeOwnedSlice(u8, allocator, projected_capabilities_owned);
+        const effective_system_prompt: ?[]const u8 = blk: {
+            const base = augmented_system_prompt orelse break :blk null;
+            const system_prompt_mod = @import("system_prompt.zig");
+            projected_guidance_owned = try system_prompt_mod.projectUsingToolsForExecution(
+                allocator,
+                base,
+                gated_tool_defs,
+            );
+            const guidance_projected = if (projected_guidance_owned) |p| p else base;
+            projected_deferred_owned = try system_prompt_mod.projectDeferredToolsForExecution(
+                allocator,
+                guidance_projected,
+                deferred_catalog_defs,
+                gated_tool_defs,
+            );
+            const deferred_projected = if (projected_deferred_owned) |p| p else guidance_projected;
+            projected_capabilities_owned = try system_prompt_mod.projectCapabilitySectionsForExecution(
+                allocator,
+                deferred_projected,
+                gated_tool_defs,
+            );
+            break :blk if (projected_capabilities_owned) |p| p else deferred_projected;
+        };
+
+        // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
+        // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
+        // **必须用 input context window(resolveMaxInputTokens,~200K),不是 output max_tokens(32K)**——
+        // 否则正常工具调研刚读几个文件(20K+)就误触发压缩、丢掉原始问题(真机 bug)。
+        // 下限 MIN_AUTO_COMPACT_THRESHOLD:避免异常小值导致每 turn 都 compact。
+        const synthetic_user_input = if (turns == 0) opts.synthetic_user_input else null;
+        const model_switch_compact = if (turns == 0) opts.model_switch_compact else null;
+        var previous_model_compact_outcome: AutoCompactOutcome = .not_needed;
+        if (fast_action == null) if (model_switch_compact) |msc| {
+            if (!std.mem.eql(u8, msc.previous_model, provider.model()) and msc.previous_context_window > msc.current_context_window) {
+                previous_model_compact_outcome = try runAutoCompactControlled(
+                    conversation,
+                    provider,
+                    effective_system_prompt,
+                    opts.inject_user_context,
+                    synthetic_user_input,
+                    provider_tool_defs,
+                    opts.model_override,
+                    msc.previous_model,
+                    opts.auto_compact_threshold,
+                    opts.auto_compact_keep_recent,
+                    "pre_sampling_previous_model_smaller_window",
+                    false,
+                    backend,
+                    sess,
+                    trace_id,
+                    depth,
+                    turns + 1,
+                    &context_warning_emitted,
+                    allocator,
+                    opts.tasks,
+                    permission_ctx.hooks,
+                    &compact_summary_reserve_tokens,
+                    opts.request_gate,
+                    opts.abort,
+                    opts.goal_meter,
+                    opts.compaction_control,
+                    false,
+                );
+                if (compactStopReason(previous_model_compact_outcome, opts.abort)) |stop_reason| {
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
+                }
+            }
+        };
+        if (fast_action == null and previous_model_compact_outcome != .skipped_no_savings) {
+            const pre_sampling_compact = try runAutoCompactControlled(
+                conversation,
+                provider,
+                effective_system_prompt,
+                opts.inject_user_context,
+                synthetic_user_input,
+                provider_tool_defs,
+                opts.model_override,
+                null,
+                opts.auto_compact_threshold,
+                opts.auto_compact_keep_recent,
+                "pre_sampling_pending_turn_threshold",
+                false,
+                backend,
+                sess,
+                trace_id,
+                depth,
+                turns + 1,
+                &context_warning_emitted,
+                allocator,
+                opts.tasks,
+                permission_ctx.hooks,
+                &compact_summary_reserve_tokens,
+                opts.request_gate,
+                opts.abort,
+                opts.goal_meter,
+                opts.compaction_control,
+                false,
+            );
+            if (compactStopReason(pre_sampling_compact, opts.abort)) |stop_reason| {
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
+            }
+        }
+
+        log.info("agent", "turn {d}/{d} starting (msgs={d})", .{ turns + 1, opts.max_turns, conversation.messages.items.len });
+
+        // 建连阶段重试(对齐 CC withRetry):瞬态网络错误/429/5xx 退避重试,UI 提示"Retrying…"。
+        // 仅覆盖建连+收头(未消费流、未输出文本);进入 stream.next() 后不再重试(已输出)。
+        // 门控/格式/着色全在 backend 的 .retry_notice 处理(show_retry/colorize)——此处只转发。
+        const RetryUi = struct {
+            be: *const UiBackend,
+            session: @import("metacodes-kernel").session_id.SessionId,
+            boundary: ?execution_effect.Boundary,
+            actor_id: @import("metacodes-kernel").session_id.SessionId,
+            request_sha256: [64]u8 = [_]u8{'0'} ** 64,
+            logical_turn: u32 = 0,
+            context_generation: u32 = 0,
+            active_attempt: u32 = 0,
+            max_attempts: u32 = 0,
+
+            fn prepare(
+                self: *@This(),
+                request_sha256: [64]u8,
+                logical_turn: u32,
+                context_generation: u32,
+                max_attempts: u32,
+                first_attempt: u32,
+            ) bool {
+                if (self.active_attempt != 0 or max_attempts == 0) return false;
+                self.request_sha256 = request_sha256;
+                self.logical_turn = logical_turn;
+                self.context_generation = context_generation;
+                self.max_attempts = max_attempts;
+                return self.startAttempt(first_attempt);
+            }
+
+            fn failed(state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) bool {
+                const self: *@This() = @ptrCast(@alignCast(state));
+                if (attempt != self.active_attempt or max == 0 or
+                    max > self.max_attempts or attempt >= max) return false;
+                if (!self.finishAttempt(.api_error, .unknown)) return false;
+                // TLS setup failures can tighten the generic retry ceiling.
+                self.max_attempts = max;
+                self.be.emitEvent(self.session, .{ .retry_notice = .{ .attempt = attempt, .max = max, .delay_ms = delay_ms } });
+                return true;
+            }
+
+            fn beforeAttempt(state: *anyopaque, attempt: u32, max: u32) bool {
+                const self: *@This() = @ptrCast(@alignCast(state));
+                if (self.active_attempt != 0 or max == 0 or max > self.max_attempts)
+                    return false;
+                self.max_attempts = max;
+                return self.startAttempt(attempt);
+            }
+
+            fn startAttempt(self: *@This(), physical_attempt: u32) bool {
+                if (physical_attempt == 0 or physical_attempt > self.max_attempts) return false;
+                model_error.noteAttempt();
+                const boundary = self.boundary orelse {
+                    self.active_attempt = physical_attempt;
+                    return true;
+                };
+                if (!boundary.emit(.{ .before = .{ .provider_request = .{
+                    .attempt_id = self.attemptId(physical_attempt),
+                    .actor_id = self.actor_id.bytes,
+                    .request_sha256 = self.request_sha256,
+                    .logical_turn = self.logical_turn,
+                    .context_generation = self.context_generation,
+                    .physical_attempt = physical_attempt,
+                    .max_attempts = self.max_attempts,
+                } } })) return false;
+                self.active_attempt = physical_attempt;
+                return true;
+            }
+
+            fn finishAttempt(
+                self: *@This(),
+                outcome: execution_effect.ProviderAttemptOutcome,
+                metering: execution_effect.Metering,
+            ) bool {
+                const physical_attempt = self.active_attempt;
+                if (physical_attempt == 0) return false;
+                self.active_attempt = 0;
+                const boundary = self.boundary orelse return true;
+                return boundary.emit(.{ .after = .{ .provider_request = .{
+                    .attempt_id = self.attemptId(physical_attempt),
+                    .outcome = outcome,
+                    .metering = metering,
+                } } });
+            }
+
+            fn hasActiveAttempt(self: *const @This()) bool {
+                return self.active_attempt != 0;
+            }
+
+            fn attemptId(self: *const @This(), physical_attempt: u32) [64]u8 {
+                return execution_effect.providerAttemptId(
+                    self.actor_id.bytes,
+                    self.request_sha256,
+                    self.logical_turn,
+                    self.context_generation,
+                    physical_attempt,
+                );
+            }
+        };
+        var retry_ui = RetryUi{
+            .be = backend,
+            .session = sess,
+            .boundary = opts.execution_boundary,
+            .actor_id = opts.agent_ident orelse sess,
+        };
+        var reporter = provider_mod.RetryReporter{
+            .state = @ptrCast(&retry_ui),
+            .failedFn = RetryUi.failed,
+            .beforeAttemptFn = RetryUi.beforeAttempt,
+        };
+
+        // 1+2. 构造当前这一轮的 API 请求并发送。若建连/收头阶段或 SSE error
+        // 明确报 context-window-exceeded,按 Rust compact recovery 路径逐步删最老
+        // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
+        var context_recovery = ContextRecoveryState{ .cap = @max(conversation.len(), 1) };
+        if (fast_action == null) model_error.beginRequest();
+        // Re-issues of this model request under `STREAM_RETRIES_PER_REQUEST`
+        // (#461): a fresh allowance for every request, so an earlier turn's
+        // re-issue cannot use it up.
+        var request_stream_retries: u8 = 0;
+        var request_overload_retries: u32 = 0;
+        var request_attempts_spent: u32 = 0;
+        var stream_attempts: u32 = 0;
+        // The Run's count when this request started: the Run allowance this
+        // request may still draw on, and how many of its re-issues it made.
+        const run_stream_retries_at_request = stream_turn_retries;
+        var turn_stop_reason: api_stream.StopReason = .unknown;
+        var rid_for_turn: log.RequestId = undefined;
+        // Re-issue counter for this turn. A context recovery or a mid-stream
+        // retry produces a *different* Provider response, so it opens a new
+        // candidate rather than continuing the abandoned one.
+        var candidate_attempt: u32 = 0;
+        var stream_cut_nudged = false;
+        // The candidate currently open, and whether it is still unsettled.
+        // Declared at turn scope because the commit-or-discard decision lives
+        // after `break :request_recovery`, and it is the decision the boundary
+        // exists to report.
+        var candidate = response_candidate.CandidateId{ .turn = turns + 1, .attempt = 0 };
+        var candidate_open = false;
+        // Totality: every candidate that begins settles exactly once. The
+        // paths below settle explicitly with the reason they know; this one
+        // catches the rest — an allocation failure between assembly and
+        // commit, and any early return a later change adds to this turn.
+        defer settleCandidate(
+            opts.response_observer,
+            &candidate_open,
+            candidate,
+            .{ .discarded = .run_error },
+        );
+
+        // 3. 收集响应 blocks。声明在 request_recovery 外层，使 SSE context
+        // recovery 可以清空临时状态后重试同一 turn。
+        var assistant_blocks = std.ArrayList(msg.Block).empty;
+        errdefer freeBlockList(allocator, &assistant_blocks);
+        var assistant_text = std.ArrayList(u8).empty;
+        defer assistant_text.deinit(allocator);
+        // 进度更新传感器(#114)的输入:本轮用户看到的模型文本里非空白的字节数(host 渲染的
+        // web_search 装饰、thinking 都不算)。
+        var visible_model_text_bytes: usize = 0;
+
+        // 思考过程累加器:本轮所有 thinking_delta/reasoning_content 拼成一个 thinking block,
+        // 存入 assistant message(preserved thinking)。下轮请求 serializeContent 回传。
+        var thinking_text = std.ArrayList(u8).empty;
+        defer thinking_text.deinit(allocator);
+
+        // provider 私有的推理续传项(issue #23,当前唯一生产者是 OpenAI Responses):
+        // 按到达顺序收集 owned item JSON,turn 末转成 reasoning_item block 存进
+        // assistant message,下轮同模型请求逐字节回传。丢弃残缺回合时随之释放。
+        var reasoning_items = std.ArrayList([]u8).empty;
+        defer freeItemList(allocator, &reasoning_items);
+
+        var tool_uses = std.ArrayList(msg.ToolUse).empty;
+        defer tool_uses.deinit(allocator);
+
+        // P0.4 流式预取:纯只读工具(Read/Grep/Glob)在其 tool_use_start 到达时就开线程执行,流末
+        // executeSlots 直接用结果。仅当无 PreToolUse hook(避免 ModifyInput 让预取输入过时)时启用。
+        const sp = @import("stream_prefetch.zig");
+        var prefetch = sp.Prefetch.init(allocator);
+        defer prefetch.deinit();
+        const prefetch_enabled = if (permission_ctx.hooks) |h| !h.hasPre() else true;
+        // 流期权限判定用的无 hook 上下文副本(不 mid-stream 跑 hook 副作用)。
+        var pc_prefetch = permission_ctx.scopedDerive(null); // U4:单 seam 值拷贝+null sink
+        pc_prefetch.hooks = null;
+        // 预取用 ToolContext:**忠实镜像下方 base_ctx 的 opts.* 字段**(广播到 concurrency-safe 全集后
+        // 只读 Bash/BashOutput/WebFetch 也流式,它们要 jobs/spawn_tick_fn/api_client 等——缺则行为分叉)。
+        // 刻意排除两类 mid-stream 不安全的:progress_reporter+ui_requester(流中不驱动 TUI/不
+        // 弹询问,且 tool_start 卡尚未 emit)、hooks(经 pc_prefetch 剥离,PreToolUse 可 ModifyInput)、session/agent_ident(UiRequest 路由/kg
+        // claim 身份,并发安全工具不用)。**维护约束**:base_ctx 新增字段若被并发安全工具读,须同步这里。
+        var prefetch_ctx = tools_mod.ToolContext{
+            .preview = opts.preview,
+            .allocator = allocator,
+            .abort = opts.abort,
+            .read_state = opts.read_state,
+            .edit_hl_cache = opts.edit_hl_cache,
+            .lsp = opts.lsp,
+            .jobs = opts.jobs,
+            .agent_jobs = opts.agent_jobs,
+            .permission_ctx = &pc_prefetch, // hooks 已剥离
+            .tasks = opts.tasks,
+            .kg = opts.kg,
+            .kg_lexical_ledger = &kg_lexical_ledger,
+            .jev = opts.jev,
+            .jev_request = kg_enumeration_text orelse "",
+            .lesson_binding = if (learning_state.active()) &learning_state.binding else null,
+            .kg_projects_dir = opts.kg_projects_dir,
+            .memdir_abs = opts.memdir_abs,
+            .api_client = opts.api_client,
+            .provider = provider,
+            .tool_defs = opts.tool_defs,
+            .agent_depth = opts.agent_depth,
+            .dyn_registry = opts.dyn_registry,
+            .tool_dispatcher = opts.tool_dispatcher,
+            .execution_policy = opts.execution_policy,
+            .tool_observer = opts.tool_observer,
+            .execution_boundary = opts.execution_boundary,
+            .project_rule_gate = opts.project_rule_gate,
+            .tool_observation_origin = .speculative_prefetch,
+            .host_services = opts.host_services,
+            .host_run = opts.host_run,
+            .explicit_invocation = opts.explicit_invocation,
+            .session_id = sessionIdText(&opts),
+            .project_dir = opts.project_dir,
+            .disable_shell_execution = opts.disable_shell_execution,
+            .sandbox = opts.sandbox,
+            .cwd_abs = opts.cwd_abs,
+            .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
+            .home_dir = opts.home_dir,
+            .state_root = opts.state_root,
+            .artifact_root = opts.artifact_root,
+            // Mirrors base_ctx: Bash bounds its own channels against this, so a
+            // prefetched Bash result must be sized by the same window as a
+            // committed one or the two paths render differently. Resolved
+            // against `model_override`, because a subagent shares its parent's
+            // Provider and differs from it only by that field.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
+            .tool_result_metrics = opts.tool_result_metrics,
+            .file_change_journal = opts.file_change_journal,
+            .additional_dirs = opts.additional_dirs,
+            .agents = opts.agents,
+            .parent_model = opts.parent_model,
+            // 本 run 真会命名的模型及其收图能力——Read 的图片门控按 model_override 判,
+            // 子 agent 不拿父模型的能力当自己的(与 result_budget 同一派生规则)。
+            .active_model = opts.model_override orelse provider.model(),
+            .image_input_supported = provider.supportsForModel(.image_input, opts.model_override),
+            // ToolSearch answers from the tools this request actually carried.
+            .request_tools = .{ .advertised = gated_tool_defs, .catalog = deferred_catalog_defs },
+            .model_tiers = opts.model_tiers,
+            .skills = opts.skills_set,
+            .mcp_sessions = opts.mcp_sessions,
+            .mcp_unavailable = opts.mcp_unavailable,
+            .mcp_late = opts.mcp_late,
+            .cron_registry = opts.cron_registry,
+            .spawn_tick_fn = opts.spawn_tick_fn, // Bash/WebFetch 长命令心跳
+        };
+
+        request_recovery: while (true) {
+            if (fast_action) |action| {
+                // No provider attempt, usage sample or response-observer event
+                // is fabricated. The exact action enters the common native
+                // slot/permission/sandbox/formal/budget dispatch below.
+                const block = try (msg.Block{ .tool_use = action }).dupe(allocator);
+                errdefer block.deinit(allocator);
+                try assistant_blocks.append(allocator, block);
+                rid_for_turn = .{ .bytes = action.id[4..16].* };
+                turn_stop_reason = .tool_use;
+                break :request_recovery;
+            }
+            // A stream may have sent usage before it failed. Reissues must
+            // respect the same dollar cap as the next logical turn.
+            if (opts.cost_budget_usd) |budget| {
+                if (run_cost_usd >= budget)
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+            }
+            const model_request_started_ns = util_time.nowNs();
+            var stream: api_stream.StreamHandle = undefined;
+            // Images bypass the byte budgets (charged at IMAGE_TOKEN_ESTIMATE), but
+            // every wired provider caps the request size with inline images. Stub
+            // the oldest delivered image results until the history fits; the
+            // current turn is bounded by the projection's per-turn image cap.
+            const image_trim = result_projection.trimDeliveredImageBytes(conversation, opts.image_request_bytes_cap);
+            if (image_trim.reduction.changed()) {
+                log.info("agent", "image wire cap: cleared {d} delivered image result(s) bytes={d}->{d} cap={d}", .{ image_trim.reduction.cleared, image_trim.reduction.bytes_before, image_trim.reduction.bytes_after, opts.image_request_bytes_cap });
+            }
+            if (image_trim.remaining_over_cap > 0) {
+                // Only non-trimmable images remain (user images, pictures no
+                // request has delivered natively): say so instead of silently
+                // dropping one; the provider's own limit decides the request.
+                log.warn("agent", "image wire cap exceeded by non-trimmable images: over_by={d} cap={d}", .{ image_trim.remaining_over_cap, opts.image_request_bytes_cap });
+            }
+            var api_messages = try buildApiMessagesWithFeatures(conversation, allocator, opts.inject_user_context, synthetic_user_input, .{
+                .harnessmm = harnessmm_enabled,
+                .rsi = opts.rsi,
+            });
+            defer freeApiMessages(&api_messages, allocator);
+            if (opts.request_gate) |gate| {
+                const max_input_tokens = serializedRequestInputTokenReserve(
+                    allocator,
+                    provider,
+                    api_messages.items,
+                    effective_system_prompt,
+                    provider_tool_defs,
+                    opts.model_override,
+                ) catch std.math.maxInt(u64);
+                if (!gate.allowsRequest(.{
+                    .max_input_tokens = max_input_tokens,
+                    // Resolved through the override like the estimate above it:
+                    // an admission decision made against the parent's output cap
+                    // admits or refuses a child request on the wrong number.
+                    .max_output_tokens = provider.maxTokensFor(opts.model_override),
+                }))
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+            }
+
+            // 击穿检测必须跟真实 provider 前缀走：swarm addendum 会改变 effective
+            // system prompt，同名工具也可能改变 description/input_schema。只看基础
+            // system 或工具名会把真实前缀漂移误报成 TTL/server-side miss。
+            {
+                var th = std.hash.Wyhash.init(0);
+                for (provider_tool_defs) |d| th.update(d.name);
+                var tbuf: [16]u8 = undefined;
+                std.mem.writeInt(u64, tbuf[0..8], th.final(), .little);
+                const tool_schema = serializeToolSchemasForCache(allocator, provider_tool_defs) catch null;
+                defer if (tool_schema) |bytes| allocator.free(bytes);
+                const model_for_req = opts.model_override orelse provider.model();
+                cache_detector.recordRequest(
+                    effective_system_prompt orelse "",
+                    tool_schema orelse tbuf[0..8],
+                    model_for_req,
+                );
+            }
+
+            const max_provider_attempts = providerAttemptLimit(opts.request_gate != null);
+            reporter.attempts_before = request_attempts_spent;
+            const request_sha256 = if (opts.execution_boundary != null)
+                canonicalAgentRequestSha256(
+                    allocator,
+                    provider,
+                    api_messages.items,
+                    effective_system_prompt,
+                    provider_tool_defs,
+                    opts.model_override,
+                ) catch return finishRun(backend, sess, trace_id, depth, .{
+                    .stop_reason = .api_error,
+                    .turns = turns,
+                    .tool_calls = total_tool_calls,
+                })
+            else
+                [_]u8{'0'} ** 64;
+            // The provider attempt id must be unique within a Run. A mid-stream
+            // failure re-issues the same request bytes (same request_sha256,
+            // same logical turn) and `prepare` restarts the provider retry
+            // budget at physical_attempt 1, so without a per-re-issue
+            // discriminator the second attempt's id collides with the first's
+            // — and a later resume's journal validation rejects the duplicate.
+            // Fold every same-turn re-issue (context recovery *and* bounded
+            // mid-stream retry) into the recorded generation; each outer
+            // `continue :request_recovery` advances exactly one of the three
+            // counters, so the sum strictly increases per turn.
+            const attempt_generation = context_recovery.attempts +
+                @as(usize, stream_turn_retries) +
+                @as(usize, request_stream_retries) +
+                @as(usize, request_overload_retries);
+            if (!retry_ui.prepare(
+                request_sha256,
+                turns + 1,
+                @intCast(@min(attempt_generation, std.math.maxInt(u32))),
+                max_provider_attempts,
+                request_attempts_spent + 1,
+            )) return finishRun(backend, sess, trace_id, depth, .{
+                .stop_reason = .api_error,
+                .turns = turns,
+                .tool_calls = total_tool_calls,
+            });
+
+            stream = provider.sendStreamRetry(
+                api_messages.items,
+                effective_system_prompt,
+                provider_tool_defs,
+                opts.abort,
+                opts.model_override,
+                null,
+                max_provider_attempts,
+                0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
+                reporter,
+                latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
+            ) catch |err| {
+                if (opts.metask_ledger_protocol) |protocol| {
+                    const failed_record = @import("metacodes-ai").provider.metask_ledger.Record{
+                        .ts = @intCast(@divTrunc(util_time.nowWallNs(), 1_000_000)),
+                        .session_id = sess.asSlice(),
+                        .protocol = protocol,
+                        .model = opts.model_override orelse provider.model(),
+                        .local_request_id = provider.requestIdText(),
+                        .server_request_id = provider.serverRequestId(),
+                        .http_status = provider.httpStatus(),
+                        .outcome = if (err == error.Aborted) "client_disconnect" else "failed",
+                        .retry_attempt = provider.retryAttempt(),
+                        .wall_elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                    };
+                    @import("metacodes-ai").provider.metask_ledger.append(allocator, opts.state_root, failed_record) catch |ledger_err|
+                        log.debug("ledger", "Metask failed-request ledger append failed: {s}", .{@errorName(ledger_err)});
+                }
+                const attempt_outcome: execution_effect.ProviderAttemptOutcome = switch (err) {
+                    error.ContextWindowExceeded => .context_window_exceeded,
+                    error.Aborted => .aborted,
+                    else => .api_error,
+                };
+                if (retry_ui.hasActiveAttempt() and
+                    !retry_ui.finishAttempt(attempt_outcome, .unknown))
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                backend.emitEvent(sess, .{ .diag_model_request = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .turn = turns + 1,
+                    .attempt = @intCast(@min(context_recovery.attempts, std.math.maxInt(u32))),
+                    .elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                    .outcome = if (err == error.ContextWindowExceeded)
+                        "context_window_exceeded"
+                    else if (err == error.DurableCapacityExceeded)
+                        "durable_capacity_deferred"
+                    else
+                        "api_error",
+                } });
+                switch (err) {
+                    // Refused before any network I/O by the durable-state
+                    // owner, which asks for compaction first (issue #430).
+                    error.DurableCapacityExceeded => switch (recoverDurableCapacity(.{
+                        .conversation = conversation,
+                        .provider = provider,
+                        .system_prompt = effective_system_prompt,
+                        .inject_user_context = opts.inject_user_context,
+                        .synthetic_user_input = synthetic_user_input,
+                        .tool_defs = provider_tool_defs,
+                        .model_override = opts.model_override,
+                        .numbers = .{},
+                        .keep_recent = opts.auto_compact_keep_recent,
+                        .backend = backend,
+                        .sess = sess,
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .state = &context_recovery,
+                        .turn_number = turns + 1,
+                        .context_warning_emitted = &context_warning_emitted,
+                        .allocator = allocator,
+                        .tasks = opts.tasks,
+                        .hookset = permission_ctx.hooks,
+                        .summary_reserve_tokens = &compact_summary_reserve_tokens,
+                        .request_gate = opts.request_gate,
+                        .abort = opts.abort,
+                        .goal_meter = opts.goal_meter,
+                        .control = opts.compaction_control,
+                    })) {
+                        .retry => continue :request_recovery,
+                        .aborted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls }),
+                        // The owner recorded its terminal (a refused
+                        // replacement, or the deferred request abandoned):
+                        // its outcome, not a model failure, explains the stop.
+                        .owner_terminal => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }),
+                    },
+                    error.ContextWindowExceeded => {
+                        if (!recoverContextWindowExceeded(.{
+                            .conversation = conversation,
+                            .provider = provider,
+                            .system_prompt = effective_system_prompt,
+                            .inject_user_context = opts.inject_user_context,
+                            .synthetic_user_input = synthetic_user_input,
+                            .tool_defs = provider_tool_defs,
+                            .model_override = opts.model_override,
+                            .numbers = provider.lastContextWindowNumbers(),
+                            .keep_recent = opts.auto_compact_keep_recent,
+                            .backend = backend,
+                            .sess = sess,
+                            .trace_id = trace_id,
+                            .depth = depth,
+                            .state = &context_recovery,
+                            .turn_number = turns + 1,
+                            .context_warning_emitted = &context_warning_emitted,
+                            .allocator = allocator,
+                            .tasks = opts.tasks,
+                            .hookset = permission_ctx.hooks,
+                            .summary_reserve_tokens = &compact_summary_reserve_tokens,
+                            .request_gate = opts.request_gate,
+                            .abort = opts.abort,
+                            .goal_meter = opts.goal_meter,
+                            .control = opts.compaction_control,
+                        })) {
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                        }
+                        continue :request_recovery;
+                    },
+                    error.Aborted => {
+                        log.warn("agent", "sendMessageStream aborted turn={d}", .{turns + 1});
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                    },
+                    else => |e| {
+                        log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
+                        model_error.noteRequestError(e);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                    },
+                }
+            };
+            // The provider accepted this request for streaming (a stream handle
+            // came back), so microcompact may treat everything in it as history.
+            // Only this evidence advances delivery: a rejected request, local
+            // appends (assistant terminal markers) and resumed transcripts stay
+            // undelivered until a request is actually accepted with them. Whether
+            // image results went out as native image parts or as placeholders is
+            // the serializer's own decision, carried back on the stream handle —
+            // never re-derived here, so it matches the bytes sent even under a
+            // runtime dialect override or a concurrent model change.
+            conversation.markDelivered(.{ .image_placeholder_ids = stream.image_placeholder_ids });
+            defer stream.deinit();
+            // Every provider, not only the HTTP clients: an accepted request
+            // ends what the attempts before it failed with.
+            model_error.clearFailure();
+
+            rid_for_turn = stream.requestId();
+            const rid = rid_for_turn;
+            log.infoId("agent", rid, "stream opened, reading events", .{});
+            stream_attempts = retry_ui.active_attempt;
+
+            // This is a semantic model-attempt boundary, not only an ANSI
+            // color hint. Consumers that observe lifecycle state must see it
+            // after a retry succeeds even when colorization is disabled.
+            backend.emitEvent(sess, .stream_begin);
+            output_channel.begin(turns + 1);
+            // From here to the commit-or-discard decision below, one candidate
+            // response is open. Every exit path settles it exactly once.
+            candidate = .{ .turn = turns + 1, .attempt = candidate_attempt };
+            candidate_attempt += 1;
+            if (opts.response_observer) |observer| observer.begin(candidate);
+            candidate_open = opts.response_observer != null;
+            var candidate_rejected = false;
+            var aborted_during_stream = false;
+            var stream_error = false;
+            // Which error ended the stream (null = none, or a context-window frame).
+            // Only connection-shaped failures qualify for STREAM_RETRIES_PER_REQUEST.
+            var stream_failure: ?anyerror = null;
+            var stream_context_window_exceeded = false;
+            var response_usage = @import("cache_break.zig").ResponseUsage{};
+            var ledger_outcome: []const u8 = "failed";
+            // The defer is declared after stream.deinit above, so it runs
+            // first and can still read the handle's server request id. It is
+            // deliberately scoped to this accepted gateway request.
+            defer if (opts.metask_ledger_protocol) |protocol| {
+                const report_usage = response_usage.reported and !stream_error and !aborted_during_stream;
+                const input_tokens: u64 = if (report_usage) response_usage.input_tokens else 0;
+                const output_tokens: u64 = if (report_usage) response_usage.output_tokens else 0;
+                const cache_read_tokens: u64 = if (report_usage) response_usage.cache_read_tokens else 0;
+                const cache_creation_tokens: u64 = if (report_usage) response_usage.cache_write_tokens else 0;
+                const record = @import("metacodes-ai").provider.metask_ledger.Record{
+                    .ts = @intCast(@divTrunc(util_time.nowWallNs(), 1_000_000)),
+                    .session_id = sess.asSlice(),
+                    .protocol = protocol,
+                    .model = opts.model_override orelse provider.model(),
+                    .local_request_id = stream.requestId().asSlice(),
+                    .server_request_id = stream.serverRequestId(),
+                    .http_status = stream.httpStatus(),
+                    .outcome = ledger_outcome,
+                    .retry_attempt = stream.retryAttempt(),
+                    .input_tokens = input_tokens,
+                    .output_tokens = output_tokens,
+                    .cache_read_tokens = cache_read_tokens,
+                    .cache_creation_tokens = cache_creation_tokens,
+                    .wall_elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                };
+                @import("metacodes-ai").provider.metask_ledger.append(allocator, opts.state_root, record) catch |err|
+                    log.debug("ledger", "Metask ledger append failed: {s}", .{@errorName(err)});
+            };
+            while (true) {
+                const ev_opt = stream.next() catch |err| switch (err) {
+                    error.Aborted => {
+                        aborted_during_stream = true;
+                        log.warnId("agent", rid, "stream aborted mid-turn", .{});
+                        break;
+                    },
+                    error.ContextWindowExceeded => {
+                        stream_error = true;
+                        stream_context_window_exceeded = true;
+                        log.warnId("agent", rid, "stream returned context-window-exceeded at turn {d}", .{turns + 1});
+                        break;
+                    },
+                    else => |e| {
+                        // 取消优先:provider.cancel 关掉 socket 后,阻塞的读可能以传输层错误醒来而没
+                        // 经过 provider 自己的 abort 检查。用户按了 Ctrl+C/Esc 就是取消,不是 API 错误
+                        // ——否则部分文本被当残片丢掉,屏幕上打"模型 API 请求失败"(2026-09-23 实录)。
+                        if (opts.abort) |a| if (a.isAborted()) {
+                            aborted_during_stream = true;
+                            log.warnId("agent", rid, "stream error {s} after abort → treated as cancel", .{@errorName(e)});
+                            break;
+                        };
+                        stream_error = true;
+                        stream_failure = e;
+                        model_error.noteStreamReadError(e);
+                        log.errId("agent", rid, "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
+                        break;
+                    },
+                };
+                const ev = ev_opt orelse break;
+                switch (ev) {
+                    .text => |text| {
+                        backend.emitEvent(sess, .{ .text_chunk = text });
+                        output_channel.note(text.len);
+                        try assistant_text.appendSlice(allocator, text);
+                        visible_model_text_bytes += progress_updates_mod.visibleLen(text);
+                        log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
+                        const admission = observeCandidate(
+                            opts.response_observer,
+                            candidate,
+                            .{ .text = text },
+                        );
+                        // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
+                        allocator.free(text);
+                        if (admission == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
+                    },
+                    .thinking => |text| {
+                        // 思考过程:不混入 assistant_text(最终回答),单独 emit 给 UI 折叠显示。
+                        // preserved thinking:累加进 thinking_text,turn 末存入 thinking block,
+                        // 下轮请求 serializeContent 回传给模型。
+                        backend.emitEvent(sess, .{ .thinking_chunk = text });
+                        try thinking_text.appendSlice(allocator, text);
+                        log.debugId("agent", rid, "thinking chunk bytes={d}", .{text.len});
+                        const admission = observeCandidate(
+                            opts.response_observer,
+                            candidate,
+                            .{ .thinking = text },
+                        );
+                        allocator.free(text);
+                        if (admission == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
+                    },
+                    .tool_use_start => |tu_in| {
+                        var tu = tu_in;
+                        // P0.6 弱模型健壮性:tool input 非法 JSON(markdown 围栏/trailing comma/括号不
+                        // 配平/前置噪声)→ 尽力 salvage,兜底 {}。单一 choke point 覆盖所有 provider。
+                        // tu.input_json 是 owned(stream 转移),修复则 free 旧、换 owned repaired。
+                        if (!message_repair_mod.isValidJson(tu.input_json)) {
+                            if (message_repair_mod.repairToolArgs(allocator, tu.input_json)) |repaired| {
+                                log.warnId("agent", rid, "tool input repaired name={s}: {s} → {s}", .{ tu.name, tu.input_json, repaired });
+                                allocator.free(tu.input_json);
+                                tu.input_json = repaired;
+                            } else |_| {} // repair OOM → 用原始(下游 tool 报错自纠)
+                        }
+                        // verbose 的 `[Tool: name]` 行移到 backend(在 tool_start 渲染时打,
+                        // 见 TuiBackend/WriterBackend);此处只入队 tool_use。
+                        log.infoId("agent", rid, "tool_use queued id={s} name={s} input_bytes={d}", .{ tu.id, tu.name, tu.input_json.len });
+                        // stream 里 id/name/input_json 都是 owned；转移所有权给 tool_uses（不 dupe）
+                        try tool_uses.append(allocator, .{
+                            .id = tu.id,
+                            .name = tu.name,
+                            .input = tu.input_json,
+                        });
+                        // Observed *before* any prefetch starts: a rejected
+                        // response tail must not start a tool effect that
+                        // should not occur.
+                        if (observeCandidate(opts.response_observer, candidate, .{ .tool_use = .{
+                            .id = tu.id,
+                            .name = tu.name,
+                            .input = tu.input_json,
+                        } }) == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
+                        // 流式执行(边流边跑):concurrency-safe(只读语义)+ 可流(非 WebSearch,不竞争
+                        // 模型 client)+ 权限 allow(纯判定不 prompt)+ 无 PreToolUse hook → 立即开线程执行,
+                        // 流末 executeSlots 直接用结果。广播自 P0.4 只读白名单(Read/Grep/Glob)到全 safe 集
+                        // (加只读 Bash `git status`/`ls`、BashOutput、WebFetch)。borrow 刚 append 的稳定堆切片。
+                        const not_aborted = if (opts.abort) |ab| !ab.isAborted() else true;
+                        const activation_allows_prefetch = !required_first_pending or
+                            if (required_first_route) |route|
+                                dialect_mod.matchesRequiredFirst(route, tu.name, tu.input_json)
+                            else
+                                true;
+                        // A call after EnterWorktree / ExitWorktree waits for it: started
+                        // now it would run in the directory being left.
+                        const after_root_move = for (tool_uses.items[0 .. tool_uses.items.len - 1]) |previous| {
+                            if (tools_mod.movesWorkingRoot(previous.name)) break true;
+                        } else false;
+                        // A call the confirm gate marks must wait for its prompt;
+                        // started here it would run before the user answered.
+                        const needs_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, tu.name) else false;
+                        if (prefetch_enabled and not_aborted and activation_allows_prefetch and !after_root_move and !needs_confirm and sp.isStreamable(tu.name) and
+                            prefetch_ctx.isPrefetchSafe(tu.name))
+                        prefetch: {
+                            // The same argument admission as the authoritative path
+                            // (issue #494): rejected arguments are not prefetched, and
+                            // admitted ones run in their canonical spelling.
+                            const canonical = tools_common.canonicalizeArgsWithAliases(allocator, tu.input_json, opts.path_aliases) catch break :prefetch;
+                            var canonical_owned = true;
+                            defer if (canonical_owned) allocator.free(canonical);
+                            if (!tools_mod.isConcurrencySafeInput(tu.name, canonical) or
+                                permission_mod.checkPermission(&pc_prefetch, tu.name, canonical) != .allow)
+                                break :prefetch;
+                            const last = &tool_uses.items[tool_uses.items.len - 1];
+                            canonical_owned = false;
+                            prefetch.startOwned(&prefetch_ctx, last.id, last.name, canonical, rid);
+                        }
+                    },
+                    .web_search_result => |w| {
+                        // 主对话:照打 UI 装饰(⏺ Web Search ...),TUI 字节与旧版一致。
+                        // ui_text 是预渲染的可见 assistant 内容(例外:含 ANSI 但属"可见输出")。
+                        // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
+                        backend.emitEvent(sess, .{ .text_chunk = w.ui_text });
+                        output_channel.note(w.ui_text.len);
+                        try assistant_text.appendSlice(allocator, w.ui_text);
+                        allocator.free(w.ui_text);
+                        allocator.free(w.content_json);
+                    },
+                    .web_search_query => |q| {
+                        // 主对话不消费 query_update 进度(仅 web_search.zig 子请求驱动 TUI);释放。
+                        allocator.free(q);
+                    },
+                    .reasoning_item => |item_json| {
+                        // 不可读、不展示、不进 assistant_text——只按序留存供下轮回传。
+                        // append 失败则就地释放(所有权尚未转移)。
+                        log.debugId("agent", rid, "reasoning item bytes={d}", .{item_json.len});
+                        const admission = observeCandidate(
+                            opts.response_observer,
+                            candidate,
+                            .{ .reasoning_item = item_json },
+                        );
+                        reasoning_items.append(allocator, item_json) catch allocator.free(item_json);
+                        if (admission == .reject) {
+                            candidate_rejected = true;
+                            break;
+                        }
+                    },
+                    .usage => |u| {
+                        // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
+                        // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
+                        backend.emitEvent(sess, .{ .usage = u });
+                        // 成本次闸累计(本 run):按模型单价把本响应 usage 折算成本。
+                        run_cost_usd += @import("metacodes-base").util.pricing.computeCost(cost_rates, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
+                        response_usage.observe(u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
+                        if (opts.goal_meter) |meter| if (meter.charge(u.input_tokens, u.output_tokens)) |limited|
+                            backend.emitEvent(sess, .{ .goal_updated = limited });
+                        log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
+                    },
+                    .done => {},
+                }
+            }
+
+            const provider_metering: execution_effect.Metering = if (response_usage.reported)
+                .{ .known = .{
+                    .input_tokens = response_usage.input_tokens,
+                    .output_tokens = response_usage.output_tokens,
+                    .cache_read_input_tokens = response_usage.cache_read_tokens,
+                    .cache_creation_input_tokens = response_usage.cache_write_tokens,
+                } }
+            else
+                .unknown;
+            const provider_outcome: execution_effect.ProviderAttemptOutcome = if (aborted_during_stream)
+                .aborted
+            else if (stream_context_window_exceeded)
+                .context_window_exceeded
+            else if (stream_error)
+                .stream_error
+            else
+                .succeeded;
+            if (provider_outcome == .succeeded) {
+                counters.saw_successful_provider_response = true;
+                if (!response_usage.reported) counters.usage_unknown = true;
+            }
+            ledger_outcome = if (aborted_during_stream) "client_disconnect" else if (stream_error) "failed" else "completed";
+            if (!retry_ui.finishAttempt(provider_outcome, provider_metering))
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+
+            // message_start/message_delta usage 是同一个 provider response 的片段，而不是
+            // 两个请求。只在成功收完整条响应后更新 token anchor 和 cache detector；否则
+            // preliminary zero usage 会把每个 warm request 误报成 cache break，partial error
+            // 也会污染下一轮基线。
+            if (!aborted_during_stream and !stream_error and response_usage.has_metering) {
+                conversation.setUsageAnchor(@intCast(response_usage.promptTokens()));
+                // An accepted prompt is a measurement too: a stated cap below it
+                // was wrong (forget it), an observed bound below it was low (raise it).
+                switch (context_caps.noteAccepted(provider.endpointId(), opts.model_override orelse provider.model(), response_usage.promptTokens())) {
+                    .invalidated => log.warnId("agent", rid, "learned context cap invalidated: server accepted {d} prompt tokens above its stated limit", .{response_usage.promptTokens()}),
+                    .raised => log.debugId("agent", rid, "learned context cap raised to {d} accepted prompt tokens", .{response_usage.promptTokens()}),
+                    .none => {},
+                }
+                if (cache_detector.checkResponse(response_usage.cache_read_tokens, response_usage.cache_write_tokens)) |reason| {
+                    log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, response_usage.cache_read_tokens, response_usage.cache_write_tokens });
+                    backend.emitEvent(sess, .{ .diag_cache_break = .{
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .cache_read = response_usage.cache_read_tokens,
+                        .cache_creation = response_usage.cache_write_tokens,
+                    } });
+                }
+            }
+            backend.emitEvent(sess, .{ .diag_model_request = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .turn = turns + 1,
+                .attempt = @intCast(@min(context_recovery.attempts, std.math.maxInt(u32))),
+                .elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                .outcome = if (aborted_during_stream)
+                    "aborted"
+                else if (stream_context_window_exceeded)
+                    "context_window_exceeded"
+                else if (stream_error)
+                    "stream_error"
+                else
+                    "success",
+            } });
+            // 闭颜色括号 + 尾换行由 backend 决定(colorize ? "\x1b[0m\n" : "\n")。
+            backend.emitEvent(sess, .stream_done);
+
+            // 抓本轮 API 报告的 stop_reason(stream.deinit 前读;defer 在 turn 末才执行)
+            turn_stop_reason = stream.stopReason();
+
+            log.infoId("agent", rid, "stream finished text_bytes={d} tool_uses={d} aborted={} err={}", .{
+                assistant_text.items.len,
+                tool_uses.items.len,
+                aborted_during_stream,
+                stream_error,
+            });
+
+            // A runtime policy refused this candidate. Treat it exactly like a
+            // discarded partial — the visible bytes are withdrawn, nothing is
+            // committed, no further tool effect starts — and end the Run
+            // rather than re-issuing: a policy rejection is deterministic, so
+            // a retry would buy the identical response a second time.
+            if (candidate_rejected) {
+                log.warnId("agent", rid, "candidate response rejected by runtime policy at turn {d}", .{turns + 1});
+                output_channel.close(.discarded, assistant_text.items);
+                // Join before freeing: a prefetch thread borrows the tool_use
+                // bytes about to be released.
+                prefetch.joinAll();
+                for (tool_uses.items) |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input);
+                }
+                tool_uses.clearRetainingCapacity();
+                // This path always returns, so the list is released outright
+                // rather than cleared for a re-issue that will not happen.
+                for (assistant_blocks.items) |b| b.deinit(allocator);
+                assistant_blocks.deinit(allocator);
+                assistant_text.clearRetainingCapacity();
+                visible_model_text_bytes = 0;
+                thinking_text.clearRetainingCapacity();
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
+                return rejectedCandidateRun(
+                    backend,
+                    sess,
+                    trace_id,
+                    depth,
+                    turns + 1,
+                    total_tool_calls,
+                    opts.response_observer,
+                    &candidate_open,
+                    candidate,
+                );
+            }
+
+            if (aborted_during_stream) {
+                settleCandidate(
+                    opts.response_observer,
+                    &candidate_open,
+                    candidate,
+                    .{ .discarded = .aborted },
+                );
+                // 保留已流出的 partial assistant text（对齐 TS 原版 `onCancel` 行为）：
+                // 让用户看到已生成的内容；下次用 /retry 能继续。**语义**:可见但未完成 → partial,
+                // 绝不能被上层当成最终结果。
+                output_channel.close(.partial, assistant_text.items);
+                // **先 join 预取线程**:它们 borrow tool_uses 的 id/name/input 字节,必须在下面 free
+                // 之前 join,否则在飞 Read/Grep 读已释放内存(Linus HIGH-1 UAF)。
+                prefetch.joinAll();
+                // tool_uses 累了一半但没收齐 content_block_stop 时可能残缺——弃掉（不 commit）。
+                for (tool_uses.items) |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input);
+                }
+                tool_uses.clearRetainingCapacity();
+
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
+                if (assistant_text.items.len > 0) {
+                    const text_owned = try allocator.dupe(u8, assistant_text.items);
+                    errdefer allocator.free(text_owned);
+                    try assistant_blocks.append(allocator, .{ .text = text_owned });
+                }
+                if (assistant_blocks.items.len > 0) {
+                    const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
+                    try conversation.append(.{ .role = .assistant, .blocks = blocks_slice });
+                } else {
+                    assistant_blocks.deinit(allocator);
+                }
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
+
+            // Stream error：不把残缺的 assistant_text / tool_uses commit 到 conversation
+            // 否则下一轮会把残片作为 context 导致模型"续写"残片。
+            // context-window-exceeded 若发生在任何 assistant payload 之前，可以安全删老
+            // history 并重开同一 turn；一旦已经流出内容，就不能假装 UI 可回滚。
+            if (stream_error) {
+                settleCandidate(
+                    opts.response_observer,
+                    &candidate_open,
+                    candidate,
+                    .{ .discarded = .stream_error },
+                );
+                // 残缺 assistant_text 下面会被整体丢弃(不 commit 到 conversation)→ discarded。
+                // 消费者据此丢掉已缓冲的该段字节,不会把残片误当结果。
+                output_channel.close(.discarded, assistant_text.items);
+                // The segment this attempt's text and thinking belonged to.
+                const discarded_segment = output_channel.last_closed;
+                const can_recover_context_error = stream_context_window_exceeded and
+                    assistant_text.items.len == 0 and
+                    tool_uses.items.len == 0 and
+                    assistant_blocks.items.len == 0;
+                // Something the user could have watched: text, thinking or a
+                // tool call reached the backend in this attempt (usage and
+                // reasoning items are not shown).
+                const showed_output = assistant_text.items.len != 0 or
+                    thinking_text.items.len != 0 or
+                    tool_uses.items.len != 0 or
+                    assistant_blocks.items.len != 0;
+                // The connection gave no answer at all (isSilentRetryFailure).
+                const connection_failure = isSilentRetryFailure(stream_failure);
+                // The response began a tool call: one the loop received, or
+                // one the parser saw open whose arguments never finished.
+                const tool_call_started = tool_uses.items.len != 0 or stream.toolCallStarted();
+                // See STREAM_RETRIES_PER_REQUEST.
+                const request_retry_eligible = connection_failure and !tool_call_started;
+                const overloaded = if (stream_failure) |failure| failure == error.ServiceUnavailable else false;
+                const overload_attempts = providerAttemptLimit(opts.request_gate != null);
+                const attempts_used = stream_attempts;
+                const thinking_bytes: u64 = thinking_text.items.len;
+                // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
+                prefetch.joinAll();
+                for (tool_uses.items) |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input);
+                }
+                tool_uses.clearRetainingCapacity();
+                for (assistant_blocks.items) |b| b.deinit(allocator);
+                assistant_blocks.clearRetainingCapacity();
+                assistant_text.clearRetainingCapacity();
+                visible_model_text_bytes = 0;
+                thinking_text.clearRetainingCapacity();
+                for (reasoning_items.items) |item| allocator.free(item);
+                reasoning_items.clearRetainingCapacity();
+                if (can_recover_context_error) {
+                    if (!recoverContextWindowExceeded(.{
+                        .conversation = conversation,
+                        .provider = provider,
+                        .system_prompt = effective_system_prompt,
+                        .inject_user_context = opts.inject_user_context,
+                        .synthetic_user_input = synthetic_user_input,
+                        .tool_defs = provider_tool_defs,
+                        .model_override = opts.model_override,
+                        .numbers = blk: {
+                            const from_frame = stream.contextWindowNumbers();
+                            break :blk if (from_frame.isEmpty()) provider.lastContextWindowNumbers() else from_frame;
+                        },
+                        .keep_recent = opts.auto_compact_keep_recent,
+                        .backend = backend,
+                        .sess = sess,
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .state = &context_recovery,
+                        .turn_number = turns + 1,
+                        .context_warning_emitted = &context_warning_emitted,
+                        .allocator = allocator,
+                        .tasks = opts.tasks,
+                        .hookset = permission_ctx.hooks,
+                        .summary_reserve_tokens = &compact_summary_reserve_tokens,
+                        .request_gate = opts.request_gate,
+                        .abort = opts.abort,
+                        .goal_meter = opts.goal_meter,
+                        .control = opts.compaction_control,
+                    })) {
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+                    }
+                    continue :request_recovery;
+                }
+                // Mid-stream transient (connection drop, malformed tail):
+                // the partial turn was fully discarded above, so a bounded
+                // re-issue of the same request is safe. Aborts keep their
+                // own path; context-window exhaustion was handled before.
+                const abort_pending = if (opts.abort) |a| a.isAborted() else false;
+                // The Run's allowance: a host that can take back what it
+                // showed (#452) extends it for a connection that gave no
+                // answer only.
+                const retractable_cap: u8 = if (connection_failure) opts.retractable_stream_retries else 0;
+                const run_retry_cap = @max(opts.max_stream_turn_retries, retractable_cap);
+                const reissue: ?enum { request, overload, run } = if (abort_pending)
+                    null
+                else if (overloaded)
+                    (if (!tool_call_started and attempts_used < overload_attempts) .overload else null)
+                else if (request_retry_eligible and request_stream_retries < STREAM_RETRIES_PER_REQUEST)
+                    .request
+                else if (stream_turn_retries < run_retry_cap)
+                    .run
+                else
+                    null;
+                if (reissue) |allowance| {
+                    switch (allowance) {
+                        .request => request_stream_retries += 1,
+                        .overload => request_overload_retries += 1,
+                        .run => stream_turn_retries += 1,
+                    }
+                    if (allowance == .overload) {
+                        request_attempts_spent = attempts_used;
+                        const delay_ms = model_error.responseRetryAfterMs() orelse client_mod.retryDelayMs(attempts_used, client_mod.RETRY_BASE_MS);
+                        log.warnId("agent", rid_for_turn, "stream overloaded → same-turn retry {d}/{d}; sleeping {d}ms", .{ attempts_used, overload_attempts, delay_ms });
+                        if (showed_output and !stream_cut_nudged) {
+                            stream_cut_nudged = true;
+                            try conversation.appendHostText(RESTART_AFTER_STREAM_CUT);
+                        }
+                        announceRetractedAttempt(backend, sess, discarded_segment, thinking_bytes, attempts_used, overload_attempts, @intCast(delay_ms));
+                        if (!client_mod.interruptibleSleepMs(delay_ms, opts.abort)) {
+                            log.warnId("agent", rid_for_turn, "aborted during stream retry backoff", .{});
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        }
+                        continue :request_recovery;
+                    }
+                    const run_used: u32 = stream_turn_retries - run_stream_retries_at_request;
+                    const failed_streams: u32 = @as(u32, request_stream_retries) + run_used;
+                    log.warnId("agent", rid_for_turn, "mid-stream failure{s} → same-turn retry {d} ({s} allowance)", .{
+                        if (showed_output) " after visible output" else "",
+                        failed_streams,
+                        @tagName(allowance),
+                    });
+                    if (showed_output and !stream_cut_nudged) {
+                        stream_cut_nudged = true;
+                        try conversation.appendHostText(RESTART_AFTER_STREAM_CUT);
+                    }
+                    if (showed_output) {
+                        // Every attempt this request may make: the first, its
+                        // own re-issue (when this failure qualifies for it or
+                        // it was spent), and what is left of the Run's.
+                        const own: u8 = if (request_retry_eligible) STREAM_RETRIES_PER_REQUEST else request_stream_retries;
+                        const max_streams: u32 = 1 + @as(u32, own) +
+                            @as(u32, run_retry_cap -| run_stream_retries_at_request);
+                        announceRetractedAttempt(
+                            backend,
+                            sess,
+                            discarded_segment,
+                            thinking_bytes,
+                            failed_streams,
+                            @max(max_streams, failed_streams + 1),
+                            opts.stream_retry_backoff_ms,
+                        );
+                        if (!waitStreamRetryBackoff(opts.abort, opts.stream_retry_backoff_ms)) {
+                            log.warnId("agent", rid_for_turn, "aborted during stream retry backoff", .{});
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        }
+                    }
+                    continue :request_recovery;
+                }
+                if (overloaded and !abort_pending) {
+                    log.errId("agent", rid_for_turn, "stream failed after {d} attempt(s): {s}", .{ attempts_used, @errorName(error.ServiceUnavailable) });
+                    last_error.noteAttempts(attempts_used);
+                }
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
+
+            break :request_recovery;
+        }
+        const rid = rid_for_turn;
+
+        // 4. 把 reasoning items + thinking + assistant text + tool_uses 组装成 Message
+        // 追加到 conversation。顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;
+        // OpenAI-compatible 的 reasoning_content 平级字段由 request.zig 序列化时处理,
+        // block 顺序无害)。
+        // reasoning_item 排在最前:OpenAI Responses 的 `output` 就是 reasoning 在前,
+        // 回传 `input` 亦然(reasoning → message/function_call)。
+        // **不产出只有 reasoning 的 assistant 消息**:那种消息 buildApiMessages 会整条
+        // 跳过(Anthropic 的 content 数组会空),于是它永远不上 wire,却仍被
+        // estimateMessageTokens 按 REASONING_ITEM_TOKEN_ESTIMATE 计入——"发给模型的
+        // 投影"与"token 估算"就此分叉,估算单调虚高、误触发 auto-compact。何况一个
+        // 什么都没产出的回合,它的推理状态也没有可续的下文。这条不变式让
+        // buildApiMessages 的 n_substantive 守卫在本进程内不可能被触发。
+        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0 or assistant_blocks.items.len > 0;
+        if (!turn_has_content) {
+            for (reasoning_items.items) |item| allocator.free(item);
+            reasoning_items.clearRetainingCapacity();
+        }
+        // 逐项**先摘表再转移**:append/dupe 在 OOM 下失败时,已转移项不再留在
+        // reasoning_items 里,顶部 defer 与 assistant_blocks 的 errdefer 不会双释放。
+        while (reasoning_items.items.len > 0) {
+            const item_json = reasoning_items.orderedRemove(0);
+            errdefer allocator.free(item_json);
+            const model_owned = try allocator.dupe(u8, opts.model_override orelse provider.model());
+            errdefer allocator.free(model_owned);
+            try assistant_blocks.append(allocator, .{ .reasoning_item = .{
+                .model = model_owned,
+                .json = item_json,
+            } });
+        }
+        if (thinking_text.items.len > 0) {
+            const th_owned = try allocator.dupe(u8, thinking_text.items);
+            errdefer allocator.free(th_owned);
+            try assistant_blocks.append(allocator, .{ .thinking = th_owned });
+        }
+        if (assistant_text.items.len > 0) {
+            const text_owned = try allocator.dupe(u8, assistant_text.items);
+            errdefer allocator.free(text_owned);
+            try assistant_blocks.append(allocator, .{ .text = text_owned });
+        }
+        for (tool_uses.items) |tu| {
+            try assistant_blocks.append(allocator, .{ .tool_use = tu });
+        }
+        // 清空 tool_uses 的所有权转移表示：此后 tool_uses.items 内的字节归 assistant_blocks 所有
+        tool_uses.clearRetainingCapacity();
+
+        // The last question before the assembled message becomes Conversation
+        // state. A policy that can only decide once the response is complete
+        // answers here; one that already refused mid-stream never reaches it.
+        // `candidate_open` is only ever set from a non-null observer, which is
+        // what makes the unwrap below total.
+        if (candidate_open and assistant_blocks.items.len > 0 and
+            opts.response_observer.?.admit(candidate) == .reject)
+        {
+            log.warnId("agent", rid, "assembled candidate refused at commit, turn {d}", .{turns + 1});
+            output_channel.close(.discarded, assistant_text.items);
+            prefetch.joinAll();
+            for (assistant_blocks.items) |b| b.deinit(allocator);
+            assistant_blocks.deinit(allocator);
+            return rejectedCandidateRun(
+                backend,
+                sess,
+                trace_id,
+                depth,
+                turns + 1,
+                total_tool_calls,
+                opts.response_observer,
+                &candidate_open,
+                candidate,
+            );
+        }
+
+        if (assistant_blocks.items.len > 0) {
+            const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
+            try conversation.append(.{ .role = .assistant, .blocks = blocks_slice, .origin = if (fast_action != null) .host else .participant });
+            settleCandidate(opts.response_observer, &candidate_open, candidate, .committed);
+        } else {
+            // 空响应，避免 deinit 释放已归还的 slice
+            assistant_blocks.deinit(allocator);
+            settleCandidate(
+                opts.response_observer,
+                &candidate_open,
+                candidate,
+                .{ .discarded = .empty },
+            );
+        }
+
+        // 5. 如果这一轮没有 tool_use，整个请求结束
+        const last_msg = &conversation.messages.items[conversation.messages.items.len - 1];
+        if (harnessmm_enabled and fast_action == null) try harnessmm.admit(last_msg.*);
+        var has_tool_use = false;
+        for (last_msg.blocks) |b| if (@as(std.meta.Tag(msg.Block), b) == .tool_use) {
+            has_tool_use = true;
+            break;
+        };
+        // 进度更新传感器(#114):这一轮用户看到模型的字了吗。每轮都观察——被终局门退回的叙述、
+        // max_tokens 截断的叙述也是叙述,沉默段归零;只调工具不说话才算一轮沉默。
+        progress_state.observeTurn(visible_model_text_bytes, has_tool_use, util_time.nowNs());
+        // 本轮跟着工具调用 → 这段文字是执行过程中的可见说明,不是最终答案。
+        if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
+        // 模型这一轮恢复了(没被截断,或带着工具调用往下走)→ 连续续写归零。
+        if (turn_stop_reason != .max_tokens or has_tool_use) continuation_streak = 0;
+
+        if (!has_tool_use) {
+            // A verifier leads round ended (isolated_verifier.zig §6): its
+            // reply is the leads text (commentary; the answer before the
+            // round is already final). The fresh verifier on the same
+            // snapshot gives the boundary's final verdict.
+            var leads_just_ended = false;
+            if (verifier_gate.leads == .active) {
+                output_channel.close(.commentary, assistant_text.items);
+                verifier_gate.leads = .idle;
+                leads_just_ended = true;
+                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, assistant_text.items)) {
+                    .continue_run => |text| {
+                        defer allocator.free(text);
+                        output_channel.final_sealed = false;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    },
+                    .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls }),
+                    .stand => {},
+                }
+            }
+            // A learning pass ended (learning_turn.zig): after distill, go on
+            // to reconcile when a lesson was accepted and stored lessons exist;
+            // otherwise the run ends with the attempt's own stop reason. No
+            // process gate judges a learning pass — the answer is already final.
+            if (learning_state.active()) {
+                output_channel.close(.commentary, assistant_text.items);
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                if (learning_state.phase == .distill) {
+                    learning_state.distill_accepted = learning_state.binding.acceptedCount();
+                    if (learning_turn_mod.afterDistill(learning_state.distill_accepted, learning_state.existing) == .reconcile) {
+                        const text = try learning_turn_mod.renderReconcile(allocator, &learning_state);
+                        defer allocator.free(text);
+                        learning_state.startPass(.reconcile);
+                        learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
+                        log.infoId("agent", rid, "learning turn reconcile accepted={d} existing={d}", .{ learning_state.distill_accepted, learning_state.existing });
+                        try conversation.appendHostText(text);
+                        continue;
+                    }
+                }
+                const report = learning_state.report(opts.learning_turn.?.mode);
+                learning_state.phase = .idle;
+                log.infoId("agent", rid, "learning turn done passes={d} lessons={d} refused={d}", .{ report.passes, report.lessons_accepted, report.lessons_refused });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
+            if (turn_stop_reason == .max_tokens and continuation_streak >= MAX_CONTINUATIONS) {
+                // The provider cut this turn at its output-token limit again
+                // after the last allowed consecutive continuation (no turn in
+                // between ended normally or called a tool), and the turn has no
+                // tool call to act on. Any text it streamed is the visible
+                // prefix of an answer that never finished, so it closes as
+                // partial and the Run ends in the explicit exhaustion state,
+                // with or without that text (#394). Only the no-text case
+                // stopped here before; visible text fell through to the
+                // common tail and was reported as a completed answer.
+                output_channel.close(.partial, assistant_text.items);
+                log.warnId("agent", rid, "max_tokens continuation budget exhausted; last turn still truncated ({d} visible bytes)", .{assistant_text.items.len});
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_tokens_exhausted, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
+            // Some Anthropic-compatible gateways accept but ignore a forced
+            // tool_choice. `required_first` is stronger than a prompt hint:
+            // one bounded, provider-neutral repair keeps the model from
+            // ending the Run before the exact activation boundary. Repeated
+            // non-compliance fails closed instead of silently bypassing the
+            // plugin contract.
+            if (required_first_pending) {
+                if (required_first_repairs >= MAX_REQUIRED_FIRST_REPAIRS or
+                    !host_injection_meter.tryConsume())
+                {
+                    // fail-closed:定性与 run 顶部 defer 兜底一致(.partial),但必须趁
+                    // assistant_text 还在作用域时显式收段——兜底只有权威字节数,Ledger
+                    // 会丢这段 partial 正文。
+                    output_channel.close(.partial, assistant_text.items);
+                    backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+                }
+                required_first_repairs += 1;
+                // 主机拒绝过早的"最终答案"并注入 required-first 修复 → 本段是过程
+                // 信息(与其它 nudge 路径同款定性),不是答案。不收段的话它会跨轮
+                // 悬开,破坏"段开/关严格配对"的协议不变式。
+                output_channel.close(.commentary, assistant_text.items);
+                const route = required_first_route.?;
+                const repair = try requiredFirstRepairText(allocator, route);
+                defer allocator.free(repair);
+                log.warnId(
+                    "agent",
+                    rid,
+                    "required-first route ignored; repair {d}/{d} tool={s}",
+                    .{ required_first_repairs, MAX_REQUIRED_FIRST_REPAIRS, route.tool_name },
+                );
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                try conversation.appendHostText(repair);
+                continue;
+            }
+            // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
+            // 注入 continue 提示让它接着写,而不是当作完成。最多连续 MAX_CONTINUATIONS 次。
+            if (turn_stop_reason == .max_tokens and continuation_streak < MAX_CONTINUATIONS) {
+                continuation_streak += 1;
+                continuations.* += 1;
+                // 被 token 上限截断 → 本段与同 group 的下一段合成一个完整结果,单独任何一段
+                // 都不是 final(`stream_done` 更不是)。
+                output_channel.close(.continued, assistant_text.items);
+                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d} (run total {d})", .{ continuation_streak, MAX_CONTINUATIONS, continuations.* });
+                // L4 诊断:续写。
+                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuation_streak, .max = MAX_CONTINUATIONS } });
+                try conversation.appendHostText(if (assistant_text.items.len == 0) RESPOND_AFTER_SILENT_TRUNCATION else CONTINUE_AFTER_TRUNCATION);
+                continuation_pending = true;
+                continue;
+            }
+            const kg_pending = kgEnumerationPending(
+                &kg_lexical_ledger,
+                gated_tool_defs,
+                kg_enumeration_query_hint,
+            );
+            if (kg_pending != .none) {
+                const repair_attempts = switch (kg_pending) {
+                    .batch => &kg_coverage_repair_attempts,
+                    .context => &kg_context_repair_attempts,
+                    .none => unreachable,
+                };
+                if (repair_attempts.* == 0) {
+                    repair_attempts.* = 1;
+                    // 主机判定这次"结论"覆盖不足并要求补检索 → 它不是最终答案,是过程信息。
+                    output_channel.close(.commentary, assistant_text.items);
+                    // A rejected batch-final may still need batch + context +
+                    // final; a rejected context-final needs context + final.
+                    // Budget/request gates still guard every provider boundary.
+                    kg_coverage_borrowed_turns +|= switch (kg_pending) {
+                        .batch => 3,
+                        .context => 2,
+                        .none => unreachable,
+                    };
+                    backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                    try conversation.appendHostText(switch (kg_pending) {
+                        .batch => kg_retrieval_protocol.ENUMERATION_COVERAGE_REPAIR,
+                        .context => kg_retrieval_protocol.ENUMERATION_CONTEXT_REPAIR,
+                        .none => unreachable,
+                    });
+                    continue;
+                }
+                // A second premature final is not accepted as a valid answer.
+                // Preserve the trace for audit and fail closed as a controlled
+                // tool loop rather than laundering an uncovered conclusion.
+                // 第二次未覆盖的"结论"不被接受为有效答案 → 已产出文本是 partial,不是 final。
+                output_channel.close(.partial, assistant_text.items);
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
+            // Verification obligation (task-agnostic process rule): a final
+            // answer after an unverified mutation gets a bounded nudge with a
+            // concrete recovery protocol. Budget exhausted → finish normally
+            // and record obligation_unmet; never block indefinitely.
+            if (opts.verification_final_gate and
+                verification_progress.unverified_mutation and
+                verification_nudges < MAX_VERIFICATION_NUDGES and
+                host_injection_meter.remaining() > 0)
+            {
+                _ = host_injection_meter.tryConsume();
+                verification_nudges += 1;
+                output_channel.close(.commentary, assistant_text.items);
+                log.infoId("agent", rid, "verification final gate nudge {d}/{d}", .{ verification_nudges, MAX_VERIFICATION_NUDGES });
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                try conversation.appendHostText(if (verification_progress.known_failing)
+                    verification_progress_mod.FINAL_GATE_KNOWN_FAILING_TEXT
+                else
+                    verification_progress_mod.FINAL_GATE_TEXT);
+                continue;
+            }
+            // Requirement-ledger closure obligation: a final answer with open
+            // ledger items (or with mutations but no ledger despite the
+            // prompt) gets one bounded nudge per premature final. The
+            // verification gate keeps priority — at most one injection per
+            // round. Formal model: RequirementLedger.lean.
+            if (opts.requirement_ledger and host_injection_meter.remaining() > 0) {
+                const counts = if (opts.tasks) |store|
+                    store.ledgerCounts()
+                else
+                    @import("task_store.zig").LedgerCounts{ .open = 0, .total = 0 };
+                switch (requirement_ledger_state.decide(
+                    counts.open,
+                    counts.total,
+                    verification_progress.mutation_seen,
+                )) {
+                    .none => {},
+                    .open_items => {
+                        _ = host_injection_meter.tryConsume();
+                        requirement_ledger_state.nudges += 1;
+                        output_channel.close(.commentary, assistant_text.items);
+                        log.infoId("agent", rid, "requirement ledger nudge {d}/{d} open={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.open });
+                        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                        const nudge = try std.fmt.allocPrint(
+                            allocator,
+                            requirement_ledger_mod.OPEN_NUDGE_FMT,
+                            .{counts.open},
+                        );
+                        defer allocator.free(nudge);
+                        try conversation.appendHostText(nudge);
+                        continue;
+                    },
+                    .coverage => {
+                        _ = host_injection_meter.tryConsume();
+                        requirement_ledger_state.nudges += 1;
+                        output_channel.close(.commentary, assistant_text.items);
+                        requirement_ledger_state.coverage_nudge_used = true;
+                        log.infoId("agent", rid, "requirement ledger coverage nudge {d}/{d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES });
+                        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                        try conversation.appendHostText(requirement_ledger_mod.COVERAGE_NUDGE_TEXT);
+                        continue;
+                    },
+                    .shallow => {
+                        _ = host_injection_meter.tryConsume();
+                        requirement_ledger_state.nudges += 1;
+                        output_channel.close(.commentary, assistant_text.items);
+                        requirement_ledger_state.shallow_nudge_used = true;
+                        log.infoId("agent", rid, "requirement ledger shallow nudge {d}/{d} total={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.total });
+                        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                        try conversation.appendHostText(requirement_ledger_mod.SHALLOW_NUDGE_TEXT);
+                        continue;
+                    },
+                }
+            }
+            // 任务义务门:author 上一轮为本任务学得的收尾义务未满足 →
+            // 有界 nudge(每义务一次,全局 ≤2,纯注入绝不硬拒)。
+            if (opts.obligations) |obligation_runtime| {
+                const obligation_decision: ?usize = if (host_injection_meter.remaining() > 0)
+                    obligation_runtime.decide().index
+                else
+                    null;
+                if (obligation_decision) |obligation_index| {
+                    const envelope = obligation_runtime.envelopes[obligation_index];
+                    _ = host_injection_meter.tryConsume();
+                    obligation_runtime.noteNudged(obligation_index);
+                    output_channel.close(.commentary, assistant_text.items);
+                    log.warnId("agent", rid, "task obligation nudge {d}/{d} needle={s}", .{ obligation_runtime.nudges_used, @import("obligation_gate.zig").MAX_OBLIGATION_NUDGES, envelope.command_needle });
+                    backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                    const nudge = try std.fmt.allocPrint(
+                        allocator,
+                        @import("obligation_gate.zig").NUDGE_FMT,
+                        .{ envelope.reason, envelope.command_needle },
+                    );
+                    defer allocator.free(nudge);
+                    try conversation.appendHostText(nudge);
+                    continue;
+                }
+            }
+            // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
+            // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
+            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+
+            // A background job can be the only remaining work after the model
+            // says it will wait. Keep this in core so every host gets the same
+            // owner-scoped, metadata-only channel and no frontend needs an idle
+            // polling loop. User input and abort always win without consuming
+            // the event; that preserves the next turn's boundary delivery.
+            if (opts.job_notifications) |registry| wait_for_jobs: {
+                const owner = opts.agent_ident orelse opts.session;
+                const pending = registry.pendingNotifySummary(owner);
+                if (pending.count == 0) break :wait_for_jobs;
+                if (job_wakeups >= opts.job_wait.max_wakeups) {
+                    // Backstop against unattended self-continuation (hazard: turn storms).
+                    log.info("agent", "job wait cap reached turn={d} wakeups={d} max_wakeups={d}", .{ turns + 1, job_wakeups, opts.job_wait.max_wakeups });
+                    break :wait_for_jobs;
+                }
+                // Spinner label: reuse set_current_tool (no new CoreEvent variants, ABI freeze).
+                // The buffer lives on this frame until the deferred clear_current_tool.
+                var label_buf: [160]u8 = undefined;
+                const label: []const u8 = if (pending.count == 1)
+                    std.fmt.bufPrint(&label_buf, "waiting for background job {s} ({s}) · Ctrl+C to stop waiting", .{ pending.first_id[0..], pending.preview() }) catch "waiting for background job · Ctrl+C to stop waiting"
+                else
+                    std.fmt.bufPrint(&label_buf, "waiting for {d} background jobs · Ctrl+C to stop waiting", .{pending.count}) catch "waiting for background jobs · Ctrl+C to stop waiting";
+                backend.emitEvent(sess, .{ .set_current_tool = .{ .name = label } });
+                defer backend.emitEvent(sess, .clear_current_tool);
+                log.info("agent", "job wait begin turn={d} pending={d} first={s}", .{ turns + 1, pending.count, pending.first_id[0..] });
+                const wait_started_ms = util_time.nowMs();
+                while (true) {
+                    // Escape hatch 1: abort. The answer given before the wait was complete,
+                    // so it stays the final segment.
+                    if (opts.abort) |a| if (a.isAborted()) {
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    };
+                    // Escape hatch 2: queued user input wins; the exit stays unannounced and
+                    // rides with that message through the next run's boundary drain.
+                    if (opts.pending_input) |probe| if (probe.hasPending()) {
+                        log.info("agent", "job wait ended: user input pending turn={d}", .{turns + 1});
+                        break;
+                    };
+                    // Escape hatch 3: bounded wait (headless sets it; TUI leaves it open).
+                    if (opts.job_wait.timeout_ms) |limit| {
+                        const now = util_time.nowMs();
+                        const elapsed: u64 = if (now >= wait_started_ms) @intCast(now - wait_started_ms) else 0;
+                        if (elapsed >= limit) {
+                            log.info("agent", "job wait timeout reached turn={d} elapsed_ms={d}", .{ turns + 1, elapsed });
+                            break;
+                        }
+                    }
+                    const poll = pollJobWait(registry, owner, allocator) catch |err| {
+                        log.warn("agent", "job wait notification skipped: {s}", .{@errorName(err)});
+                        break;
+                    };
+                    const events = poll.events;
+                    if (events.len > 0) {
+                        defer @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                        const text = job_notification_mod.render(allocator, events) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break;
+                        };
+                        defer allocator.free(text);
+                        // Persist first. Only a delivered notification turns the earlier text into
+                        // commentary; on failure the segment stays open for the .final close below,
+                        // so it is never closed twice.
+                        conversation.appendHostText(text) catch |err| {
+                            log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
+                            break;
+                        };
+                        output_channel.close(.commentary, assistant_text.items);
+                        job_wakeups += 1;
+                        log.info("agent", "job notification delivered after wait id={s} turn={d} wakeups={d}", .{ events[0].id[0..], turns + 1, job_wakeups });
+                        continue :outer_turn;
+                    }
+                    @import("job_registry.zig").freeJobExitEvents(allocator, events);
+                    if (opts.preview.monitor_events) {
+                        const monitor_text = takeMonitorNotifications(registry, owner, allocator) catch |err| {
+                            log.warn("agent", "monitor notification skipped: {s}", .{@errorName(err)});
+                            break;
+                        };
+                        if (monitor_text) |text| {
+                            defer allocator.free(text);
+                            conversation.appendHostText(text) catch |err| {
+                                log.warn("agent", "monitor notification skipped: {s} (events dropped)", .{@errorName(err)});
+                                break;
+                            };
+                            output_channel.close(.commentary, assistant_text.items);
+                            job_wakeups += 1;
+                            log.info("agent", "monitor notification delivered after wait turn={d} wakeups={d}", .{ turns + 1, job_wakeups });
+                            continue :outer_turn;
+                        }
+                    }
+                    // Jobs ended but were already observed via BashOutput/KillShell: nothing to say.
+                    if (!poll.any_running) break;
+                    if (opts.job_wait.poll_slice_ms > 0) util_time.sleepMs(opts.job_wait.poll_slice_ms);
+                }
+            }
+            // Test integrity (TestIntegrity.lean): before any check, compare
+            // the suite with the run-start baseline. Weakened tests in enforce
+            // mode earn one message (restore, or quote the request); the check
+            // gate below then judges against the restored tests.
+            if (depth == 0 and test_integrity_state.armed and test_integrity_state.touched) {
+                test_integrity_state.rescan(allocator, opts.abort) catch |err| switch (err) {
+                    error.Aborted => {
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                if (opts.test_integrity) |integrity| {
+                    const weakened = test_integrity_state.weakenedNow();
+                    const decision = test_integrity_mod.policy(integrity.mode, test_integrity_state.nudges, weakened > 0);
+                    log.infoId("agent", rid, "test integrity weakened={d} decision={s} nudges={d}/{d}", .{ weakened, @tagName(decision), test_integrity_state.nudges, test_integrity_mod.MAX_NUDGES });
+                    if (decision == .nudge) {
+                        const text = try test_integrity_mod.renderNudge(allocator, &test_integrity_state.last.?);
+                        defer allocator.free(text);
+                        test_integrity_state.noteNudged();
+                        // The host found weakened tests: this answer is not final.
+                        output_channel.close(.commentary, assistant_text.items);
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    }
+                }
+            }
+            // Host check gate (CheckGate.lean): the model stopped after a
+            // delivery-capable action, so the host runs the pinned check itself.
+            // A clean failure in enforce mode continues this conversation with
+            // the verdict; every other outcome ends the run as it stands.
+            if (opts.check_gate) |gate| if (depth == 0 and check_gate_state.shouldCheck()) {
+                check_gate_state.tests_weakened = if (test_integrity_state.scan_fresh) test_integrity_state.testsWeakened() else null;
+                backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the pinned host check" } });
+                // Where the work is now: a Run may have moved into a worktree.
+                const root = if (opts.host_services) |hs| hs.workingRoot() orelse opts.cwd_abs else opts.cwd_abs;
+                const cwd: ?[]const u8 = if (root.len > 0) root else null;
+                var outcome = check_gate_mod.runCheck(allocator, gate, cwd, opts.abort, &check_gate_state) catch |err| {
+                    backend.emitEvent(sess, .clear_current_tool);
+                    switch (err) {
+                        // Ctrl+C while the check ran: the answer before it stays final.
+                        error.Aborted => {
+                            output_channel.close(.final, assistant_text.items);
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                    }
+                };
+                backend.emitEvent(sess, .clear_current_tool);
+                defer outcome.deinit(allocator);
+                check_gate_state.noteVerdict(&outcome);
+                // Only an enforced learning turn ever quotes the verdict.
+                if (opts.learning_turn) |learning| if (learning.mode == .enforce and depth == 0)
+                    learning_state.captureVerdict(allocator, gate.command, &outcome);
+                const decision = check_gate_mod.decide(gate.mode, gate.max_continuations, check_gate_state.continuations, outcome.verdict);
+                log.infoId("agent", rid, "host check verdict={s} passed={d}/{d} exit={d} decision={s} continuations={d}/{d}", .{
+                    @tagName(outcome.verdict), outcome.passed, outcome.total, outcome.exit_code, @tagName(decision), check_gate_state.continuations, gate.max_continuations,
+                });
+                check_gate_state.noteDecision(decision);
+                // Isolated verifier: only after a green, untainted pinned
+                // check, at most MAX_VERIFIER_BOUNDARIES times per run.
+                if (verifier_armed and outcome.verdict == .passed and verifier_gate.canStartBoundary()) {
+                    const verifier = opts.isolated_verifier.?;
+                    verifier_gate.boundaries += 1;
+                    backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the isolated verifier" } });
+                    var vresult = try verifierSpawn(allocator, &verifier_gate, verifier, verifierDeps(&opts, provider, tool_defs, permission_ctx, sess), root, .{ .command = gate.command, .passed = outcome.passed, .total = outcome.total }, null);
+                    defer vresult.deinit();
+                    backend.emitEvent(sess, .clear_current_tool);
+                    log.infoId("agent", rid, "isolated verifier boundary={d} result={s}", .{ verifier_gate.boundaries, @tagName(vresult.outcome) });
+                    if (opts.abort) |a| if (a.isAborted()) {
+                        verifier_gate.dropSnapshot();
+                        output_channel.close(.final, assistant_text.items);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    };
+                    const leads_round = verifier.mode == .enforce and vresult.outcome == .unverified and
+                        check_gate_state.continuations < gate.max_continuations;
+                    if (leads_round) {
+                        // One leads round (§6): it consumes a continuation
+                        // of the check gate's budget. The answer is final
+                        // now; the round's reply is commentary unless a
+                        // post-leads FAIL sends the run back to work.
+                        check_gate_state.noteDecision(.continue_run);
+                        verifier_gate.leads = .active;
+                        verifier_gate.leads_turns = 0;
+                        verifier_gate.leads_rounds += 1;
+                        verifier_borrowed_turns +|= isolated_verifier_mod.LEADS_MAX_TURNS + 1;
+                        const text = try isolated_verifier_mod.renderLeadsRequest(allocator, vresult.outcome.unverified.not_established);
+                        defer allocator.free(text);
+                        output_channel.close(.final, assistant_text.items);
+                        output_channel.final_sealed = true;
+                        try conversation.appendHostText(text);
+                        continue :outer_turn;
+                    }
+                    switch (try verifierConclude(allocator, &verifier_gate, verifier, gate, &check_gate_state, &vresult)) {
+                        .continue_run => |text| {
+                            defer allocator.free(text);
+                            output_channel.close(.commentary, assistant_text.items);
+                            try conversation.appendHostText(text);
+                            continue :outer_turn;
+                        },
+                        .stand, .exhausted => {},
+                    }
+                }
+                if (decision == .continue_run) {
+                    const text = try check_gate_mod.renderContinuation(allocator, gate, &outcome, &check_gate_state);
+                    defer allocator.free(text);
+                    // 主机裁决没过 → 这段"结论"是过程信息,不是最终答案。
+                    output_channel.close(.commentary, assistant_text.items);
+                    try conversation.appendHostText(text);
+                    continue :outer_turn;
+                }
+            };
+            // Stop hook (Claude Code semantics): every configured hook runs here
+            // (memory extraction and other side effects included); a blocking
+            // hook continues the run with its reason, within its own bound.
+            if (depth == 0) if (permission_ctx.hooks) |hs| if (hs.hasStop()) {
+                const stdin_json = try stopHookStdin(allocator, conversation, "end_turn", stop_hook_active);
+                defer allocator.free(stdin_json);
+                var stop = hooks_mod.runStopHooks(hs.stop, allocator, stdin_json, opts.abort);
+                defer stop.deinit(allocator);
+                if (opts.abort) |a| if (a.isAborted()) {
+                    output_channel.close(.final, assistant_text.items);
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                };
+                if (check_gate_mod.stopContinues(stop.blocked, check_gate_state.stop_hook_blocks)) {
+                    check_gate_state.stop_hook_blocks += 1;
+                    stop_hook_active = true;
+                    log.infoId("agent", rid, "Stop hook block {d}/{d}", .{ check_gate_state.stop_hook_blocks, check_gate_mod.MAX_STOP_HOOK_BLOCKS });
+                    const text = try check_gate_mod.renderStopFeedback(allocator, stop.reason);
+                    defer allocator.free(text);
+                    output_channel.close(.commentary, assistant_text.items);
+                    try conversation.appendHostText(text);
+                    continue :outer_turn;
+                }
+                if (stop.blocked) log.warnId("agent", rid, "Stop hook asked to continue again; block budget {d} spent, finishing", .{check_gate_mod.MAX_STOP_HOOK_BLOCKS});
+            };
+            // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
+            if (test_integrity_state.armed and !leads_just_ended) test_integrity_state.noteFinalAnswer(assistant_text.items);
+            output_channel.close(.final, assistant_text.items);
+            // Learning turn (learning_turn.zig): the answer is final; decide on
+            // the verdict the check gate left at this workspace.
+            if (opts.learning_turn) |learning| if (depth == 0) {
+                const grounding: learning_turn_mod.Grounding = if (opts.check_gate != null and check_gate_state.checks > 0 and !check_gate_state.dirty)
+                    learning_turn_mod.groundingOf(check_gate_state.last_verdict)
+                else
+                    .unchecked;
+                const store: ?*@import("../kg/client.zig").KgClient = if (opts.kg) |kg| (if (kg.ready) kg else null) else null;
+                const decision = learning_turn_mod.decide(grounding, store != null);
+                learning_state.grounding = grounding;
+                learning_state.decision = decision;
+                log.infoId("agent", rid, "learning turn {s} grounding={s} decision={s}", .{ @tagName(learning.mode), @tagName(grounding), @tagName(decision) });
+                if (decision == .distill and learning.mode == .enforce) {
+                    learning_state.bind(if (grounding == .passed) .passed else .failed, learning, trace_id);
+                    const existing = try lesson_mod.collectForTask(allocator, store.?, learning_state.binding.task, learning_turn_mod.MAX_EXISTING_SHOWN);
+                    defer lesson_mod.freeStored(allocator, existing);
+                    learning_state.existing = existing.len;
+                    const text = try learning_turn_mod.renderDistill(allocator, &learning_state, existing);
+                    defer allocator.free(text);
+                    output_channel.final_sealed = true;
+                    learning_state.startPass(.distill);
+                    learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
+                    try conversation.appendHostText(text);
+                    continue :outer_turn;
+                }
+            };
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
+        // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加。
+        //    批1:权限检查主线程串行,执行按 isConcurrencySafe 分批并发(tool_exec.zig)。
+        const tool_stage_started_ns = util_time.nowNs();
+        var result_blocks = std.ArrayList(msg.Block).empty;
+        errdefer {
+            for (result_blocks.items) |b| b.deinit(allocator);
+            result_blocks.deinit(allocator);
+        }
+
+        // 6a. 收集 tool_use + 主线程串行做权限检查 → slots。
+        const tool_exec = @import("tool_exec.zig");
+        var slots = std.ArrayList(tool_exec.Slot).empty;
+        // 单个 defer 覆盖所有退出路径(正常/挂起/fatal/错误):slot-owned payload 全部回收。
+        // 已转移 ownership 的字段(takeContent 置 null)天然跳过——转移必须走 takeContent。
+        defer {
+            for (slots.items) |*s| s.deinit(allocator);
+            slots.deinit(allocator);
+        }
+        const hookset = permission_ctx.hooks;
+        const admission = ToolAdmission{
+            .opts = opts,
+            .permission_ctx = permission_ctx,
+            .backend = backend,
+            .sess = sess,
+            .trace_id = trace_id,
+            .depth = depth,
+            .rid = rid,
+            .learning_pass = learning_state.active(),
+            .verifier_leads = verifier_gate.leads == .active,
+        };
+        var code_bridge = CodeBridge{
+            .gpa = allocator,
+            .scratch = std.heap.ArenaAllocator.init(allocator),
+            .conversation = conversation,
+            .admission = admission,
+            .start_backend = if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) backend else span_sink,
+            .result_backend = if (opts.event_projection.emitToolResult(opts.emit_tool_cards)) backend else span_sink,
+            .total_tool_calls = &total_tool_calls,
+        };
+        defer code_bridge.deinit();
+        var required_first_accepted = false;
+        for (last_msg.blocks) |b| {
+            const tu = switch (b) {
+                .tool_use => |t| t,
+                else => continue,
+            };
+            total_tool_calls += 1;
+            if (required_first_pending) {
+                const route = required_first_route.?;
+                const exact_required_call = dialect_mod.matchesRequiredFirst(
+                    route,
+                    tu.name,
+                    tu.input,
+                );
+                if (!exact_required_call or required_first_accepted) {
+                    log.warnId(
+                        "permission",
+                        rid,
+                        "required-first DENY tool={s}; pending={s}",
+                        .{ tu.name, route.tool_name },
+                    );
+                    backend.emitEvent(sess, .{ .policy_decision = .{
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .id = tu.id,
+                        .tool = tu.name,
+                        .decision = "deny",
+                        .source = "model_activation_required_first",
+                        .allowed = false,
+                    } });
+                    var denied = tool_exec.Slot{
+                        .decision = .denied,
+                        .name = tu.name,
+                        .id = tu.id,
+                        .input = tu.input,
+                    };
+                    denied.content = try tool_error.errorToJson(
+                        "RequiredFirstPending",
+                        "tool '{s}' cannot run before the exact required-first '{s}' activation succeeds",
+                        .{ tu.name, route.tool_name },
+                        allocator,
+                    );
+                    denied.is_error = true;
+                    try slots.append(allocator, denied);
+                    continue;
+                }
+                // Calls in one assistant message are parallel, not ordered.
+                // Admit exactly one activation and deny every sibling above;
+                // ordinary tools become eligible only on the next model turn
+                // after the paired successful result is in Conversation.
+                required_first_accepted = true;
+            }
+            var admitted = try admission.admit(tu, allocator);
+            errdefer admitted.deinit(allocator);
+            try slots.append(allocator, admitted);
+        }
+
+        // AgentDef/skill execution ceilings are a distinct, final policy
+        // layer.  executeOne remains the enforcing seam (and returns a paired
+        // tool_result), while this event makes a denial visible to native eval
+        // telemetry instead of looking like an unexplained tool failure.
+        if (opts.execution_policy) |execution_policy| {
+            for (slots.items) |*slot| {
+                if (slot.decision != .run or
+                    execution_policy.allowsInvocation(slot.name, slot.input)) continue;
+                log.warnId("permission", rid, "execution policy DENY tool={s}", .{slot.name});
+                backend.emitEvent(sess, .{ .policy_decision = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .id = slot.id,
+                    .tool = slot.name,
+                    .decision = "deny",
+                    .source = "execution_policy",
+                    .allowed = false,
+                } });
+            }
+        }
+
+        // 6b. 构造一次 ToolContext(所有 tool 共用;并发 job 各自换独立 arena allocator)。
+        // 工具进度 trampoline 的 per-run 存储(backend + session),供 progress_state 指向。
+        // 声明在 base_ctx 同作用域,生命周期覆盖整个工具执行。
+        var progress_tramp: ProgressTramp = undefined;
+        var event_tramp: EventTramp = undefined; // U6 A2:agent_lifecycle/tasks_changed 通知
+        var base_ctx = tools_mod.ToolContext{
+            .allocator = allocator,
+            .abort = opts.abort,
+            .read_state = opts.read_state,
+            .edit_hl_cache = opts.edit_hl_cache,
+            .lsp = opts.lsp,
+            .jobs = opts.jobs,
+            .agent_jobs = opts.agent_jobs,
+            .swarm = opts.swarm,
+            .permission_ctx = @constCast(permission_ctx),
+            .tasks = opts.tasks,
+            .kg = opts.kg,
+            .kg_lexical_ledger = &kg_lexical_ledger,
+            .jev = opts.jev,
+            .jev_request = kg_enumeration_text orelse "",
+            .lesson_binding = if (learning_state.active()) &learning_state.binding else null,
+            .kg_projects_dir = opts.kg_projects_dir,
+            .memdir_abs = opts.memdir_abs,
+            .api_client = opts.api_client,
+            // Root App runs may reuse agent_jobs' owned provider config. Nested
+            // agents can carry a model override while agent_jobs still stores
+            // the parent model, so deriving there would silently search with
+            // the wrong model; they stay on their private serial client unless
+            // their caller supplies an explicit matching factory.
+            .provider_factory = opts.provider_factory orelse if (opts.agent_depth == 0)
+                if (opts.agent_jobs) |registry| registry.providerFactory() else null
+            else
+                null,
+            .provider = provider, // P0.5:子 spawn 继承父 provider(跨 provider 正确)
+            .tool_defs = opts.tool_defs,
+            .agent_depth = opts.agent_depth,
+            .dyn_registry = opts.dyn_registry,
+            .tool_dispatcher = opts.tool_dispatcher,
+            .execution_policy = opts.execution_policy,
+            .tool_observer = opts.tool_observer,
+            .execution_boundary = opts.execution_boundary,
+            .project_rule_gate = opts.project_rule_gate,
+            .tool_observation_origin = .authoritative,
+            .host_services = opts.host_services,
+            .host_run = opts.host_run,
+            .explicit_invocation = opts.explicit_invocation,
+            .session_id = sessionIdText(&opts),
+            .project_dir = opts.project_dir,
+            .disable_shell_execution = opts.disable_shell_execution,
+            .sandbox = opts.sandbox,
+            .cwd_abs = opts.cwd_abs,
+            .resolve_relative_paths = opts.resolve_relative_paths,
+            .path_aliases = opts.path_aliases,
+            .home_dir = opts.home_dir,
+            .state_root = opts.state_root,
+            .artifact_root = opts.artifact_root,
+            // The same value the projection pass below uses. Deriving it here
+            // is what lets a tool bound its own output against the real window
+            // instead of against the floor the budget can never go under - and
+            // against the window of the model this run will actually name, not
+            // the parent's.
+            .result_budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
+            .tool_result_metrics = opts.tool_result_metrics,
+            .file_change_journal = opts.file_change_journal,
+            .additional_dirs = opts.additional_dirs,
+            .agents = opts.agents,
+            .parent_model = opts.parent_model,
+            // 本 run 真会命名的模型及其收图能力——Read 的图片门控按 model_override 判,
+            // 子 agent 不拿父模型的能力当自己的(与 result_budget 同一派生规则)。
+            .active_model = opts.model_override orelse provider.model(),
+            .image_input_supported = provider.supportsForModel(.image_input, opts.model_override),
+            // ToolSearch answers from the tools this request actually carried.
+            .request_tools = .{ .advertised = gated_tool_defs, .catalog = deferred_catalog_defs },
+            .model_tiers = opts.model_tiers,
+            .skills = opts.skills_set,
+            .mcp_sessions = opts.mcp_sessions,
+            .mcp_unavailable = opts.mcp_unavailable,
+            .mcp_late = opts.mcp_late,
+            .cron_registry = opts.cron_registry,
+        };
+
+        // 工具执行期 progress 通路(对齐 cc onProgress):把 WebSearch 子请求的
+        // query_update/results_received 格式化成第二行文本,经 backend.emit(.tool_progress) 喂 UI。
+        // Legacy UI only wires depth zero. AgentCore captures progress from
+        // real children too; its private projector suppresses model-tool
+        // internals before they reach the Host.
+        if (opts.event_projection.emitToolProgress(opts.agent_depth)) {
+            progress_tramp = .{ .be = backend, .session = sess };
+            base_ctx.progress_reporter = .{ .ctx = @ptrCast(&progress_tramp), .reportFn = &ProgressTramp.cb };
+        }
+        if (opts.agent_depth == 0) {
+            // U6 A2:only the real root injects agent_lifecycle/tasks_changed.
+            event_tramp = .{ .be = backend, .session = sess };
+            base_ctx.event_reporter = .{
+                .ctx = @ptrCast(&event_tramp),
+                .agentFn = &EventTramp.agentCb,
+                .tasksFn = &EventTramp.tasksCb,
+            };
+        }
+
+        // Legacy subagents have no terminal UI. AgentCore explicit projections
+        // reuse the outer Run's UI bridge and identity without faking depth.
+        if (opts.ui_requester != null and
+            opts.event_projection.allowUiRequests(opts.agent_depth))
+        {
+            base_ctx.ui_requester = opts.ui_requester;
+        }
+        // 子进程心跳(Bash 长命令"仍在运行")per-session 通路:从 opts 透传到 ctx → spawn 层。
+        base_ctx.spawn_tick_fn = opts.spawn_tick_fn;
+        base_ctx.session = sess; // UiRequest 路由到本 session 视图(M5)
+        base_ctx.agent_ident = opts.agent_ident orelse sess; // 对外身份(claim);主 loop=session,subagent=spawn 时 gen
+        base_ctx.kg_agent_ident = opts.kg_agent_ident;
+        base_ctx.preview = opts.preview;
+        if (opts.preview.execute_code) base_ctx.code_executor = .{ .ctx = &code_bridge, .executeFn = CodeBridge.execute };
+
+        // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
+        // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
+        // 不再 import tool_card UI widget(层泄漏修复)。headless/subagent(depth>0)/无 theme
+        // 时 tool_render_theme=null → 不 emit(那些场景 WriterBackend 也 no-op)。
+        const tool_start_be: ?*const UiBackend = if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) backend else span_sink;
+        if (tool_start_be) |start_be| {
+            for (slots.items) |*s| {
+                // Lifecycle represents the model's tool attempt, not proof of
+                // dispatch. Denied attempts still receive a paired result and
+                // must therefore receive a start event as well.
+                start_be.emitEvent(sess, .{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
+            }
+        }
+        // 进度事件:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
+        // 无条件 emit——backend 自决消费(顶层 TuiBackend 忽略 .progress;JobEntry 后端更新树)。
+        for (slots.items) |*s| {
+            if (s.decision == .run) {
+                emitProgress(backend, sess, turns + 1, s.name, s.input, total_tool_calls);
+                break;
+            }
+        }
+        // P0.4:流式预取命中的 slot 直接填结果(executeSlots 会跳过 prefetched 的,不重复执行)。
+        for (slots.items) |*s| {
+            if (s.decision != .run) continue;
+            if (prefetch.take(s.id)) |pf| {
+                s.content = pf.content;
+                s.sealed = pf.sealed;
+                s.file_refs = pf.file_refs;
+                s.file_changes = pf.file_changes;
+                s.file_changes_overflow = pf.file_changes_overflow;
+                s.file_changes_lost = pf.file_changes_lost;
+                s.is_error = pf.is_error;
+                s.elapsed_ms = pf.elapsed_ms;
+                s.effect = pf.effect;
+                s.effect_valid = pf.effect_valid;
+                s.prefetched = true;
+            }
+        }
+        // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
+        // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
+        const recovery_plan = tool_exec_mod.planRecoveryAllowance(slots.items, base_ctx.result_budget);
+        code_bridge.recovery_charged = recovery_plan.charged_bytes;
+        const deferred_recovery: usize = recovery_plan.deferred_count;
+        for (slots.items) |*s| {
+            if (s.decision != .deferred) continue;
+            if (s.prefetched) {
+                if (s.content) |c| allocator.free(c);
+                s.content = null;
+                s.prefetched = false;
+            }
+            // A deferred slot keeps no sealed handle either (#45); ReadArtifact
+            // never seals, so this only guards the invariant.
+            s.sealed.discard();
+            // The planner charges only served slots, so this is the amount charged before every deferred slot.
+            s.content = try tool_exec_mod.renderRecoveryDeferral(allocator, s.input, recovery_plan, recovery_plan.charged_bytes);
+            s.is_error = true;
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = s.id,
+                .tool = s.name,
+                .decision = "deferred",
+                .source = "recovery_allowance",
+                .allowed = false,
+            } });
+        }
+        if (deferred_recovery > 0) log.info("agent", "recovery allowance: charged={d} allowance={d} deferred={d}", .{ recovery_plan.charged_bytes, recovery_plan.allowance_bytes, deferred_recovery });
+        const exec_outcome = tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        // Merge borrowed evidence only. Inner tool bytes never enter Conversation.
+        const combined_slots = if (code_bridge.slots.items.len == 0) null else allocator.alloc(tool_exec.Slot, slots.items.len + code_bridge.slots.items.len) catch {
+            // Allocation failure cannot erase evidence of tools already run.
+            drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+            drainFileChanges(code_bridge.slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+            try exec_outcome;
+            return error.OutOfMemory;
+        };
+        defer if (combined_slots) |combined| allocator.free(combined);
+        const observed_slots = if (combined_slots) |combined| blk: {
+            @memcpy(combined[0..code_bridge.slots.items.len], code_bridge.slots.items);
+            @memcpy(combined[code_bridge.slots.items.len..], slots.items);
+            break :blk combined;
+        } else slots.items;
+        // Delivery-cadence sensor: observe every executed slot now, before the
+        // suspend and host-fatal paths return without reaching the turn's
+        // tail (Codex review 2026-09-21: a suspended sibling batch used to
+        // leave the terminal record at zero).
+        // A learning pass is outside the attempt (in_learning_pass): the
+        // process sensors below neither count it nor can end it. Only its
+        // lesson refusals are counted.
+        if (in_learning_pass) learning_state.lessons_refused +|= countRefusedLessons(observed_slots);
+        if (!in_learning_pass and (opts.delivery_cadence or opts.delivery_cadence_observe))
+            delivery_cadence_state.observeSlots(allocator, observed_slots);
+        // Host-check-gate sensor, same placement and reason: a delivery-capable
+        // action must mark the run dirty before any early return.
+        if (!in_learning_pass and opts.check_gate != null) check_gate_state.observeSlots(allocator, observed_slots);
+        if (!in_learning_pass and test_integrity_state.armed) test_integrity_state.observeSlots(allocator, observed_slots);
+        // Stall-gate sensor, same placement: the content is still on the slots
+        // (it moves into result_blocks below). First forget what the model can
+        // no longer see — compaction or microcompaction since the last round —
+        // so a re-read of a cleared result counts as news.
+        if (!in_learning_pass) if (stall_state) |state| {
+            state.forgetInvisible(conversation.messages.items, conversation.activeStart());
+            _ = state.observeSlots(observed_slots);
+        };
+        // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
+        drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+        drainFileChanges(code_bridge.slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
+        if (!in_learning_pass) for (code_bridge.slots.items) |inner| {
+            const content = inner.content orelse continue;
+            if (!inner.is_error or !isEnvironmentFault(content)) continue;
+            environment_faults +|= 1;
+            backend.emitEvent(sess, .{ .environment_fault = .{
+                .tool = inner.name,
+                .code = util_json.extractStringField(content, "code") orelse "",
+                .detail = util_json.extractStringField(content, "detail") orelse "",
+                .count = environment_faults,
+                .limit = MAX_ENVIRONMENT_FAULTS,
+            } });
+        };
+        try exec_outcome;
+        // Execution completed without a fatal host result: this is the batch
+        // commit boundary, so sealed artifacts and their references commit together.
+        try tool_exec.publishSealedResults(slots.items, allocator, rid);
+        // Publication can replace an outer slot's content (inline fallback or
+        // withdrawn attachments). Refresh the borrowed view before late sensors
+        // read it, also dropping file-change records already drained above.
+        if (combined_slots) |combined| {
+            @memcpy(combined[0..code_bridge.slots.items.len], code_bridge.slots.items);
+            @memcpy(combined[code_bridge.slots.items.len..], slots.items);
+        }
+        // 成功条件义务 2.0:结果侧回填 met——只有执行成功(!is_error 且
+        // exit_code=0,bash.zig 序列化以 `"exit_code":N}` 收尾)才算履约。
+        if (opts.obligations) |obligation_runtime| {
+            for (slots.items) |*result_slot| {
+                if (result_slot.decision != .run) continue;
+                // R4-1:结果侧**不按名过滤**——slot 带 raw 名("bash" 经 P0.6 修名后真
+                // 执行),按名筛会漏掉 case-variant 的成功回填(dispatch 侧已按 canonical
+                // 记账,两侧键分裂 → 义务永不 met)。observeResult 本就按 pending id 精确
+                // 匹配:非 Bash slot 的 id 永不命中已记账槽,无误报,无需名闸。
+                const body = result_slot.content orelse continue;
+                const ok = !result_slot.is_error and
+                    std.mem.indexOf(u8, body, "\"exit_code\":0}") != null;
+                obligation_runtime.observeResult(result_slot.id, ok);
+            }
+        }
+        backend.emitEvent(sess, .{ .diag_tool_stage = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .turn = turns + 1,
+            .tool_calls = @intCast(slots.items.len),
+            .elapsed_ms = elapsedSinceNs(tool_stage_started_ns),
+        } });
+        if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
+            // P2.1:只发 clear_current_tool 清运行态动态卡。真结果由下方每 slot 的单条
+            // tool_result(真 content)承载,不再双发空+实。
+            backend.emitEvent(sess, .clear_current_tool);
+        }
+
+        // 6c.5 L3 挂起:本轮有工具返 error.UiPending(异步 custom UI 未完成)→ 整轮挂起。
+        // **API 配对约束**:assistant 的每个 tool_use 须在紧接 user 消息里有 tool_result,不能拆
+        // 两次。故挂起时**不**提交任何 partial user 消息;已完成工具的结果 stash 进 SuspendInfo,
+        // resume 时与 pending 的迟来结果一起补成单条 user 消息(A+B 同 turn)。
+        // 找首个 pending 作挂起点;其余 pending(MVP 不支持多挂起点)→ 当错误,resume 时也配对补。
+        var first_pending: ?*tool_exec.Slot = null;
+        for (slots.items) |*s| {
+            if (s.pending) {
+                first_pending = s;
+                break;
+            }
+        }
+        if (first_pending) |s| {
+            // 收集**所有非挂起点**工具的结果(已完成的用真实结果;其余 pending 用错误占位)——
+            // 它们都要在 resume 时与挂起点的迟来结果同 turn 补齐,满足 API 配对。
+            var completed: std.ArrayList(SuspendInfo.CompletedResult) = .empty;
+            errdefer {
+                for (completed.items) |entry| {
+                    allocator.free(entry.tool_use_id);
+                    allocator.free(entry.content);
+                }
+                completed.deinit(allocator);
+            }
+            var completed_names: std.ArrayList([]const u8) = .empty;
+            defer completed_names.deinit(allocator);
+            var pending_siblings: std.ArrayList(SuspendInfo.PendingSibling) = .empty;
+            errdefer {
+                for (pending_siblings.items) |sibling| {
+                    allocator.free(sibling.tool_use_id);
+                    allocator.free(sibling.kind);
+                    allocator.free(sibling.payload_json);
+                }
+                pending_siblings.deinit(allocator);
+            }
+            for (slots.items) |*o| {
+                if (o == s or o.decision != .run) continue;
+                if (o.pending and opts.suspend_all_pending) {
+                    // The whole batch waits elsewhere: hand the sibling over
+                    // with its request intact (ownership moves, no placeholder).
+                    try pending_siblings.append(allocator, .{
+                        .tool_use_id = try allocator.dupe(u8, o.id),
+                        .kind = if (o.pending_kind) |k| k else try allocator.dupe(u8, ""),
+                        .payload_json = if (o.pending_payload) |p| p else try allocator.dupe(u8, "{}"),
+                    });
+                    o.pending_kind = null;
+                    o.pending_payload = null;
+                    if (o.content) |c| {
+                        allocator.free(c);
+                        o.content = null;
+                    }
+                    continue;
+                }
+                const content: []const u8 = if (o.pending)
+                    // 非首个 pending:MVP 不支持并发挂起 → 错误占位(模型 resume 后可重试)。
+                    try tool_error.errorToJson("ConcurrentSuspendUnsupported", "tool {s} requested UI while another suspended; not supported in MVP", .{o.name}, allocator)
+                else
+                    try allocator.dupe(u8, o.content orelse "{}");
+                try completed.append(allocator, .{
+                    .tool_use_id = try allocator.dupe(u8, o.id),
+                    .content = content,
+                    .is_error = if (o.pending) true else o.is_error,
+                });
+                try completed_names.append(allocator, o.name);
+                // 释放 slot 原 owned 内存(content 已 dupe 进 completed;pending 的 kind/payload
+                // 不进 SuspendInfo)——否则泄漏(正常路径 content 移交 result_blocks,此处改 dupe)。
+                if (o.content) |c| {
+                    allocator.free(c);
+                    o.content = null;
+                }
+                if (o.pending) {
+                    if (o.pending_kind) |k| allocator.free(k);
+                    if (o.pending_payload) |p| allocator.free(p);
+                    o.pending_kind = null;
+                    o.pending_payload = null;
+                }
+            }
+            // Suspended sibling results are persisted before suspend.json is
+            // written. They cannot bypass the same one-shot projection simply
+            // because another tool requested asynchronous UI.
+            const suspended_items = try allocator.alloc(result_projection.Item, completed.items.len);
+            defer allocator.free(suspended_items);
+            for (completed.items, 0..) |*entry, index| {
+                suspended_items[index] = .{
+                    .tool_name = completed_names.items[index],
+                    .content = &entry.content,
+                    .is_error = entry.is_error,
+                };
+            }
+            const suspended_projection_stats = try result_projection.project(allocator, suspended_items, .{
+                .session_root = opts.artifact_root,
+                .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
+                .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
+            });
+            if (opts.tool_result_metrics) |metrics| metrics.recordProjection(suspended_projection_stats);
+            // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
+            result_blocks.clearAndFree(allocator);
+            const kind = s.pending_kind orelse "";
+            const payload = s.pending_payload orelse "{}";
+            // 异步前端据此投递 UI 请求(tool_use_id + 渲染规格)。
+            backend.emitEvent(sess, .{ .ui_request_pending = .{ .tool_use_id = s.id, .request_json = payload } });
+            // SuspendInfo 接管挂起点 slot 的 pending 字符串所有权(移动,不重复 dupe);置 null 防 double-free。
+            const si = SuspendInfo{
+                .tool_use_id = try allocator.dupe(u8, s.id),
+                .kind = if (s.pending_kind) |k| k else try allocator.dupe(u8, ""),
+                .payload_json = if (s.pending_payload) |p| p else try allocator.dupe(u8, "{}"),
+                .completed_results = try completed.toOwnedSlice(allocator),
+                .pending_siblings = try pending_siblings.toOwnedSlice(allocator),
+                .allocator = allocator,
+            };
+            s.pending_kind = null;
+            s.pending_payload = null;
+            log.infoId("agent", rid, "run SUSPENDED tool_use_id={s} kind={s} completed_siblings={d}", .{ s.id, kind, si.completed_results.len });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si });
+        }
+
+        const observe_verification = opts.verification_checkpoint or
+            opts.verification_final_gate or opts.verification_final_observe or
+            opts.requirement_ledger or opts.requirement_ledger_observe;
+        // PO-V2 M2(observe-only):候选信号要的是"编辑发生时,最近验证是否
+        // 失败"——必须取 observeTurn 之前的位;本轮自己的验证结果属于下一轮。
+        const pre_turn_verification_failed = verification_progress.last_verification_failed;
+        const inject_verification_checkpoint = observe_verification and
+            verification_progress.observeTurn(allocator, observed_slots) and
+            opts.verification_checkpoint;
+        if (observe_verification) {
+            if (opts.tool_observer) |observer| {
+                for (observed_slots) |slot| {
+                    if (slot.decision != .run or slot.is_error) continue;
+                    const is_file_edit = std.mem.eql(u8, slot.name, "Edit") or
+                        std.mem.eql(u8, slot.name, "Write") or
+                        std.mem.eql(u8, slot.name, "NotebookEdit");
+                    if (!is_file_edit) continue;
+                    if (!verification_progress_mod.isRealizedMutation(slot.effect, slot.effect_valid)) continue;
+                    const edit_path = verification_progress_mod.slotFilePath(allocator, slot.input) orelse continue;
+                    defer allocator.free(edit_path);
+                    if (!verification_progress_mod.isTestFilePath(edit_path)) continue;
+                    _ = observer.emit(.{ .test_weakening_candidate = .{
+                        .dispatch_id = slot.id,
+                        .path_sha256 = tools_mod.tool_observation.sha256Hex(edit_path),
+                        .tool = slot.name,
+                        .assert_tokens_touched = verification_progress_mod.editTouchesAssertTokens(slot.input),
+                        .last_verification_failed = pre_turn_verification_failed,
+                    } });
+                }
+            }
+        }
+
+        // 6d. 按原顺序回填 result_blocks。
+        // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。
+        var post_ctx: std.ArrayList(u8) = .empty;
+        defer post_ctx.deinit(allocator);
+        try post_ctx.appendSlice(allocator, code_bridge.post_context.items);
+        for (slots.items) |*s| {
+            // takeContent:ownership 转移给 result_blocks 并置空 slot 字段——
+            // 顶部 defer 的 Slot.deinit 不会再碰它(双释放防线)。
+            const content = s.takeContent() orelse try tool_error.errorToJson("InternalError", "tool {s} produced no result", .{s.name}, allocator);
+            // 已离开 slot、尚未进 result_blocks 的真空期:本迭代内 try 失败由此兜底。
+            // 旗标而非裸 errdefer:append 后 ownership 归 result_blocks(其 errdefer 接管),
+            // 本迭代若再加 try 也不会双释放。
+            var content_transferred = false;
+            errdefer if (!content_transferred) allocator.free(content);
+            const tool_use_id = try allocator.dupe(u8, s.id);
+            errdefer if (!content_transferred) allocator.free(tool_use_id);
+            try result_blocks.append(allocator, .{ .tool_result = .{
+                .tool_use_id = tool_use_id,
+                .content = content,
+                .is_error = s.is_error,
+            } });
+            content_transferred = true;
+
+            // PostToolUse hook(执行后,仅真跑过的 slot):收集 additionalContext 注入下轮上下文。
+            if (s.decision == .run) {
+                if (hookset) |hs| if (hs.hasPost()) {
+                    if (hooks_mod.runPostToolUse(hs, allocator, s.name, s.input, content, opts.abort)) |ac| {
+                        defer allocator.free(ac);
+                        if (post_ctx.items.len > 0) post_ctx.append(allocator, '\n') catch {};
+                        post_ctx.appendSlice(allocator, ac) catch {};
+                    }
+                };
+            }
+
+            // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
+            // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
+            // 但那些场景用 WriterBackend,tool_result no-op)。渲染移入 backend(renderResult)。
+            const tool_result_be: ?*const UiBackend = if (opts.event_projection.emitToolResult(opts.emit_tool_cards)) backend else span_sink;
+            if (tool_result_be) |result_be| {
+                result_be.emitEvent(sess, .{ .tool_result = .{
+                    .id = s.id,
+                    .name = s.name,
+                    .input = s.input,
+                    .content = content,
+                    .is_error = s.is_error,
+                    .elapsed_ms = s.elapsed_ms,
+                    .file_refs = s.file_refs,
+                } });
+            }
+
+            // 环境故障:出现即告知(事件),累计到阈值本轮结束后停(见下方对话提交处)。
+            // content 的所有权已归 result_blocks,这里只读。**必须在 tool_result 之后发**:
+            // TUI 在 tool_result 时才把动态卡 commit 进滚动区,先发故障行会让它印在上一张卡
+            // 下面,读起来像是上一条命令出了错(2026-09-23 实录)。
+            // A learning pass ran after the attempt ended: its faults do not count toward the breaker.
+            if (!in_learning_pass and s.is_error and isEnvironmentFault(content)) {
+                environment_faults += 1;
+                backend.emitEvent(sess, .{ .environment_fault = .{
+                    .tool = s.name,
+                    .code = util_json.extractStringField(content, "code") orelse "",
+                    .detail = util_json.extractStringField(content, "detail") orelse "",
+                    .count = environment_faults,
+                    .limit = MAX_ENVIRONMENT_FAULTS,
+                } });
+            }
+        }
+
+        if (result_blocks.items.len == 0) {
+            result_blocks.deinit(allocator);
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
+        // Hooks and UI above observe the exact execution result. Only now do
+        // we commit the deterministic model-visible representation. This runs
+        // once per result; later requests reuse the same Conversation bytes,
+        // preserving provider prompt-cache prefixes.
+        const projection_items = try allocator.alloc(result_projection.Item, result_blocks.items.len);
+        defer allocator.free(projection_items);
+        for (result_blocks.items, 0..) |*block, index| {
+            if (block.* != .tool_result) unreachable;
+            projection_items[index] = .{
+                .tool_name = slots.items[index].name,
+                .content = &block.tool_result.content,
+                .is_error = block.tool_result.is_error,
+            };
+        }
+        const projection_stats = try result_projection.project(allocator, projection_items, .{
+            .session_root = opts.artifact_root,
+            .budget = result_budget_mod.Budget.fromModel(provider.maxInputTokensFor(opts.model_override)),
+            // Fresh results get whatever the cap leaves after the images no trim
+            // may remove (user images, undelivered results already in history).
+            .per_turn_image_bytes = opts.image_request_bytes_cap -| conversation.nonTrimmableImageBytes(),
+        });
+        if (opts.tool_result_metrics) |metrics| metrics.recordProjection(projection_stats);
+        if (projection_stats.changed() or projection_stats.budget_exhausted) {
+            log.info("agent", "tool-result projection: raw={d} projected={d} artifact_bytes={d} spills={d} fallback={d} turn_spills={d} image_spills={d} image_exempt={d} regrown={d} reinlined={d} session_artifact_bytes={d} budget_exhausted={}", .{
+                projection_stats.raw_bytes,
+                projection_stats.projected_bytes,
+                projection_stats.artifact_bytes,
+                projection_stats.artifact_spill_count,
+                projection_stats.unrecoverable_fallback_count,
+                projection_stats.turn_budget_spills,
+                projection_stats.image_spills,
+                projection_stats.image_exempt_count,
+                projection_stats.envelope_regrown_count,
+                projection_stats.envelope_reinlined_count,
+                projection_stats.session_artifact_bytes,
+                projection_stats.budget_exhausted,
+            });
+        }
+
+        // PostToolUse additionalContext → 同一 user 消息追加一个 text block(下轮模型可见)。
+        if (post_ctx.items.len > 0) {
+            const ctx_text = try std.fmt.allocPrint(allocator, "[PostToolUse hook]\n{s}", .{post_ctx.items});
+            try result_blocks.append(allocator, .{ .text = ctx_text });
+        }
+        if (inject_verification_checkpoint) {
+            const checkpoint = try allocator.dupe(
+                u8,
+                verification_progress_mod.CHECKPOINT_TEXT,
+            );
+            try result_blocks.append(allocator, .{ .text = checkpoint });
+        }
+        // Requirement-ledger prompt: once, at the first tool-result boundary
+        // (the cacheable first request stays byte-identical across arms).
+        if (opts.requirement_ledger and !requirement_ledger_state.prompt_emitted) {
+            requirement_ledger_state.prompt_emitted = true;
+            const prompt = try allocator.dupe(
+                u8,
+                requirement_ledger_mod.LEDGER_PROMPT_TEXT,
+            );
+            try result_blocks.append(allocator, .{ .text = prompt });
+        }
+        // Churn caution: enforced-gate arms only (observe mode must stay
+        // behavior-neutral), at most once per session, fired the turn a
+        // mutation lands on previously-verified state.
+        if (opts.verification_final_gate and verification_progress.takeChurnCaution()) {
+            const caution = try allocator.dupe(
+                u8,
+                verification_progress_mod.FRESHNESS_TEXT,
+            );
+            try result_blocks.append(allocator, .{ .text = caution });
+        }
+        if (opts.jev) |advisor| {
+            if (advisor.advises(.enumeration_intent) and !kg_enumeration_judged and !kg_enumeration_query_hint and
+                kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, false) == .none and
+                kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, true) == .batch)
+            {
+                kg_enumeration_judged = true;
+                kg_enumeration_soft_hint = try judgeEnumerationIntent(advisor, allocator, opts, kg_enumeration_text.?);
+            }
+        }
+        const kg_pending = kgEnumerationPending(
+            &kg_lexical_ledger,
+            gated_tool_defs,
+            kg_enumeration_query_hint or kg_enumeration_soft_hint,
+        );
+        if (kg_pending == .batch and !kg_coverage_reminder_emitted) {
+            const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_COVERAGE_REMINDER);
+            try result_blocks.append(allocator, .{ .text = reminder });
+            kg_coverage_reminder_emitted = true;
+        } else if (kg_pending == .context and !kg_context_reminder_emitted) {
+            const reminder = try allocator.dupe(u8, kg_retrieval_protocol.ENUMERATION_CONTEXT_REMINDER);
+            try result_blocks.append(allocator, .{ .text = reminder });
+            kg_context_reminder_emitted = true;
+        }
+
+        const blocks_owned = try result_blocks.toOwnedSlice(allocator);
+        try conversation.append(.{ .role = .user, .blocks = blocks_owned });
+        if (harnessmm_enabled) {
+            var certificate = try harnessmm.observe(conversation.messages.items[conversation.messages.items.len - 1], turns + 1);
+            defer if (certificate) |*value| value.deinit();
+            if (certificate) |*value| try harnessmm_journal.?.append(allocator, value);
+        }
+        // The round's results are now the last message, one block per slot:
+        // the stall gate anchors each key to the block the model will see.
+        if (!in_learning_pass) if (stall_state) |state| state.anchorRound(conversation.messages.items);
+
+        // 环境故障熔断:第 MAX_ENVIRONMENT_FAULTS 次之后停。放在结果提交进对话**之后**,
+        // 续接时模型看得到全部证据;用 .tool_loop 收口(ABI 里保留的熔断停止原因),并发
+        // diag_breaker_tripped 供评估/诊断流。
+        if (environment_faults >= MAX_ENVIRONMENT_FAULTS) {
+            backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = environment_faults } });
+            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+            fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
+        // Stall gate (StallGate.lean): decided after the results are committed,
+        // so a resumed run sees all the evidence; the environment-fault breaker
+        // above is the more specific cause and goes first. Enforce ends the run
+        // without injecting anything; observe only records the decision.
+        if (!in_learning_pass) if (opts.stall_gate) |mode| if (stall_state) |state| if (state.decide(opts.stall_gate_thresholds)) |cause| {
+            const report = state.noteDecided(cause);
+            log.warn("agent", "stall gate {s}: cause={s} stale_rounds={d} repeats={d} tool={s} round={d}", .{ @tagName(mode), @tagName(cause), report.stale_rounds, report.repeats, report.tool.slice(), report.round });
+            if (mode == .enforce) {
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                fireStopHook(permission_ctx.hooks, allocator, conversation, "stalled", depth);
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .stalled, .turns = turns + 1, .tool_calls = total_tool_calls, .stall = report });
+            }
+        };
+
+        // Mid-turn follow-up compact: after tool_result blocks are appended and
+        // before the next sampling request, re-check the actual pending request.
+        // This is the explicit Rust/metacode "post_sampling_follow_up_threshold"
+        // equivalent; the next loop's pre-sampling check would be close, but this
+        // makes the follow-up boundary a real trigger point with its own cause.
+        const post_tool_compact = try runAutoCompactControlled(
+            conversation,
+            provider,
+            effective_system_prompt,
+            opts.inject_user_context,
+            null,
+            gated_tool_defs,
+            opts.model_override,
+            null,
+            opts.auto_compact_threshold,
+            opts.auto_compact_keep_recent,
+            "post_tool_follow_up_threshold",
+            false,
+            backend,
+            sess,
+            trace_id,
+            depth,
+            turns + 1,
+            &context_warning_emitted,
+            allocator,
+            opts.tasks,
+            permission_ctx.hooks,
+            &compact_summary_reserve_tokens,
+            opts.request_gate,
+            opts.abort,
+            opts.goal_meter,
+            opts.compaction_control,
+            false,
+        );
+        if (compactStopReason(post_tool_compact, opts.abort)) |stop_reason| {
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
+        // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
+        // end_turn 路径在上方提前 return + diag_run_end 收口,故不重复发)。
+        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+    }
+
+    // 循环正常退出 = turns >= max_turns
+    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls });
+}
+
+const KgEnumerationPending = enum { none, batch, context };
+
+/// Ask the System-One judge whether the run's user request needs enumeration
+/// coverage, journal the consultation, and return whether it armed the soft
+/// hint (advisory mode and a positive answer). Every failure arms nothing.
+fn judgeEnumerationIntent(
+    advisor: *@import("../jev/advisor.zig").Advisor,
+    allocator: std.mem.Allocator,
+    opts: Options,
+    text: []const u8,
+) error{OutOfMemory}!bool {
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return false;
+    const judgment = advisor.judgeEnumerationIntent(allocator, opts.abort, text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The loop's own abort check ends the run; a skipped judgment arms nothing.
+        error.Aborted => return false,
+    };
+    const threshold = @import("../kg/retrieval_protocol.zig").ENUMERATION_JUDGE_THRESHOLD_PERCENT;
+    const positive = judgment.answered() and judgment.percents[0] >= threshold;
+    const armed = positive and advisor.actuates();
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(judgment.audit.event(armed, @intCast(judgment.count), @intFromBool(positive), @intFromBool(positive)));
+    }
+    log.info("agent", "enumeration judge mode={s} outcome={s} percent={d} armed={}", .{
+        @tagName(judgment.audit.mode), @tagName(judgment.audit.outcome), judgment.percents[0], armed,
+    });
+    return armed;
+}
+
+fn kgEnumerationPending(
+    ledger: *@import("../kg/lexical_query_plan.zig").Ledger,
+    tool_defs: []const json_mod.ToolDefinition,
+    query_hint: bool,
+) KgEnumerationPending {
+    var kg_recall_visible = false;
+    var kg_context_visible = false;
+    for (tool_defs) |definition| {
+        if (std.mem.eql(u8, definition.name, "KgRecall")) {
+            kg_recall_visible = true;
+        } else if (std.mem.eql(u8, definition.name, "KgContext")) {
+            kg_context_visible = true;
+        }
+    }
+    if (!kg_recall_visible) return .none;
+    const coverage = ledger.coverageState();
+    const enumeration_active = coverage.successful_plan_calls > 0 and
+        (query_hint or coverage.enumeration_plan_calls > 0);
+    if (!enumeration_active) return .none;
+    if (!coverage.enumeration_batch_committed) return .batch;
+    if (kg_context_visible and
+        coverage.enumeration_context_required and
+        !coverage.enumeration_context_committed) return .context;
+    return .none;
+}
+
+test "enumeration coverage gate ignores query wording before a successful recall" {
+    var ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
+    const tool_defs = [_]json_mod.ToolDefinition{.{
+        .name = "KgRecall",
+        .description = "recall",
+        .input_schema = .{ .prop_specs = &.{}, .required = &.{} },
+    }};
+
+    try std.testing.expectEqual(KgEnumerationPending.none, kgEnumerationPending(&ledger, &tool_defs, true));
+    try std.testing.expectEqual(KgEnumerationPending.none, kgEnumerationPending(&ledger, &.{}, true));
+}
+
+fn elapsedSinceNs(started_ns: util_time.Nanos) u64 {
+    const now = util_time.nowNs();
+    if (now <= started_ns) return 0;
+    return @intCast(@divTrunc(now - started_ns, std.time.ns_per_ms));
+}
+
+/// L3 恢复:把异步 UI 响应 + 同轮已完成工具的结果**一起**注入为单条 user 消息(满足 API 的
+/// tool_use/tool_result 同 turn 配对),然后续跑 run()。
+///
+/// conversation 须已含挂起点的 assistant(带那些 tool_use)——同进程时它还在内存;跨进程/重启
+/// 时由调用方先 loadTranscript 从盘重建。resumeRun 不关心来源,只:① 构造一条 user 消息,内含
+/// **挂起点 tool_use 的迟来 tool_result(content=response_json)+ completed_results 里每个同轮
+/// 已完成工具的 tool_result**;② 调 run() 续跑。response_json / completed 借用,append 时 dupe。
+///
+/// **为什么要 completed_results**:挂起的那条 assistant 消息可能有多个 tool_use(A=pending,
+/// B/C=done)。API 要求 A+B+C 的 tool_result 都在紧接的同一条 user 消息里。挂起时已完成的 B/C
+/// 结果没单独提交(那样会拆 turn 违规),而是 stash 在 SuspendInfo.completed_results,此刻一起补。
+/// Resume a run suspended with `suspend_all_pending`: every pending tool use of
+/// the batch (the suspend point and its `pending_siblings`) plus the completed
+/// siblings arrive as one list, and enter the conversation as one user message
+/// so the API's tool_use/tool_result pairing holds. `results` are borrowed.
+pub fn resumeRunWithResults(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    results: []const SuspendInfo.CompletedResult,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+) !RunResult {
+    if (results.len == 0) return error.NoResultsToResume;
+    // Refused before the results are appended, as in `resumeRun`.
+    try refuseServerTools(tool_defs, opts);
+    var blocks: std.ArrayList(msg.Block) = .empty;
+    errdefer {
+        for (blocks.items) |block| block.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+    for (results) |result| {
+        const id = try allocator.dupe(u8, result.tool_use_id);
+        errdefer allocator.free(id);
+        const content = try allocator.dupe(u8, result.content);
+        errdefer allocator.free(content);
+        try blocks.append(allocator, .{ .tool_result = .{
+            .tool_use_id = id,
+            .content = content,
+            .is_error = result.is_error,
+        } });
+    }
+    try conversation.append(.{ .role = .user, .blocks = try blocks.toOwnedSlice(allocator) });
+    log.info("agent", "resume: injected {d} tool_result(s) for a remote batch, continuing run", .{results.len});
+    return run(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator);
+}
+
+pub fn resumeRun(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    resumed_tool_use_id: []const u8,
+    response_json: []const u8,
+    completed_results: []const SuspendInfo.CompletedResult,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+) !RunResult {
+    // Refused before the resumed results are appended: a refused resume must
+    // leave the Conversation exactly as it was.
+    try refuseServerTools(tool_defs, opts);
+    // 一条 user 消息,内含挂起点的迟来结果 + 所有同轮已完成工具的结果(同 turn 配对)。
+    var blocks: std.ArrayList(msg.Block) = .empty;
+    errdefer blocks.deinit(allocator);
+    try blocks.append(allocator, .{ .tool_result = .{
+        .tool_use_id = try allocator.dupe(u8, resumed_tool_use_id),
+        .content = try allocator.dupe(u8, response_json),
+        .is_error = false,
+    } });
+    for (completed_results) |cr| {
+        try blocks.append(allocator, .{ .tool_result = .{
+            .tool_use_id = try allocator.dupe(u8, cr.tool_use_id),
+            .content = try allocator.dupe(u8, cr.content),
+            .is_error = cr.is_error,
+        } });
+    }
+    try conversation.append(.{ .role = .user, .blocks = try blocks.toOwnedSlice(allocator) });
+    log.info("agent", "resume: injected {d} tool_result(s) (pending={s} + {d} siblings), continuing run", .{ completed_results.len + 1, resumed_tool_use_id, completed_results.len });
+    // 续跑(可能再次挂起——resume 可链式)。
+    return run(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator);
+}
+
+/// 取对话里最近一条 user 文本 block(borrowed),用于 web_search 显示真实 query。
+/// 找不到返回 ""。从后往前找第一条 role==.user 且含 text block 的。
+fn latestUserText(conversation: *const @import("metacodes-kernel").conversation.Conversation) []const u8 {
+    var i: usize = conversation.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const m = conversation.messages.items[i];
+        if (m.role != .user) continue;
+        for (m.blocks) |b| {
+            // host 注入的记录(进度提醒等)不是用户原话:跳过,继续往前找。
+            if (b == .text and b.text.len > 0 and !@import("host_injection_meter.zig").isHostText(m, b.text)) return b.text;
+        }
+    }
+    return "";
+}
+
+/// 把 Conversation 中的所有消息 1:1 映射为 `types.ApiMessage`，
+/// 供 `client.sendMessageStream` 使用。调用方必须用 `freeApiMessages` 释放。
+fn buildApiMessages(
+    conversation: *const Conversation,
+    allocator: std.mem.Allocator,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+) !std.ArrayList(types.ApiMessage) {
+    // Estimates conservatively include historical notes. Actual requests use
+    // the resolved run selections below, without rewriting durable history.
+    return buildApiMessagesWithFeatures(conversation, allocator, inject_user_context, synthetic_user_input, .{ .harnessmm = true, .rsi = true });
+}
+
+const OptimizationNotes = struct { harnessmm: bool, rsi: bool };
+
+fn buildApiMessagesWithFeatures(
+    conversation: *const Conversation,
+    allocator: std.mem.Allocator,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    notes: OptimizationNotes,
+) !std.ArrayList(types.ApiMessage) {
+    var out = std.ArrayList(types.ApiMessage).empty;
+    errdefer {
+        freeApiMessages(&out, allocator);
+    }
+
+    // 首条 user-context message(对齐 cc prependUserContext):合成一条 user message,
+    // content 单 text block = `<system-reminder>` 包裹的 CLAUDE.md/AutoMem/currentDate。
+    // 借用 inject_user_context 的字节(不 dupe);freeApiMessages 只 free content 数组本身,
+    // 不 free block 内字符串——与下方 conversation 借用块同策略。
+    if (inject_user_context) |ctx_text| {
+        if (ctx_text.len > 0) {
+            const contents = try allocator.alloc(types.ApiContent, 1);
+            contents[0] = .{ .text = ctx_text };
+            try out.append(allocator, .{ .role = .user, .content = contents });
+        }
+    }
+
+    // P1.5 纯投影:压缩摘要作为边界前一条 assistant 消息注入(原始消息仍全量留在 conversation,
+    // 只是不发)。发给模型 = [inject_ctx] + [summary] + activeMessages()。与 totalTokens 投影一致。
+    if (conversation.compact_summary) |summ| {
+        if (summ.len > 0) {
+            const contents = try allocator.alloc(types.ApiContent, 1);
+            contents[0] = .{ .text = summ }; // 借用 conversation 拥有的摘要字节
+            try out.append(allocator, .{ .role = .assistant, .content = contents });
+        }
+    }
+
+    for (conversation.activeMessages()) |m| {
+        // A restored host instruction cannot reactivate a disabled feature.
+        // Keep message positions, native calls/results and transcript bytes;
+        // only omit our standalone guidance from this provider projection.
+        if (m.origin == .host and m.blocks.len == 1 and m.blocks[0] == .text) {
+            const text = m.blocks[0].text;
+            if ((!notes.harnessmm and std.mem.startsWith(u8, text, harnessmm_mod.AUTHOR_MARKER)) or
+                (!notes.rsi and std.mem.startsWith(u8, text, @import("../skills/rsi.zig").PREFIX))) continue;
+        }
+        try @import("metacodes-kernel").appendHistoryMessage(&out, allocator, m);
+    }
+    if (synthetic_user_input) |synthetic_text| {
+        if (synthetic_text.len > 0) {
+            const contents = try allocator.alloc(types.ApiContent, 1);
+            contents[0] = .{ .text = synthetic_text };
+            try out.append(allocator, .{ .role = .user, .content = contents });
+        }
+    }
+    // P0.6 弱模型健壮性层:发请求前规范化——剥孤儿 tool_result + 补缺失结果 + 合并连续同角色。
+    // 维持 content 数组 owned / block 借用的内存契约(见 message_repair 顶注)。
+    try @import("message_repair.zig").normalizeApiMessages(allocator, &out);
+    return out;
+}
+
+fn freeApiMessages(list: *std.ArrayList(types.ApiMessage), allocator: std.mem.Allocator) void {
+    for (list.items) |m| {
+        allocator.free(m.content);
+    }
+    list.deinit(allocator);
+}
+
+fn estimateNextRequestTokens(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    conversation: *const Conversation,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !usize {
+    // 热路径:usage 锚点有效 → 服务端实计 tokens + 锚点后新消息的本地估算。
+    // 锚点请求已含 system/tools/inject_user_context,不重复计;synthetic 只在
+    // turns==0 发,锚点在则它已被计入或不再发,同样不补。
+    if (conversation.usageAnchor()) |anchor| {
+        var total: usize = anchor.context_tokens;
+        for (conversation.messages.items[anchor.msg_count..]) |m| {
+            total += estimateMessageTokens(m);
+        }
+        return total;
+    }
+    // 冷路径(首轮/后端不报 usage/前缀被 compact 改写):序列化真实下一请求做全量估算。
+    var api_messages = try buildApiMessages(conversation, allocator, inject_user_context, synthetic_user_input);
+    defer freeApiMessages(&api_messages, allocator);
+    return estimateApiRequestTokens(allocator, provider, api_messages.items, system_prompt, tool_defs, model_override);
+}
+
+/// 单条消息的 token 估算(usage 锚点后缀用):text/tool_use/tool_result 各 block
+/// 走 Conversation.estimateTokens,再加 JSON 信封开销;thinking 不回 API 不计。
+fn estimateMessageTokens(m: msg.Message) usize {
+    var total: usize = 8; // message 信封(role/content 括号)
+    for (m.blocks) |b| {
+        total += 12; // block 信封(type/id 等字段)
+        switch (b) {
+            .text => |t| total += Conversation.estimateTokens(t),
+            .tool_use => |tu| total += Conversation.estimateTokens(tu.name) + Conversation.estimateTokens(tu.input),
+            // usage-anchor 热路径同口径:Read 图像 tool_result 落在锚点后缀时按
+            // IMAGE_TOKEN_ESTIMATE 计,否则一次大图 Read 就把 anchor+增量推过
+            // auto_threshold,每图强制一次有损 compact。
+            .tool_result => |tr| total += if (json_mod.extractImageResult(tr.content) != null)
+                conversation_mod.IMAGE_TOKEN_ESTIMATE
+            else
+                Conversation.estimateTokens(tr.content),
+            .thinking => {},
+            .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
+            // 加密推理状态:回传时 provider 按它编码的**推理 token** 计费,不是
+            // 按密文字节。密文没有可本地推断的 token 数,取保守常量高估——
+            // auto-compact 宁可早触发,绝不因低估爆窗口(与图像同一取向)。
+            .reasoning_item => total += conversation_mod.REASONING_ITEM_TOKEN_ESTIMATE,
+        }
+    }
+    return total;
+}
+
+/// 估算/预留/身份专用投影:把图像载荷换成短占位 text(真实请求绝不经此路径)。
+/// 覆盖两种图像通道:一等 `.image` block 与 Read 工具图像形态的 tool_result
+/// (`{"type":"image",...}` JSON,经 request.zig extractImageResult 判定)。
+/// 动机:①字节估算(≈bytes/4)会把 MB 级 base64 计成~百万 token(3.75MB 图 ≈ 125 万),
+/// 误触发 auto-compact 与预算门;②这些路径统一走 Anthropic 序列化器,非 claude 模型带图
+/// 会因 vision 守门报错(request_gate 场景 catch 成 maxInt → 必被预算拒)。投影后
+/// body 无 base64、序列化必成功;图的真实贡献按 IMAGE_TOKEN_ESTIMATE 单独加回。
+/// 返回 null = 无图(调用方直接用原 slice,零分配零拷贝)。
+/// pub:agentcore session_budget 的请求字节测量复用同一投影(加回真实载荷长度)。
+pub const EstimationProjection = struct {
+    messages: []types.ApiMessage,
+    image_count: usize,
+
+    pub fn deinit(self: EstimationProjection, allocator: std.mem.Allocator) void {
+        for (self.messages) |m| allocator.free(m.content);
+        allocator.free(self.messages);
+    }
+};
+
+/// 需要在估算前换成占位的载荷块:base64 直接进字节估算会把一张图计成上百万
+/// token,且会撞上非 Claude 模型的能力守门。
+fn contentNeedsProjection(c: types.ApiContent) bool {
+    return switch (c) {
+        .image => true,
+        .tool_result => |tr| json_mod.extractImageResult(tr.content) != null,
+        else => false,
+    };
+}
+
+pub fn projectPayloadsForEstimation(allocator: std.mem.Allocator, messages: []const types.ApiMessage) !?EstimationProjection {
+    var image_count: usize = 0;
+    for (messages) |m| for (m.content) |c| {
+        if (contentNeedsProjection(c)) image_count += 1;
+    };
+    if (image_count == 0) return null;
+    const out = try allocator.alloc(types.ApiMessage, messages.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |m| allocator.free(m.content);
+        allocator.free(out);
+    }
+    for (messages, 0..) |m, i| {
+        const content = try allocator.alloc(types.ApiContent, m.content.len);
+        for (m.content, 0..) |c, ci| content[ci] = switch (c) {
+            .image => .{ .text = "[image]" }, // static 占位,借用语义与其余 block 一致
+            .tool_result => |tr| if (json_mod.extractImageResult(tr.content) != null)
+                .{ .tool_result = .{
+                    .tool_use_id = tr.tool_use_id,
+                    .content = "[image tool result]",
+                    .is_error = tr.is_error,
+                } }
+            else
+                c,
+            else => c,
+        };
+        out[i] = .{ .role = m.role, .content = content };
+        built = i + 1;
+    }
+    return .{ .messages = out, .image_count = image_count };
+}
+
+/// 投影 + Anthropic-canonical 序列化(估算/预留/身份共用的唯一入口——"序列化用于
+/// 度量必先投影"的不变量在此由构造保证,新消费者无法绕过)。调用方 free body。
+const EstimationBody = struct { body: []u8, image_tokens: u64 };
+
+fn serializeForEstimation(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !EstimationBody {
+    const projection = try projectPayloadsForEstimation(allocator, messages);
+    defer if (projection) |p| p.deinit(allocator);
+    const effective: []const types.ApiMessage = if (projection) |p| p.messages else messages;
+    const image_tokens: u64 = @intCast((if (projection) |p| p.image_count else 0) * conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = model_override orelse provider.model(),
+        // Same override as the line above. The two describe one request, and
+        // reading them from different models is how an estimate drifts from
+        // what is actually sent.
+        .max_tokens = provider.maxTokensFor(model_override),
+        .messages = effective,
+        .system = system_prompt,
+        .stream = true,
+        .tools = tool_defs,
+        .reasoning_effort = provider.reasoningEffort(),
+    }, allocator);
+    return .{ .body = body, .image_tokens = image_tokens };
+}
+
+fn estimateApiRequestTokens(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !usize {
+    const est = try serializeForEstimation(allocator, provider, messages, system_prompt, tool_defs, model_override);
+    defer allocator.free(est.body);
+    return Conversation.estimateTokens(est.body) +| @as(usize, @intCast(est.image_tokens));
+}
+
+/// Conservative request-local input reserve used by the paid evaluation gate.
+/// Freeze both independent estimates: twice the calibrated local tokenizer
+/// estimate, or one token per two serialized UTF-8 bytes, whichever is larger.
+/// The fixed margin covers provider-side chat framing absent from the JSON.
+fn serializedRequestInputTokenReserve(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !u64 {
+    // 图像经估算投影(serializeForEstimation):按 IMAGE_TOKEN_ESTIMATE 计入 estimated
+    // (随 doubled 一起获得 2x 预留),不按 base64 字节计——否则一张图就把预留推到
+    // ~百万 token,request_gate 必拒。byte_reserve 的 floor 相应基于投影后 body:
+    // provider 按 token 计费(base64 字节不进 tokenizer 语义),图的预留由
+    // IMAGE_TOKEN_ESTIMATE*2(≈2x 缩放上限)承担,不再由 wire 字节 floor 承担。
+    const est = try serializeForEstimation(allocator, provider, messages, system_prompt, tool_defs, model_override);
+    defer allocator.free(est.body);
+    const estimated = @as(u64, @intCast(Conversation.estimateTokens(est.body))) +| est.image_tokens;
+    const doubled_estimate = estimated *| 2;
+    const byte_reserve = (@as(u64, @intCast(est.body.len)) +| 1) / 2;
+    return @max(doubled_estimate, byte_reserve) +| 4096;
+}
+
+/// Provider-neutral identity of the exact AgentLoop request IR. Concrete
+/// transports may serialize different wire dialects, but retries and restored
+/// runs compare this canonical projection before any provider I/O.
+/// 图像处理:canonical 序列化用估算投影(占位替换,避开 vision 守门——否则非 claude
+/// vision 模型带图的 execution-boundary 会话在此报错,run 直接 .api_error),图像
+/// 内容的身份经原始载荷字节按序追加进 hash(sha256Hex 每段带长度前缀,无拼接歧义):
+/// 两图交换/换内容/换 MIME → hash 变;身份完备且恒可计算。
+fn canonicalAgentRequestSha256(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) ![64]u8 {
+    const est = try serializeForEstimation(allocator, provider, messages, system_prompt, tool_defs, model_override);
+    defer allocator.free(est.body);
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+    try parts.append(allocator, est.body);
+    for (messages) |m| for (m.content) |c| switch (c) {
+        .image => |img| {
+            try parts.append(allocator, img.media_type);
+            try parts.append(allocator, img.data);
+        },
+        // 推理续传项不进 Anthropic canonical 序列化(那是 Responses 私有形态),
+        // 但两个只在它上有差别的请求确实是不同的请求 IR —— 一并进身份哈希。
+        .reasoning_item => |item| {
+            try parts.append(allocator, item.model);
+            try parts.append(allocator, item.json);
+        },
+        .tool_result => |tr| if (json_mod.extractImageResult(tr.content) != null) {
+            try parts.append(allocator, tr.content);
+        },
+        else => {},
+    };
+    return execution_effect.sha256Hex(parts.items);
+}
+
+fn estimateNextRequestTokensOrFallback(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    conversation: *const Conversation,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) usize {
+    return estimateNextRequestTokens(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override) catch |err| {
+        log.warn("agent", "actual request token estimate failed: {s}; using fallback estimate", .{@errorName(err)});
+        return estimateNextRequestTokensFallback(conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs);
+    };
+}
+
+const AutoCompactOutcome = enum {
+    not_needed,
+    compacted,
+    skipped_no_savings,
+    /// The Run was cancelled while compacting.
+    aborted,
+    /// The durable-state owner refused the replacement at the commit point
+    /// (issue #430). It recorded its own terminal; the Run stops the way a
+    /// request the owner refused stops, never as a cancellation.
+    refused,
+    api_error,
+};
+
+/// The stop a compaction outcome imposes on the Run, or null when the Run
+/// continues. One mapping for every boundary, so a new outcome cannot be
+/// silently treated as "continue".
+fn compactStopReason(outcome: AutoCompactOutcome, abort: ?*const AbortSignal) ?StopReason {
+    return switch (outcome) {
+        .not_needed, .compacted, .skipped_no_savings => null,
+        .aborted => stopReasonForAbort(abort),
+        // A refused replacement ends where a refused owner admission ends: a
+        // failed request whose reason is the owner's recorded outcome.
+        .refused, .api_error => .api_error,
+    };
+}
+
+fn serializeToolSchemasForCache(
+    allocator: std.mem.Allocator,
+    tool_defs: []const json_mod.ToolDefinition,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (tool_defs, 0..) |tool, index| {
+        if (index > 0) try out.append(allocator, ',');
+        try @import("metacodes-ai").api.request.serializeOneTool(tool, &out, allocator);
+    }
+    try out.append(allocator, ']');
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Pressure for the model a request will actually name, bounded by any wall
+/// learned on this endpoint (core.context_caps). Every threshold in this file
+/// must come from here, never from `ContextPressure.fromModel` directly, or a
+/// learned cap silently stops applying to that one check.
+fn pressureFor(
+    provider: provider_mod.Provider,
+    model_override: ?[]const u8,
+    configured_threshold: ?usize,
+    request_tokens: usize,
+) context_pressure_mod.ContextPressure {
+    const model = model_override orelse provider.model();
+    const learned = context_caps.learnedInputCap(provider.endpointId(), model);
+    return context_pressure_mod.ContextPressure.fromModelWithCap(
+        provider.maxInputTokensFor(model_override),
+        provider.maxTokensFor(model_override),
+        configured_threshold,
+        request_tokens,
+        if (learned) |cap| @intCast(@min(cap, @as(u64, std.math.maxInt(usize)))) else null,
+    );
+}
+
+/// Per-turn context-window recovery state.
+const ContextRecoveryState = struct {
+    /// Physical recovery attempts this turn (compaction retries and trims).
+    attempts: usize = 0,
+    /// Upper bound on attempts: one per message, so a turn cannot spin forever.
+    cap: usize,
+    /// Compaction retries spent this turn (see CONTEXT_RECOVERY_COMPACT_RETRIES).
+    compact_retries: u32 = 0,
+};
+
+/// How many times one turn may answer a rejection with a summary compaction
+/// before falling back to trimming (mecode: PRE_SEND_CONTEXT_COMPACT_RETRY_LIMIT).
+/// One is enough when compaction works; a second rejection right after a
+/// compaction means the retained suffix itself does not fit.
+pub const CONTEXT_RECOVERY_COMPACT_RETRIES: u32 = 1;
+
+const RecoveryArgs = struct {
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+    /// Numbers from the rejection body (empty when the provider said nothing usable).
+    numbers: error_class.ContextWindowNumbers,
+    keep_recent: usize,
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    state: *ContextRecoveryState,
+    turn_number: u32,
+    context_warning_emitted: ?*bool,
+    allocator: std.mem.Allocator,
+    tasks: ?*@import("task_store.zig").TaskStore,
+    hookset: ?*const hooks_mod.HookSet,
+    summary_reserve_tokens: ?*usize,
+    request_gate: ?request_gate_mod.Gate,
+    abort: ?*const AbortSignal,
+    goal_meter: ?*@import("metacodes-guard").core.goal.Meter,
+    /// The durable-state owner (issue #430). When present the recovery
+    /// compaction reports to it and the trim fallback is off: trimming would
+    /// rewrite durable history outside the guarded commit.
+    control: ?compaction_control.Control = null,
+};
+
+/// The server rejected the pending request as too large. Turn that into a
+/// measurement and a real compaction, not a one-message shave:
+///   1. learn the wall for (endpoint, model) — from the body's numbers when it
+///      has them, else from the last accepted size (provider-neutral);
+///   2. mark the conversation full (Codex `set_total_tokens_full`) so every
+///      later threshold check agrees that compaction is due;
+///   3. run the summary compaction once per turn (mecode's pre-send retry
+///      limit) and let the caller retry the same turn;
+///   4. only when compaction had nothing to drop, fall back to trimming the
+///      oldest message pair — the Rust one-item-at-a-time loop, which in the
+///      references wraps the *summary* request, never the sampling request.
+/// Returns false when the turn must end with api_error.
+///
+/// History: until 2026-09-22 this function was only step 4. With a threshold
+/// above the real wall (catalog 917,504 vs ≈883K on the Metask glm-5.3-flash
+/// route) that became the steady state: 75 rejections in 21 minutes, two
+/// messages shaved per turn, the prompt cache broken every turn, and the
+/// original task statement dropped with no summary.
+fn recoverContextWindowExceeded(args: RecoveryArgs) bool {
+    const st = args.state;
+    st.attempts += 1;
+    if (st.attempts > st.cap) {
+        log.err("agent", "context-window recovery exhausted turn={d} attempts={d}", .{ args.turn_number, st.attempts });
+        return false;
+    }
+    const conversation = args.conversation;
+    const provider = args.provider;
+    const model = args.model_override orelse provider.model();
+    const endpoint = provider.endpointId();
+    const assumed_completion: u64 = provider.maxTokensFor(args.model_override);
+
+    // 1. Measure the wall.
+    const anchor_before = conversation.usageAnchor();
+    const local_estimate = estimateNextRequestTokensOrFallback(args.allocator, provider, conversation, args.system_prompt, args.inject_user_context, args.synthetic_user_input, args.tool_defs, args.model_override);
+    const server_cap = args.numbers.inputCap(assumed_completion);
+    const server_actual = args.numbers.inputActual(assumed_completion);
+    const input_cap: u64 = server_cap orelse blk: {
+        // No numbers: the last accepted size is a lower bound any backend
+        // provides; a cold session only has its own estimate of what it sent.
+        if (anchor_before) |a| break :blk @intCast(a.context_tokens);
+        break :blk @intCast(local_estimate);
+    };
+    const source: context_caps.Source = if (server_cap != null) .server_message else .observed;
+    const learn = context_caps.learnInputCap(endpoint, model, input_cap, source);
+    const pressure = pressureFor(provider, args.model_override, null, local_estimate);
+    log.warn("agent", "context window exceeded turn={d} attempt={d} model={s} server_limit={?d} server_actual={?d} input_cap={d} cap_source={s} learn={s} anchor={?d} local_estimate={d} catalog_effective={d} effective={d} auto_threshold={d}", .{
+        args.turn_number,
+        st.attempts,
+        model,
+        server_cap,
+        server_actual,
+        input_cap,
+        source.label(),
+        @tagName(learn),
+        if (anchor_before) |a| @as(?usize, a.context_tokens) else null,
+        local_estimate,
+        pressure.catalog_effective_window,
+        pressure.effective_context_window,
+        pressure.auto_compact_threshold,
+    });
+
+    // 2. Mark full: what was just sent is at least the wall.
+    const rejected_size: usize = @intCast(@max(server_actual orelse 0, input_cap));
+    conversation.setUsageAnchor(@max(rejected_size, 1));
+
+    // 3. Summary compaction, once per turn.
+    if (st.compact_retries < CONTEXT_RECOVERY_COMPACT_RETRIES) {
+        st.compact_retries += 1;
+        const outcome = runAutoCompactControlled(
+            conversation,
+            provider,
+            args.system_prompt,
+            args.inject_user_context,
+            args.synthetic_user_input,
+            args.tool_defs,
+            args.model_override,
+            null,
+            null,
+            args.keep_recent,
+            "context_window_exceeded_recovery",
+            true,
+            args.backend,
+            args.sess,
+            args.trace_id,
+            args.depth,
+            args.turn_number,
+            args.context_warning_emitted,
+            args.allocator,
+            args.tasks,
+            args.hookset,
+            args.summary_reserve_tokens,
+            args.request_gate,
+            args.abort,
+            args.goal_meter,
+            args.control,
+            false,
+        ) catch |err| {
+            log.err("agent", "context-window recovery compaction failed turn={d}: {s}", .{ args.turn_number, @errorName(err) });
+            noteUnrecoveredContextWindow(args.abort);
+            return false;
+        };
+        switch (outcome) {
+            .compacted => return true,
+            // Cancelled, or the durable-state owner refused the replacement
+            // and recorded its own terminal: not a context-window failure.
+            .aborted, .refused => return false,
+            .api_error => {
+                noteUnrecoveredContextWindow(args.abort);
+                return false;
+            },
+            // Nothing droppable (active window already ≤ keep_recent) or the
+            // savings gate refused: fall through to the trim.
+            .not_needed, .skipped_no_savings => {},
+        }
+    }
+
+    // A durable-state owner keeps history behind its guarded commit: no trim.
+    // The rejection stands, bounded at one compaction per turn (issue #430).
+    if (args.control != null) {
+        log.err("agent", "context-window recovery exhausted turn={d}: compaction could not make the request fit and trimming is disabled for durable state", .{args.turn_number});
+        noteUnrecoveredContextWindow(args.abort);
+        return false;
+    }
+
+    // 4. Last resort: shave the oldest pair. Invalidate the anchor first so
+    // before/after telemetry share the cold baseline (otherwise before is the
+    // marked-full anchor and after a cold estimate, and dropping one message
+    // reads as growth — 2026-07-06 fix4.log: dropped=1 before=203081 after=415469).
+    conversation.invalidateUsageAnchor();
+    const before_tokens = estimateNextRequestTokensOrFallback(args.allocator, provider, conversation, args.system_prompt, args.inject_user_context, args.synthetic_user_input, args.tool_defs, args.model_override);
+    const before_active = conversation.activeMessages().len;
+    const dropped = conversation.removeOldestForContextRecovery();
+    if (dropped == 0) {
+        log.err("agent", "context-window recovery impossible turn={d} active_msgs={d}", .{ args.turn_number, conversation.activeMessages().len });
+        return false;
+    }
+    const after_tokens = estimateNextRequestTokensOrFallback(args.allocator, provider, conversation, args.system_prompt, args.inject_user_context, args.synthetic_user_input, args.tool_defs, args.model_override);
+    const kept_active = conversation.activeMessages().len;
+    log.warn("agent", "context-window recovery trim: dropped={d} active_msgs={d}->{d} before_tokens={d} after_tokens={d} attempt={d}", .{ dropped, before_active, kept_active, before_tokens, after_tokens, st.attempts });
+    args.backend.emitEvent(args.sess, .{ .auto_compact = .{
+        .dropped = @as(u32, @intCast(dropped)),
+        .kept = @as(u32, @intCast(kept_active)),
+        .before_tokens = @intCast(before_tokens),
+        .after_tokens = @intCast(after_tokens),
+        .cause = "context_window_exceeded_trim",
+    } });
+    return true;
+}
+
+/// The Run is about to stop because the context window still refuses the
+/// request. A recovery summary request may have succeeded in between and
+/// cleared the rejection the Run will report; say what actually stopped it.
+fn noteUnrecoveredContextWindow(abort: ?*const AbortSignal) void {
+    if (abort) |signal| if (signal.isAborted()) return;
+    model_error.noteContextWindowUnrecovered(
+        "The request exceeds the model's context window and automatic compaction could not make it fit.",
+    );
+}
+
+const DurableRecovery = enum {
+    /// Re-issue the same turn.
+    retry,
+    /// The Run was cancelled.
+    aborted,
+    /// The owner recorded the Run's terminal: it refused the replacement, or
+    /// the loop gave up on the deferred request and told it so.
+    owner_terminal,
+};
+
+/// The durable-state owner deferred the pending request
+/// (`error.DurableCapacityExceeded`): compact once for its capacity, then
+/// re-issue the same turn. A compaction that relieved nothing has told the
+/// owner so through `settle`, and the re-issued request then meets the
+/// owner's real refusal and its terminal outcome — the recovery cannot loop
+/// (issue #430). When the loop stops without re-issuing (the turn's recovery
+/// bound is spent, or the compaction itself failed) it abandons the deferred
+/// request to the owner, which records the same refusal, so the Run never
+/// ends as an unexplained provider failure.
+fn recoverDurableCapacity(args: RecoveryArgs) DurableRecovery {
+    // Only a durable-state owner defers; without one there is nobody to ask.
+    const control = args.control orelse unreachable;
+    const st = args.state;
+    st.attempts += 1;
+    if (st.attempts > st.cap) {
+        log.err("agent", "durable-capacity recovery exhausted turn={d} attempts={d}", .{ args.turn_number, st.attempts });
+        control.abandonDeferred();
+        return .owner_terminal;
+    }
+    const outcome = runAutoCompactControlled(
+        args.conversation,
+        args.provider,
+        args.system_prompt,
+        args.inject_user_context,
+        args.synthetic_user_input,
+        args.tool_defs,
+        args.model_override,
+        null,
+        null,
+        args.keep_recent,
+        "durable_capacity_recovery",
+        false,
+        args.backend,
+        args.sess,
+        args.trace_id,
+        args.depth,
+        args.turn_number,
+        args.context_warning_emitted,
+        args.allocator,
+        args.tasks,
+        args.hookset,
+        args.summary_reserve_tokens,
+        args.request_gate,
+        args.abort,
+        args.goal_meter,
+        args.control,
+        true,
+    ) catch |err| {
+        log.err("agent", "durable-capacity compaction failed turn={d}: {s}", .{ args.turn_number, @errorName(err) });
+        control.abandonDeferred();
+        return .owner_terminal;
+    };
+    return switch (outcome) {
+        .aborted => .aborted,
+        .refused => .owner_terminal,
+        .api_error => {
+            control.abandonDeferred();
+            return .owner_terminal;
+        },
+        .compacted, .not_needed, .skipped_no_savings => .retry,
+    };
+}
+
+/// 构造 PostCompact hook 的 stdin JSON(summary 是自由文本须 JSON 转义)。
+fn buildPostCompactStdin(allocator: std.mem.Allocator, trigger: []const u8, summary: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"hook_event_name\":\"PostCompact\",\"trigger\":");
+    try util_json.writeJsonString(&aw.writer, trigger);
+    try aw.writer.writeAll(",\"summary\":");
+    try util_json.writeJsonString(&aw.writer, summary);
+    try aw.writer.writeAll("}");
+    return try aw.toOwnedSlice();
+}
+
+fn emitContextProjection(
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    conversation: *const Conversation,
+    kind: []const u8,
+    cause: []const u8,
+    reduction: Conversation.ToolResultReduction,
+) void {
+    if (!reduction.changed()) return;
+    const changed = reduction.cleared +| reduction.truncated;
+    backend.emitEvent(sess, .{ .context_projection = .{
+        .kind = kind,
+        .changed_items = @intCast(@min(changed, @as(usize, std.math.maxInt(u32)))),
+        .bytes_before = @intCast(reduction.bytes_before),
+        .bytes_after = @intCast(reduction.bytes_after),
+        .active_messages = @intCast(@min(conversation.activeMessages().len, @as(usize, std.math.maxInt(u32)))),
+        .cause = cause,
+    } });
+}
+
+/// 构造 Stop hook 的 stdin JSON(last_message 自由文本须转义)。供记忆提取等 side-effect hook 用。
+fn buildStopStdin(allocator: std.mem.Allocator, stop_reason: []const u8, last_message: []const u8, num_messages: usize, stop_hook_active: bool) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"hook_event_name\":\"Stop\",\"stop_reason\":");
+    try util_json.writeJsonString(&aw.writer, stop_reason);
+    try aw.writer.writeAll(",\"last_message\":");
+    try util_json.writeJsonString(&aw.writer, last_message);
+    try aw.writer.print(",\"num_messages\":{d},\"stop_hook_active\":{}}}", .{ num_messages, stop_hook_active });
+    return try aw.toOwnedSlice();
+}
+
+/// Stop hook stdin: the last assistant text (bounded) and the message count,
+/// plus `stop_hook_active` — true once a Stop hook has already sent this run
+/// back to work, so a script can tell a repeat stop from the first one.
+fn stopHookStdin(allocator: std.mem.Allocator, conversation: *const Conversation, stop_reason: []const u8, stop_hook_active: bool) ![]u8 {
+    var last_text: []const u8 = "";
+    var i = conversation.messages.items.len;
+    while (i > 0) : (i -= 1) {
+        const m = conversation.messages.items[i - 1];
+        if (m.role != .assistant) continue;
+        for (m.blocks) |b| switch (b) {
+            .text => |t| {
+                last_text = t;
+                break;
+            },
+            else => {},
+        };
+        if (last_text.len > 0) break;
+    }
+    const MAX_STOP_TEXT = 4000;
+    const trimmed = if (last_text.len > MAX_STOP_TEXT) last_text[0..MAX_STOP_TEXT] else last_text;
+    return buildStopStdin(allocator, stop_reason, trimmed, conversation.messages.items.len, stop_hook_active);
+}
+
+/// Stop hook on a terminal stop that cannot continue (the controlled
+/// `tool_loop` finish): side effects only, a block is ignored. The natural
+/// end_turn path runs the hooks through `runStopHooks` and honours a block.
+/// depth!=0(subagent)不触发;无 Stop hook 直接返回。
+fn fireStopHook(hookset: ?*const hooks_mod.HookSet, allocator: std.mem.Allocator, conversation: *const Conversation, stop_reason: []const u8, depth: u8) void {
+    if (depth != 0) return;
+    const hs = hookset orelse return;
+    if (!hs.hasStop()) return;
+    const stdin_json = stopHookStdin(allocator, conversation, stop_reason, false) catch return;
+    defer allocator.free(stdin_json);
+    if (hooks_mod.runLifecycleHooks(hs.stop, allocator, "Stop", stdin_json)) |ac| allocator.free(ac);
+}
+
+fn runAutoCompactIfNeeded(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+    compact_model_override: ?[]const u8,
+    configured_threshold: ?usize,
+    keep_recent: usize,
+    trigger_cause: []const u8,
+    /// The server just rejected the pending request: compact regardless of
+    /// what the local estimate says (the estimate was wrong by definition).
+    forced: bool,
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    turn: u32,
+    context_warning_emitted: ?*bool,
+    allocator: std.mem.Allocator,
+    tasks: ?*@import("task_store.zig").TaskStore,
+    hookset: ?*const hooks_mod.HookSet,
+    summary_reserve_tokens: ?*usize,
+    request_gate: ?request_gate_mod.Gate,
+    abort: ?*const AbortSignal,
+    goal_meter: ?*@import("metacodes-guard").core.goal.Meter,
+) !AutoCompactOutcome {
+    return runAutoCompactControlled(
+        conversation,
+        provider,
+        system_prompt,
+        inject_user_context,
+        synthetic_user_input,
+        tool_defs,
+        model_override,
+        compact_model_override,
+        configured_threshold,
+        keep_recent,
+        trigger_cause,
+        forced,
+        backend,
+        sess,
+        trace_id,
+        depth,
+        turn,
+        context_warning_emitted,
+        allocator,
+        tasks,
+        hookset,
+        summary_reserve_tokens,
+        request_gate,
+        abort,
+        goal_meter,
+        null,
+        false,
+    );
+}
+
+/// Commits a kernel replacement only when the durable-state owner allows it
+/// (issue #430). Same suffix check and abort rule as the kernel's default.
+const ControlledCommit = struct {
+    control: compaction_control.Control,
+
+    fn commit(
+        raw: *anyopaque,
+        live: *Conversation,
+        suffix: *const Conversation.SuffixSnapshot,
+        replacement: *Conversation,
+        signal: *const AbortSignal,
+    ) compact_kernel.CommitResult {
+        const self: *ControlledCommit = @ptrCast(@alignCast(raw));
+        if (signal.isAborted()) return .aborted;
+        if (!self.control.allowCommit(replacement)) return .refused;
+        return if (live.replaceWithOwnedIfSuffixUnchanged(suffix, replacement))
+            .committed
+        else
+            .concurrent_mutation;
+    }
+};
+
+/// `runAutoCompactIfNeeded` reporting to the durable-state owner's control
+/// (issue #430). `durable_recovery` is the same-turn answer to
+/// `error.DurableCapacityExceeded`: compaction is forced like a context-window
+/// recovery, but the owner's capacity, not the window, asked for it.
+fn runAutoCompactControlled(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+    compact_model_override: ?[]const u8,
+    configured_threshold: ?usize,
+    keep_recent: usize,
+    requested_cause: []const u8,
+    forced: bool,
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    turn: u32,
+    context_warning_emitted: ?*bool,
+    allocator: std.mem.Allocator,
+    tasks: ?*@import("task_store.zig").TaskStore,
+    hookset: ?*const hooks_mod.HookSet,
+    summary_reserve_tokens: ?*usize,
+    request_gate: ?request_gate_mod.Gate,
+    abort: ?*const AbortSignal,
+    goal_meter: ?*@import("metacodes-guard").core.goal.Meter,
+    control: ?compaction_control.Control,
+    durable_recovery: bool,
+) !AutoCompactOutcome {
+    var outcome: AutoCompactOutcome = .not_needed;
+    // Durable pressure is the owner's to declare: it deferred the pending
+    // request (durable_recovery), or it asks at this boundary.
+    const durable_pressure = if (control) |c|
+        durable_recovery or (!forced and c.wantsCompaction())
+    else
+        false;
+    const trigger: compaction_control.Trigger = if (durable_pressure) .durable_capacity else .context_window;
+    const trigger_cause: []const u8 = if (durable_pressure and !durable_recovery)
+        "durable_capacity_threshold"
+    else
+        requested_cause;
+
+    var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+    var pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
+    emitContextWarningIfNeeded(backend, sess, pressure, context_warning_emitted);
+    // 正常:auto=max(formula, 32K floor);micro=其下一档。强制旋钮(仅测试/power-user)存在时,
+    // auto/micro 一起钉到强制值——让短对话也能触发真实 summary 压缩+投影。一次 getenv,不在热路径重复读。
+    const forced_threshold = forcedAutoCompactThreshold();
+    const auto_threshold: usize = forced_threshold orelse
+        @max(pressure.auto_compact_threshold, MIN_AUTO_COMPACT_THRESHOLD);
+    const micro_threshold = forced_threshold orelse
+        @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
+    // Both tool-result passes rewrite committed history in place. A
+    // durable-state owner admits durable changes only through the kernel's
+    // guarded commit, so with a control installed they do not run; the
+    // kernel's own reduction of its preview still does (issue #430).
+    const in_place_reduction = control == null;
+    if (in_place_reduction and !forced and !durable_pressure and request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
+        var reduced = result_projection.microcompactToolResultsByRecentResults(conversation, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+        // Clearing deliberately preserves the most recent results, and skips
+        // anything whose artifact envelope is its only recovery capability.
+        // Neither exemption bounds a single oversized result that entered the
+        // Conversation under a different budget (a /resume'd transcript, or a
+        // switch to a smaller window), because projection never re-runs on
+        // history. Bound those here against the same per-result budget
+        // projection uses, so the `truncated=` field of the line below stops
+        // being structurally zero.
+        reduced.merge(result_projection.truncateLargeToolResults(
+            conversation,
+            conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
+        ));
+        if (reduced.changed()) {
+            outcome = .compacted;
+            log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d} cause={s}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold, trigger_cause });
+            emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
+            request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+            pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
+        }
+    }
+
+    if (forced or durable_pressure or request_tokens_before >= auto_threshold) {
+        // PreCompact hook(压缩前):喂 {trigger, active_msgs, tokens},side-effect(如存盘/记忆快照),非阻塞。
+        if (hookset) |hs| if (hs.hasPreCompact()) {
+            const pre_json = std.fmt.allocPrint(allocator, "{{\"hook_event_name\":\"PreCompact\",\"trigger\":\"{s}\",\"active_messages\":{d},\"tokens\":{d}}}", .{ trigger_cause, conversation.activeMessages().len, request_tokens_before }) catch null;
+            if (pre_json) |pj| {
+                defer allocator.free(pj);
+                if (hooks_mod.runLifecycleHooks(hs.pre_compact, allocator, "PreCompact", pj)) |ac| allocator.free(ac);
+            }
+        };
+        const compact_summary = @import("compact_summary.zig");
+        const summary_model = compact_model_override orelse model_override;
+        const eff_keep_recent = forcedAutoCompactKeep() orelse keep_recent;
+        if (conversation.compactBoundary(eff_keep_recent) <= conversation.compact_boundary) {
+            if (durable_pressure) if (control) |c| c.settle(.durable_capacity, .nothing_to_compact);
+            return outcome;
+        }
+        // 任务锚:进行中的任务确定性追加到摘要尾(压缩有损,闭环纪律硬保底)。
+        const task_anchor: ?[]u8 = if (tasks) |ts| compact_summary.buildTaskAnchor(allocator, ts) else null;
+        defer if (task_anchor) |a| allocator.free(a);
+        // Lifecycle boundary: compact is now admitted. Keep this separate
+        // from diag_compact_request, whose existing meaning is the completed
+        // provider summary request consumed by evaluation telemetry.
+        const compact_started_ns = util_time.nowNs();
+        var compact_lifecycle_outcome: []const u8 = "api_error";
+        backend.emitEvent(sess, .{ .diag_compact_begin = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .turn = turn,
+            .cause = trigger_cause,
+        } });
+        defer backend.emitEvent(sess, .{ .diag_compact_end = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .turn = turn,
+            .elapsed_ms = elapsedSinceNs(compact_started_ns),
+            .outcome = compact_lifecycle_outcome,
+            .cause = trigger_cause,
+        } });
+        const EstimateContext = struct {
+            allocator: std.mem.Allocator,
+            provider: provider_mod.Provider,
+            system_prompt: ?[]const u8,
+            inject_user_context: ?[]const u8,
+            synthetic_user_input: ?[]const u8,
+            tool_defs: []const json_mod.ToolDefinition,
+            model_override: ?[]const u8,
+
+            fn estimate(raw: *anyopaque, value: *const Conversation) usize {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return estimateNextRequestTokensOrFallback(
+                    self.allocator,
+                    self.provider,
+                    value,
+                    self.system_prompt,
+                    self.inject_user_context,
+                    self.synthetic_user_input,
+                    self.tool_defs,
+                    self.model_override,
+                );
+            }
+        };
+        var estimate_ctx = EstimateContext{
+            .allocator = allocator,
+            .provider = provider,
+            .system_prompt = system_prompt,
+            .inject_user_context = inject_user_context,
+            .synthetic_user_input = synthetic_user_input,
+            .tool_defs = tool_defs,
+            .model_override = model_override,
+        };
+        var local_abort = AbortSignal.init();
+        const signal = abort orelse &local_abort;
+        var controlled_commit: ControlledCommit = undefined;
+        if (control) |c| {
+            controlled_commit = .{ .control = c };
+            c.begin(trigger);
+        }
+        const report = compact_kernel.run(
+            allocator,
+            conversation,
+            provider,
+            signal,
+            .{
+                .committer = if (control != null) .{
+                    .ctx = &controlled_commit,
+                    .commit_fn = ControlledCommit.commit,
+                } else null,
+                .keep_recent = eff_keep_recent,
+                .model_override = summary_model,
+                .task_anchor = task_anchor,
+                .estimator = .{
+                    .ctx = &estimate_ctx,
+                    .estimate_fn = EstimateContext.estimate,
+                },
+                .minimum_saved_percent = COMPACT_MIN_SAVED_PERCENT,
+                .minimum_summary_reserve_tokens = if (compact_model_override == null)
+                    if (summary_reserve_tokens) |reserve| reserve.* else 0
+                else
+                    0,
+                .request_gate = request_gate,
+                .target_tokens = auto_threshold,
+                // Automatic compaction is the lossy one nobody asked for: keep
+                // the user's requests verbatim (bounded) so the task survives.
+                .preserve_user_prompts_tokens = compact_summary.USER_PROMPTS_BUDGET_TOKENS,
+            },
+        ) catch |err| {
+            log.warn("agent", "auto-compact kernel failed: {s}", .{@errorName(err)});
+            if (control) |c| c.settle(trigger, .not_committed);
+            return .api_error;
+        };
+        // The owner settles on the state the Run continues from: after the
+        // PostCompact hook below has extended the summary.
+        defer if (control) |c| c.settle(trigger, switch (report.outcome) {
+            .compacted, .degraded => .{ .committed = conversation },
+            .no_change, .aborted, .refused => .not_committed,
+        });
+        // Persist metered usage before the diagnostic event. If the process is
+        // hard-killed between the two complete NDJSON records, budget evidence
+        // survives even if request-count telemetry is conservatively partial.
+        if (usageChanged(report.usage)) {
+            backend.emitEvent(sess, .{ .usage = report.usage });
+            if (goal_meter) |meter| if (meter.charge(report.usage.input_tokens, report.usage.output_tokens)) |limited|
+                backend.emitEvent(sess, .{ .goal_updated = limited });
+        }
+        if (report.summary_request) |request| {
+            backend.emitEvent(sess, .{ .diag_compact_request = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .turn = turn,
+                .elapsed_ms = request.elapsed_ms,
+                .outcome = @tagName(request.outcome),
+                .cause = trigger_cause,
+            } });
+        }
+        switch (report.outcome) {
+            .aborted => {
+                compact_lifecycle_outcome = "aborted";
+                return .aborted;
+            },
+            .refused => {
+                compact_lifecycle_outcome = "refused";
+                return .refused;
+            },
+            .no_change => {
+                if (compact_model_override == null and report.summary_request != null) {
+                    if (summary_reserve_tokens) |reserve|
+                        reserve.* = @max(reserve.*, report.summary_overhead_tokens);
+                }
+                const active_reserve = if (summary_reserve_tokens) |reserve| reserve.* else 0;
+                log.warn("agent", "auto-compact skipped: summary savings below {d}% before_tokens={d} after_tokens={d} summary_reserve_tokens={d} paid_request={} cause={s}", .{ COMPACT_MIN_SAVED_PERCENT, report.before_tokens, report.after_tokens, active_reserve, report.summary_request != null, trigger_cause });
+                outcome = .skipped_no_savings;
+                compact_lifecycle_outcome = "no_change";
+            },
+            .compacted, .degraded => {
+                compact_lifecycle_outcome = if (report.outcome == .compacted) "compacted" else "degraded";
+                if (compact_model_override == null) {
+                    if (summary_reserve_tokens) |reserve| reserve.* = 0;
+                }
+                // PostCompact hook(压缩后):喂 {trigger, summary},其 additionalContext 拼进投影摘要
+                // → 模型下轮读得到(条目 I 的挂载点:重注入 active skill/MCP)。非阻塞。
+                if (hookset) |hs| if (hs.hasPostCompact()) {
+                    const pj = buildPostCompactStdin(allocator, trigger_cause, conversation.compact_summary orelse "") catch null;
+                    if (pj) |json| {
+                        defer allocator.free(json);
+                        if (hooks_mod.runLifecycleHooks(hs.post_compact, allocator, "PostCompact", json)) |extra| {
+                            defer allocator.free(extra);
+                            conversation.appendToCompactSummary(extra);
+                        }
+                    }
+                };
+                // 投影:len() 不变(原始不删),真正收缩的是活跃窗口——日志/事件的"after/kept"用活跃计数。
+                const cause: []const u8 = if (report.emergency_reduced)
+                    "tool_result_pressure"
+                else if (report.outcome == .degraded)
+                    "summary_fallback"
+                else
+                    trigger_cause;
+                log.info("agent", "auto-compact: dropped {d} old messages kept={d} threshold={d} before_tokens={d} after_tokens={d} cause={s}", .{ report.dropped, report.kept, auto_threshold, report.before_tokens, report.after_tokens, cause });
+                backend.emitEvent(sess, .{ .auto_compact = .{
+                    .dropped = @as(u32, @intCast(report.dropped)),
+                    .kept = @as(u32, @intCast(report.kept)),
+                    .before_tokens = @intCast(report.before_tokens),
+                    .after_tokens = @intCast(report.after_tokens),
+                    .cause = cause,
+                } });
+                outcome = .compacted;
+                request_tokens_before = report.after_tokens;
+                pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
+            },
+        }
+    }
+
+    if (outcome == .skipped_no_savings) return outcome;
+
+    if (pressure.isAtBlockingLimit()) {
+        if (in_place_reduction) {
+            var reduced = result_projection.microcompactToolResultsByRecentResults(conversation, 0);
+            // Same rationale as the stale-result valve above, and it matters more
+            // here: at the blocking limit the request is otherwise rejected, so a
+            // single unbounded surviving result is the difference between
+            // recovering and returning api_error.
+            reduced.merge(result_projection.truncateLargeToolResults(
+                conversation,
+                conversation_mod.toolResultContextBytes(provider.maxInputTokensFor(model_override)),
+            ));
+            if (reduced.changed()) {
+                outcome = .compacted;
+                const before_block_tokens = request_tokens_before;
+                request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+                pressure = pressureFor(provider, model_override, configured_threshold, request_tokens_before);
+                log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
+                // This is the same lossy operation as the earlier stale-result
+                // pressure valve.  Keep the mechanism kind stable; the trigger
+                // cause already records that this happened at the blocking limit.
+                emitContextProjection(backend, sess, conversation, "stale_tool_result_microcompact", trigger_cause, reduced);
+            }
+        }
+        if (pressure.isAtBlockingLimit()) {
+            // A forced recovery already paid for its compaction; the retry the
+            // caller is about to make is the real test, not this local model
+            // (whose learned cap may be a small observed lower bound).
+            if (forced and outcome == .compacted) return outcome;
+            log.err("agent", "context blocking limit reached: tokens={d} blocking_limit={d} raw_window={d} effective_window={d} cause={s}", .{ request_tokens_before, pressure.blocking_limit, pressure.raw_context_window, pressure.effective_context_window, trigger_cause });
+            return .api_error;
+        }
+    }
+    return outcome;
+}
+
+fn emitContextWarningIfNeeded(
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    pressure: context_pressure_mod.ContextPressure,
+    emitted: ?*bool,
+) void {
+    const flag = emitted orelse return;
+    if (flag.*) return;
+    if (pressure.level() != .medium) return;
+    flag.* = true;
+    backend.emitEvent(sess, .{ .context_warning = .{
+        .current_tokens = @intCast(pressure.current_context_tokens),
+        .warning_threshold = @intCast(pressure.warning_threshold),
+        .auto_compact_threshold = @intCast(pressure.auto_compact_threshold),
+        .blocking_limit = @intCast(pressure.blocking_limit),
+        .level = pressure.level().label(),
+    } });
+}
+
+fn usageChanged(usage: api_stream.UsageDelta) bool {
+    return usage.input_tokens != 0 or
+        usage.output_tokens != 0 or
+        usage.cache_read_input_tokens != 0 or
+        usage.cache_creation_input_tokens != 0;
+}
+
+fn estimateNextRequestTokensFallback(
+    conversation: *const Conversation,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+) usize {
+    var total = conversation.totalTokens();
+    if (system_prompt) |s| total += Conversation.estimateTokens(s);
+    if (inject_user_context) |s| total += Conversation.estimateTokens(s);
+    if (synthetic_user_input) |s| total += Conversation.estimateTokens(s);
+    for (tool_defs) |tool| {
+        total += Conversation.estimateTokens(tool.name);
+        total += Conversation.estimateTokens(tool.description);
+        if (tool.server_type) |server_type| total += Conversation.estimateTokens(server_type);
+        total += estimateInputSchemaTokens(tool.input_schema);
+    }
+    return total;
+}
+
+/// The one way a Run ends because a runtime policy refused a candidate.
+///
+/// Both rejection sites — mid-stream and at the commit question — end here so
+/// they cannot drift on the settlement, the turn count, or the stop reason.
+/// `.budget` is the existing "a governor stopped this Run" reason; the caller
+/// that installed the observer is the one that knows which governor.
+fn rejectedCandidateRun(
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    turn: u32,
+    tool_calls: u32,
+    observer: ?response_candidate.Observer,
+    open: *bool,
+    candidate: response_candidate.CandidateId,
+) RunResult {
+    settleCandidate(observer, open, candidate, .{ .discarded = .rejected });
+    backend.emitEvent(sess, .{ .diag_turn_end = .{
+        .trace_id = trace_id,
+        .depth = depth,
+        .turn = turn,
+        .tool_calls = tool_calls,
+    } });
+    return finishRun(backend, sess, trace_id, depth, .{
+        .stop_reason = .budget,
+        .turns = turn,
+        .tool_calls = tool_calls,
+    });
+}
+
+/// One place where "no observer installed" means "accept". Keeping the
+/// `null` branch here rather than at each call site is what makes the
+/// unobserved path — the whole existing behavior — impossible to change by
+/// accident when a new observation point is added.
+fn observeCandidate(
+    observer: ?response_candidate.Observer,
+    candidate: response_candidate.CandidateId,
+    increment: response_candidate.Increment,
+) response_candidate.Admission {
+    const installed = observer orelse return .accept;
+    return installed.observe(candidate, increment);
+}
+
+fn settleCandidate(
+    observer: ?response_candidate.Observer,
+    open: *bool,
+    candidate: response_candidate.CandidateId,
+    settlement: response_candidate.Settlement,
+) void {
+    if (!open.*) return;
+    open.* = false;
+    if (observer) |installed| installed.settle(candidate, settlement);
+}
+
+/// A re-issue of an attempt that showed output (#452, #461). The attempt's
+/// text segment has already closed `discarded`; what it showed in thinking is
+/// withdrawn under the same segment identity, then the next attempt is
+/// announced the way a connection retry is: `failed_streams` of at most
+/// `max_streams` failed, and the next starts after `delay_ms`.
+fn announceRetractedAttempt(
+    backend: *const UiBackend,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    segment: ?output_semantics.Segment,
+    thinking_bytes: u64,
+    failed_streams: u32,
+    max_streams: u32,
+    delay_ms: u32,
+) void {
+    if (thinking_bytes != 0) if (segment) |closed| backend.emitEvent(sess, .{ .thinking_discarded = .{
+        .index = closed.index,
+        .turn = closed.turn,
+        .group = closed.group,
+        .bytes = thinking_bytes,
+    } });
+    backend.emitEvent(sess, .{ .retry_notice = .{
+        .attempt = failed_streams,
+        .max = max_streams,
+        .delay_ms = delay_ms,
+    } });
+}
+
+/// The wait between a `retry_notice` and the re-issue it announced (#461).
+/// False when the Run was cancelled before or during it: nothing more is sent.
+fn waitStreamRetryBackoff(abort: ?*const AbortSignal, delay_ms: u32) bool {
+    const aborted = struct {
+        fn check(signal: ?*const AbortSignal) bool {
+            return if (signal) |a| a.isAborted() else false;
+        }
+    }.check;
+    var left: u32 = delay_ms;
+    while (left > 0) {
+        if (aborted(abort)) return false;
+        const step = @min(left, 10);
+        util_time.sleepMs(step);
+        left -= step;
+    }
+    return !aborted(abort);
+}
+
+fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {
+    var total = Conversation.estimateTokens(schema.type);
+    if (schema.prop_specs) |props| {
+        total += estimatePropSpecsTokens(props);
+    }
+    if (schema.required) |required| {
+        for (required) |r| total += Conversation.estimateTokens(r);
+    }
+    if (schema.properties) |props| {
+        var it = props.iterator();
+        while (it.next()) |entry| total += Conversation.estimateTokens(entry.key_ptr.*);
+    }
+    // Serialized only when declared, so the estimate only grows for a tool
+    // whose provider-visible schema actually grew.
+    if (schema.additional_properties != null)
+        total += Conversation.estimateTokens("additionalProperties");
+    return total;
+}
+
+fn estimatePropSpecsTokens(props: []const json_mod.PropSpec) usize {
+    var total: usize = 0;
+    for (props) |prop| {
+        total += Conversation.estimateTokens(prop.name);
+        total += Conversation.estimateTokens(prop.type);
+        total += Conversation.estimateTokens(prop.description);
+        if (prop.items_type) |t| total += Conversation.estimateTokens(t);
+        if (prop.enum_values) |vals| {
+            for (vals) |v| total += Conversation.estimateTokens(v);
+        }
+        if (prop.items_props) |nested| total += estimatePropSpecsTokens(nested);
+        if (prop.items_required) |required| {
+            for (required) |r| total += Conversation.estimateTokens(r);
+        }
+        if (prop.object_props) |nested| total += estimatePropSpecsTokens(nested);
+        if (prop.object_required) |required| {
+            for (required) |r| total += Conversation.estimateTokens(r);
+        }
+    }
+    return total;
+}
+
+test "emitProgress 发 CoreEvent.progress 到 backend(L1:进度=事件)" {
+    const S = struct {
+        var hits: u32 = 0;
+        var last_turn: u32 = 0;
+        var last_calls: u32 = 0;
+        var last_tool: [16]u8 = undefined;
+        var last_tool_len: usize = 0;
+        fn emit(_: *anyopaque, _: ui_backend.SessionId, ev: ui_backend.CoreEvent) void {
+            switch (ev) {
+                .progress => |p| {
+                    hits += 1;
+                    last_turn = p.turn;
+                    last_calls = p.tool_calls;
+                    last_tool_len = @min(p.tool_name.len, last_tool.len);
+                    @memcpy(last_tool[0..last_tool_len], p.tool_name[0..last_tool_len]);
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: ui_backend.SessionId) ?ui_backend.UiEvent {
+            return null;
+        }
+    };
+    S.hits = 0;
+    var dummy: u8 = 0;
+    const be = ui_backend.UiBackend{ .ctx = @ptrCast(&dummy), .emit = &S.emit, .poll = &S.poll };
+    emitProgress(&be, .single, 2, "Grep", "{}", 5);
+    try std.testing.expectEqual(@as(u32, 1), S.hits);
+    try std.testing.expectEqual(@as(u32, 2), S.last_turn);
+    try std.testing.expectEqual(@as(u32, 5), S.last_calls);
+    try std.testing.expectEqualStrings("Grep", S.last_tool[0..S.last_tool_len]);
+}
+
+test "buildApiMessages maps blocks" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "hi");
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    try std.testing.expect(api.items.len == 1);
+    try std.testing.expect(api.items[0].role == .user);
+    try std.testing.expect(api.items[0].content.len == 1);
+    try std.testing.expectEqualStrings("hi", api.items[0].content[0].text);
+}
+
+test "buildApiMessages omits thinking-only assistant before continuation" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    try c.appendText(.user, "fix the bug");
+    const thinking_blocks = try a.alloc(msg.Block, 1);
+    thinking_blocks[0] = .{ .thinking = try a.dupe(u8, "private truncated reasoning") };
+    try c.append(.{ .role = .assistant, .blocks = thinking_blocks });
+    try c.appendText(.user, "Continue exactly where you left off.");
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    try std.testing.expectEqual(@as(usize, 1), api.items.len);
+    try std.testing.expectEqual(types.MessageRole.user, api.items[0].role);
+    try std.testing.expect(api.items[0].content.len > 0);
+    for (api.items) |message| try std.testing.expect(message.content.len > 0);
+}
+
+test "buildApiMessages projects thinking in order and borrows its bytes (issue #421)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    try c.appendText(.user, "what time is it");
+    const blocks = try a.alloc(msg.Block, 3);
+    blocks[0] = .{ .thinking = try a.dupe(u8, "need the clock") };
+    blocks[1] = .{ .text = try a.dupe(u8, "checking") };
+    blocks[2] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "get_time"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = blocks });
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    // The trailing tool_use gets a stub result; the assistant message keeps
+    // every block, thinking first, so the dialect can decide.
+    try std.testing.expectEqual(types.MessageRole.assistant, api.items[1].role);
+    const content = api.items[1].content;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+    try std.testing.expectEqualStrings("need the clock", content[0].thinking);
+    try std.testing.expectEqual(c.messages.items[1].blocks[0].thinking.ptr, content[0].thinking.ptr);
+    try std.testing.expectEqualStrings("checking", content[1].text);
+    try std.testing.expectEqualStrings("get_time", content[2].tool_use.name);
+}
+
+test "buildApiMessages maps tool_use and tool_result" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    // assistant with tool_use
+    const blks_a = try a.alloc(msg.Block, 1);
+    blks_a[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{\"path\":\"/x\"}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = blks_a });
+
+    // user with tool_result
+    const blks_u = try a.alloc(msg.Block, 1);
+    blks_u[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "ok"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blks_u });
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+
+    try std.testing.expect(api.items.len == 2);
+    try std.testing.expect(@as(std.meta.Tag(types.ApiContent), api.items[0].content[0]) == .tool_use);
+    try std.testing.expect(@as(std.meta.Tag(types.ApiContent), api.items[1].content[0]) == .tool_result);
+}
+
+test "buildApiMessages empty conversation returns empty" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    try std.testing.expect(api.items.len == 0);
+}
+
+test "buildApiMessages preserves roles" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "u1");
+    try c.appendText(.assistant, "a1");
+    try c.appendText(.user, "u2");
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    try std.testing.expect(api.items[0].role == .user);
+    try std.testing.expect(api.items[1].role == .assistant);
+    try std.testing.expect(api.items[2].role == .user);
+}
+
+test "buildApiMessages multiple blocks per message" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blks = try a.alloc(msg.Block, 2);
+    blks[0] = .{ .text = try a.dupe(u8, "preamble") };
+    blks[1] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = blks });
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    try std.testing.expect(api.items[0].content.len == 2);
+}
+
+test "buildApiMessages appends one-shot synthetic user input without mutating conversation" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "real user");
+
+    var api = try buildApiMessages(&c, a, null, "synthetic steering");
+    defer freeApiMessages(&api, a);
+
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+    // P0.6 normalizeApiMessages 合并相邻同角色:real user + synthetic 都是 user →
+    // 合成 1 条 user 消息(2 个 text block),满足 OpenAI/Gemini 严格角色交替。conversation 不被改动。
+    try std.testing.expectEqual(@as(usize, 1), api.items.len);
+    try std.testing.expect(api.items[0].role == .user);
+    try std.testing.expectEqual(@as(usize, 2), api.items[0].content.len);
+    try std.testing.expectEqualStrings("real user", api.items[0].content[0].text);
+    try std.testing.expectEqualStrings("synthetic steering", api.items[0].content[1].text);
+}
+
+const TestProviderState = struct {
+    model: []const u8 = "test-model",
+    max_tokens: u32 = 777,
+    max_input_tokens: u32 = 200_000,
+    supports_web_search: bool = true,
+    reasoning_effort: ?types.ReasoningEffort = null,
+    allocator: ?std.mem.Allocator = null,
+    compact_summary_response: ?[]const u8 = null,
+    last_send_model_override: ?[]const u8 = null,
+    compact_stream_stage: u8 = 0,
+    compact_request_count: u32 = 0,
+};
+
+fn testProvider(state: *TestProviderState) provider_mod.Provider {
+    const F = struct {
+        fn asState(ctx: *anyopaque) *TestProviderState {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn model(ctx: *anyopaque) []const u8 {
+            return asState(ctx).model;
+        }
+        fn sendStream(ctx: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, model_override: ?[]const u8, _: ?json_mod.ToolChoice, _: []const u8) anyerror!provider_mod.StreamHandle {
+            const st = asState(ctx);
+            if (st.compact_summary_response == null or st.allocator == null)
+                return error.UnexpectedTestCall;
+            st.compact_request_count += 1;
+            st.last_send_model_override = model_override;
+            st.compact_stream_stage = 0;
+            return .{
+                .ctx = ctx,
+                .nextFn = streamNext,
+                .deinitFn = streamDeinit,
+                .stopReasonFn = streamStop,
+                .requestIdFn = streamRequestId,
+            };
+        }
+        fn streamNext(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+            const st = asState(ctx);
+            defer st.compact_stream_stage += 1;
+            return switch (st.compact_stream_stage) {
+                0 => .{ .text = try st.allocator.?.dupe(u8, st.compact_summary_response.?) },
+                1 => .{ .usage = .{ .input_tokens = 11, .output_tokens = 7 } },
+                2 => .{ .done = {} },
+                else => null,
+            };
+        }
+        fn streamDeinit(_: *anyopaque) void {}
+        fn streamStop(_: *anyopaque) api_stream.StopReason {
+            return .end_turn;
+        }
+        fn streamRequestId(_: *anyopaque) log.RequestId {
+            return log.RequestId{ .bytes = [_]u8{1} ** 12 };
+        }
+        fn sendStreamRetry(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: u32, _: u64, _: ?provider_mod.RetryReporter, _: []const u8) anyerror!provider_mod.StreamHandle {
+            return error.UnexpectedTestCall;
+        }
+        fn send(ctx: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
+            const st = asState(ctx);
+            st.last_send_model_override = model_override;
+            if (st.compact_summary_response) |body| {
+                const a = st.allocator orelse return error.UnexpectedTestCall;
+                return .{ .content = try a.dupe(u8, body) };
+            }
+            return error.UnexpectedTestCall;
+        }
+        fn maxTokens(ctx: *anyopaque) u32 {
+            return asState(ctx).max_tokens;
+        }
+        fn maxInputTokens(ctx: *anyopaque) u32 {
+            return asState(ctx).max_input_tokens;
+        }
+        fn reasoningEffort(ctx: *anyopaque) ?types.ReasoningEffort {
+            return asState(ctx).reasoning_effort;
+        }
+        fn supports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
+            if (cap == .web_search) return asState(ctx).supports_web_search;
+            return true;
+        }
+    };
+    return .{
+        .ctx = @ptrCast(state),
+        .modelFn = F.model,
+        .sendStreamFn = F.sendStream,
+        .sendStreamRetryFn = F.sendStreamRetry,
+        .sendFn = F.send,
+        .maxTokensFn = F.maxTokens,
+        .maxInputTokensFn = F.maxInputTokens,
+        .reasoningEffortFn = F.reasoningEffort,
+        .supportsFn = F.supports,
+    };
+}
+
+test "estimateNextRequestTokens serializes the actual next Anthropic request" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "short");
+
+    var state = TestProviderState{ .model = "base-model", .max_tokens = 777, .reasoning_effort = .medium };
+    const provider = testProvider(&state);
+    const tool_defs = [_]json_mod.ToolDefinition{.{
+        .name = "Read",
+        .description = "Read file contents",
+        .input_schema = .{ .prop_specs = &.{.{ .name = "file_path", .type = "string", .description = "Path to read" }}, .required = &.{"file_path"} },
+    }};
+    const estimated = try estimateNextRequestTokens(
+        a,
+        provider,
+        &c,
+        "system prompt text",
+        "user context text",
+        "synthetic steering text",
+        &tool_defs,
+        "override-model",
+    );
+
+    var api = try buildApiMessages(&c, a, "user context text", "synthetic steering text");
+    defer freeApiMessages(&api, a);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = "override-model",
+        .max_tokens = 777,
+        .messages = api.items,
+        .system = "system prompt text",
+        .stream = true,
+        .tools = &tool_defs,
+        .reasoning_effort = .medium,
+    }, a);
+    defer a.free(body);
+    try std.testing.expectEqual(Conversation.estimateTokens(body), estimated);
+    try std.testing.expectEqual(
+        @max(
+            @as(u64, @intCast(Conversation.estimateTokens(body))) * 2,
+            (@as(u64, @intCast(body.len)) + 1) / 2,
+        ) + 4096,
+        try serializedRequestInputTokenReserve(
+            a,
+            provider,
+            api.items,
+            "system prompt text",
+            &tool_defs,
+            "override-model",
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, body, "synthetic steering text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "override-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"medium\"}") != null);
+}
+
+test "cache-break fingerprint binds full schemas for same-named tools" {
+    const a = std.testing.allocator;
+    const first = [_]json_mod.ToolDefinition{.{
+        .name = "Read",
+        .description = "read a file",
+        .input_schema = .{
+            .prop_specs = &.{.{ .name = "file_path", .type = "string" }},
+            .required = &.{"file_path"},
+        },
+    }};
+    const changed = [_]json_mod.ToolDefinition{.{
+        .name = "Read",
+        .description = "read a bounded file slice",
+        .input_schema = .{
+            .prop_specs = &.{
+                .{ .name = "file_path", .type = "string" },
+                .{ .name = "limit", .type = "integer" },
+            },
+            .required = &.{"file_path"},
+        },
+    }};
+    const first_bytes = try serializeToolSchemasForCache(a, &first);
+    defer a.free(first_bytes);
+    const changed_bytes = try serializeToolSchemasForCache(a, &changed);
+    defer a.free(changed_bytes);
+    try std.testing.expect(!std.mem.eql(u8, first_bytes, changed_bytes));
+
+    var detector = @import("cache_break.zig").CacheBreakDetector{};
+    detector.recordRequest("stable-system", first_bytes, "glm-5.2");
+    _ = detector.checkResponse(5_000, 0);
+    detector.recordRequest("stable-system", changed_bytes, "glm-5.2");
+    try std.testing.expectEqualStrings(
+        "tool schemas changed",
+        detector.checkResponse(100, 4_900).?,
+    );
+}
+
+test "usage anchor: estimate = server tokens + suffix estimate; no anchor falls back to serialize" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "question");
+
+    var state = TestProviderState{};
+    const provider = testProvider(&state);
+
+    // 无锚点:冷路径 = 序列化全请求估算。
+    const cold = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    try std.testing.expect(cold > 0);
+
+    // 设锚点(模拟 message_start usage),再追加后缀。
+    c.setUsageAnchor(100_000);
+    try c.appendText(.assistant, "reply text");
+    const anchored = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    var expected: usize = 100_000;
+    expected += estimateMessageTokens(c.messages.items[1]);
+    try std.testing.expectEqual(expected, anchored);
+}
+
+test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风暴回归)" {
+    // 实测场景(2026-07-06):glm-5.2 窗口 262144,一轮 20 个并发 Read。
+    // 旧行为:纯字节估算 384K > blocking 239K → 全部 tool_result 未给模型看就清成
+    // stub,模型拿 20 个空结果幻觉"已完成"。真实用量仅 ~15K/245K。
+    // 新行为:usage 锚点(真实 in+cache)+ 后缀校准估算 → 远低于阈值,一个都不清。
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "read all 20 files");
+    c.setUsageAnchor(13_522); // message_start 报的真实 prompt tokens
+
+    // 20 个 tool_use + 20 个 32KB tool_result(toolResultContextBytes(262144) 截断后)。
+    const tu_blocks = try a.alloc(msg.Block, 20);
+    for (tu_blocks, 0..) |*b, i| {
+        var idbuf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&idbuf, "t{d}", .{i});
+        b.* = .{ .tool_use = .{
+            .id = try a.dupe(u8, id),
+            .name = try a.dupe(u8, "Read"),
+            .input = try a.dupe(u8, "{\"file_path\":\"/tmp/data.txt\"}"),
+        } };
+    }
+    try c.append(.{ .role = .assistant, .blocks = tu_blocks });
+    const tr_blocks = try a.alloc(msg.Block, 20);
+    for (tr_blocks, 0..) |*b, i| {
+        var idbuf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&idbuf, "t{d}", .{i});
+        const content = try a.alloc(u8, 32 * 1024);
+        @memset(content, 'r');
+        b.* = .{ .tool_result = .{
+            .tool_use_id = try a.dupe(u8, id),
+            .content = content,
+            .is_error = false,
+        } };
+    }
+    try c.append(.{ .role = .user, .blocks = tr_blocks });
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .max_input_tokens = 262_144, // metask /v1/models 实测值
+        .max_tokens = 64_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        null, // 阈值走窗口公式:auto=229144
+        10,
+        "post_tool_follow_up_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+
+    // est = 13522 + 20×(32768/4) + 信封 ≈ 178K < 229144 → 不触发;结果全部保留。
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    for (c.messages.items[2].blocks) |b| {
+        try std.testing.expect(b.tool_result.content.len == 32 * 1024); // 无一被清成 stub
+    }
+}
+
+test "auto-compact preflight never rewrites an already committed tool_result" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "inspect large output");
+
+    // 配对的 tool_use:否则 tool_result 是孤儿,P0.6 normalizeApiMessages 会剥掉它 → 巨内容不进估算。
+    const tu_blocks = try a.alloc(msg.Block, 1);
+    tu_blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "toolu_huge"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = tu_blocks });
+
+    const limit = conversation_mod.toolResultContextBytes(200_000);
+    const blocks = try a.alloc(msg.Block, 1);
+    const huge = try a.alloc(u8, limit * 4);
+    @memset(huge, 'A');
+    huge[huge.len - 1] = 'Z';
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "toolu_huge"),
+        .content = huge,
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    var state = TestProviderState{};
+    const provider = testProvider(&state);
+    const before = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    var api_before = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api_before, a);
+    const body_before = try json_mod.serializeMessagesRequest(.{
+        .model = provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = api_before.items,
+        .stream = true,
+        .tools = &.{},
+    }, a);
+    defer a.free(body_before);
+    const Capture = struct {
+        count: u32 = 0,
+        kind: ?[]const u8 = null,
+        changed_items: u32 = 0,
+        bytes_before: u64 = 0,
+        bytes_after: u64 = 0,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .context_projection => |projection| {
+                    self.count += 1;
+                    self.kind = projection.kind;
+                    self.changed_items = projection.changed_items;
+                    self.bytes_before = projection.bytes_before;
+                    self.bytes_after = projection.bytes_after;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        null,
+        2,
+        "post_tool_follow_up_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    try std.testing.expectEqual(@as(u32, 0), cap.count);
+    const after = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    try std.testing.expectEqual(before, after);
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = api.items,
+        .stream = true,
+        .tools = &.{},
+    }, a);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "toolu_huge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Z") != null);
+    try std.testing.expectEqual(Conversation.estimateTokens(body), after);
+    try std.testing.expectEqualStrings(body_before, body);
+}
+
+/// One user prompt, then fourteen 12 KB tool results: enough stale results
+/// for the microcompact pass to clear all but the most recent.
+const STALE_TOOL_RESULT_COUNT = 14;
+
+fn staleToolResultFixture(a: std.mem.Allocator, c: *Conversation) !void {
+    try c.appendText(.user, "inspect the accumulated results");
+    const result_count = STALE_TOOL_RESULT_COUNT;
+    const tool_uses = try a.alloc(msg.Block, result_count);
+    for (tool_uses, 0..) |*block, index| {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "micro-{d}", .{index});
+        block.* = .{ .tool_use = .{
+            .id = try a.dupe(u8, id),
+            .name = try a.dupe(u8, "Read"),
+            .input = try a.dupe(u8, "{}"),
+        } };
+    }
+    try c.append(.{ .role = .assistant, .blocks = tool_uses });
+
+    const tool_results = try a.alloc(msg.Block, result_count);
+    for (tool_results, 0..) |*block, index| {
+        var id_buf: [24]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "micro-{d}", .{index});
+        const content = try a.alloc(u8, 12 * 1024);
+        @memset(content, 'r');
+        block.* = .{ .tool_result = .{
+            .tool_use_id = try a.dupe(u8, id),
+            .content = content,
+            .is_error = false,
+        } };
+    }
+    try c.append(.{ .role = .user, .blocks = tool_results });
+}
+
+test "auto-compact emits stale tool-result projection from the real microcompact path" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try staleToolResultFixture(a, &c);
+    const result_count = STALE_TOOL_RESULT_COUNT;
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .max_input_tokens = 100_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const base_tokens = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    const target_tokens: usize = 51_000;
+    const padding_len = if (base_tokens < target_tokens)
+        (target_tokens - base_tokens) * 4
+    else
+        0;
+    const system_prompt = try a.alloc(u8, padding_len);
+    defer a.free(system_prompt);
+    @memset(system_prompt, 's');
+    const before_tokens = try estimateNextRequestTokens(a, provider, &c, system_prompt, null, null, &.{}, null);
+    const pressure = context_pressure_mod.ContextPressure.fromModel(
+        provider.maxInputTokens(),
+        provider.maxTokens(),
+        null,
+        before_tokens,
+    );
+    try std.testing.expect(before_tokens > pressure.warning_threshold);
+    try std.testing.expect(before_tokens < pressure.auto_compact_threshold);
+
+    const Capture = struct {
+        count: u32 = 0,
+        kind: ?[]const u8 = null,
+        changed_items: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .context_projection => |projection| {
+                    self.count += 1;
+                    self.kind = projection.kind;
+                    self.changed_items = projection.changed_items;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        system_prompt,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        null,
+        2,
+        "post_tool_follow_up_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    try std.testing.expectEqual(@as(u32, 1), cap.count);
+    try std.testing.expectEqualStrings("stale_tool_result_microcompact", cap.kind.?);
+    try std.testing.expectEqual(
+        @as(u32, result_count - conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP),
+        cap.changed_items,
+    );
+}
+
+test "issue #430: with a compaction control no in-place tool-result reduction rewrites durable history" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try staleToolResultFixture(a, &c);
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .max_input_tokens = 100_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    // The same pending request the previous test clears stale results for:
+    // inside the microcompact band, below the auto-compact threshold.
+    const base_tokens = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    const target_tokens: usize = 51_000;
+    const padding_len = if (base_tokens < target_tokens) (target_tokens - base_tokens) * 4 else 0;
+    const system_prompt = try a.alloc(u8, padding_len);
+    defer a.free(system_prompt);
+    @memset(system_prompt, 's');
+    const before_tokens = try estimateNextRequestTokens(a, provider, &c, system_prompt, null, null, &.{}, null);
+    const pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), null, before_tokens);
+    try std.testing.expect(before_tokens > pressure.warning_threshold);
+    try std.testing.expect(before_tokens < pressure.auto_compact_threshold);
+
+    const Capture = struct {
+        projections: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .context_projection) self.projections += 1;
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const version = c.mutation_version;
+    var recorder = compaction_control.Recorder{};
+    const outcome = try runAutoCompactControlled(&c, provider, system_prompt, null, null, &.{}, null, null, null, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+    // Nothing ran: no clearing, no truncation, no compaction attempt.
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    try std.testing.expectEqual(@as(u32, 0), cap.projections);
+    try std.testing.expectEqual(version, c.mutation_version);
+    try std.testing.expectEqual(@as(u32, 0), recorder.begins);
+    for (c.messages.items[2].blocks) |block| switch (block) {
+        .tool_result => |result| try std.testing.expectEqual(@as(usize, 12 * 1024), result.content.len),
+        else => return error.TestUnexpectedResult,
+    };
+}
+
+test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool suffix" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    // 8192 ASCII ≈ 2048 est-token/条(校准估算 ASCII/4);30 条 ≈ 61K > 32K 阈值。
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try c.appendText(.user, chunk);
+    }
+
+    const tool_use_blocks = try a.alloc(msg.Block, 1);
+    tool_use_blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{\"file_path\":\"/tmp/huge\"}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = tool_use_blocks });
+
+    const tool_result_blocks = try a.alloc(msg.Block, 1);
+    tool_result_blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "tool output"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = tool_result_blocks });
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        cause: ?[]const u8 = null,
+        dropped: u32 = 0,
+        compact_requests: u32 = 0,
+        compact_request_outcome: ?[]const u8 = null,
+        compact_request_cause: ?[]const u8 = null,
+        compact_begins: u32 = 0,
+        compact_ends: u32 = 0,
+        compact_end_outcome: ?[]const u8 = null,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .auto_compact => |ac| {
+                    self.cause = ac.cause;
+                    self.dropped = ac.dropped;
+                },
+                .diag_compact_request => |request| {
+                    self.compact_requests += 1;
+                    self.compact_request_outcome = request.outcome;
+                    self.compact_request_cause = request.cause;
+                },
+                .diag_compact_begin => self.compact_begins += 1,
+                .diag_compact_end => |event| {
+                    self.compact_ends += 1;
+                    self.compact_end_outcome = event.outcome;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+
+    const before_active = c.activeMessages().len;
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "post_tool_follow_up_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    try std.testing.expect(cap.dropped > 0);
+    try std.testing.expectEqual(@as(u32, 1), cap.compact_requests);
+    try std.testing.expectEqual(@as(u32, 1), cap.compact_begins);
+    try std.testing.expectEqual(@as(u32, 1), cap.compact_ends);
+    try std.testing.expectEqualStrings("compacted", cap.compact_end_outcome.?);
+    try std.testing.expectEqualStrings("success", cap.compact_request_outcome.?);
+    try std.testing.expectEqualStrings("post_tool_follow_up_threshold", cap.compact_request_cause.?);
+    // 投影:原始消息全量保留(len 不变),收缩的是活跃窗口。
+    const active = c.activeMessages();
+    try std.testing.expect(active.len < before_active);
+    try std.testing.expectEqualStrings("post_tool_follow_up_threshold", cap.cause.?);
+    // 保住工具后缀:活跃窗口末尾仍是配对的 tool_use / tool_result(不留孤儿)。
+    try std.testing.expect(active[active.len - 2].blocks[0] == .tool_use);
+    try std.testing.expect(active[active.len - 1].blocks[0] == .tool_result);
+}
+
+test "auto-compact does not buy a summary when fixed request overhead makes savings impossible" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "one");
+    try c.appendText(.assistant, "two");
+    try c.appendText(.user, "three");
+    try c.appendText(.assistant, "four");
+
+    const system_prompt = try a.alloc(u8, 160 * 1024);
+    defer a.free(system_prompt);
+    @memset(system_prompt, 's');
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "summary that must not be requested",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        system_prompt,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "pre_sampling_pending_turn_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, outcome);
+    try std.testing.expectEqual(@as(u32, 0), provider_state.compact_request_count);
+    try std.testing.expectEqual(@as(usize, 0), c.compact_boundary);
+}
+
+test "auto-compact checks runtime request gate before provider side effect" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+    const GateState = struct {
+        checks: usize = 0,
+        fn allows(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return false;
+        }
+    };
+    var gate_state = GateState{};
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "pre_sampling_pending_turn_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        .{ .ctx = @ptrCast(&gate_state), .allows_fn = GateState.allows },
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.aborted, outcome);
+    try std.testing.expectEqual(@as(usize, 1), gate_state.checks);
+    try std.testing.expectEqual(@as(u32, 0), provider_state.compact_request_count);
+    try std.testing.expectEqual(@as(usize, 0), c.compact_boundary);
+}
+
+test "auto-compact feeds realized summary overhead back into retry preview" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    // Dropping the prefix without a summary easily clears the 5% gate, but
+    // this realized summary is large enough to erase those savings. The first
+    // attempt therefore supplies a measured overhead reserve; the unchanged
+    // second attempt must be rejected locally without another provider call.
+    const oversized_summary = try a.alloc(u8, 240 * 1024);
+    defer a.free(oversized_summary);
+    @memset(oversized_summary, 's');
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = oversized_summary,
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+    var summary_reserve_tokens: usize = 0;
+
+    const first = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "post_tool_follow_up_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        &summary_reserve_tokens,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, first);
+    try std.testing.expectEqual(@as(u32, 1), provider_state.compact_request_count);
+    try std.testing.expect(summary_reserve_tokens > 0);
+
+    const second = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "pre_sampling_pending_turn_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        1,
+        null,
+        a,
+        null,
+        null,
+        &summary_reserve_tokens,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, second);
+    try std.testing.expectEqual(@as(u32, 1), provider_state.compact_request_count);
+    try std.testing.expectEqual(@as(usize, 0), c.compact_boundary);
+}
+
+test "auto-compact summary carries in_progress task anchor through compaction" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try c.appendText(.user, chunk);
+    }
+
+    var store = @import("task_store.zig").TaskStore.init(a);
+    defer store.deinit();
+    try store.createWithId("kg-42", "修复解析器", "细节", .in_progress);
+    try store.createWithId("kg-43", "已完成的不进锚", "细节", .completed);
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "post_tool_follow_up_threshold",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        &store,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+
+    // 投影:摘要存在 compact_summary(投影时作边界前一条 assistant 消息注入),不在 messages.items。
+    // 里面必须带确定性任务锚(进行中任务 + 闭合指引),completed 不进锚。
+    try std.testing.expect(c.compact_summary != null);
+    const summ = c.compact_summary.?;
+    try std.testing.expect(std.mem.indexOf(u8, summ, "compact 任务锚") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summ, "kg-42 修复解析器") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summ, "small summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summ, "kg-43") == null); // completed 不进锚
+}
+
+test "auto-compact charges its summary request to the Run's goal (issue #277)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Sink.emit, .poll = Sink.poll };
+
+    const goal = @import("metacodes-guard").core.goal;
+    var state = goal.State.init(a);
+    defer state.deinit();
+    try state.setNew("ship it", null);
+    var meter = goal.Meter.init(&state);
+    meter.beginRun();
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, &meter);
+    _ = meter.endRun();
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    // The summary request's usage (11 in, 7 out) is goal work like any other.
+    try std.testing.expectEqual(@as(u64, 18), state.current.?.tokens_used);
+}
+
+fn compactionControlFixture(a: std.mem.Allocator, c: *Conversation) !void {
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+}
+
+const NullBackend = struct {
+    fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+    fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+        return null;
+    }
+};
+
+test "issue #430: a compaction control sees every attempt and its refusal keeps the Conversation" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = NullBackend.emit, .poll = NullBackend.poll };
+
+    // Allowed: begin, one commit check, settled as committed.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+        var recorder = compaction_control.Recorder{};
+        const outcome = try runAutoCompactControlled(&c, testProvider(&provider_state), null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+        try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+        try std.testing.expectEqual(@as(u32, 1), recorder.begins);
+        try std.testing.expectEqual(@as(u32, 1), recorder.allow_calls);
+        try std.testing.expectEqual(@as(u32, 1), recorder.committed);
+        try std.testing.expectEqual(compaction_control.Trigger.context_window, recorder.last_trigger.?);
+        try std.testing.expect(c.compact_summary != null);
+    }
+    // Refused at the commit point: refused, nothing replaced.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        const version = c.mutation_version;
+        var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+        var recorder = compaction_control.Recorder{ .allow = false };
+        const outcome = try runAutoCompactControlled(&c, testProvider(&provider_state), null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+        // A refusal is the owner's terminal, never reported as a cancellation.
+        try std.testing.expectEqual(AutoCompactOutcome.refused, outcome);
+        try std.testing.expectEqual(@as(u32, 1), recorder.not_committed);
+        try std.testing.expectEqual(@as(u32, 0), recorder.committed);
+        try std.testing.expect(c.compact_summary == null);
+        try std.testing.expectEqual(version, c.mutation_version);
+        try std.testing.expectEqual(@as(usize, 30), c.len());
+    }
+    // Durable pressure alone, far below the token threshold: the owner's
+    // trigger compacts; with nothing compactable it is told so instead.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 2_000_000, .max_tokens = 32_000 };
+        var recorder = compaction_control.Recorder{ .wants = true };
+        const outcome = try runAutoCompactControlled(&c, testProvider(&provider_state), null, null, null, &.{}, null, null, null, 2, "pre_sampling_pending_turn_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, recorder.control(), false);
+        try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+        try std.testing.expectEqual(compaction_control.Trigger.durable_capacity, recorder.last_trigger.?);
+        try std.testing.expectEqual(@as(u32, 1), recorder.committed);
+
+        var small = Conversation.init(a);
+        defer small.deinit();
+        try small.appendText(.user, "one");
+        var nothing = compaction_control.Recorder{ .wants = true };
+        const none = try runAutoCompactControlled(&small, testProvider(&provider_state), null, null, null, &.{}, null, null, null, 2, "pre_sampling_pending_turn_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, null, nothing.control(), false);
+        try std.testing.expectEqual(AutoCompactOutcome.not_needed, none);
+        try std.testing.expectEqual(@as(u32, 0), nothing.begins);
+        try std.testing.expectEqual(@as(u32, 1), nothing.nothing);
+    }
+}
+
+test "issue #430: a refused replacement and an abandoned deferral end the Run as the owner's terminal" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = NullBackend.emit, .poll = NullBackend.poll };
+    // Every boundary maps a refusal to the failed-request stop, and only a
+    // cancellation to `aborted`.
+    try std.testing.expectEqual(@as(?StopReason, .api_error), compactStopReason(.refused, null));
+    try std.testing.expectEqual(@as(?StopReason, .api_error), compactStopReason(.api_error, null));
+    try std.testing.expectEqual(@as(?StopReason, .aborted), compactStopReason(.aborted, null));
+    try std.testing.expectEqual(@as(?StopReason, null), compactStopReason(.compacted, null));
+
+    var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+    const Args = struct {
+        fn of(c: *Conversation, p: provider_mod.Provider, b: *const UiBackend, st: *ContextRecoveryState, alloc: std.mem.Allocator, control: compaction_control.Control) RecoveryArgs {
+            return .{
+                .conversation = c,
+                .provider = p,
+                .system_prompt = null,
+                .inject_user_context = null,
+                .synthetic_user_input = null,
+                .tool_defs = &.{},
+                .model_override = null,
+                .numbers = .{},
+                .keep_recent = 2,
+                .backend = b,
+                .sess = .single,
+                .trace_id = [_]u8{0} ** 12,
+                .depth = 0,
+                .state = st,
+                .turn_number = 1,
+                .context_warning_emitted = null,
+                .allocator = alloc,
+                .tasks = null,
+                .hookset = null,
+                .summary_reserve_tokens = null,
+                .request_gate = null,
+                .abort = null,
+                .goal_meter = null,
+                .control = control,
+            };
+        }
+    };
+    // The owner refuses the capacity compaction's replacement: its terminal,
+    // nothing to abandon.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{ .allow = false };
+        var st = ContextRecoveryState{ .cap = 4 };
+        try std.testing.expectEqual(DurableRecovery.owner_terminal, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.allow_calls);
+        try std.testing.expectEqual(@as(u32, 0), recorder.abandoned);
+        try std.testing.expect(c.compact_summary == null);
+    }
+    // The turn's recovery bound is spent: the deferred request is abandoned
+    // to the owner without another compaction.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{};
+        var st = ContextRecoveryState{ .cap = 1, .attempts = 1 };
+        try std.testing.expectEqual(DurableRecovery.owner_terminal, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.abandoned);
+        try std.testing.expectEqual(@as(u32, 0), recorder.begins);
+    }
+    // A compaction that relieved something re-issues the turn.
+    {
+        var c = Conversation.init(a);
+        defer c.deinit();
+        try compactionControlFixture(a, &c);
+        var recorder = compaction_control.Recorder{};
+        var st = ContextRecoveryState{ .cap = 4 };
+        try std.testing.expectEqual(DurableRecovery.retry, recoverDurableCapacity(Args.of(&c, testProvider(&provider_state), &backend, &st, a, recorder.control())));
+        try std.testing.expectEqual(@as(u32, 1), recorder.committed);
+        try std.testing.expectEqual(@as(u32, 0), recorder.abandoned);
+    }
+}
+
+test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    // PreCompact hook 写 marker(证明压缩前触发);PostCompact hook 回 additionalContext(模拟重注入 skill)。
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    var marker_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pre_marker = try std.fmt.bufPrintZ(&marker_buf, "{s}/precompact-fired.marker", .{root_buf[0..root_len]});
+    const pre_cmd = try std.fmt.allocPrint(a, "touch -- {s}", .{pre_marker});
+    defer a.free(pre_cmd);
+    const pre_cmds = [_][]const u8{pre_cmd};
+    const pre_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &pre_cmds }};
+    const post_cmds = [_][]const u8{"echo '{\"additionalContext\":\"ACTIVE_SKILL_REINJECTED\"}'"};
+    const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
+    const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .pre_compact = &pre_entries, .post_compact = &post_entries, .allocator = a };
+
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null, null, null, null);
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+
+    // PreCompact 真触发:marker 文件存在。
+    const pre_fd = pfs.open(@ptrCast(pre_marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(pre_fd >= 0);
+    if (pre_fd >= 0) _ = pfs.close(pre_fd);
+    // PostCompact 的 additionalContext 拼进投影摘要 → 模型下轮读得到。
+    try std.testing.expect(c.compact_summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.compact_summary.?, "ACTIVE_SKILL_REINJECTED") != null);
+}
+
+test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触发(G-rest)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "do something");
+    try c.appendText(.assistant, "DONE_MARKER_ANSWER");
+
+    var marker_buf: [512]u8 = undefined;
+    const marker = tt.path(&marker_buf, "stop-hook-fired.marker");
+    pfs.unlinkPath(marker.ptr) catch {};
+    const hook_cmd = try std.fmt.allocPrint(a, "cat > {s}", .{marker});
+    defer a.free(hook_cmd);
+    const cmds = [_][]const u8{hook_cmd};
+    const entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &cmds }};
+    const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .stop = &entries, .allocator = a };
+
+    // 顶层(depth=0)触发:hook 收到含 Stop/last_message/stop_reason 的 stdin。
+    fireStopHook(&hs, a, &c, "end_turn", 0);
+    {
+        const fd = pfs.open(@ptrCast(marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        try std.testing.expect(fd >= 0);
+        defer _ = pfs.close(fd);
+        var buf: [1024]u8 = undefined;
+        const n = pfs.read(fd, buf[0..buf.len]);
+        try std.testing.expect(n > 0);
+        const got = buf[0..@intCast(n)];
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"Stop\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "DONE_MARKER_ANSWER") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "end_turn") != null);
+    }
+
+    // 负向:subagent(depth=1)不触发(marker 删后不重现)。
+    pfs.unlinkPath(@ptrCast(marker.ptr)) catch {};
+    fireStopHook(&hs, a, &c, "end_turn", 1);
+    const fd2 = pfs.open(@ptrCast(marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd2 < 0); // 不触发 → 文件不存在
+    if (fd2 >= 0) _ = pfs.close(fd2);
+}
+
+test "previous-model compact uses old model override before smaller-window sampling" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    // 8192 ASCII ≈ 2048 est-token/条;30 条 ≈ 61K > 32K 阈值(校准估算 ASCII/4)。
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'p');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try c.appendText(.user, chunk);
+    }
+
+    var provider_state = TestProviderState{
+        .model = "new-small-model",
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 80_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        cause: ?[]const u8 = null,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .auto_compact => |ac| self.cause = ac.cause,
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        "old-large-model",
+        32_000,
+        2,
+        "pre_sampling_previous_model_smaller_window",
+        false,
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    try std.testing.expectEqualStrings("old-large-model", provider_state.last_send_model_override.?);
+    try std.testing.expectEqualStrings("pre_sampling_previous_model_smaller_window", cap.cause.?);
+}
+
+/// Shared fixture for the context-window recovery tests: a provider whose
+/// first sampling request is rejected as too large, and a stream that answers
+/// "ok" to every later request (summary or retry alike).
+const ContextRecoveryFixture = struct {
+    const FakeStream = struct {
+        allocator: std.mem.Allocator,
+        attempt: u32 = 0,
+        index: u32 = 0,
+        rid: log.RequestId = undefined,
+
+        fn next(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.attempt == 0) return error.ContextWindowExceeded;
+            if (self.index == 0) {
+                self.index += 1;
+                return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "ok") };
+            }
+            return null;
+        }
+        fn deinit(_: *anyopaque) void {}
+        fn stop(ctx: *anyopaque) api_stream.StopReason {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return if (self.attempt == 0) .unknown else .end_turn;
+        }
+        fn requestId(ctx: *anyopaque) log.RequestId {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.rid;
+        }
+    };
+
+    const FakeProvider = struct {
+        allocator: std.mem.Allocator,
+        sends: u32 = 0,
+        /// Requests made through `sendStream` (the summary transport), by count.
+        summary_sends: u32 = 0,
+        streams: [4]FakeStream = undefined,
+        numbers: error_class.ContextWindowNumbers = .{},
+        endpoint: []const u8 = "",
+
+        fn asState(ctx: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn model(_: *anyopaque) []const u8 {
+            return "fake";
+        }
+        fn sendStreamRetry(ctx: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: u32, _: u64, _: ?provider_mod.RetryReporter, _: []const u8) anyerror!provider_mod.StreamHandle {
+            const st = asState(ctx);
+            if (st.sends >= st.streams.len) return error.UnexpectedTestCall;
+            const attempt = st.sends;
+            st.streams[attempt] = .{ .allocator = st.allocator, .attempt = attempt, .rid = log.genRequestId() };
+            st.sends += 1;
+            return .{
+                .ctx = @ptrCast(&st.streams[attempt]),
+                .nextFn = FakeStream.next,
+                .deinitFn = FakeStream.deinit,
+                .stopReasonFn = FakeStream.stop,
+                .requestIdFn = FakeStream.requestId,
+            };
+        }
+        fn sendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!provider_mod.StreamHandle {
+            asState(ctx).summary_sends += 1;
+            return sendStreamRetry(ctx, messages, system, tools, abort, model_override, tool_choice, 0, 0, null, user_query);
+        }
+        fn send(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?[]const u8) anyerror!provider_mod.ApiResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 32_000;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 200_000;
+        }
+        fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+            return null;
+        }
+        fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+            return false;
+        }
+        fn lastNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+            return asState(ctx).numbers;
+        }
+        fn endpointId(ctx: *anyopaque) []const u8 {
+            return asState(ctx).endpoint;
+        }
+        fn provider(self: *@This()) provider_mod.Provider {
+            return .{
+                .ctx = @ptrCast(self),
+                .modelFn = model,
+                .sendStreamFn = sendStream,
+                .sendStreamRetryFn = sendStreamRetry,
+                .sendFn = send,
+                .maxTokensFn = maxTokens,
+                .maxInputTokensFn = maxInputTokens,
+                .reasoningEffortFn = reasoningEffort,
+                .supportsFn = supports,
+                .lastContextWindowNumbersFn = lastNumbers,
+                .endpointIdFn = endpointId,
+            };
+        }
+    };
+
+    const Capture = struct {
+        auto_compacts: u32 = 0,
+        last_cause: []const u8 = "",
+        last_dropped: u32 = 0,
+        last_kept: u32 = 0,
+        text: std.ArrayList(u8) = .empty,
+        allocator: std.mem.Allocator,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .auto_compact => |c| {
+                    self.auto_compacts += 1;
+                    self.last_cause = c.cause;
+                    self.last_dropped = c.dropped;
+                    self.last_kept = c.kept;
+                },
+                .text_chunk => |t| self.text.appendSlice(self.allocator, t) catch {},
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+};
+
+test "context-window rejection with nothing to compact trims the oldest pair and records an observed cap" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "oldest context");
+    try c.appendText(.assistant, "middle context");
+    try c.appendText(.user, "current request");
+
+    var fp = ContextRecoveryFixture.FakeProvider{ .allocator = a, .endpoint = "https://fake.endpoint" };
+    var cap = ContextRecoveryFixture.Capture{ .allocator = a };
+    defer cap.text.deinit(a);
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = ContextRecoveryFixture.Capture.emit, .poll = ContextRecoveryFixture.Capture.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    // keep_recent (default 10) exceeds the history: compaction has nothing to
+    // drop, so recovery falls back to the trim.
+    const result = try run(&c, fp.provider(), &.{}, &perm, .{ .max_turns = 2, .colorize = false }, &backend, a);
+
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 2), fp.sends);
+    try std.testing.expectEqual(@as(u32, 0), fp.summary_sends);
+    try std.testing.expectEqual(@as(u32, 1), cap.auto_compacts);
+    try std.testing.expectEqualStrings("context_window_exceeded_trim", cap.last_cause);
+    try std.testing.expectEqualStrings("ok", cap.text.items);
+    // 投影:trim 推进 boundary 丢 "oldest context",不删原始。
+    // 全量 = [oldest, middle, current, ok(assistant 回复)];活跃窗口从 middle 起。
+    try std.testing.expectEqual(@as(usize, 4), c.len());
+    try std.testing.expectEqual(@as(usize, 1), c.activeStart());
+    const active = c.activeMessages();
+    try std.testing.expectEqualStrings("middle context", active[0].blocks[0].text);
+    try std.testing.expectEqualStrings("current request", active[1].blocks[0].text);
+    try std.testing.expectEqualStrings("oldest context", c.messages.items[0].blocks[0].text);
+    // No numbers in the rejection: the wall is recorded from the local size, as an observation.
+    const learned = context_caps.lookup("https://fake.endpoint", "fake") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(context_caps.Source.observed, learned.source);
+    try std.testing.expect(learned.input_cap > 0);
+}
+
+test "context-window rejection forces a summary compaction, keeps the first request verbatim, then retries" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    // Enough bulk that dropping the prefix clears the 5% savings gate even
+    // after the summary prefix and the preserved request are added back.
+    // ≈60K tokens in total, so the observed cap sits well above the fixed buffers.
+    const filler = "f" ** 60_000;
+    try c.appendText(.user, "oldest context: rerun the benchmark " ++ filler);
+    try c.appendText(.assistant, "middle one " ++ filler);
+    try c.appendText(.user, "middle two " ++ filler);
+    try c.appendText(.assistant, "middle three " ++ filler);
+    try c.appendText(.user, "current request");
+
+    var fp = ContextRecoveryFixture.FakeProvider{ .allocator = a, .endpoint = "https://fake.endpoint" };
+    var cap = ContextRecoveryFixture.Capture{ .allocator = a };
+    defer cap.text.deinit(a);
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = ContextRecoveryFixture.Capture.emit, .poll = ContextRecoveryFixture.Capture.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, fp.provider(), &.{}, &perm, .{ .max_turns = 2, .colorize = false, .auto_compact_keep_recent = 1 }, &backend, a);
+
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    // rejected sampling → summary request → retried sampling
+    try std.testing.expectEqual(@as(u32, 3), fp.sends);
+    try std.testing.expectEqual(@as(u32, 1), fp.summary_sends);
+    try std.testing.expectEqual(@as(u32, 1), cap.auto_compacts);
+    try std.testing.expectEqualStrings("context_window_exceeded_recovery", cap.last_cause);
+    try std.testing.expectEqual(@as(u32, 4), cap.last_dropped);
+    try std.testing.expectEqualStrings("ok", cap.text.items);
+    // Projection: summary replaces the four dropped messages; only "current request" stays active.
+    try std.testing.expectEqual(@as(usize, 6), c.len());
+    try std.testing.expectEqual(@as(usize, 4), c.activeStart());
+    try std.testing.expectEqualStrings("current request", c.activeMessages()[0].blocks[0].text);
+    const summary = c.compact_summary orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, summary, "ok") != null);
+    // The user's first request survives verbatim; the assistant filler does not.
+    try std.testing.expect(std.mem.indexOf(u8, summary, "[1] oldest context: rerun the benchmark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "middle one") == null);
+    // The trim path was never needed.
+    try std.testing.expectEqualStrings("oldest context: rerun the benchmark " ++ filler, c.messages.items[0].blocks[0].text);
+}
+
+test "context-window rejection with server numbers learns the stated cap for the endpoint" {
+    context_caps.resetForTest();
+    defer context_caps.resetForTest();
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "oldest context");
+    try c.appendText(.assistant, "middle context");
+    try c.appendText(.user, "current request");
+
+    var fp = ContextRecoveryFixture.FakeProvider{
+        .allocator = a,
+        .endpoint = "https://gateway.example/v1",
+        .numbers = .{ .input_limit = 150_000, .input_actual = 160_000 },
+    };
+    var cap = ContextRecoveryFixture.Capture{ .allocator = a };
+    defer cap.text.deinit(a);
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = ContextRecoveryFixture.Capture.emit, .poll = ContextRecoveryFixture.Capture.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, fp.provider(), &.{}, &perm, .{ .max_turns = 2, .colorize = false }, &backend, a);
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+
+    const learned = context_caps.lookup("https://gateway.example/v1", "fake") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 150_000), learned.input_cap);
+    try std.testing.expectEqual(context_caps.Source.server_message, learned.source);
+    // The same model on another endpoint learned nothing.
+    try std.testing.expectEqual(@as(?u64, null), context_caps.learnedInputCap("https://other.example", "fake"));
+    // With the wall learned, the pressure model now sits inside it.
+    const p = pressureFor(fp.provider(), null, null, 0);
+    try std.testing.expectEqual(@as(?usize, 150_000), p.learned_input_cap);
+    try std.testing.expect(p.auto_compact_threshold < 150_000);
+}
+
+test "context warning emits once only at medium pressure" {
+    const Capture = struct {
+        warnings: u32 = 0,
+        level: ?[]const u8 = null,
+        current_tokens: u64 = 0,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .context_warning => |w| {
+                    self.warnings += 1;
+                    self.level = w.level;
+                    self.current_tokens = w.current_tokens;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    var emitted = false;
+
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 147_999), &emitted);
+    try std.testing.expectEqual(@as(u32, 0), cap.warnings);
+    try std.testing.expect(!emitted);
+
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 148_000), &emitted);
+    try std.testing.expectEqual(@as(u32, 1), cap.warnings);
+    try std.testing.expect(emitted);
+    try std.testing.expectEqualStrings("medium", cap.level.?);
+    try std.testing.expectEqual(@as(u64, 148_000), cap.current_tokens);
+
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 152_000), &emitted);
+    try std.testing.expectEqual(@as(u32, 1), cap.warnings);
+
+    emitted = false;
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 155_000), &emitted);
+    try std.testing.expectEqual(@as(u32, 1), cap.warnings);
+    try std.testing.expect(!emitted);
+}
+
+test "auto-compact preflight keeps serialized request valid UTF-8 after multibyte truncation" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const limit = conversation_mod.toolResultContextBytes(0);
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(a);
+    while (payload.items.len < limit * 3) {
+        try payload.appendSlice(a, "路径/中文/🙂/");
+    }
+
+    // 配对 tool_use:否则 tool_result 是孤儿,normalizeApiMessages 会剥掉 → body 里就没有它。
+    const tu_blocks = try a.alloc(msg.Block, 1);
+    tu_blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "toolu_utf8"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = tu_blocks });
+
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "toolu_utf8"),
+        .content = try a.dupe(u8, payload.items),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    const reduced = result_projection.truncateLargeToolResults(&c, limit);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(c.messages.items[1].blocks[0].tool_result.content));
+
+    var state = TestProviderState{};
+    const provider = testProvider(&state);
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = api.items,
+        .stream = true,
+        .tools = &.{},
+    }, a);
+    defer a.free(body);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
+    try std.testing.expect(std.mem.indexOf(u8, body, "original_bytes") != null);
+}
+
+test "buildEffectiveToolSet hides unactivated deferred tools for compact estimate" {
+    const a = std.testing.allocator;
+    const tool_defs = [_]json_mod.ToolDefinition{
+        .{
+            .name = "Read",
+            .description = "Read file contents",
+            .input_schema = .{ .prop_specs = &.{.{ .name = "file_path", .type = "string" }}, .required = &.{"file_path"} },
+        },
+        .{
+            .name = "DeferredHuge",
+            .description = "This deferred schema should not affect the next request estimate until activated.",
+            .input_schema = .{ .prop_specs = &.{.{ .name = "payload", .type = "string", .description = "large hidden payload" }}, .required = &.{"payload"} },
+            .deferred = true,
+        },
+    };
+    var activated = std.StringHashMap(void).init(a);
+    defer activated.deinit();
+    var permission_ctx = permission_mod.PermissionContext{ .allocator = a };
+    var state = TestProviderState{};
+    var effective = try buildEffectiveToolSet(
+        a,
+        &tool_defs,
+        &permission_ctx,
+        &activated,
+        null,
+        testProvider(&state),
+    );
+    defer effective.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), effective.defs.len);
+    try std.testing.expectEqualStrings("Read", effective.defs[0].name);
+}
+
+test "buildEffectiveToolSet applies an execution policy before provider exposure" {
+    const Policy = struct {
+        fn allowsTool(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "Read");
+        }
+        fn allowsInvocation(
+            _: *const anyopaque,
+            name: []const u8,
+            _: []const u8,
+        ) bool {
+            return std.mem.eql(u8, name, "Read");
+        }
+        var sentinel: u8 = 0;
+    };
+    const tool_defs = [_]json_mod.ToolDefinition{
+        .{ .name = "Read", .description = "read", .input_schema = .{} },
+        .{ .name = "Write", .description = "write", .input_schema = .{} },
+    };
+    var permission_ctx = permission_mod.PermissionContext{
+        .allocator = std.testing.allocator,
+    };
+    var provider_state = TestProviderState{};
+    var effective = try buildEffectiveToolSet(
+        std.testing.allocator,
+        &tool_defs,
+        &permission_ctx,
+        null,
+        .{
+            .ctx = @ptrCast(&Policy.sentinel),
+            .allowsToolFn = Policy.allowsTool,
+            .allowsInvocationFn = Policy.allowsInvocation,
+        },
+        testProvider(&provider_state),
+    );
+    defer effective.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), effective.defs.len);
+    try std.testing.expectEqualStrings("Read", effective.defs[0].name);
+}
+
+test "StopReason has aborted and max_turns" {
+    // 编译时保证 stop_reason 含新枚举值
+    const r: StopReason = .aborted;
+    try std.testing.expect(r == .aborted);
+    const r2: StopReason = .max_turns;
+    try std.testing.expect(r2 == .max_turns);
+    const r3: StopReason = .max_tokens_exhausted;
+    try std.testing.expect(r3 == .max_tokens_exhausted);
+}
+
+test "auto-compact 阈值用 input context window 而非 output max_tokens(防回归真机 bug)" {
+    // 真机 bug:阈值曾用 output max_tokens(sonnet 默认 32K)*0.7 → 工具调研刚读几个文件就误触发
+    // 压缩、丢掉原始问题。修复:改用 input context window(~200K)扣 output reserve 后的 CC/Rust 阈值。
+    // 源级守卫:阈值算式必须调 resolveMaxInputTokens(而非 output 的解析器),且 MIN 不再是早期小值。
+    const src = @embedFile("agent_loop.zig");
+    // 仍守"用 input window 而非 output max_tokens",但两者现在都按本次请求真正
+    // 会用的模型解析:subagent 与父共享 Provider,只靠 model_override 区分,拿父
+    // 窗口给子算阈值就是把 200K 的历史发给 32K 端点。
+    try std.testing.expect(std.mem.indexOf(u8, src, "ContextPressure.fromModel(provider.maxInputTokensFor(model_override), provider.maxTokensFor(model_override)") != null);
+    // 全额输出预留(服务端校验 in+max_tokens ≤ window):200K-32K-13K = 155K。
+    try std.testing.expectEqual(@as(usize, 155_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
+    try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
+}
+
+test "微压缩两趟都接线:clear 与 truncate 必须同时在生产路径上" {
+    // 回归守卫:`truncateLargeToolResults` 曾经零生产调用者——全仓每一个调用点
+    // 都在 test 块内,而下面这条日志行一直打印 `truncated={d}`,该字段结构性
+    // 恒为 0。projection 只在结果**提交那一刻**限界且从不重投影历史,所以
+    // /resume 载入的历史、或切到更小窗口的模型,其超限结果没有任何一层管得到。
+    // 两个压力阀点都必须按 provider 窗口派生的同一预算跑截断趟。
+    // 只数标识符,不数空白:钉死缩进会让这条守卫在任何一次重新格式化后失效,
+    // 而它要守的是"两个压力阀都调了这一趟",跟版式无关。
+    const src = @embedFile("agent_loop.zig");
+    var count: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, src, cursor, "reduced.merge(result_projection.truncateLargeToolResults(")) |at| {
+        cursor = at + 1;
+        // 同一条语句里必须紧跟着按 provider 窗口派生的预算,不能各自造常量。
+        const tail = src[at..@min(src.len, at + 240)];
+        if (std.mem.indexOf(u8, tail, "toolResultContextBytes(provider.maxInputTokensFor(model_override))") != null) count += 1;
+    }
+    // 一处在 micro 阈值带,一处在 blocking-limit 恢复。
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "parseForcedAutoCompactThreshold: 合法强制值 + 坏值回退 null" {
+    // 合法:e2e 用它在短对话直接钉低阈值触发真实压缩+投影。
+    try std.testing.expectEqual(@as(?usize, 3000), parseForcedAutoCompactThreshold("3000"));
+    // 空 / 0 / 非法 → null(坏 env 绝不改压缩行为)。
+    try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold(""));
+    try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold("0"));
+    try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold("garbage"));
+    // 无 env 时 getenv 返回 null → 走正常 formula+floor(wiring 由真模型 e2e 验证)。
+}
+
+test "估算投影:image 按 IMAGE_TOKEN_ESTIMATE 计,不按 base64 字节(防爆表/误 compact)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    // 800KB 伪 base64:按旧字节估算 ≈ 20 万 token;按投影应只计 IMAGE_TOKEN_ESTIMATE。
+    const big = try a.alloc(u8, 800_000);
+    @memset(big, 'A');
+    const blocks = try a.alloc(msg.Block, 2);
+    blocks[0] = .{ .text = try a.dupe(u8, "看图") };
+    blocks[1] = .{ .image = .{ .media_type = try a.dupe(u8, "image/png"), .data = big } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    // model 用非 claude 名:投影后估算序列化不再触发 vision 守门(此前会 error 落 fallback)。
+    var state = TestProviderState{ .model = "gpt-4o", .max_tokens = 777, .reasoning_effort = null };
+    const provider = testProvider(&state);
+    const estimated = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    try std.testing.expect(estimated >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    try std.testing.expect(estimated < 50_000); // 远小于按字节计的 ~20 万
+
+    // request_gate 的 input 预留同理:不因图爆表,也不因非 vision 模型报错(此前
+    // catch maxInt → 预算门必拒)。
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    const reserve = try serializedRequestInputTokenReserve(a, provider, api.items, null, &.{}, null);
+    try std.testing.expect(reserve < 100_000);
+    try std.testing.expect(reserve >= 2 * @as(u64, conversation_mod.IMAGE_TOKEN_ESTIMATE));
+}
+
+test "projectPayloadsForEstimation: 无图返 null(零拷贝),有图替换占位并计数" {
+    const a = std.testing.allocator;
+    const text_only = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
+    };
+    try std.testing.expect((try projectPayloadsForEstimation(a, &text_only)) == null);
+
+    const mixed = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .text = "a" },
+            .{ .image = .{ .media_type = "image/png", .data = "XXXX" } },
+            .{ .image = .{ .media_type = "image/jpeg", .data = "YYYY" } },
+        } },
+    };
+    const proj = (try projectPayloadsForEstimation(a, &mixed)).?;
+    defer proj.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), proj.image_count);
+    try std.testing.expectEqualStrings("a", proj.messages[0].content[0].text);
+    try std.testing.expectEqualStrings("[image]", proj.messages[0].content[1].text);
+    try std.testing.expectEqualStrings("[image]", proj.messages[0].content[2].text);
+}
+
+test "估算投影覆盖 tool_result 图像形态(Read 截图不爆表)" {
+    const a = std.testing.allocator;
+    // Read 工具图像形态 tool_result:800KB 伪 base64。
+    const big = try a.alloc(u8, 800_000);
+    defer a.free(big);
+    @memset(big, 'A');
+    const tr_content = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{big});
+    defer a.free(tr_content);
+
+    const contents = [_]types.ApiContent{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = tr_content } },
+    };
+    const messages = [_]types.ApiMessage{.{ .role = .user, .content = &contents }};
+    const proj = (try projectPayloadsForEstimation(a, &messages)).?;
+    defer proj.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), proj.image_count);
+    try std.testing.expectEqualStrings("[image tool result]", proj.messages[0].content[0].tool_result.content);
+    try std.testing.expectEqualStrings("t1", proj.messages[0].content[0].tool_result.tool_use_id);
+
+    // 端到端:估算不按 base64 字节计。
+    var state = TestProviderState{ .model = "gpt-4o", .max_tokens = 777, .reasoning_effort = null };
+    const provider = testProvider(&state);
+    const estimated = try estimateApiRequestTokens(a, provider, &messages, null, &.{}, null);
+    try std.testing.expect(estimated < 50_000);
+}
+
+test "canonical 请求身份:非 claude vision 模型带图可算,图内容参与身份" {
+    // 此前经 Anthropic 序列化器直算 → gpt-4o 带图报 ImageInputUnsupported,
+    // execution-boundary 会话 run 直接 .api_error(review 轮修复,此测试锁定)。
+    const a = std.testing.allocator;
+    var state = TestProviderState{ .model = "gpt-4o", .max_tokens = 777, .reasoning_effort = null };
+    const provider = testProvider(&state);
+
+    const c1 = [_]types.ApiContent{
+        .{ .text = "look" },
+        .{ .image = .{ .media_type = "image/png", .data = "AAAA" } },
+    };
+    const m1 = [_]types.ApiMessage{.{ .role = .user, .content = &c1 }};
+    const h1 = try canonicalAgentRequestSha256(a, provider, &m1, null, &.{}, null);
+
+    // 图内容变 → 身份变(占位投影不丢失图像身份)。
+    const c2 = [_]types.ApiContent{
+        .{ .text = "look" },
+        .{ .image = .{ .media_type = "image/png", .data = "BBBB" } },
+    };
+    const m2 = [_]types.ApiMessage{.{ .role = .user, .content = &c2 }};
+    const h2 = try canonicalAgentRequestSha256(a, provider, &m2, null, &.{}, null);
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+
+    // 同输入 → 同身份(确定性)。
+    const h1_again = try canonicalAgentRequestSha256(a, provider, &m1, null, &.{}, null);
+    try std.testing.expectEqualStrings(&h1, &h1_again);
+}
+
+test "usage-anchor 热路径:Read 图像 tool_result 增量按 IMAGE_TOKEN_ESTIMATE 计" {
+    // 锚点后缀里一条 5MB 级图像 tool_result 若按字节/4 计 → anchor+~125 万,
+    // maybeAutoCompact 每图强制一次有损 compact(review 轮修复,此测试锁定)。
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, 400_000);
+    defer a.free(big);
+    @memset(big, 'A');
+    const tr_content = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{big});
+    defer a.free(tr_content);
+    const blocks = [_]msg.Block{
+        .{ .tool_result = .{ .tool_use_id = "t1", .content = tr_content } },
+    };
+    const m = msg.Message{ .role = .user, .blocks = @constCast(&blocks) };
+    const total = estimateMessageTokens(m);
+    try std.testing.expect(total >= conversation_mod.IMAGE_TOKEN_ESTIMATE);
+    try std.testing.expect(total < 50_000);
+}
+
+// ── candidate-response boundary (issue #34) ─────────────────────────────────
+
+/// A Provider whose stream is scripted, and whose tail can be withheld until
+/// the test releases it. Withholding is the point: it is what proves an
+/// observation reaches the boundary *before* the response completes, which no
+/// amount of after-the-fact inspection can distinguish from buffering.
+const CandidateFake = struct {
+    const Script = enum { text_then_tail, text_then_error, text_then_tool_then_tail };
+
+    allocator: std.mem.Allocator,
+    script: Script,
+    /// Set by the test to let the blocked stream continue.
+    release: std.atomic.Value(bool) = .init(false),
+    /// Set by the stream when it has started waiting for that release.
+    blocked: std.atomic.Value(bool) = .init(false),
+    /// Observed by the test: still false while the response is incomplete.
+    completed: std.atomic.Value(bool) = .init(false),
+    abort_here: ?*AbortSignal = null,
+    index: u32 = 0,
+    sends: u32 = 0,
+    rid: log.RequestId = undefined,
+
+    fn state(ctx: *anyopaque) *CandidateFake {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Block until the test releases the tail. A real Provider surfaces a
+    /// cancellation as `error.Aborted` out of `next()`; this reproduces that
+    /// so the loop's abort path is the one under test rather than a
+    /// test-only shortcut.
+    fn waitForRelease(self: *CandidateFake) !void {
+        self.blocked.store(true, .release);
+        var spins: usize = 0;
+        while (!self.release.load(.acquire) and spins < 2000) : (spins += 1)
+            util_time.sleepMs(1);
+        if (self.abort_here) |signal| {
+            if (signal.isAborted()) return error.Aborted;
+        }
+    }
+
+    fn next(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+        const self = state(ctx);
+        const step = self.index;
+        self.index += 1;
+        switch (self.script) {
+            .text_then_tail => switch (step) {
+                0 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "first") },
+                1 => {
+                    try self.waitForRelease();
+                    return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "-tail") };
+                },
+                else => {
+                    self.completed.store(true, .release);
+                    return null;
+                },
+            },
+            .text_then_error => switch (step) {
+                0 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "first") },
+                else => {
+                    self.completed.store(true, .release);
+                    return error.ConnectionResetByPeer;
+                },
+            },
+            .text_then_tool_then_tail => switch (step) {
+                0 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "first") },
+                1 => return api_stream.StreamEvent{ .tool_use_start = .{
+                    .id = try self.allocator.dupe(u8, "tu_1"),
+                    .name = try self.allocator.dupe(u8, "Read"),
+                    .input_json = try self.allocator.dupe(u8, "{\"file_path\":\"/nonexistent\"}"),
+                } },
+                2 => return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "-tail") },
+                else => {
+                    self.completed.store(true, .release);
+                    return null;
+                },
+            },
+        }
+    }
+
+    fn streamDeinit(_: *anyopaque) void {}
+
+    fn stop(_: *anyopaque) api_stream.StopReason {
+        return .end_turn;
+    }
+
+    fn requestId(ctx: *anyopaque) log.RequestId {
+        return state(ctx).rid;
+    }
+
+    fn sendStreamRetry(
+        ctx: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?json_mod.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = state(ctx);
+        if (self.sends > 0) return error.UnexpectedTestCall;
+        self.sends += 1;
+        self.index = 0;
+        self.rid = log.genRequestId();
+        return .{
+            .ctx = ctx,
+            .nextFn = next,
+            .deinitFn = streamDeinit,
+            .stopReasonFn = stop,
+            .requestIdFn = requestId,
+        };
+    }
+
+    fn sendStream(
+        ctx: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?json_mod.ToolChoice,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStreamRetry(ctx, messages, system, tools, abort, model_override, tool_choice, 0, 0, null, user_query);
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.UnexpectedTestCall;
+    }
+
+    fn model(_: *anyopaque) []const u8 {
+        return "fake";
+    }
+    fn maxTokens(_: *anyopaque) u32 {
+        return 32_000;
+    }
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+
+    fn provider(self: *CandidateFake) provider_mod.Provider {
+        return .{
+            .ctx = @ptrCast(self),
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+};
+
+const CandidateSegments = struct {
+    allocator: std.mem.Allocator,
+    text: std.ArrayList(u8) = .empty,
+    dispositions: std.ArrayList(output_semantics.Disposition) = .empty,
+
+    fn deinit(self: *CandidateSegments) void {
+        self.text.deinit(self.allocator);
+        self.dispositions.deinit(self.allocator);
+    }
+
+    fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+        const self: *CandidateSegments = @ptrCast(@alignCast(ctx));
+        switch (ev) {
+            .text_chunk => |t| self.text.appendSlice(self.allocator, t) catch {},
+            .output_segment_end => |e| self.dispositions.append(self.allocator, e.disposition) catch {},
+            else => {},
+        }
+    }
+
+    fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+        return null;
+    }
+};
+
+/// Provider fixture for the continuation-budget boundary. Every response is
+/// cut off, carrying `text` (none when empty), with an optional tool call on
+/// the final response.
+const MaxTokensFake = struct {
+    allocator: std.mem.Allocator,
+    text: []const u8 = "",
+    include_final_tool: bool = false,
+    sends: u32 = 0,
+    stream_step: u8 = 0,
+    rid: log.RequestId = undefined,
+
+    fn state(ctx: *anyopaque) *MaxTokensFake {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn next(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+        const self = state(ctx);
+        defer self.stream_step += 1;
+        if (self.text.len > 0 and self.stream_step == 0) {
+            return .{ .text = try self.allocator.dupe(u8, self.text) };
+        }
+        if (self.include_final_tool and self.sends == 4 and self.stream_step == 0) {
+            return .{ .tool_use_start = .{
+                .id = try self.allocator.dupe(u8, "tu_final"),
+                .name = try self.allocator.dupe(u8, "DefinitelyUnknown"),
+                .input_json = try self.allocator.dupe(u8, "{}"),
+            } };
+        }
+        return null;
+    }
+
+    fn streamDeinit(_: *anyopaque) void {}
+
+    fn stop(_: *anyopaque) api_stream.StopReason {
+        return .max_tokens;
+    }
+
+    fn requestId(ctx: *anyopaque) log.RequestId {
+        return state(ctx).rid;
+    }
+
+    fn sendStreamRetry(
+        ctx: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?json_mod.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = state(ctx);
+        self.sends += 1;
+        self.stream_step = 0;
+        self.rid = log.genRequestId();
+        return .{
+            .ctx = ctx,
+            .nextFn = next,
+            .deinitFn = streamDeinit,
+            .stopReasonFn = stop,
+            .requestIdFn = requestId,
+        };
+    }
+
+    fn sendStream(
+        ctx: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?json_mod.ToolChoice,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStreamRetry(ctx, messages, system, tools, abort, model_override, tool_choice, 0, 0, null, user_query);
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const json_mod.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.UnexpectedTestCall;
+    }
+
+    fn model(_: *anyopaque) []const u8 {
+        return "max-tokens-fake";
+    }
+
+    fn maxTokens(_: *anyopaque) u32 {
+        return 16_384;
+    }
+
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+
+    fn provider(self: *MaxTokensFake) provider_mod.Provider {
+        return .{
+            .ctx = @ptrCast(self),
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+};
+
+const CandidateRun = struct {
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    permission: *const permission_mod.PermissionContext,
+    backend: *const UiBackend,
+    observer: response_candidate.Observer,
+    abort: ?*AbortSignal = null,
+    allocator: std.mem.Allocator,
+    result: ?anyerror!RunResult = null,
+
+    fn go(self: *CandidateRun) void {
+        self.result = run(
+            self.conversation,
+            self.provider,
+            &.{},
+            self.permission,
+            .{
+                .max_turns = 1,
+                .colorize = false,
+                .response_observer = self.observer,
+                .abort = self.abort,
+            },
+            self.backend,
+            self.allocator,
+        );
+    }
+};
+
+test "a candidate observation reaches the boundary before the response completes" {
+    // Issue #34's verification, exactly: emit the first text event, block, and
+    // check that the observation is already visible while the Provider still
+    // has a tail to send. Anything that buffered the whole response first
+    // would fail here and only here.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tail };
+    var recorder = response_candidate.Recorder{ .allocator = a };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    var driver = CandidateRun{
+        .conversation = &conversation,
+        .provider = fake.provider(),
+        .permission = &perm,
+        .backend = &backend,
+        .observer = recorder.observer(),
+        .allocator = a,
+    };
+    var thread = try std.Thread.spawn(.{}, CandidateRun.go, .{&driver});
+
+    var spins: usize = 0;
+    while (!fake.blocked.load(.acquire) and spins < 2000) : (spins += 1)
+        util_time.sleepMs(1);
+    try std.testing.expect(fake.blocked.load(.acquire));
+    // The response has not completed, and the first increment is already at
+    // the boundary.
+    try std.testing.expect(!fake.completed.load(.acquire));
+    try std.testing.expect(recorder.count(.began) == 1);
+    try std.testing.expect(recorder.textAt(1, "first".len));
+
+    fake.release.store(true, .release);
+    thread.join();
+
+    const result = try (driver.result orelse return error.RunDidNotFinish);
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(
+        response_candidate.Settlement.committed,
+        recorder.settlement().?,
+    );
+    // Both halves of the response were assembled and committed as one message.
+    try std.testing.expectEqual(@as(usize, 2), conversation.len());
+    try std.testing.expectEqualStrings("first-tail", conversation.messages.items[1].blocks[0].text);
+    try std.testing.expectEqualStrings("first-tail", segments.text.items);
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.final, segments.dispositions.items[0]);
+}
+
+test "max_tokens_exhausted is an explicit terminal stop with or without visible text" {
+    // #394: the no-text case always stopped here; a turn that still streamed
+    // text used to fall through to the common tail and close as `final`.
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "still cut " }) |text| {
+        errdefer std.debug.print("text=\"{s}\"\n", .{text});
+        var conversation = Conversation.init(a);
+        defer conversation.deinit();
+        try conversation.appendText(.user, "go");
+
+        var fake = MaxTokensFake{ .allocator = a, .text = text };
+        var segments = CandidateSegments{ .allocator = a };
+        defer segments.deinit();
+        var ledger = output_semantics.Ledger.init(a);
+        defer ledger.deinit();
+        const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+        const perm = permission_mod.createContext(.bypass_permissions, a);
+
+        const result = try run(
+            &conversation,
+            fake.provider(),
+            &.{},
+            &perm,
+            .{ .max_turns = 4, .colorize = false, .output_ledger = &ledger },
+            &backend,
+            a,
+        );
+
+        try std.testing.expectEqual(StopReason.max_tokens_exhausted, result.stop_reason);
+        try std.testing.expectEqual(@as(u32, 4), fake.sends);
+        try std.testing.expectEqual(@as(u32, 4), result.turns);
+        try std.testing.expectEqual(@as(u32, 3), result.continuations);
+        // Each response with text is committed as an assistant message
+        // between the host's continuation prompts.
+        try std.testing.expectEqual(@as(usize, if (text.len == 0) 4 else 8), conversation.len());
+        const nudge = conversation.messages.items[if (text.len == 0) 1 else 2].blocks;
+        try std.testing.expectEqualStrings(
+            if (text.len == 0) RESPOND_AFTER_SILENT_TRUNCATION else CONTINUE_AFTER_TRUNCATION,
+            nudge[nudge.len - 1].text,
+        );
+        try std.testing.expectEqualSlices(
+            output_semantics.Disposition,
+            &.{ .continued, .continued, .continued, .partial },
+            segments.dispositions.items,
+        );
+        // The text is delivered, marked partial, and never as the answer.
+        try std.testing.expect(ledger.finalText() == null);
+        const expected = try std.mem.concat(a, u8, &.{ text, text, text, text });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, ledger.partialText().?);
+        try std.testing.expectEqualStrings(expected, segments.text.items);
+    }
+}
+
+test "max_tokens_exhausted preserves a complete tool_use instead of failing" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = MaxTokensFake{ .allocator = a, .include_final_tool = true };
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 4, .colorize = false },
+        &backend,
+        a,
+    );
+
+    try std.testing.expectEqual(StopReason.max_turns, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 4), fake.sends);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    try std.testing.expect(result.stop_reason != .max_tokens_exhausted);
+}
+
+test "Options.telemetry records the Run as a span tree in the session store, tool calls included" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(std.testing.io, &dir_buf)];
+
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "trace me");
+    var fake = MaxTokensFake{ .allocator = a, .include_final_tool = true };
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    // emit_tool_cards stays false: the frontend never sees tool events, the
+    // recorder still does.
+    const result = try run(&conversation, fake.provider(), &.{}, &perm, .{
+        .max_turns = 4,
+        .colorize = false,
+        .telemetry = .{ .session_dir = dir },
+    }, &backend, a);
+    try std.testing.expectEqual(StopReason.max_turns, result.stop_reason);
+
+    const body = try telemetry.store.readAsRequest(a, dir, "test");
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const spans = parsed.value.object.get("resourceSpans").?.array.items[0].object.get("scopeSpans").?.array.items[0].object.get("spans").?.array.items;
+
+    var chats: u32 = 0;
+    var turns: u32 = 0;
+    var root_id: ?[]const u8 = null;
+    var tool_parent: ?[]const u8 = null;
+    var turn_ids: std.ArrayList([]const u8) = .empty;
+    defer turn_ids.deinit(a);
+    const trace_id = spans[0].object.get("traceId").?.string;
+    for (spans) |span| {
+        const name = span.object.get("name").?.string;
+        try std.testing.expectEqualStrings(trace_id, span.object.get("traceId").?.string);
+        if (std.mem.eql(u8, name, "chat max-tokens-fake")) chats += 1;
+        if (std.mem.startsWith(u8, name, "turn ")) {
+            turns += 1;
+            try turn_ids.append(a, span.object.get("spanId").?.string);
+        }
+        if (std.mem.eql(u8, name, "execute_tool DefinitelyUnknown")) tool_parent = span.object.get("parentSpanId").?.string;
+        if (std.mem.eql(u8, name, "invoke_agent metacodes")) {
+            root_id = span.object.get("spanId").?.string;
+            try std.testing.expect(span.object.get("parentSpanId") == null);
+            const attrs = try std.json.Stringify.valueAlloc(a, span.object.get("attributes").?, .{});
+            defer a.free(attrs);
+            try std.testing.expect(std.mem.indexOf(u8, attrs, "\"stringValue\":\"max_turns\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, attrs, "trace me") != null);
+        }
+    }
+    try std.testing.expectEqual(fake.sends, chats);
+    try std.testing.expectEqual(result.turns, turns);
+    try std.testing.expect(root_id != null);
+    var tool_under_turn = false;
+    for (turn_ids.items) |id| if (std.mem.eql(u8, id, tool_parent.?)) {
+        tool_under_turn = true;
+    };
+    try std.testing.expect(tool_under_turn);
+    // The root ends last.
+    try std.testing.expectEqualStrings("invoke_agent metacodes", spans[spans.len - 1].object.get("name").?.string);
+}
+
+test "without Options.telemetry a Run writes no span store" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+    var fake = MaxTokensFake{ .allocator = a };
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    _ = try run(&conversation, fake.provider(), &.{}, &perm, .{ .max_turns = 1, .colorize = false }, &backend, a);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, telemetry.store.FILE_NAME, .{}));
+}
+
+test "a stream error settles the candidate as discarded and commits nothing" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_error };
+    var recorder = response_candidate.Recorder{ .allocator = a };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{
+            .max_turns = 1,
+            .colorize = false,
+            .response_observer = recorder.observer(),
+            // One attempt only: a same-turn re-issue would open a second
+            // candidate and this test is about the first one's settlement.
+            .max_stream_turn_retries = 0,
+        },
+        &backend,
+        a,
+    );
+    try std.testing.expectEqual(StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.began));
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.settled));
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .stream_error },
+        recorder.settlement().?,
+    );
+    // The partial is withdrawn from the visible stream and never reaches
+    // Conversation, so the next turn cannot continue a fragment.
+    try std.testing.expectEqual(@as(usize, 1), conversation.len());
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.discarded, segments.dispositions.items[0]);
+}
+
+test "a cancellation settles the candidate as aborted" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var abort = AbortSignal.init();
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tail };
+    fake.abort_here = &abort;
+    var recorder = response_candidate.Recorder{ .allocator = a };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    var driver = CandidateRun{
+        .conversation = &conversation,
+        .provider = fake.provider(),
+        .permission = &perm,
+        .backend = &backend,
+        .observer = recorder.observer(),
+        .abort = &abort,
+        .allocator = a,
+    };
+    var thread = try std.Thread.spawn(.{}, CandidateRun.go, .{&driver});
+
+    var spins: usize = 0;
+    while (!fake.blocked.load(.acquire) and spins < 2000) : (spins += 1)
+        util_time.sleepMs(1);
+    abort.abort(.user_interrupt);
+    fake.release.store(true, .release);
+    thread.join();
+
+    const result = try (driver.result orelse return error.RunDidNotFinish);
+    try std.testing.expectEqual(StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .aborted },
+        recorder.settlement().?,
+    );
+    // A cancelled response keeps what the user already saw, as `partial`.
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.partial, segments.dispositions.items[0]);
+}
+
+test "a rejected tail neither commits nor starts the tool effect it named" {
+    // text -> tool_use -> rejected tail. The rejection lands on the tool call,
+    // which is the observation that decides whether an effect starts at all.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tool_then_tail };
+    // Observation 0 is the text; observation 1 is the assembled tool call.
+    var recorder = response_candidate.Recorder{ .allocator = a, .reject_observe_at = 1 };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 2, .colorize = false, .response_observer = recorder.observer() },
+        &backend,
+        a,
+    );
+
+    try std.testing.expectEqual(StopReason.budget, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls);
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .rejected },
+        recorder.settlement().?,
+    );
+    // Nothing reached Conversation: the user turn is still the only message.
+    try std.testing.expectEqual(@as(usize, 1), conversation.len());
+    // The published prefix is withdrawn rather than left standing as an answer.
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.discarded, segments.dispositions.items[0]);
+    // The rejection stopped the stream: the tail was never read.
+    try std.testing.expect(!fake.completed.load(.acquire));
+}
+
+test "a candidate refused at the commit question drops its assembled tool calls" {
+    // The other rejection door: every increment was accepted, the response
+    // completed, and only the assembled message is refused. The cleanup shape
+    // differs — the tool calls now live in `assistant_blocks`, and a prefetch
+    // thread may already be borrowing their bytes — so it needs its own cover.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tool_then_tail };
+    fake.release.store(true, .release);
+    var recorder = response_candidate.Recorder{ .allocator = a, .reject_admit = true };
+    defer recorder.deinit();
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(
+        &conversation,
+        fake.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 2, .colorize = false, .response_observer = recorder.observer() },
+        &backend,
+        a,
+    );
+
+    // The whole response was read — this rejection is not an early stop.
+    try std.testing.expect(fake.completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.admitted));
+    try std.testing.expectEqual(StopReason.budget, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.tool_calls);
+    try std.testing.expectEqual(
+        response_candidate.Settlement{ .discarded = .rejected },
+        recorder.settlement().?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), conversation.len());
+    try std.testing.expectEqual(@as(usize, 1), segments.dispositions.items.len);
+    try std.testing.expectEqual(output_semantics.Disposition.discarded, segments.dispositions.items[0]);
+}
+
+test "the unobserved path is unchanged" {
+    // Null observer is the whole existing behavior. Asserting it here means a
+    // later observation point cannot quietly change what an embedder without
+    // one sees.
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "go");
+
+    var fake = CandidateFake{ .allocator = a, .script = .text_then_tail };
+    fake.release.store(true, .release);
+    var segments = CandidateSegments{ .allocator = a };
+    defer segments.deinit();
+    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+
+    const result = try run(&conversation, fake.provider(), &.{}, &perm, .{
+        .max_turns = 1,
+        .colorize = false,
+    }, &backend, a);
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), conversation.len());
+    try std.testing.expectEqualStrings("first-tail", conversation.messages.items[1].blocks[0].text);
+}
+
+test "生产代码不得用无参的 maxTokens()/maxInputTokens()" {
+    // 这条守卫直接编码规则本身,而不是它的某一个实例。
+    //
+    // 三轮 review 下来同一个形状反复出现:规则被断言,然后只在眼前那一处应用。
+    // `maxTokensFor` 加进来之后,`serializeForEstimation` 里 `.model` 用了
+    // override 而同一个字面量的 `.max_tokens` 没用;request gate 的
+    // `max_output_tokens` 也没用;agentcore 的 `canonicalRequestBytes` 同样。
+    // 每一处都是"model 记得,maxTokens 忘了"。
+    //
+    // subagent 与父共享 Provider,只靠 model_override 区分,所以生产路径上任何
+    // 无参变体都是在问错模型。测试区不受限:那里 provider 就是唯一的模型。
+    // 测试块在本文件里是**穿插**的(第一个在文件很靠前处),所以不能用"第一个
+    // test 之后都是测试"来切——那个假设本身就是同一类错误。改判每次出现之前
+    // 最近的顶层声明是 `test` 还是 `fn`。
+    const src = @embedFile("agent_loop.zig");
+    for ([_][]const u8{ "provider.maxTokens()", "provider.maxInputTokens()" }) |needle| {
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, src, cursor, needle)) |at| {
+            cursor = at + needle.len;
+            const before = src[0..at];
+            const in_test = std.mem.lastIndexOf(u8, before, "\ntest \"") orelse 0;
+            const in_fn = @max(
+                std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0,
+                std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0,
+            );
+            // 最近的顶层声明必须是 test;否则就是生产路径在问错模型。
+            try std.testing.expect(in_test > in_fn);
+        }
+    }
+    // 且 For 变体确实被用上了(否则上面可以靠删掉调用来通过)。
+    try std.testing.expect(std.mem.indexOf(u8, src, "maxInputTokensFor(opts.model_override)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "maxTokensFor(model_override)") != null);
+}
+
+test "估算随 model_override 变化,而不是只换个模型名" {
+    // `serializeForEstimation` 的 `.model` 一直读 override,`.max_tokens` 读的却
+    // 是 provider 自己的——同一个请求体,两个模型。子模型输出上限更小时,估算
+    // 出的请求与真正发出的请求就不是同一个。
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn model(_: *anyopaque) []const u8 {
+            return "parent";
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 32_000;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 200_000;
+        }
+        fn maxTokensForModel(_: *anyopaque, name: []const u8) u32 {
+            return if (std.mem.eql(u8, name, "child")) 1_024 else 32_000;
+        }
+        fn maxInputTokensFor(_: *anyopaque, _: []const u8) u32 {
+            return 200_000;
+        }
+        fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+            return false;
+        }
+        fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+            return null;
+        }
+    };
+    var ctx: u8 = 0;
+    const provider = provider_mod.Provider{
+        .ctx = &ctx,
+        .modelFn = Fake.model,
+        .sendStreamFn = undefined,
+        .sendStreamRetryFn = undefined,
+        .sendFn = undefined,
+        .maxTokensFn = Fake.maxTokens,
+        .maxInputTokensFn = Fake.maxInputTokens,
+        .maxTokensForFn = Fake.maxTokensForModel,
+        .maxInputTokensForFn = Fake.maxInputTokensFor,
+        .reasoningEffortFn = Fake.reasoningEffort,
+        .supportsFn = Fake.supports,
+    };
+
+    const messages = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
+    };
+
+    // 直接看序列化出来的请求体:估算的 token 数按字节除以 4,32000→1024 只差
+    // 一个字符,除完可能相等,断言不到点上。
+    const parent = try serializeForEstimation(a, provider, &messages, null, &.{}, null);
+    defer a.free(parent.body);
+    try std.testing.expect(std.mem.indexOf(u8, parent.body, "\"model\":\"parent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.body, "\"max_tokens\":32000") != null);
+
+    const child = try serializeForEstimation(a, provider, &messages, null, &.{}, "child");
+    defer a.free(child.body);
+    // 模型换了,输出上限必须跟着换——同一个请求体不能描述两个模型。
+    try std.testing.expect(std.mem.indexOf(u8, child.body, "\"model\":\"child\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, child.body, "\"max_tokens\":1024") != null);
+}
+
+test "run inputs: an adoption that aborts the Run adopts nothing more and builds no request (#270)" {
+    // A Host callback that rejects `input_adopted` aborts the Run. The loop
+    // must stop at that boundary: no further input adopted, and no provider
+    // request attempted (this provider fails the Run if one is).
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "root prompt");
+    var queue = run_input_mod.Queue.init(a, .{});
+    defer queue.deinit();
+    queue.open(1, null);
+    _ = try queue.submit(1, "first input");
+    _ = try queue.submit(2, "second input");
+
+    var signal = AbortSignal.init();
+    const Probe = struct {
+        signal: *AbortSignal,
+        adopted: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .input_adopted) {
+                self.adopted += 1;
+                self.signal.abort(.host_failure);
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("metacodes-kernel").session_id.SessionId) ?@import("metacodes-guard").core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var probe = Probe{ .signal = &signal };
+    const backend = UiBackend{ .ctx = @ptrCast(&probe), .emit = Probe.emit, .poll = Probe.poll };
+    var state = TestProviderState{};
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, testProvider(&state), &.{}, &perm, .{
+        .max_turns = 3,
+        .colorize = false,
+        .abort = &signal,
+        .run_inputs = &queue,
+    }, &backend, a);
+
+    try std.testing.expectEqual(StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.turns);
+    try std.testing.expectEqual(@as(u32, 1), probe.adopted);
+    try std.testing.expectEqual(run_input_mod.Reconciliation{ .accepted = 2, .adopted = 1 }, queue.close());
+    // Root prompt plus the one adopted input; the second stayed out.
+    try std.testing.expectEqual(@as(usize, 2), c.len());
+}
+
+/// The session id a ToolContext carries as text: `opts.session_id` when the
+/// caller set it, else the routing `opts.session` unless it is the `.single`
+/// sentinel. Headless and REPL runs set only `session`, and the sealed
+/// Skill ledger (and anything else keyed by session) read the text form, so
+/// without this fallback those records carried an empty session id.
+fn sessionIdText(opts: *const Options) []const u8 {
+    if (opts.session_id.len != 0) return opts.session_id;
+    if (std.mem.eql(u8, opts.session.asSlice(), @import("metacodes-kernel").session_id.SessionId.single.asSlice())) return "";
+    return opts.session.asSlice();
+}
+
+test "sessionIdText prefers the explicit id, then the routing session, never the sentinel" {
+    var opts: Options = .{};
+    try std.testing.expectEqualStrings("", sessionIdText(&opts));
+    opts.session = .{ .bytes = .{'a'} ** 24 };
+    try std.testing.expectEqualStrings("a" ** 24, sessionIdText(&opts));
+    opts.session_id = "explicit";
+    try std.testing.expectEqualStrings("explicit", sessionIdText(&opts));
+}
+
+test "trimDeliveredImageBytes stubs the oldest delivered images first and never an undelivered one" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8, data_len: usize) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, data_len);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&c, a, "t1", 4096); // 0,1 oldest
+    try T.imageTurn(&c, a, "t2", 4096); // 2,3
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
+    try T.imageTurn(&c, a, "t3", 4096); // 4,5 undelivered (current turn)
+    const one = c.messages.items[1].blocks[0].tool_result.content.len;
+    // Cap admits two images: only the oldest delivered one is stubbed; the undelivered
+    // current-turn image is never touched even though it is the newest.
+    const reduced = result_projection.trimDeliveredImageBytes(&c, 2 * one + 16);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, conversation_mod.TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[3].blocks[0].tool_result.content) != null);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[5].blocks[0].tool_result.content) != null);
+    // A cap that only the undelivered image could satisfy still leaves it alone.
+    const tight = result_projection.trimDeliveredImageBytes(&c, one / 2);
+    try std.testing.expectEqual(@as(usize, 1), tight.reduction.cleared);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[5].blocks[0].tool_result.content) != null);
+    const rest = result_projection.trimDeliveredImageBytes(&c, one / 2);
+    try std.testing.expect(!rest.reduction.changed());
+    try std.testing.expectEqual(one - one / 2, rest.remaining_over_cap);
+}
+
+test "trimDeliveredImageBytes: a resumed history whose persisted flags are false stays protected and reports the remainder" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try T.imageTurn(&c, a, "t1"); // 0,1 answered by 2
+    try c.appendText(.assistant, "first reply");
+    try T.imageTurn(&c, a, "t2"); // 3,4 answered by 5
+    try c.appendText(.assistant, "second reply");
+    try T.imageTurn(&c, a, "t3"); // 6,7 trailing, unanswered
+    // No watermark anywhere (an old transcript, or pictures a non-vision model
+    // never saw natively): nothing is trimmable, and the caller learns how far
+    // the request still exceeds the cap instead of silently losing a picture.
+    const one = c.messages.items[1].blocks[0].tool_result.content.len;
+    const trim = result_projection.trimDeliveredImageBytes(&c, one + 16);
+    try std.testing.expectEqual(@as(usize, 0), trim.reduction.cleared);
+    try std.testing.expectEqual(3 * one - (one + 16), trim.remaining_over_cap);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[1].blocks[0].tool_result.content) != null);
+    try std.testing.expectEqual(3 * one, c.nonTrimmableImageBytes());
+    // Once the watermark says the first two were received natively, they trim oldest first.
+    c.messages.items[1].blocks[0].tool_result.delivered = true;
+    c.messages.items[4].blocks[0].tool_result.delivered = true;
+    const trimmed = result_projection.trimDeliveredImageBytes(&c, one + 16);
+    try std.testing.expectEqual(@as(usize, 2), trimmed.reduction.cleared);
+    try std.testing.expectEqual(@as(usize, 0), trimmed.remaining_over_cap);
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[7].blocks[0].tool_result.content) != null);
+}
+
+test "trimDeliveredImageBytes: once any watermark exists, a local assistant append cannot make an unseen image trimmable" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const T = struct {
+        fn imageTurn(conv: *Conversation, al: std.mem.Allocator, id: []const u8) !void {
+            const tu = try al.alloc(msg.Block, 1);
+            tu[0] = .{ .tool_use = .{ .id = try al.dupe(u8, id), .name = try al.dupe(u8, "Read"), .input = try al.dupe(u8, "{}") } };
+            try conv.append(.{ .role = .assistant, .blocks = tu });
+            const data = try al.alloc(u8, 4096);
+            defer al.free(data);
+            @memset(data, 'A');
+            const img = try std.fmt.allocPrint(al, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+            const blocks = try al.alloc(msg.Block, 1);
+            blocks[0] = .{ .tool_result = .{ .tool_use_id = try al.dupe(u8, id), .content = img, .is_error = false } };
+            try conv.append(.{ .role = .user, .blocks = blocks });
+        }
+    };
+    try c.appendText(.user, "start");
+    c.markDelivered(.{ .image_placeholder_ids = &.{} }); // an accepted request exists: flags are authoritative
+    try T.imageTurn(&c, a, "t1"); // 1,2 undelivered: the next request was rejected...
+    try c.appendText(.assistant, "{\"agentcore\":\"checkpoint_payload_resource_limit\"}"); // ...and a local marker followed
+    const one = c.messages.items[2].blocks[0].tool_result.content.len;
+    // The marker is not delivery evidence: the unseen image is not trimmable.
+    try std.testing.expect(!result_projection.trimDeliveredImageBytes(&c, one / 2).reduction.changed());
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[2].blocks[0].tool_result.content) != null);
+}
+
+test "trimDeliveredImageBytes: first-class user images consume the allowance but are never cleared" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const inputs = [_]msg.ImageInput{.{ .media_type = "image/png", .data = "A" ** 4096 }};
+    var user_image = try msg.userMessageWithImages(a, "look", &inputs);
+    errdefer user_image.deinit(a);
+    try c.append(user_image);
+    const tu = try a.alloc(msg.Block, 1);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try a.alloc(u8, 4096);
+    defer a.free(data);
+    @memset(data, 'B');
+    const img = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = img, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    c.markDelivered(.{ .image_placeholder_ids = &.{} });
+    // Cap would admit the tool image alone, but the user image already takes 4096:
+    // the delivered tool image is cleared, the user image block stays.
+    const reduced = result_projection.trimDeliveredImageBytes(&c, img.len + 100);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
+    try std.testing.expect(c.messages.items[0].blocks[1] == .image);
+    // The user image is what remains non-trimmable.
+    try std.testing.expectEqual(@as(usize, 4096), c.nonTrimmableImageBytes());
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[2].blocks[0].tool_result.content, conversation_mod.TOOL_RESULT_CLEARED_STUB));
+}
+
+test "delivery watermark: a placeholder sibling in a parallel turn does not pin its natively-sent siblings" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const tu = try a.alloc(msg.Block, 2);
+    tu[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_png"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    tu[1] = .{ .tool_use = .{ .id = try a.dupe(u8, "t_webp"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try c.append(.{ .role = .assistant, .blocks = tu });
+    const data = try a.alloc(u8, 4096);
+    defer a.free(data);
+    @memset(data, 'A');
+    const png = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"{s}\"}}", .{data});
+    const webp = try std.fmt.allocPrint(a, "{{\"type\":\"image\",\"media_type\":\"image/webp\",\"data\":\"{s}\"}}", .{data});
+    const blocks = try a.alloc(msg.Block, 2);
+    blocks[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_png"), .content = png, .is_error = false } };
+    blocks[1] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t_webp"), .content = webp, .is_error = false } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    const placeholders = [_][]const u8{"t_webp"};
+    c.markDelivered(.{ .image_placeholder_ids = &placeholders });
+    try std.testing.expect(!c.messages.items[1].delivered);
+    try std.testing.expect(c.messages.items[1].blocks[0].tool_result.delivered);
+    try std.testing.expect(!c.messages.items[1].blocks[1].tool_result.delivered);
+    // The wire cap can trim the delivered PNG while the WebP stays protected.
+    const reduced = result_projection.trimDeliveredImageBytes(&c, webp.len + 16);
+    try std.testing.expectEqual(@as(usize, 1), reduced.reduction.cleared);
+    try std.testing.expect(std.mem.startsWith(u8, c.messages.items[1].blocks[0].tool_result.content, conversation_mod.TOOL_RESULT_CLEARED_STUB));
+    try std.testing.expect(json_mod.extractImageResult(c.messages.items[1].blocks[1].tool_result.content) != null);
+    // Microcompact under pressure likewise clears only the delivered block.
+    const micro = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 0), micro.cleared);
+}
+
+test "usage anchor: microcompact clear invalidates it" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blocks = try a.alloc(msg.Block, 1);
+    const content = try a.alloc(u8, 512);
+    @memset(content, 'x');
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = content,
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    try c.appendText(.assistant, "done");
+    c.setUsageAnchor(50_000);
+    try std.testing.expect(c.usageAnchor() != null);
+
+    const reduced = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expect(c.usageAnchor() == null); // 前缀被改写,实计数不再可信
+}
+
+test "usage anchor: microcompact never expands a short result" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "short result"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    try c.appendText(.assistant, "done");
+    c.setUsageAnchor(50_000);
+
+    const reduced = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 0), reduced.cleared);
+    try std.testing.expectEqualStrings("short result", c.messages.items[0].blocks[0].tool_result.content);
+    try std.testing.expect(c.usageAnchor() != null);
+}
+
+test "usage anchor: truncating a post-anchor tool_result keeps the anchor (glm 逐轮截断回归)" {
+    // 实测回归(2026-07-06 fix2.log):每轮新 Read 结果被 preflight truncate,
+    // 粗粒度失效把锚点每轮打回冷路径字节估算 → 真实 106K 被估成 222K+ 误触发 microcompact。
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "read files");
+    c.setUsageAnchor(100_000); // 覆盖 messages[0..1]
+
+    // 锚点之后追加一条超大 tool_result(属于后缀)。
+    const blocks = try a.alloc(msg.Block, 1);
+    const huge = try a.alloc(u8, 100 * 1024);
+    @memset(huge, 'x');
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = huge,
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    const reduced = result_projection.truncateLargeToolResults(&c, 32 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    // 后缀截断不影响前缀实计数 → 锚点仍有效。
+    try std.testing.expect(c.usageAnchor() != null);
+
+    // 清后缀 result(index 1 ≥ msg_count 1,不在锚点覆盖区)同样保锚点。
+    const cleared = result_projection.microcompactToolResultsByRecentResults(&c, 0);
+    try std.testing.expectEqual(@as(usize, 1), cleared.cleared);
+    try std.testing.expect(c.usageAnchor() != null);
+}

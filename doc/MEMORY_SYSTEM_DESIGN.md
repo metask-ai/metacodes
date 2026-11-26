@@ -209,7 +209,7 @@ cc **当前 build 已移除**（grep 无 `startsWith('#')` 输入模式）。zig
 ## 4. 模块划分（zig-cc 实现）
 
 ```
-src/core/memory/
+packages/coding/src/core/memory/
   ├── claudemd.zig      # 通道A加载器:递归收集 + @import + 标签拼接 + MEMORY_INSTRUCTION_PROMPT
   ├── import.zig        # @path 提取 + 递归内联 + 深度/循环/扩展名
   ├── user_context.zig  # 合成首条 <system-reminder> user message

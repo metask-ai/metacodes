@@ -62,7 +62,7 @@ paired-evaluation hypothesis for task 12714.
 
 ## 3. Identity, version and namespace
 
-`src/plugin/contract.zig` is normative for value semantics:
+`packages/coding/src/plugin/contract.zig` is normative for value semantics:
 
 - `PluginId`: 3–48 ASCII bytes; lowercase alphanumeric segments separated by
   dots, with internal hyphens allowed. Paths, underscores, empty segments and
@@ -207,7 +207,7 @@ Dependencies are resolved only after the winning set is known.
 ## 8. Lifecycle and snapshot semantics
 
 The loader performs `discover -> parse -> validate -> resolve -> project ->
-activate -> publish`. Publication is atomic. `src/plugin/effect_scope.zig`
+activate -> publish`. Publication is atomic. `packages/coding/src/plugin/effect_scope.zig`
 implements the trusted static-plugin effect owner as a typed state machine:
 `staging -> active -> disposing -> disposed`. Every fallible descriptor,
 filesystem, process-handshake and contribution projection step completes before
@@ -305,7 +305,7 @@ Plugin self-improvement is a promotion pipeline, not live self-modifying code:
 7. regressions drain/rollback to the previous generation.
 
 The in-run self-evolution path (`METACODES_SELF_EVOLUTION`, headless only, off
-by default; `src/core/self_evolution.zig`) is not this pipeline. Its
+by default; `packages/coding/src/core/self_evolution.zig`) is not this pipeline. Its
 provisional rules are TinyKG nodes that the next Run merges into the project
 rule gate, and the fixed kernel enforces them there without promotion. They
 are limited to the closed `RuleSpec` IR, carry a candidate receipt each, and a
@@ -341,7 +341,7 @@ Conversation, and `ReadArtifact` recovery.
 
 | Stage | Frozen now | Runtime status |
 |---|---|---|
-| Contract types/kernel boundary | yes | `src/plugin/contract.zig` |
+| Contract types/kernel boundary | yes | `packages/coding/src/plugin/contract.zig` |
 | Strict data manifest/discovery/dependencies | yes | implemented in `plugin/manifest.zig` + `plugin/runtime.zig` |
 | Static Host tool compatibility plugin | yes | implemented through `AgentRuntime`; Host effect metadata reaches native permission guard |
 | Static effect ownership | yes | typed `EffectScope`; dependency-order activation, staging-only registrar, reverse/idempotent cleanup, activation-failure rollback, and `RuntimeBusy` Session pinning have L2 proof |
@@ -363,7 +363,7 @@ Conversation, and `ReadArtifact` recovery.
 | Plugin inventory through Host interfaces | yes | implemented as immutable `metacodes.plugin-inventory/v1`: Zig `AgentRuntime.describePlugins`, CLI `--dump-plugins`, Web `/state.plugin_inventory` |
 | Paired coding/security/performance verdict | evaluation rules yes | deterministic receipt passes; first `1.2.0` paid attempt failed closed after 9/36 rows, so no paired verdict exists yet |
 
-`src/plugin/support.zig` is the executable status matrix. It exhaustively maps
+`packages/coding/src/plugin/support.zig` is the executable status matrix. It exhaustively maps
 every `(HostProfile, Form, Capability)` to active Runtime support, an existing
 Host-plane seam, a governed-native-only boundary, or planned fail-closed work.
 `plugin/runtime.zig` additionally rejects a capability whose descriptor has no

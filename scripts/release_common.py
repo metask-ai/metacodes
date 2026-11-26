@@ -16,7 +16,7 @@ from typing import List, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 ZON = "build.zig.zon"
-VERSION_ZIG = "src/version.zig"
+VERSION_ZIG = "packages/base/src/version.zig"
 CHANGELOG = "CHANGELOG.md"
 PROTOCOL = "evals/plugin-v1/protocol.json"
 

@@ -111,7 +111,7 @@
       },
       "assert_in": [
         {
-          "file": "src/version.zig",
+          "file": "packages/base/src/version.zig",
           "regex": "pub const semver = \"([^\"]+)\";"
         }
       ]
@@ -157,7 +157,7 @@
     {
       "id": "mcp_startup_timeout_seconds",
       "source": {
-        "file": "src/mcp/config.zig",
+        "file": "packages/coding/src/mcp/config.zig",
         "regex": "pub const DEFAULT_STARTUP_TIMEOUT_MS: u32 = (\\d+)_000;"
       },
       "assert_in": [
@@ -170,7 +170,7 @@
     {
       "id": "mcp_codex_tool_timeout_seconds",
       "source": {
-        "file": "src/mcp/config.zig",
+        "file": "packages/coding/src/mcp/config.zig",
         "regex": "pub const CODEX_TOOL_TIMEOUT_MS: u32 = (\\d+)_000;"
       },
       "assert_in": [
@@ -183,7 +183,7 @@
     {
       "id": "skill_listing_description_bytes",
       "source": {
-        "file": "src/skills/runtime/model_tool.zig",
+        "file": "packages/coding/src/skills/runtime/model_tool.zig",
         "regex": "pub const LISTING_MAX_DESCRIPTION_BYTES: usize = (\\d+);"
       },
       "assert_in": [
@@ -196,7 +196,7 @@
     {
       "id": "skill_listing_budget_kib",
       "source": {
-        "file": "src/core/system_prompt.zig",
+        "file": "packages/coding/src/core/system_prompt.zig",
         "regex": "pub const SKILL_LISTING_BUDGET_BYTES: usize = (\\d+) \\* 1024;"
       },
       "assert_in": [
@@ -209,7 +209,7 @@
     {
       "id": "skill_discovery_depth",
       "source": {
-        "file": "src/skills/runtime/catalog.zig",
+        "file": "packages/coding/src/skills/runtime/catalog.zig",
         "regex": "pub const COMPAT_MAX_DISCOVERY_DEPTH: usize = (\\d+);"
       },
       "assert_in": [
@@ -222,7 +222,7 @@
     {
       "id": "sealed_protocol_id",
       "source": {
-        "file": "src/skills/sealed/protocol.zig",
+        "file": "packages/coding/src/skills/sealed/protocol.zig",
         "regex": "pub const PROTOCOL_ID = \"(metask\\.sealed-skill/v\\d+)\";"
       },
       "assert_in": [

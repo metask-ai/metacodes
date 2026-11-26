@@ -105,7 +105,7 @@ revision 内增加语义：
    MCP compatibility window 滚动或 legacy adapter 退场；AgentCore 进入稳定支持候选。
    任一条件触发时必须对两条路径执行影响审计与对应回归，避免单边安全修复。长期收敛路径
    在“CLI 迁移到 AgentCore Runtime”与“共同下沉到窄 canonical seam”之间待定；本条目
-   不扩大 Revision 6 范围，也不授权修改 `src/core/agent_loop.zig`。
+   不扩大 Revision 6 范围，也不授权修改 `packages/coding/src/core/agent_loop.zig`。
 6. **E6 — MCP freshness 与 schema capability honesty（已关闭，Revision 6）**：Runtime
    snapshot 现在携带 clocked expiry/cache scope；modern TTL 受 5 分钟 cap 约束，legacy
    使用 30 秒保守 TTL。fresh Session view 拒绝过期 server，restore 降级失效相关
@@ -127,11 +127,11 @@ revision 内增加语义：
    patch 掩盖。**Owner**：shared Core/Permission 架构负责人。**触发条件**：修改
    `agent_loop`、引入 typed prompt outcome，或真实消费方要求模型按 cancelled/unavailable
    采取不同恢复策略。处置必须同时覆盖 CLI/TUI/Web/child 与 AgentCore，未经独立设计批准
-   不得借 Revision 6 修改 `src/core/agent_loop.zig`。
+   不得借 Revision 6 修改 `packages/coding/src/core/agent_loop.zig`。
 9. **E9 — budgeted Provider stream 的 bounded spool 时序（已关闭，issue #34）**：该债务的
    根因是 shared Core 未把"candidate Provider response → Conversation commit"暴露成可观测、
    可否决的语义边界，AgentCore 只能在 facade 内有界缓存完整 stream 作为保守补偿。
-   `src/core/response_candidate.zig` 现在就是那条边界：AgentLoop 按 canonical 增量
+   `packages/coding/src/core/response_candidate.zig` 现在就是那条边界：AgentLoop 按 canonical 增量
    （text/thinking/reasoning_item/装配完成的 tool_use）通知 observer，observer 可在任一增量
    或最终 commit 前否决；被否决的 candidate 走与 discarded partial 完全相同的路径——可见段
    以 `discarded` 收尾、不进 Conversation、不启动尚未开始的 tool effect。

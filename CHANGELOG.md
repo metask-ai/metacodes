@@ -292,6 +292,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The lower packages are separate Zig modules under `packages/`.** `base`,
+  `ai`, `kernel`, `guard`, `coding`, `session` and `teamwork` moved from
+  `src/` to `packages/<package>/src/` and are the named modules
+  `metacodes-<package>`; `src/` keeps `lib.zig` and `internal.zig`. Nothing
+  changes for a consumer: `metacodes-core` is still rooted at `src/lib.zig`
+  and its Zig API snapshot is byte-identical, as are the C ABI, `agentcore.h`,
+  event JSON, stream-json, request bytes, transcripts and CLI output. Inside
+  the repository a file names another package's file through its module,
+  `@import("metacodes-base").util.log`, and a relative import can no longer
+  leave its package. `layer_baseline.zon` is empty: 0 upward imports, 0 deep
+  imports (from 1815), 0 package cycles and 0 wide module roots. Each package
+  has its own test step (`zig build test:base` ... `test:teamwork`), and
+  `zig build test:lib` runs one sharded binary per package.
+
 - **Zig source API: tool-result reduction moved out of `Conversation`, and
   the packages no longer form a cycle.** `Conversation.microcompactToolResults`,
   `microcompactToolResultsByRecentResults`, `truncateLargeToolResults` and

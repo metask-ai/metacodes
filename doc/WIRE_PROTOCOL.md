@@ -3,9 +3,9 @@
 Status: implemented contract. Normative for every Host that carries a Session
 across a process or network boundary: the bundled `--web`/`serve` HTTP
 surface (`apps/cli/src/web/`), `SessionHost` behind an embedder's transport
-(`src/core/session_host.zig`), and any Host in another language. The
-encoder and parser are `src/core/protocol/wire.zig`; routing by declared
-capabilities is `src/core/protocol/frontend_capabilities.zig`. Conformance
+(`packages/session/src/core/session_host.zig`), and any Host in another language. The
+encoder and parser are `packages/coding/src/core/protocol/wire.zig`; routing by declared
+capabilities is `packages/coding/src/core/protocol/frontend_capabilities.zig`. Conformance
 vectors: `tests/fixtures/wire/v1`. Evidence that a declaration changes what a
 frontend is asked: `apps/cli/tests/component/frontend_capabilities_test.zig` (HTTP
 surface and `SessionHost`) and `tests/e2e/frontend_capabilities_e2e.py` (the

@@ -20,6 +20,30 @@ var stdout_writer: std.Io.File.Writer = undefined;
 var test_ids: test_id_record.Record = undefined;
 var test_ids_buffer: [4096]u8 = undefined;
 var recording = false;
+var picker_trace: ?std.Io.File.Writer = null;
+var trace_buffer: [1024]u8 = undefined;
+
+fn openPickerTrace(environ: std.process.Environ, argv0: []const u8) !void {
+    if (!std.mem.eql(u8, std.fs.path.stem(argv0), "picker-test")) return;
+    const path = environ.getAlloc(std.heap.page_allocator, "METACODES_PICKER_TRACE") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return,
+        else => return err,
+    };
+    defer std.heap.page_allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(runner_io, path, .{ .read = true, .truncate = false });
+    errdefer file.close(runner_io);
+    var writer = file.writer(runner_io, &trace_buffer);
+    try writer.seekTo(try file.length(runner_io));
+    picker_trace = writer;
+    try trace("server starting", "");
+}
+
+fn trace(phase: []const u8, name: []const u8) !void {
+    if (picker_trace) |*writer| {
+        try writer.interface.print("{s}\t{s}\n", .{ phase, name });
+        try writer.interface.flush();
+    }
+}
 
 pub fn main(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
@@ -39,6 +63,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             std.debug.panic("unrecognized command line argument: {s}", .{arg});
         }
     }
+    if (listen) openPickerTrace(init.environ, args[0]) catch |err|
+        std.debug.panic("cannot open picker trace: {t}", .{err});
     if (dir_path) |path| {
         test_id_record.open(&test_ids, &test_ids_buffer, runner_io, init.environ, path, args[0], "");
         recording = true;
@@ -67,7 +93,7 @@ fn runTest(init: std.process.Init.Minimal, test_fn: std.builtin.TestFn) Outcome 
     const status: std.zig.Server.Message.TestResults.Status = if (test_fn.func()) |_| .pass else |err| switch (err) {
         error.SkipZigTest => .skip,
         else => s: {
-            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            if (@errorReturnTrace()) |stack_trace| std.debug.dumpErrorReturnTrace(stack_trace);
             break :s .fail;
         },
     };
@@ -93,13 +119,18 @@ fn mainServer(init: std.process.Init.Minimal) !void {
     });
 
     while (true) {
+        try trace("waiting for command", "");
         const hdr = try server.receiveMessage();
         switch (hdr.tag) {
             .exit => {
+                try trace("exit requested", "");
                 if (recording) test_ids.close(runner_io);
+                try trace("exiting", "");
+                if (picker_trace) |writer| writer.file.close(runner_io);
                 return std.process.exit(0);
             },
             .query_test_metadata => {
+                try trace("sending metadata", "");
                 const allocator = std.heap.page_allocator;
                 const test_fns = builtin.test_functions;
                 var string_bytes: std.ArrayList(u8) = .empty;
@@ -122,9 +153,14 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 });
             },
             .run_test => {
+                try trace("reading test index", "");
                 const index = try server.receiveBody_u32();
+                const test_fn = builtin.test_functions[index];
+                try trace("sending test_started", test_fn.name);
                 try server.serveStringMessage(.test_started, &.{});
-                const outcome = runTest(init, builtin.test_functions[index]);
+                try trace("started", test_fn.name);
+                const outcome = runTest(init, test_fn);
+                try trace(@tagName(outcome.status), test_fn.name);
                 const Flags = std.zig.Server.Message.TestResults.Flags;
                 try server.serveTestResults(.{
                     .index = index,

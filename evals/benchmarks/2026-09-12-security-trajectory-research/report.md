@@ -96,7 +96,7 @@ false-positive-trap-bind 则需要区别对待。轨迹中 `/workdir` 的 owner 
 
 原始二进制搜索一个普通临时文本文件：不存在的模式返回系统错误；实际存在的 `->needle` 被当成选项；普通模式 `ordinary` 正常返回行号。这同时给出了两个失败和一个正向对照。
 
-根因一是生产 `executeBody` 分支把零字节结果送进 `Capture.seal()`，后者明确拒绝空内容。根因二是组装 ripgrep argv 时直接追加 pattern，缺少 `-e` 或选项终止分隔；legacy 和 spool 分支都有同样的参数问题。[Grep 参数组装](../../../src/tools/grep.zig#L141)、[空输出封存](../../../src/tools/grep.zig#L226)、[CAS 空内容约束](../../../src/core/tool_result_artifact.zig#L198)
+根因一是生产 `executeBody` 分支把零字节结果送进 `Capture.seal()`，后者明确拒绝空内容。根因二是组装 ripgrep argv 时直接追加 pattern，缺少 `-e` 或选项终止分隔；legacy 和 spool 分支都有同样的参数问题。[Grep 参数组装](https://github.com/metask-ai/metacodes/blob/9cc0e049af84d9cc92dc0b40ec525318f25640bd/src/tools/grep.zig#L141)、[空输出封存](https://github.com/metask-ai/metacodes/blob/9cc0e049af84d9cc92dc0b40ec525318f25640bd/src/tools/grep.zig#L226)、[CAS 空内容约束](https://github.com/metask-ai/metacodes/blob/9cc0e049af84d9cc92dc0b40ec525318f25640bd/src/core/tool_result_artifact.zig#L198)
 
 应在工具层把 `rg` 的合法无匹配解释为成功的空结果，而不是放宽所有 artifact 的封存约束。回归用例必须进入 `executeBody`、配置真实 artifact store，并覆盖无匹配、分页越界、连字符开头模式、普通命中、真实启动错误。现有许多测试调用的是 legacy `execute`，不能代表生产 spool 路径。30 次错误的分数代价仍然未知：模型有时能改用 Bash 绕过，但多轮反复搜索明显值得避免。
 
@@ -104,7 +104,7 @@ false-positive-trap-bind 则需要区别对待。轨迹中 `/workdir` 的 owner 
 
 2,633 条出站请求及其 upstream_body 中，assistant 历史 thinking/reasoning 块计数全部为零。代理摘要有 310 条响应记录到 reasoning，共 2,161,370 字符；native 事件也持续记录 thinking。摘要字段覆盖并不完整，不能因此说另外 2,323 条响应都没有思考。
 
-本地假模型以标准 thinking_delta 返回思考，再调用工具。Grep 实验共 4 轮，native 明确收到 4 轮 thinking，4 条后续历史计数仍全部为零。源码 `buildApiMessages` 对 `.thinking` 直接 `continue`，在此次二进制来源提交和当前源码中都能看到。旁边“preserved thinking”注释表示的意图与实际 API 投影不一致。[请求投影](../../../src/core/agent_loop.zig#L3131)
+本地假模型以标准 thinking_delta 返回思考，再调用工具。Grep 实验共 4 轮，native 明确收到 4 轮 thinking，4 条后续历史计数仍全部为零。源码 `buildApiMessages` 对 `.thinking` 直接 `continue`，在此次二进制来源提交和当前源码中都能看到。旁边“preserved thinking”注释表示的意图与实际 API 投影不一致。[请求投影](https://github.com/metask-ai/metacodes/blob/9cc0e049af84d9cc92dc0b40ec525318f25640bd/src/core/agent_loop.zig#L3131)
 
 Z.ai 文档要求工具调用时保留并回传 thinking；标准 API 上启用跨轮保留还涉及 `clear_thinking=false` 及原样返回 reasoning 内容。这里的缺失发生在进入 WorkBuddy proxy 之前，所以不能只修改 proxy 的温度参数来修复。[Z.ai thinking 协议说明](https://docs.z.ai/guides/capabilities/thinking-mode)
 

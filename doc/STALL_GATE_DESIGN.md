@@ -1,6 +1,6 @@
 # Stall gate: in-run zero-information-gain breaker
 
-Status: implemented (`src/core/stall_gate.zig`, Lean mirror
+Status: implemented (`packages/coding/src/core/stall_gate.zig`, Lean mirror
 `control-plane/lean/MetaCodesControl/StallGate.lean`).
 
 ## Problem

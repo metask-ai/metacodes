@@ -63,7 +63,7 @@ LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("gates-macos-
 # job whose legs or shards each one reports. Gates (macOS) and Gates (Windows)
 # report where the gates ran, a pool or the hosted legs: test_ci_pool_plan.py.
 RESULT_JOBS = {
-    "Gates (Linux)": ["gates-linux", "test-ids", "scope"],
+    "Gates (Linux)": ["gates-linux", "test-ids"],
     "Gates (macOS)": ["runner-plan", "gates-macos-watch", "gates-macos"],
     "Gates (Windows)": ["runner-plan", "windows-gates-watch", "windows-gates"],
     "TTY (Linux)": "tty-linux",
@@ -165,7 +165,7 @@ class ClassifyTest(unittest.TestCase):
 
     def test_markdown_outside_doc_and_the_top_level_is_an_input(self) -> None:
         # Prompt templates are @embedFile'd; agent and Skill fixtures are read by tests.
-        for path in ("src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
+        for path in ("packages/coding/src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
             with self.subTest(path=path):
                 self.assertEqual(ci_scope.classify([path])[0], "full")
 
@@ -427,9 +427,9 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, changes, layout)
                 self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
                 self.assertTrue(chosen.product and chosen.tty)
-        self.assertEqual(layout.owner("src/core/conversation.zig"), "kernel")
-        self.assertEqual(layout.owner("src/core/agent_loop.zig"), "coding")
-        self.assertEqual(layout.owner("src/core/tools_extra.zig"), "coding")
+        self.assertEqual(layout.owner("packages/kernel/src/conversation.zig"), "kernel")
+        self.assertEqual(layout.owner("packages/coding/src/core/agent_loop.zig"), "coding")
+        self.assertEqual(layout.owner("packages/coding/src/core/tools_extra.zig"), "coding")
         self.assertEqual(layout.owner("tests/helpers/x.zig"), "testing")
 
     def test_a_package_is_charged_for_each_baseline_entry_it_is_part_of(self) -> None:
@@ -556,7 +556,6 @@ class LayoutTest(unittest.TestCase):
             selection = ci_scope.select(scope, changes, layout)
             self.assertEqual(selection.offline_eval, bool(extra))
             self.assertIn(target, ci_scope.local_commands(scope, selection)[0])
-            self.assertFalse(ci_scope.needs_model_eval(changes, [], ROOT, None))
 
     def test_local_commands_follow_the_selection(self) -> None:
         layout = fixture_layout()
@@ -617,9 +616,6 @@ class PackageScopeMainTest(unittest.TestCase):
                 {"source": "README.md", "destination": "share/doc/README.md"}]}), encoding="utf-8")
         (self.repo / "evals/plugin-v1").mkdir(parents=True)
         (self.repo / ci_scope.PROTOCOL).write_text(json.dumps({"implementation_paths": ["build.zig"]}), encoding="utf-8")
-        suite = self.repo / ci_scope.CORE_E2E_SUITE
-        suite.parent.mkdir(parents=True)
-        suite.write_bytes((ROOT / ci_scope.CORE_E2E_SUITE).read_bytes())
         (self.repo / ci_scope.LAYERS).write_text(FIXTURE_LAYERS, encoding="utf-8")
         (self.repo / ci_scope.LAYER_BASELINE).write_text(FIXTURE_BASELINE, encoding="utf-8")
         (self.repo / ci_scope.BUILD).write_text(FIXTURE_BUILD, encoding="utf-8")
@@ -693,66 +689,14 @@ class PackageScopeMainTest(unittest.TestCase):
         self.run_main("--event", "pull_request", "--base", "HEAD^1", "--fast-path", "true", "--record", str(record))
         self.assertTrue(json.loads(record.read_text(encoding="utf-8"))["fast_path"])
 
-    def test_model_comparison_follows_the_diff_even_on_a_full_migration(self) -> None:
-        (self.repo / "src/core/kernel").mkdir(parents=True)
-        self.edit("src/core/kernel/loop.zig")
+    def test_core_changes_keep_offline_evaluation_without_a_provider_report(self) -> None:
+        (self.repo / "packages/kernel/src").mkdir(parents=True)
+        self.edit("packages/kernel/src/loop.zig")
         self.commit("loop")
-        for labels in ([], ["--labels", "migration"]):
-            got = self.run_main("--event", "pull_request", "--base", "HEAD^1", *labels)
-            self.assertEqual((got["offline_eval"], got["model_eval"]), ("true", "true"))
-        self.git("mv", "src/core/kernel/loop.zig", "moved.zig")
-        self.commit("move")
-        got = self.run_main("--event", "merge_group", "--base", "HEAD^1")
-        self.assertEqual(got["model_eval"], "true")
-        self.edit("README.md")
-        self.commit("docs")
-        for label, offline, model in (("", "false", "false"), ("migration", "true", "false"),
-                                      ("model-eval", "true", "true")):
-            got = self.run_main("--event", "pull_request", "--base", "HEAD^1", "--labels", label)
-            self.assertEqual((got["offline_eval"], got["model_eval"]), (offline, model))
-
-    def test_model_comparison_tracks_individual_suite_inputs_and_runtime_files(self) -> None:
-        conf = "tests/e2e/scenarios/13_perm_interactive.conf"
-        (self.repo / conf).parent.mkdir(parents=True)
-        (self.repo / conf).write_bytes((ROOT / conf).read_bytes())
-        self.commit("install the core scenario configuration")
-        for path, required in (
-            ("tests/e2e/scenarios/00_smoke.txt", True),
-            ("tests/e2e/scenarios/02_html_game.conf", True),
-            ("tests/e2e/fixtures/answers_13.txt", True),
-            ("tests/e2e/scenarios/01_game_design.txt", False),
-            ("src/core/kernel/loop_test.zig", False),
-            ("src/api/model_name_consumers_test.zig", False),
-            ("src/provider/capability_matrix_test.zig", False),
-            ("packages/kernel/tests/loop.zig", False),
-            ("src/core/kernel/loop.zig", True),
-            ("src/core/test_integrity.zig", True),
-        ):
-            with self.subTest(path=path):
-                (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
-                self.edit(path)
-                self.commit(path)
-                got = self.run_main("--event", "pull_request", "--base", "HEAD^1")
-                self.assertEqual((got["model_eval"], got["offline_eval"]), (str(required).lower(), "true"))
-        (self.repo / conf).unlink()
-        changes = [("M", "tests/e2e/fixtures/answers_13.txt")]
-        self.assertTrue(ci_scope.needs_model_eval(changes, [], self.repo, "HEAD"))
-        self.assertFalse(ci_scope.needs_model_eval(changes, [], self.repo, None))
-        self.assertTrue(ci_scope.needs_model_eval([("D", conf)], [], self.repo, None))
-
-    def test_local_suite_selects_its_declared_fixture_and_validator(self) -> None:
-        manifest = self.repo / ci_scope.CORE_E2E_SUITE
-        suite = json.loads(manifest.read_text(encoding="utf-8"))
-        task = suite["tasks"][0]
-        fixture = "tests/e2e/fixtures/new.json"
-        validator = "evals/validators/new.py"
-        task["environment"]["fixtures"] = [fixture]
-        task["success"]["checks"].append({"type": "validator", "validator": validator})
-        manifest.write_text(json.dumps(suite), encoding="utf-8")
-        for path in (fixture, validator):
-            with self.subTest(path=path):
-                self.assertTrue(ci_scope.needs_model_eval([("D", path)], [], self.repo, None))
-                self.assertFalse(ci_scope.needs_model_eval([("D", path)], [], self.repo, "HEAD"))
+        for event in ("pull_request", "merge_group"):
+            got = self.run_main("--event", event, "--base", "HEAD^1")
+            self.assertEqual(got["offline_eval"], "true")
+            self.assertNotIn("model_eval", got)
 
     def test_the_nightly_report_reads_what_each_pull_request_recorded(self) -> None:
         self.edit("src/mid/a.zig")
@@ -1004,23 +948,6 @@ class WorkflowTest(unittest.TestCase):
                                       capture_output=True, text=True)
                 self.assertEqual(proc.returncode == 0, passes, proc.stdout + proc.stderr)
 
-    @unittest.skipIf(os.name == "nt", "bash and jq")
-    def test_model_eval_requires_latest_success_for_this_pair_with_a_report(self) -> None:
-        step = self.jobs["gates-linux-result"]["steps"][1]
-        self.assertIn("needs.scope.outputs.model_eval != 'false'", step["if"])
-        self.assertEqual(self.jobs["gates-linux-result"]["permissions"], {"statuses": "read"})
-        context = "model-eval/" + "b" * 40
-        passed = {"context": context, "state": "success", "target_url": "https://example.org/report"}
-        args = '[[ "$*" == "api --paginate --slurp repos/org/repo/commits/head/statuses?per_page=100" ]]'
-        stub = 'gh() { ' + args + ' && echo "$PAGES"; }\n'
-        for pages, ok in (([[], [passed]], True), ([[]], False), ([[dict(passed, context="other")]], False),
-                          ([[dict(passed, state="pending"), passed]], False), ([[dict(passed, target_url=None)]], False)):
-            with self.subTest(pages=pages):
-                env = dict(os.environ, GITHUB_REPOSITORY="org/repo", BASE_SHA="b" * 40,
-                           HEAD_SHA="head", PAGES=json.dumps(pages))
-                result = subprocess.run([*BASH, stub + step["run"]], env=env, capture_output=True)
-                self.assertEqual(result.returncode == 0, ok, result.stderr)
-
     def test_every_leg_flag_a_step_reads_is_set_by_a_leg(self) -> None:
         # A flag no leg sets is a step that runs on no runner at all. A step
         # the OS condition keeps off this platform (the arm64 cross-stage on
@@ -1191,7 +1118,7 @@ class WorkflowTest(unittest.TestCase):
         for name in ("Record the executed test IDs", "Upload the executed test IDs"):
             self.assertTrue(steps[name]["if"].endswith("&& env.COMPLETE != 'false'"), name)
         job = self.jobs["test-ids"]
-        kept = [step for step in job["steps"] if step.get("uses", "").startswith(("actions/download-artifact@", "actions/upload-artifact@"))
+        kept = [step for step in job["steps"] if step.get("with", {}).get("name") == "test-ids" or step.get("with", {}).get("pattern") == "test-ids-raw-*"
                 or step.get("name") == "Collect the executed test IDs"]
         self.assertEqual(len(kept), 3)
         for step in kept:
@@ -1339,6 +1266,23 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, [])
         self.assertIn("relevant=true", output)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_native_gate_follows_moved_core_and_isolated_roots(self) -> None:
+        for path in (
+            "packages/ai/src/core/auth.zig",
+            "packages/kernel/src/loop.zig",
+            "packages/guard/src/core/goal.zig",
+            "packages/coding/src/core/agent_loop.zig",
+            "packages/session/src/core/session_host.zig",
+            "packages/coding/src/lsp_test_root.zig",
+            "packages/base/src/platform/platform.zig",
+            "packages/base/src/root.zig",
+        ):
+            with self.subTest(path=path):
+                proc, _, output = self.run_step("pull_request", path)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("relevant=true", output)
 
     def test_native_steps_read_relevance(self) -> None:
         steps = self.workflow["jobs"]["native-windows-gate"]["steps"]

@@ -41,7 +41,7 @@ the session's directories, and answer its permission questions. The rules
   process teammates) inherits it, exactly as it inherits provider keys:
   metacodes never edits its libc environment after startup, because that
   environment block is borrowed and an `unsetenv` could leave a dangling read
-  (see `src/core/auth.zig`).
+  (see `packages/ai/src/core/auth.zig`).
 - **Bind.** `--web-bind` / `METACODES_WEB_BIND` may name any IP literal. A
   non-loopback address is refused at startup unless a token is set or
   `--web-allow-unauth` is given; the latter hands the session to anyone who

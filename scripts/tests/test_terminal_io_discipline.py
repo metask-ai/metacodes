@@ -6,7 +6,7 @@ write in the process into EINTR. A key read that takes that for end of input
 cancels a reverse search, closes the transcript viewer or denies a permission
 prompt; a write loop that stops on it drops the rest of a frame (#340).
 
-In ``apps/cli/src/repl/`` and ``src/permission/prompt.zig``:
+In ``apps/cli/src/repl/`` and ``packages/guard/src/permission/prompt.zig``:
 
 * a raw terminal read (``platform_term.readInput(``, ``pfs.read(``,
   ``std.c.read(``) is followed within a few lines by the retry check
@@ -34,7 +34,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCOPE_DIRS = (Path("apps/cli/src/repl"),)
-SCOPE_FILES = (Path("src/permission/prompt.zig"),)
+SCOPE_FILES = (Path("packages/guard/src/permission/prompt.zig"),)
 RAW_READ = re.compile(r"\b(?:platform_term\.readInput|pfs\.read|std\.c\.read)\s*\(")
 RAW_WRITE = re.compile(r"\b(?:pfs\.write|std\.c\.write|posix\.write)\s*\(")
 RETRY = re.compile(r"\b(?:retryInterruptedRead|readInterrupted)\s*\(")
@@ -122,7 +122,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
     def test_the_rule_still_sees_the_repl(self):
         # An empty scan would pass trivially; the seam itself must be in it.
         self.assertIn(Path("apps/cli/src/repl/input.zig"), governed_sources(ROOT))
-        self.assertIn(Path("src/permission/prompt.zig"), governed_sources(ROOT))
+        self.assertIn(Path("packages/guard/src/permission/prompt.zig"), governed_sources(ROOT))
 
     def test_scanner_reports_unchecked_reads_and_raw_writes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -164,7 +164,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
                 "    _ = std.c.read(0, &b, 1); // no EINTR: poll reported data\n"
                 "}\n",
             )
-            write(root, "src/permission/prompt.zig", "const n = platform_term.readInput(0, &buf);\n")
+            write(root, "packages/guard/src/permission/prompt.zig", "const n = platform_term.readInput(0, &buf);\n")
             write(root, "src/other/elsewhere.zig", "_ = pfs.write(fd, x);\n")
             self.assertEqual(
                 violations(root),
@@ -174,7 +174,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
                     "apps/cli/src/repl/viewer.zig:2: raw read without the EINTR retry (use input.readKey)",
                     "apps/cli/src/repl/viewer.zig:4: raw write (use pfs.writeAll)",
                     "apps/cli/src/repl/viewer.zig:5: raw write (use pfs.writeAll)",
-                    "src/permission/prompt.zig:1: raw read without the EINTR retry (use input.readKey)",
+                    "packages/guard/src/permission/prompt.zig:1: raw read without the EINTR retry (use input.readKey)",
                 ],
             )
 
