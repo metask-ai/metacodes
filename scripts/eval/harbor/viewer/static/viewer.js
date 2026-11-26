@@ -338,7 +338,7 @@ function comparisonPicker(profiles, crossProfile) {
         if (!bySuite.has(item.suite)) bySuite.set(item.suite, []);
         bySuite.get(item.suite).push({ run: item.job.name, suite: item.suite_name || item.suite,
           owner: crossProfile ? profile.id : group.id,
-          label: [crossProfile ? profileName(profile) : null, group.label, item.model, item.run].filter(Boolean).join(' · ') });
+          label: [crossProfile ? profileName(profile) : null, group.label, item.model, item.tasks?.length ? `${item.tasks.length} 题` : null, item.run].filter(Boolean).join(' · ') });
       }
     }
   }
@@ -377,20 +377,56 @@ function comparisonPicker(profiles, crossProfile) {
     h('label', { class: 'field' }, '第二份结果', right), compare);
 }
 
-function multiProfileCompareDock(chosen) {
+function profileSuiteEntries(chosen) {
   const bySuite = new Map();
   for (const p of chosen) {
-    const latestBySuite = new Map();
-    for (const item of p.items || []) {
-      if (!item.job) continue;
-      latestBySuite.set(item.suite, { suite: item.suite, suiteName: item.suite_name || item.suite, job: item.job.name });
-    }
-    for (const [sid, entry] of latestBySuite) {
-      if (!bySuite.has(sid)) bySuite.set(sid, { suiteName: entry.suiteName, jobs: new Map() });
-      bySuite.get(sid).jobs.set(p.id, entry.job);
+    for (const group of groupedItems(p)) {
+      for (const { item } of group.entries) {
+        if (!item.job) continue;
+        if (!bySuite.has(item.suite)) bySuite.set(item.suite, { suiteName: item.suite_name || item.suite, byProfile: new Map() });
+        const bucket = bySuite.get(item.suite).byProfile;
+        if (!bucket.has(p.id)) bucket.set(p.id, []);
+        const tasksCount = item.tasks?.length || item.job.planned || 0;
+        bucket.get(p.id).push({
+          run: item.job.name,
+          model: item.model || '',
+          tasks: tasksCount,
+          startedAt: item.job.started_at || item.started_at || '',
+          label: [group.label, item.model || '—', tasksCount ? `${tasksCount} 题` : null, item.job.name].filter(Boolean).join(' · '),
+        });
+      }
     }
   }
-  const shared = [...bySuite.entries()].filter(([, v]) => v.jobs.size === chosen.length);
+  return [...bySuite.entries()].filter(([, v]) => chosen.every((p) => (v.byProfile.get(p.id) || []).length > 0));
+}
+
+function bestJobEntry(entries, model) {
+  const pool = model !== null ? entries.filter((e) => e.model === model) : entries;
+  return [...pool].sort((a, b) => b.tasks - a.tasks || String(b.startedAt).localeCompare(String(a.startedAt)))[0];
+}
+
+function pickDefaultProfileJobs(chosen, byProfile, saved) {
+  const sets = chosen.map((p) => new Set(byProfile.get(p.id).map((e) => e.model)));
+  const sharedModels = [...sets[0]].filter((m) => sets.every((s) => s.has(m)));
+  let preferredModel = null;
+  if (sharedModels.length) {
+    preferredModel = sharedModels.sort((a, b) => {
+      const score = (m) => chosen.reduce((sum, p) => sum + (bestJobEntry(byProfile.get(p.id), m)?.tasks || 0), 0);
+      return score(b) - score(a);
+    })[0];
+  }
+  const result = {};
+  for (const p of chosen) {
+    const entries = byProfile.get(p.id);
+    const kept = saved?.[p.id];
+    if (kept && entries.some((e) => e.run === kept)) result[p.id] = kept;
+    else result[p.id] = bestJobEntry(entries, preferredModel).run;
+  }
+  return result;
+}
+
+function multiProfileCompareDock(chosen) {
+  const shared = profileSuiteEntries(chosen);
   const key = chosen.map((p) => p.id).join(',');
   const picked = state.comparisons.get(key) || {};
   const chips = chosen.map((p, i) => h('span', { class: 'mono', style: 'font-size:12px' },
@@ -398,26 +434,54 @@ function multiProfileCompareDock(chosen) {
   const clearBtn = h('button', { type: 'button', class: 'button sm', onclick: () => { state.selected.clear(); render(); } }, '清空');
   if (!shared.length) {
     return h('section', { class: 'compare-dock' },
-      h('div', { class: 'compare-dock-left' }, h('span', { class: 'tag acc', text: `已勾选 ${chosen.length} 个 Profile` }), ...chips,
-        h('span', { class: 'muted', text: '暂无所有已选 Profile 共有的评测集结果' })),
-      h('div', { class: 'compare-dock-right' }, clearBtn));
+      h('div', { class: 'compare-dock-top' },
+        h('div', { class: 'compare-dock-left' }, h('span', { class: 'tag acc', text: `已勾选 ${chosen.length} 个 Profile` }), ...chips,
+          h('span', { class: 'muted', text: '暂无所有已选 Profile 共有的评测集结果' })),
+        h('div', { class: 'compare-dock-right' }, clearBtn)));
   }
-  const currentSuite = shared.some(([sid]) => sid === picked.suite) ? picked.suite : shared[0][0];
+  const bySuite = new Map(shared);
+  const currentSuite = bySuite.has(picked.suite) ? picked.suite : shared[0][0];
   const suiteSelect = h('select', { 'aria-label': '共同评测集' }, shared.map(([sid, v]) =>
     h('option', { value: sid, selected: sid === currentSuite, text: '共同评测集：' + v.suiteName })));
   const go = h('a', { class: 'button primary sm', text: `打开 ${chosen.length} 版本对比台 →` });
-  const syncHref = () => {
-    const entry = bySuite.get(suiteSelect.value);
-    picked.suite = suiteSelect.value;
+  const picksBox = h('div', { class: 'compare-dock-picks' });
+  const selects = new Map();
+
+  function syncHref() {
+    const sid = suiteSelect.value;
+    const saved = picked.jobsBySuite?.[sid] || {};
+    for (const [pid, sel] of selects) saved[pid] = sel.value;
+    picked.suite = sid;
+    picked.jobsBySuite = { ...(picked.jobsBySuite || {}), [sid]: saved };
     state.comparisons.set(key, picked);
-    const jobs = chosen.map((p) => entry.jobs.get(p.id)).filter(Boolean);
+    const jobs = chosen.map((p) => saved[p.id]).filter(Boolean);
     go.href = '#/compare/' + jobs.map(encodeURIComponent).join(',');
-  };
-  suiteSelect.onchange = syncHref;
-  syncHref();
+  }
+
+  function drawPicks() {
+    const sid = suiteSelect.value;
+    const { byProfile } = bySuite.get(sid);
+    const defaults = pickDefaultProfileJobs(chosen, byProfile, picked.jobsBySuite?.[sid]);
+    selects.clear();
+    picksBox.replaceChildren(...chosen.map((p, i) => {
+      const entries = byProfile.get(p.id);
+      const sel = h('select', { 'aria-label': `${profileName(p)} 参与对比的作业`, onchange: syncHref },
+        entries.map((e) => h('option', { value: e.run, selected: e.run === defaults[p.id], text: e.label })));
+      selects.set(p.id, sel);
+      return h('label', { class: 'compare-dock-pick' },
+        h('span', {}, h('b', { style: `color:${profileColor(i)}`, text: '★' }), h('span', { class: 'mono', text: profileName(p) })),
+        sel);
+    }));
+    syncHref();
+  }
+
+  suiteSelect.onchange = drawPicks;
+  drawPicks();
   return h('section', { class: 'compare-dock' },
-    h('div', { class: 'compare-dock-left' }, h('span', { class: 'tag acc', text: `已勾选 ${chosen.length} 个 Profile` }), ...chips),
-    h('div', { class: 'compare-dock-right' }, suiteSelect, go, clearBtn));
+    h('div', { class: 'compare-dock-top' },
+      h('div', { class: 'compare-dock-left' }, h('span', { class: 'tag acc', text: `已勾选 ${chosen.length} 个 Profile` }), ...chips),
+      h('div', { class: 'compare-dock-right' }, suiteSelect, go, clearBtn)),
+    picksBox);
 }
 
 async function renderOverview() {
@@ -1832,15 +1896,17 @@ async function renderCompare(names, profileId) {
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } }, '导出对比 CSV');
+  const modelsAcrossJobs = new Set(jobs.map((j) => j.model).filter(Boolean));
   const ctrlBar = h('div', { class: 'cmp-ctrl' },
     h('div', { class: 'cmp-chips' }, h('span', { class: 'muted', style: 'font-size:12px', text: '对比对象：' }), ...chips),
     h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' },
+      modelsAcrossJobs.size > 1 ? h('span', { class: 'tag warn', text: `含 ${modelsAcrossJobs.size} 个不同模型` }) : null,
       suiteName ? h('span', { class: 'tag', text: '评测集：' + suiteName }) : null, exportBtn));
 
   const points = jobs.map((j) => commonCostPass(j, common));
   const commonRates = jobs.map((_, i) => common.length ? common.filter((t) => byJob[i].get(t).status === 'pass').length / common.length : null);
   const baseRate = commonRates[0];
-  const baseCost = jobs[0].summary.cost_per_task;
+  const baseCommonCost = points[0]?.cost;
   const summaryRows = jobs.map((j, i) => {
     const s = j.summary;
     const isBase = i === 0;
@@ -1856,7 +1922,7 @@ async function renderCompare(names, profileId) {
       }
     }
     const rDelta = !isBase ? deltaPct(commonRates[i], baseRate) : '';
-    const cDelta = !isBase ? deltaRel(s.cost_per_task, baseCost) : null;
+    const cDelta = !isBase ? deltaRel(point?.cost, baseCommonCost) : null;
     const meanTok = s.token_trials ? s.total_tokens / s.token_trials : null;
     const roleTag = isBase ? h('span', { class: 'tag warn', style: 'margin-right:6px', text: '基准' })
       : h('button', { type: 'button', class: 'tag acc', style: 'margin-right:6px;cursor:pointer', title: '点击设为基准',
@@ -1867,18 +1933,20 @@ async function renderCompare(names, profileId) {
         pct(commonRates[i], 1), rDelta ? ` (${rDelta})` : ''),
       h('td', { class: 'num mono' }, isBase ? h('span', { class: 'faint', text: '基准' })
         : common.length ? h('span', {}, h('span', { class: 'pos', text: '+' + wins }), ' / ', h('span', { class: 'neg', text: '-' + losses })) : dash()),
-      h('td', { class: 'num mono', text: `${s.tasks_solved || 0} / ${s.tasks_attempted || 0}` }),
       h('td', { class: 'num mono' + (cDelta ? (cDelta.value < 0 ? ' pos' : cDelta.value > 0 ? ' neg' : '') : '') },
-        usd(s.cost_per_task), cDelta ? ` (${cDelta.text})` : ''),
-      h('td', { class: 'num mono', text: usd(s.cost_per_pass) }),
+        point ? usd(point.cost) : dash(), cDelta ? ` (${cDelta.text})` : '',
+        point ? h('span', { class: 'sub mono', text: `均通过 ${pct(point.pass, 1)}` }) : null),
+      h('td', {}, frontier ? h('span', { class: 'tag pos', text: '★ 前沿' }) : point ? '' : dash()),
+      h('td', { class: 'num mono' }, usd(s.cost_per_task),
+        h('span', { class: 'sub mono', text: `通过 ${usd(s.cost_per_pass)}` })),
+      h('td', { class: 'num mono', text: `${s.tasks_solved || 0} / ${s.tasks_attempted || 0}` }),
       h('td', { class: 'num mono', text: compact(meanTok) }),
-      h('td', { class: 'num mono', text: pct(s.cache_hit_rate) }),
-      h('td', {}, frontier ? h('span', { class: 'tag pos', text: '★ 前沿' }) : point ? '' : dash()));
+      h('td', { class: 'num mono', text: pct(s.cache_hit_rate) }));
   });
-  const summaryHeads = ['Profile 版本', '共同题首次满分', '较基准胜负', '至少通过一次', '每题成本', '每次通过成本', '平均总 Token', '缓存命中', '前沿'];
-  const summaryPanel = panel('多版本总览矩阵', `共同首次有效 ${common.length} / ${tasks.length} 题 · 点击任意版本标签可切换基准`,
+  const summaryHeads = ['Profile 版本', '共同题首次满分', '较基准胜负', '共同题成本 / 均通过', '前沿', '全量每题 / 通过成本', '至少通过一次', '平均总 Token', '缓存命中'];
+  const summaryPanel = panel('多版本总览矩阵', `共同首次有效 ${common.length} / ${tasks.length} 题 · 成本变化与前沿均按共同题计算 · 点击版本标签可切换基准`,
     h('div', { class: 'table-scroll' }, h('table', {},
-      h('thead', {}, h('tr', {}, summaryHeads.map((t, i) => h('th', { class: i > 0 && i < summaryHeads.length - 1 ? 'num' : null, text: t })))),
+      h('thead', {}, h('tr', {}, summaryHeads.map((t, i) => h('th', { class: i > 0 && i !== 4 ? 'num' : null, text: t })))),
       h('tbody', {}, summaryRows))));
 
   const candIdx = jobs.length - 1;
@@ -1980,7 +2048,7 @@ async function renderCompare(names, profileId) {
       ...jobs.map((j, i) => h('th', {},
         h('span', { style: `color:${colors[i]};margin-right:5px`, text: '★' }),
         h('span', { text: jobTitle(j) }),
-        h('span', { class: 'sub mono', text: (j.profile_version ? `v${j.profile_version} · ` : '') + (i === 0 ? '基准' : i === candIdx ? '候选' : `版本 ${i + 1}`) }))),
+        h('span', { class: 'sub mono', text: [j.profile_version ? `v${j.profile_version}` : null, modelsAcrossJobs.size > 1 ? j.model : null, i === 0 ? '基准' : i === candIdx ? '候选' : `版本 ${i + 1}`].filter(Boolean).join(' · ') }))),
       h('th', { text: '演进趋势' }),
       h('th', { class: 'num' }, 'Token 变化', h('span', { class: 'sub', text: '候选 vs 基准' })))),
     tbody));
@@ -2353,7 +2421,14 @@ async function renderLeaderboard(suiteId) {
   const ourRanked = [...rankedByJob.values()].sort((a, b) => b.score - a.score);
   const ourColorMap = new Map(ourRanked.map((j, i) => [j.name, profileColor(i)]));
   if (!state.boardSelected[d.suite]) {
-    state.boardSelected[d.suite] = new Set(ourRanked.slice(0, 4).map((j) => j.name));
+    const byModel = new Map();
+    for (const j of ourRanked) {
+      const mk = modelKey(j.model);
+      if (!byModel.has(mk)) byModel.set(mk, []);
+      byModel.get(mk).push(j);
+    }
+    const multi = [...byModel.values()].filter((g) => g.length >= 2).sort((a, b) => b.length - a.length)[0];
+    state.boardSelected[d.suite] = new Set((multi || ourRanked).slice(0, 4).map((j) => j.name));
   }
   const selectedSet = state.boardSelected[d.suite];
   for (const name of [...selectedSet]) if (!rankedByJob.has(name)) selectedSet.delete(name);
