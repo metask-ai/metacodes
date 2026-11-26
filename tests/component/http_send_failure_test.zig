@@ -223,7 +223,7 @@ test "L2 send failure: each provider client opens a new connection after an uplo
 // http_connection. A call to the `Request` method directly brings back a
 // connection that survives its own failed send.
 const SEND_METHODS = [_][]const u8{ ".sendBodyComplete(", ".sendBodiless(", ".sendBodilessUnflushed(", ".sendBody(" };
-const HELPER_FILE = "src/api/http_connection.zig";
+const HELPER_FILE = "packages/ai/src/api/http_connection.zig";
 
 const SendScan = struct {
     /// Calls through `http_connection`.

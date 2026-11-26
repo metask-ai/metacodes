@@ -1,6 +1,6 @@
 //! L2 组件测试(层2):工具执行冒烟 —— 统一走 dispatch 整链。
 //!
-//! 与既有 src/tools/*.zig 单测的区别:那些**直调 execute**,绕过了 dispatch 的
+//! 与既有 packages/coding/src/tools/*.zig 单测的区别:那些**直调 execute**,绕过了 dispatch 的
 //! validateRequired + validateTypes 前置校验链;而 agent_loop 实际走的是 dispatch。
 //! 本测试用 cc.tools.dispatch(&ctx, name, args) 跑完整链路,确保:
 //!   ① 正常入参 → 工具执行成功、输出含预期;

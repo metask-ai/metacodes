@@ -40,7 +40,7 @@ def expected_sources(rev, event):
     if result.returncode:
         wiring = (git('rev-parse', f'{rev}:build.zig'), git('rev-parse', f'{rev}:.github/workflows/ci.yml'))
         require(wiring in PRE_INVENTORY_WIRING, 'base predates the Linux ID inventory and has unknown test wiring')
-        bootstrap = ids.ROOT / SOURCES
+        bootstrap = (ids.ROOT / SOURCES).with_name('linux-sources-pre-inventory.tsv')
         require(sha256(bootstrap) == 'ddfebf5ab1eb5dcb8a1c5ed159d3a31b2b991138d75a226e58e0e76fcd3f2edd',
                 'cannot verify a pre-inventory baseline with a changed source plan')
         plan = bootstrap.read_text()

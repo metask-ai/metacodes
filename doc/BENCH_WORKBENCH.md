@@ -1383,7 +1383,7 @@ the other features' flags, and only on an SSH executor whose entry sets
   `agent_timeout_multiplier`. The cap is in metacodes' price estimate,
   not a provider bill; without the run's OpenRouter price (below) a model
   missing from metacodes' table is charged at the Sonnet fallback rates
-  (`src/util/pricing.zig`), and the cap, and the isolated verifier's own
+  (`packages/base/src/util/pricing.zig`), and the cap, and the isolated verifier's own
   $0.20, stop far earlier than real spend would. The first real-model runs
   without it ran out of budget or ended with no audit verdict.
 

@@ -64,7 +64,7 @@ Jev 本身是 typed decision engine，不是代码生成器或 coding-agent LLM�
 
 ## 与当前 metacodes 的落点
 
-当前 `src/plugin/runtime.zig` 的 `advisory_hook` 只有布尔型
+当前 `packages/coding/src/plugin/runtime.zig` 的 `advisory_hook` 只有布尔型
 `allowsTool/allowsInvocation` 上限，不能表达概率分布、Pareto 结果或
 `unresolved` mass；不能把 JevTree 硬塞进这个接口。当前 process plugin v1 也
 只有 `host_tool`，不能隐式包住 AgentLoop。合适的形状是一个由内核拥有生命周期
@@ -216,7 +216,7 @@ AgentLoop。
 
 ### Stage 1：shadow observer
 
-新增 `src/core/decision_advisor.zig`（名称待冻结），由 `AgentLoop.Options` 可选
+新增 `packages/coding/src/core/decision_advisor.zig`（名称待冻结），由 `AgentLoop.Options` 可选
 挂载，在一个完整 turn boundary、effective tool set 和 native permission 分类之后
 观测；不在 stream 或 prefetch 路径中阻塞。
 写入 versioned `jev_decision_query_v1`、`jev_action_distribution_v1`、

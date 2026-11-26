@@ -99,7 +99,7 @@ fn runCase(requester: ?*Scripted) ![]u8 {
     defer conv.deinit();
     try conv.appendText(.user, "run the probe");
 
-    // As AgentSession configures it (src/core/agent_session.zig).
+    // As AgentSession configures it (packages/session/src/core/agent_session.zig).
     var perm = cc.permission.createContext(.default, a);
     perm.no_interactive_prompt = true;
     if (requester) |scripted| perm.ui_requester = .{ .ctx = scripted, .requestFn = Scripted.request };

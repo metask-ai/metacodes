@@ -1,7 +1,7 @@
 # 工作区行尾一律 LF,不看开发者的 core.autocrlf。
 #
 # 动机不是风格统一。`@embedFile` 把模板按**字节**嵌进二进制,而 rule_author 的
-# prompt SHA-256 是缓存键与历史收据的契约(src/core/rule_author.zig)。在
+# prompt SHA-256 是缓存键与历史收据的契约(packages/coding/src/core/rule_author.zig)。在
 # core.autocrlf=true 的 Windows checkout 上模板带 CRLF,摘要随之漂移:
 #   期望 9e6affe7ae9548a90f9d52fc537956f334e3730828b80d512cc2f8ba8b063514
 #   实得 4750cbbccdf6f6bc2d147f7c611f9029bfb49a9a6a3315a29a77d7295c9a9336

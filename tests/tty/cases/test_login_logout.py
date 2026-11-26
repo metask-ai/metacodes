@@ -185,7 +185,7 @@ def test_login_signs_in_in_the_browser_and_the_session_and_next_start_use_it(bin
 
 
 def _metask_offer_id(model, endpoint="https://napi.metask-ai.com/v1/messages"):
-    """The offer id of the compiled Metask route for `model` (src/provider/ids.zig
+    """The offer id of the compiled Metask route for `model` (packages/ai/src/provider/ids.zig
     `OfferId.derive`): what `/model` stores when it is chosen for every session."""
     digest = hashlib.sha256(b"metacodes.offer.v1")
     for field in ("metask", "default", "anthropic_messages", endpoint, model, ""):

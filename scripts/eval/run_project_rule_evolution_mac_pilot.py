@@ -25,7 +25,7 @@ TASK_CAPABILITY = "task-hierarchy-canonical-read-v1"
 ONTOLOGY_CAPABILITY = "tinykg-ontology-rule-snapshot-v1"
 SUMMARY = "A governed ontology is context, not promotion authority."
 FALSIFIER = "A held-out replay observes ontology context self-authorizing promotion."
-KG_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "src/kg/client.zig"
+KG_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "packages/coding/src/kg/client.zig"
 
 
 def _expected_store_contract() -> tuple[str, str]:

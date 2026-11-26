@@ -1,0 +1,1834 @@
+//! Process-lifetime provider runtime (issue #16, delivery slice P1).
+//!
+//! `startup.zig` resolves one route and throws its registry away, which is all
+//! a bootstrap needs. A picker needs the opposite: a registry, catalog, and
+//! kernel that live as long as the session, so a client can list offers,
+//! validate a candidate, and commit — repeatedly, against stable ids.
+//!
+//! Heap-allocated on purpose. `Kernel` borrows `*const OfferCatalog`, so the
+//! catalog must not move after the kernel has seen it; a by-value `Host` copied
+//! into a struct field would leave the kernel pointing at the old address.
+
+const std = @import("std");
+const util_fs = @import("metacodes-base").util.fs;
+const ids = @import("ids.zig");
+const registry_mod = @import("registry.zig");
+const control_plane = @import("control_plane.zig");
+const selection_mod = @import("selection.zig");
+const config_store = @import("config_store.zig");
+const custom_provider = @import("custom_provider.zig");
+const config_doc = @import("config_doc.zig");
+const openrouter = @import("openrouter.zig");
+const openrouter_profile = @import("profiles/openrouter.zig");
+const bedrock_catalog = @import("bedrock_catalog.zig");
+const offer_mod = @import("offer.zig");
+const profile_mod = @import("profile.zig");
+const metask_profile = @import("profiles/metask.zig");
+const metask_catalog = @import("metask_catalog.zig");
+const controls_mod = @import("controls.zig");
+const ControlSpec = controls_mod.ControlSpec;
+
+pub const ProviderRegistry = registry_mod.ProviderRegistry;
+pub const OfferCatalog = registry_mod.OfferCatalog;
+pub const Kernel = control_plane.Kernel;
+pub const Slug = ids.Slug;
+
+pub const HostError = error{OutOfMemory} || registry_mod.RegisterError;
+
+/// One `providers.<id>.oauth_client_id` entry as the host keeps it (#87).
+pub const ConfiguredClientId = struct { provider_id: Slug, client_id: []const u8 };
+
+pub const Host = struct {
+    allocator: std.mem.Allocator,
+    registry: ProviderRegistry,
+    catalog: OfferCatalog,
+    /// Catalog the kernel handed out before the most recent refresh. Kept alive
+    /// until the next refresh because `adoptCatalog` documents that a previous
+    /// catalog must outlive in-flight readers.
+    retired: ?OfferCatalog = null,
+    /// Owns every string the configured profiles point at. It must outlive the
+    /// registry, which borrows them.
+    custom: ?custom_provider.Definitions = null,
+    /// Own the strings of every provider catalog ingested at runtime, one
+    /// arena per ingest, released only when the host ends.
+    ///
+    /// Not one slot: an ingest for one provider used to free the arena behind
+    /// another provider's profile, and the very next rebuild read it. Not freed
+    /// on a same-provider replace either: the retired catalog and any picker
+    /// snapshot taken before the swap still borrow the previous model names.
+    /// Ingests happen at startup, on `/providers refresh`, and on an API-key
+    /// switch, so what this keeps is a few kilobytes per user action.
+    catalog_arenas: std.ArrayList(std.heap.ArenaAllocator) = .empty,
+    /// Why a stage of `adoptDurableState` did not apply, if one did not.
+    ///
+    /// This subsystem must not print — it has no UI and no business owning one
+    /// — but swallowing the reason entirely means a broken `custom_providers`
+    /// section shows up much later as "unknown provider", with nothing to
+    /// connect the two. The caller reports it.
+    startup_warning: ?[]const u8 = null,
+    /// The first `config.json` entry passed over for naming a built-in
+    /// provider (`shadowedNotice` words it). Reported by the caller, as
+    /// `startup_warning` is.
+    config_shadowed: ?Shadowed = null,
+    /// The configuration currently applied to the catalog, owned here.
+    ///
+    /// Catalog options are *host state*, not a per-call argument: a rebuild
+    /// that forgot them would quietly resurrect a disabled provider and
+    /// collapse a multi-account pool back to one offer, which is exactly what
+    /// `/providers refresh` used to do.
+    config_bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty,
+    config_exclusions: std.ArrayList(Slug) = .empty,
+    /// `providers.<id>.oauth_client_id` (#87): the client an installation
+    /// registered for a profile that declares none. The strings live in
+    /// `config_client_arena`, which only the host's end frees: a login that
+    /// is presenting one of them may still be in flight when the
+    /// configuration is applied again, so a swap appends rather than frees.
+    config_client_ids: std.ArrayList(ConfiguredClientId) = .empty,
+    config_client_arena: ?std.heap.ArenaAllocator = null,
+    kernel: Kernel,
+
+    pub fn create(allocator: std.mem.Allocator) HostError!*Host {
+        const self = try allocator.create(Host);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .allocator = allocator,
+            .registry = try ProviderRegistry.initWithBuiltins(allocator),
+            .catalog = undefined,
+            .kernel = undefined,
+        };
+        errdefer self.registry.deinit();
+
+        self.catalog = self.registry.buildCatalog(allocator, .{ .revision = .initial }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // A built-in profile that cannot produce a catalog is a programming
+            // error, not a runtime condition; an empty catalog would silently
+            // become "no providers exist".
+            else => return error.OutOfMemory,
+        };
+        self.kernel = Kernel.init(allocator, &self.catalog);
+        self.kernel.registry = &self.registry;
+        return self;
+    }
+
+    pub fn destroy(self: *Host) void {
+        const allocator = self.allocator;
+        self.kernel.deinit();
+        if (self.retired) |*old| old.deinit();
+        self.catalog.deinit();
+        // The registry borrows the configured profiles' strings, so it goes
+        // first.
+        self.registry.deinit();
+        if (self.custom) |*definitions| definitions.deinit();
+        for (self.catalog_arenas.items) |*arena| arena.deinit();
+        self.catalog_arenas.deinit(allocator);
+        self.config_bindings.deinit(allocator);
+        self.config_exclusions.deinit(allocator);
+        self.config_client_ids.deinit(allocator);
+        if (self.config_client_arena) |*arena| arena.deinit();
+        allocator.destroy(self);
+    }
+
+    /// Register the providers the user configured.
+    ///
+    /// Best effort by design: a malformed `custom_providers` section must not
+    /// stop a session that also has working built-in providers. It is reported
+    /// rather than swallowed — the caller decides how loudly.
+    pub fn adoptCustomProviders(self: *Host, text: []const u8) custom_provider.DefinitionError!void {
+        var definitions = try custom_provider.parse(self.allocator, text);
+        errdefer definitions.deinit();
+
+        // Everything is validated and capacity reserved *before* anything is
+        // mutated. A failure halfway through would otherwise leave the registry
+        // holding profiles that borrow this arena while the errdefer releases
+        // it — and re-adopting the same configuration would fail outright,
+        // which is what a second `/providers refresh` does.
+        for (definitions.profiles()) |built| {
+            // A definition named like a built-in provider (OpenRouter became
+            // one) is passed over alone, and said so: failing the whole
+            // section would take every other provider of the user's with it.
+            if (self.isBuiltinId(built.id)) {
+                self.noteConfigShadowed(.custom_providers, built.id);
+                continue;
+            }
+            self.registry.checkUpsert(built) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.DuplicateProviderId => error.DuplicateProviderId,
+                else => error.InvalidDocument,
+            };
+        }
+        self.registry.reserve(definitions.profiles().len) catch return error.OutOfMemory;
+
+        // From here nothing fails, so the swap is atomic.
+        for (definitions.profiles()) |built| {
+            if (self.isBuiltinId(built.id)) continue;
+            self.registry.upsertAssumeCapacity(built);
+        }
+        if (self.custom) |*previous| {
+            // A provider the configuration no longer declares must be dropped
+            // before its arena is released, or the registry keeps a profile
+            // pointing into freed memory.
+            for (previous.profiles()) |old| {
+                if (definitions.find(old.id.slice()) == null) _ = self.registry.removeRuntime(old.id);
+            }
+            previous.deinit();
+        }
+        self.custom = definitions;
+        try self.refreshCatalog();
+    }
+
+    fn refreshCatalog(self: *Host) custom_provider.DefinitionError!void {
+        self.refresh() catch return error.OutOfMemory;
+    }
+
+    pub const IngestError = openrouter.AdapterError || bedrock_catalog.AdapterError || registry_mod.RegisterError;
+
+    /// Ingest a provider catalog: one `GET /models` document plus one
+    /// `GET /models/{id}/endpoints` document per model the caller cares about.
+    ///
+    /// The two are parsed separately and stay separate — a model with three
+    /// endpoints becomes three offers, because a model name is not a route.
+    /// Registering replaces any previous ingest for `provider_id`, and the
+    /// catalog revision moves, so a client can tell its snapshot went stale.
+    ///
+    /// The kernel does not fetch. The caller supplies the bytes, which is what
+    /// keeps this subsystem free of a transport dependency.
+    pub fn ingestOpenRouter(
+        self: *Host,
+        provider_id: Slug,
+        models_json: []const u8,
+        endpoint_documents: []const []const u8,
+    ) IngestError!void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        // Disarmed once the host owns it; releasing it afterwards would leave
+        // the registry holding a profile that borrows from it.
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        var models = try openrouter.parseModels(self.allocator, models_json);
+        defer models.deinit();
+
+        var channels: std.ArrayList(profile_mod.ChannelDescriptor) = .empty;
+        var worst = offer_mod.HealthStatus.healthy;
+        for (endpoint_documents) |document| {
+            var endpoints = try openrouter.parseEndpoints(self.allocator, document);
+            defer endpoints.deinit();
+            const model = models.find(endpoints.canonical_model_id) orelse continue;
+            for (endpoints.endpoints.items) |endpoint| {
+                if (endpoint.health.status == .degraded) worst = .degraded;
+                if (endpoint.health.status == .unavailable) worst = .unavailable;
+            }
+            const built = try openrouter.buildChannels(scratch, model.*, endpoints.endpoints.items);
+            // One channel per endpoint, across models: the endpoint a tag (or
+            // an upstream name) names serves every model it lists, and two
+            // channels with one id are not a profile the registry admits.
+            for (built) |channel| {
+                for (channels.items) |*existing| {
+                    if (!existing.id.eql(channel.id)) continue;
+                    const merged = try scratch.alloc(profile_mod.ModelEntry, existing.models.len + channel.models.len);
+                    @memcpy(merged[0..existing.models.len], existing.models);
+                    @memcpy(merged[existing.models.len..], channel.models);
+                    existing.models = merged;
+                    break;
+                } else channels.append(scratch, channel) catch return error.OutOfMemory;
+            }
+        }
+        if (channels.items.len == 0) return error.InvalidDocument;
+
+        const kinds = try scratch.alloc(profile_mod.CredentialKind, 1);
+        kinds[0] = .api_key;
+        const aliases = try scratch.alloc(profile_mod.EnvAlias, 1);
+        aliases[0] = .{ .name = "OPENROUTER_API_KEY", .kind = .api_key, .canonical = true };
+
+        const built = profile_mod.ProviderProfile{
+            .id = provider_id,
+            .implementation_id = Slug.lit("openrouter"),
+            .display_name = "OpenRouter",
+            .channels = channels.items,
+            .accepted_credential_kinds = kinds,
+            .env_aliases = aliases,
+            .default_channel = channels.items[0].id,
+        };
+        // Validate and reserve before mutating: a refresh replaces its own
+        // previous registration, and a half-applied one would leave the
+        // registry pointing into an arena about to be released.
+        try self.registry.checkUpsert(built);
+        try self.registry.reserve(1);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+
+        // Infallible from here, so the registry and the arena that backs it
+        // change together.
+        self.registry.upsertAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
+        // Prices and health arrived with the catalog, so the events that
+        // describe them are emitted here — the kernel does not fetch and cannot
+        // notice on its own.
+        self.kernel.notePricingUpdated(provider_id);
+        self.kernel.noteProviderHealth(provider_id, worst);
+    }
+
+    /// Replace the built-in OpenRouter profile's models with an account's
+    /// listing (`GET /api/v1/models/user`): one offer per model that takes
+    /// tools, all on the profile's router channel (`auto`), at the address
+    /// the channel has now (the development override may have moved it,
+    /// `rebaseOrigin`). Returns how many models it took. A listing with none
+    /// is refused and the previous models stay: a stale list is a far better
+    /// answer than an empty one, and offer ids are derived from the stable
+    /// binding, so a stored pin resolves again after a refresh.
+    pub fn ingestOpenRouterBuiltin(self: *Host, models_json: []const u8) IngestError!usize {
+        const current = self.registry.findById(openrouter_profile.PROFILE.id) orelse return error.InvalidDocument;
+        if (current.channels.len == 0) return error.InvalidDocument;
+
+        var parsed = try openrouter.parseModels(self.allocator, models_json);
+        defer parsed.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        const entries = try openrouter.routerEntries(scratch, parsed.models.items);
+        if (entries.len == 0) return error.InvalidDocument;
+        const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
+        channels[0] = current.channels[0];
+        channels[0].base_url = try scratch.dupe(u8, current.channels[0].base_url);
+        channels[0].models = &.{};
+        var built = current.*;
+        built.channels = channels;
+        built.models = entries;
+        try self.registry.checkReplace(built);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+        self.registry.replaceAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
+        self.kernel.notePricingUpdated(built.id);
+        return entries.len;
+    }
+
+    /// Which wire protocols an ingested Metask inventory offers.
+    pub const MetaskWires = enum {
+        /// The historical Messages route only: the API-key path, whose
+        /// session transport is Messages and whose key was never shown to
+        /// serve Chat Completions. One route per model also keeps
+        /// `/model use <id>` unambiguous there.
+        messages,
+        /// Messages and Chat Completions: the authenticated session gateway.
+        messages_and_chat,
+    };
+
+    /// Replace Metask's compiled inventory with a gateway's `/v1/models`
+    /// document. The gateway origin is kept separate from either protocol
+    /// path; every returned model is materialized once per wire in `wires`.
+    /// The reasoning levels a Metask model takes (`metask_catalog.Model.efforts`,
+    /// the gateway's words), as the `reasoning_effort` control `/model` offers
+    /// and a commit applies; none when the gateway names none. Copied into
+    /// `arena`, which the registry keeps. A model the gateway only switches off
+    /// and on takes `none` and `high` under "Thinking", as MiniMax M3 does.
+    fn metaskReasoningControls(arena: std.mem.Allocator, model: metask_catalog.Model) ![]const ControlSpec {
+        if (model.thinking_off_or_on) return &METASK_THINKING_OFF_OR_ON;
+        const efforts = model.efforts;
+        if (efforts.len == 0) return &.{};
+        const values = try arena.alloc([]const u8, efforts.len);
+        for (efforts, 0..) |effort, i| values[i] = try arena.dupe(u8, effort);
+        const specs = try arena.alloc(ControlSpec, 1);
+        specs[0] = .{
+            .id = "reasoning_effort",
+            .label = "Reasoning effort",
+            .kind = .enumeration,
+            .allowed_values = values,
+        };
+        return specs;
+    }
+
+    const METASK_THINKING_OFF_OR_ON_VALUES = [_][]const u8{ "none", "high" };
+    const METASK_THINKING_OFF_OR_ON = [_]ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Thinking",
+        .kind = .enumeration,
+        .allowed_values = &METASK_THINKING_OFF_OR_ON_VALUES,
+    }};
+
+    pub fn ingestMetask(
+        self: *Host,
+        gateway_origin: []const u8,
+        models_json: []const u8,
+        wires: MetaskWires,
+    ) IngestError!void {
+        var parsed = metask_catalog.parseModels(self.allocator, models_json) catch return error.InvalidDocument;
+        defer parsed.deinit();
+        if (parsed.models.items.len == 0) return error.InvalidDocument;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        const models = try scratch.alloc(profile_mod.ModelEntry, parsed.models.items.len);
+        for (parsed.models.items, 0..) |model, i| {
+            var capabilities = offer_mod.CapabilityMatrix{
+                // The provider kernel deliberately has no wall-clock
+                // dependency. The catalog source is known; freshness is
+                // represented by the host's catalog revision rather than an
+                // import of the application time utility.
+                .provenance = offer_mod.Provenance.known(.provider_catalog, null),
+            };
+            capabilities = capabilities.with(.reasoning, model.reasoning);
+            capabilities = capabilities.with(.vision, model.vision);
+            models[i] = .{
+                .request_model_id = try scratch.dupe(u8, model.id),
+                .display_name = try scratch.dupe(u8, model.display_name),
+                .canonical_model_id = null,
+                .limits = .{
+                    .context_window = model.max_input_tokens,
+                    .max_input_tokens = model.max_input_tokens,
+                    .max_output_tokens = model.max_tokens,
+                    .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
+                    .provenance = offer_mod.Provenance.known(.provider_catalog, null),
+                },
+                .capabilities = capabilities,
+                .quote = .unknown,
+                .controls = try metaskReasoningControls(scratch, model),
+            };
+        }
+
+        const channel = try scratch.create(profile_mod.ChannelDescriptor);
+        channel.* = metask_profile.PROFILE.channels[0];
+        channel.base_url = try scratch.dupe(u8, std.mem.trimEnd(u8, gateway_origin, "/"));
+        // The compiled profile intentionally retains only the historical
+        // Messages route so model-only legacy selections stay unambiguous.
+        // An authenticated session gateway opts into both wire protocols.
+        const routes = try scratch.alloc(profile_mod.ProtocolRoute, switch (wires) {
+            .messages => 1,
+            .messages_and_chat => 2,
+        });
+        routes[0] = .{ .protocol = .anthropic_messages };
+        if (wires == .messages_and_chat) {
+            routes[1] = .{ .protocol = .openai_chat, .path_suffix = "/v1/chat/completions" };
+        }
+        channel.routes = routes;
+        channel.models = models;
+        const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
+        channels[0] = channel.*;
+        const built = profile_mod.ProviderProfile{
+            .id = metask_profile.PROFILE.id,
+            .implementation_id = metask_profile.PROFILE.implementation_id,
+            .display_name = metask_profile.PROFILE.display_name,
+            .aliases = metask_profile.PROFILE.aliases,
+            .channels = channels,
+            .accepted_credential_kinds = metask_profile.PROFILE.accepted_credential_kinds,
+            .env_aliases = metask_profile.PROFILE.env_aliases,
+            .auth = metask_profile.PROFILE.auth,
+            .default_channel = channel.id,
+            .endpoint_policy = metask_profile.PROFILE.endpoint_policy,
+            .oauth_token_url = metask_profile.PROFILE.oauth_token_url,
+            .oauth_device_authorization_url = metask_profile.PROFILE.oauth_device_authorization_url,
+            .oauth_client_id = metask_profile.PROFILE.oauth_client_id,
+        };
+        try self.registry.checkReplace(built);
+        try self.registry.reserve(0);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+        self.registry.replaceAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
+    }
+
+    /// The Metask profile the registry holds now, compiled or ingested, for
+    /// a caller that may have to put it back (`restoreMetask`). What it
+    /// points at lives until `destroy`: an ingested profile's arena stays in
+    /// `catalog_arenas`.
+    pub fn metaskProfile(self: *const Host) ?profile_mod.ProviderProfile {
+        const found = self.registry.findById(metask_profile.PROFILE.id) orelse return null;
+        return found.*;
+    }
+
+    /// Move every channel of provider `id` whose address starts with
+    /// `from_origin` onto `to_origin`, keeping the rest of the address and
+    /// everything else about the profile. For a provider whose sign-in and
+    /// requests all hang off one origin (OpenRouter's key grant), so that the
+    /// development override that moves its sign-in moves its requests too,
+    /// and a test pointed at a local mock reaches nothing else.
+    pub fn rebaseOrigin(self: *Host, id: Slug, from_origin: []const u8, to_origin: []const u8) HostError!void {
+        const current = self.registry.findById(id) orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+        const channels = try scratch.dupe(profile_mod.ChannelDescriptor, current.channels);
+        var changed = false;
+        for (channels) |*channel| {
+            if (!std.mem.startsWith(u8, channel.base_url, from_origin)) continue;
+            channel.base_url = try std.fmt.allocPrint(scratch, "{s}{s}", .{ to_origin, channel.base_url[from_origin.len..] });
+            changed = true;
+        }
+        // The key pages' checks too: a pasted key is checked there, and the
+        // check carries the key. The pages themselves are only shown and
+        // opened in a browser, and stay as declared.
+        var setup = current.api_key_setup;
+        if (setup) |*value| {
+            const pages = try scratch.dupe(profile_mod.KeyPage, value.pages);
+            for (pages) |*page| {
+                if (page.check_url) |url| if (std.mem.startsWith(u8, url, from_origin)) {
+                    page.check_url = try std.fmt.allocPrint(scratch, "{s}{s}", .{ to_origin, url[from_origin.len..] });
+                    changed = true;
+                };
+            }
+            value.pages = pages;
+        }
+        if (!changed) {
+            arena.deinit();
+            return;
+        }
+        var built = current.*;
+        built.channels = channels;
+        built.api_key_setup = setup;
+        try self.registry.checkReplace(built);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+        self.registry.replaceAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        try self.refresh();
+    }
+
+    /// Put back a Metask profile `metaskProfile` returned, undoing an ingest
+    /// whose purpose failed (a `/login` whose commit did not happen, #485).
+    pub fn restoreMetask(self: *Host, profile: profile_mod.ProviderProfile) HostError!void {
+        try self.registry.checkReplace(profile);
+        try self.registry.reserve(0);
+        self.registry.replaceAssumeCapacity(profile);
+        try self.refresh();
+    }
+
+    /// Rebuild the catalog and hand it to the kernel. The previous catalog is
+    /// retired rather than freed, so a reader that snapshotted the old pointer
+    /// finishes against valid memory.
+    pub fn refresh(self: *Host) HostError!void {
+        return self.rebuild();
+    }
+
+    /// The single catalog swap. Every rebuild goes through it: two copies of
+    /// "retire, replace, adopt" would eventually disagree about which one
+    /// bumps the revision or which one keeps the previous generation alive.
+    fn rebuild(self: *Host) HostError!void {
+        // The revision has to move, or a client cannot tell that its snapshot
+        // went stale — which is the whole reason a refresh is observable. The
+        // applied configuration always rides along: it is host state, and a
+        // rebuild that dropped it would resurrect a disabled provider.
+        const effective = registry_mod.CatalogOptions{
+            .revision = self.catalog.revision.next(),
+            .credential_bindings = self.config_bindings.items,
+            .excluded_providers = self.config_exclusions.items,
+        };
+
+        var rebuilt = self.registry.buildCatalog(self.allocator, effective) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.OutOfMemory,
+        };
+        errdefer rebuilt.deinit();
+
+        if (self.retired) |*old| old.deinit();
+        self.retired = self.catalog;
+        self.catalog = rebuilt;
+        self.kernel.adoptCatalog(&self.catalog);
+    }
+
+    /// Ingest one Bedrock region's catalog: a ListFoundationModels document
+    /// and a ListInferenceProfiles document (`bedrock_catalog.zig`).
+    ///
+    /// The provider is a configured instance (`provider_id`), never the
+    /// built-in `bedrock` profile: a runtime source may replace its own
+    /// registration, not a built-in one. Like `ingestOpenRouter`, the bytes come
+    /// from the caller; this kernel does not fetch.
+    pub fn ingestBedrock(
+        self: *Host,
+        provider_id: Slug,
+        region: []const u8,
+        foundation_models_json: []const u8,
+        inference_profiles_json: ?[]const u8,
+    ) IngestError!void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var moved = false;
+        errdefer if (!moved) arena.deinit();
+        const scratch = arena.allocator();
+
+        const models = try bedrock_catalog.parseFoundationModels(scratch, foundation_models_json);
+        const profiles = if (inference_profiles_json) |json| try bedrock_catalog.parseInferenceProfiles(scratch, json) else &.{};
+        const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
+        channels[0] = try bedrock_catalog.buildChannel(scratch, region, models, profiles);
+
+        const kinds = try scratch.alloc(profile_mod.CredentialKind, 1);
+        kinds[0] = .api_key;
+        const aliases = try scratch.alloc(profile_mod.EnvAlias, 1);
+        aliases[0] = .{ .name = "AWS_BEARER_TOKEN_BEDROCK", .kind = .api_key, .canonical = true };
+
+        const built = profile_mod.ProviderProfile{
+            .id = provider_id,
+            .implementation_id = Slug.lit("bedrock"),
+            .display_name = "Amazon Bedrock (catalog)",
+            .channels = channels,
+            .accepted_credential_kinds = kinds,
+            .env_aliases = aliases,
+            .auth = .bearer,
+            .default_channel = channels[0].id,
+        };
+        try self.registry.checkUpsert(built);
+        try self.registry.reserve(1);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
+        self.registry.upsertAssumeCapacity(built);
+        self.catalog_arenas.appendAssumeCapacity(arena);
+        moved = true;
+        self.refresh() catch return error.OutOfMemory;
+    }
+
+    /// Ingest provider catalogs named by the configuration.
+    ///
+    /// The documents are read from disk rather than fetched, on purpose: this
+    /// subsystem must not depend on a transport, and a catalog saved by
+    /// `curl > file` refreshes exactly the same way a live fetch would. The
+    /// parsing, the offer construction, and the events are identical either
+    /// way, so wiring a fetcher later changes only where the bytes come from.
+    ///
+    /// Shape (`kind` defaults to `openrouter`):
+    /// ```json
+    /// "provider_catalogs": {
+    ///   "openrouter": {"models_file": "…/models.json",
+    ///                  "endpoint_files": ["…/deepseek.json"]},
+    ///   "bedrock-us": {"kind": "bedrock", "region": "us-east-1",
+    ///                  "foundation_models_file": "…/foundation-models.json",
+    ///                  "inference_profiles_file": "…/inference-profiles.json"}
+    /// }
+    /// ```
+    pub fn ingestConfiguredCatalogs(self: *Host, text: []const u8) IngestError!void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        const root = std.json.parseFromSliceLeaky(std.json.Value, arena, trimmed, .{}) catch
+            return error.InvalidDocument;
+        if (root != .object) return error.InvalidDocument;
+        const section = root.object.get("provider_catalogs") orelse return;
+        if (section != .object) return error.InvalidDocument;
+
+        var it = section.object.iterator();
+        while (it.next()) |pair| {
+            const provider_id = Slug.parse(pair.key_ptr.*) catch return error.InvalidSlug;
+            // A catalog may not take over a built-in provider (OpenRouter is
+            // one since it gained its own sign-in): that entry alone is
+            // passed over, and said so, rather than failing the rest.
+            if (self.isBuiltinId(provider_id)) {
+                self.noteConfigShadowed(.provider_catalogs, provider_id);
+                continue;
+            }
+            const entry = pair.value_ptr.*;
+            if (entry != .object) return error.InvalidDocument;
+            const kind = stringField(entry.object.get("kind")) orelse "openrouter";
+            if (std.mem.eql(u8, kind, "bedrock")) {
+                const region = stringField(entry.object.get("region")) orelse return error.InvalidDocument;
+                const models_path = stringField(entry.object.get("foundation_models_file")) orelse return error.InvalidDocument;
+                const models_json = readFile(arena, models_path) catch return error.InvalidDocument;
+                const profiles_json: ?[]const u8 = if (stringField(entry.object.get("inference_profiles_file"))) |path|
+                    readFile(arena, path) catch return error.InvalidDocument
+                else
+                    null;
+                try self.ingestBedrock(provider_id, region, models_json, profiles_json);
+                continue;
+            }
+            if (!std.mem.eql(u8, kind, "openrouter")) return error.InvalidDocument;
+            const models_path = stringField(entry.object.get("models_file")) orelse return error.InvalidDocument;
+            const models_json = readFile(arena, models_path) catch return error.InvalidDocument;
+
+            var documents: std.ArrayList([]const u8) = .empty;
+            if (entry.object.get("endpoint_files")) |list| {
+                if (list != .array) return error.InvalidDocument;
+                for (list.array.items) |item| {
+                    const path = stringField(item) orelse return error.InvalidDocument;
+                    const document = readFile(arena, path) catch return error.InvalidDocument;
+                    documents.append(arena, document) catch return error.OutOfMemory;
+                }
+            }
+            try self.ingestOpenRouter(provider_id, models_json, documents.items);
+        }
+    }
+
+    /// Expiry warning window. A day is enough notice to rotate a credential
+    /// without being so early the warning becomes background noise.
+    pub const CREDENTIAL_EXPIRY_WARNING_SECONDS: i64 = 24 * 60 * 60;
+
+    /// Apply the configuration document to the catalog: credential pools and
+    /// disabled providers.
+    ///
+    /// A credential participates in the offer id, so two accounts on the same
+    /// route are two offers rather than one route that quietly changes identity
+    /// depending on which key resolution happened to pick. That is what makes
+    /// "switch to my work account" a selectable route instead of an invisible
+    /// side effect — and it is why the picker needs no separate credential
+    /// stage: the accounts *are* offers.
+    ///
+    /// A disabled provider is excluded here rather than at resolution, so
+    /// "disabled" is visible in every UI at once: the picker, `model.list`, and
+    /// `--provider` all read the catalog.
+    pub fn applyProviderConfiguration(self: *Host, document: *const config_doc.Document) HostError!void {
+        // Owned by these locals until `moved` flips. After that the host owns
+        // them, and letting these errdefers still fire would free memory the
+        // restore path below has already released — a double free, not a wrong
+        // answer.
+        var moved = false;
+        var bindings: std.ArrayList(registry_mod.CredentialBinding) = .empty;
+        errdefer if (!moved) bindings.deinit(self.allocator);
+        for (document.providers.items) |entry| {
+            if (!entry.enabled) continue;
+            for (entry.credentials.items()) |credential| {
+                bindings.append(self.allocator, .{
+                    .provider_id = entry.id,
+                    .credential_ref = credential.id,
+                }) catch return error.OutOfMemory;
+            }
+        }
+        // A disabled provider stays configured but is not routable. Doing this
+        // in the catalog rather than at resolution keeps "disabled" visible
+        // everywhere at once: the picker, `model.list`, and `--provider` all
+        // read the catalog.
+        var disabled: std.ArrayList(Slug) = .empty;
+        errdefer if (!moved) disabled.deinit(self.allocator);
+        for (document.providers.items) |entry| {
+            if (entry.enabled) continue;
+            disabled.append(self.allocator, entry.id) catch return error.OutOfMemory;
+        }
+        // The installation's OAuth clients (#87). Copied into the arena the
+        // host keeps for them: a `Prepared` login holds the slice for the
+        // whole grant, so the previous strings must outlive this swap.
+        var client_ids: std.ArrayList(ConfiguredClientId) = .empty;
+        errdefer if (!moved) client_ids.deinit(self.allocator);
+        for (document.providers.items) |entry| {
+            const configured = entry.oauth_client_id orelse continue;
+            if (self.config_client_arena == null) {
+                self.config_client_arena = std.heap.ArenaAllocator.init(self.allocator);
+            }
+            const owned = self.config_client_arena.?.allocator().dupe(u8, configured.slice()) catch
+                return error.OutOfMemory;
+            client_ids.append(self.allocator, .{ .provider_id = entry.id, .client_id = owned }) catch
+                return error.OutOfMemory;
+        }
+
+        // The new configuration is *swapped in*, and the old lists are kept
+        // until the rebuild succeeds: a failed rebuild would otherwise leave
+        // the host claiming a configuration its catalog does not reflect.
+        //
+        // No early return when both lists are empty: the configuration can also
+        // transition *back* to "nothing configured", and skipping the rebuild
+        // then would leave the previous exclusions in force.
+        const previous_bindings = self.config_bindings;
+        const previous_exclusions = self.config_exclusions;
+        const previous_client_ids = self.config_client_ids;
+        moved = true;
+        self.config_bindings = bindings;
+        self.config_exclusions = disabled;
+        self.config_client_ids = client_ids;
+        errdefer {
+            self.config_bindings.deinit(self.allocator);
+            self.config_exclusions.deinit(self.allocator);
+            self.config_client_ids.deinit(self.allocator);
+            self.config_bindings = previous_bindings;
+            self.config_exclusions = previous_exclusions;
+            self.config_client_ids = previous_client_ids;
+        }
+
+        try self.rebuild();
+
+        var retired_bindings = previous_bindings;
+        var retired_exclusions = previous_exclusions;
+        var retired_client_ids = previous_client_ids;
+        retired_bindings.deinit(self.allocator);
+        retired_exclusions.deinit(self.allocator);
+        retired_client_ids.deinit(self.allocator);
+    }
+
+    /// The OAuth client the installation configured for `id`
+    /// (`providers.<id>.oauth_client_id`), or null when it relies on the
+    /// profile's own declaration or on `--client-id`. The slice stays valid
+    /// for the host's lifetime (see `config_client_arena`).
+    pub fn oauthClientIdFor(self: *const Host, id: Slug) ?[]const u8 {
+        for (self.config_client_ids.items) |entry| {
+            if (entry.provider_id.eql(id)) return entry.client_id;
+        }
+        return null;
+    }
+
+    /// Whether `id` names a provider this binary ships.
+    pub fn isBuiltinId(self: *const Host, id: Slug) bool {
+        for (self.registry.profiles.items[0..self.registry.builtin_count]) |profile| {
+            if (profile.id.eql(id)) return true;
+        }
+        return false;
+    }
+
+    /// Where in `config.json` a definition named like a built-in provider was.
+    pub const ShadowedSection = enum {
+        custom_providers,
+        provider_catalogs,
+
+        pub fn key(self: ShadowedSection) []const u8 {
+            return @tagName(self);
+        }
+    };
+
+    /// The first `config.json` entry passed over for taking a built-in
+    /// provider's id. Both CLI builders and the TUI say it once
+    /// (`shadowedNotice`).
+    pub const Shadowed = struct { section: ShadowedSection, id: Slug };
+
+    fn noteConfigShadowed(self: *Host, section: ShadowedSection, id: Slug) void {
+        if (self.config_shadowed != null) return;
+        self.config_shadowed = .{ .section = section, .id = id };
+    }
+
+    /// `custom_providers.openrouter was not loaded: openrouter is now built in;
+    /// rename it to keep using it`, or the catalog equivalent. No newline.
+    pub fn shadowedNotice(self: *const Host, buffer: []u8) ?[]const u8 {
+        const shadowed = self.config_shadowed orelse return null;
+        return switch (shadowed.section) {
+            .custom_providers => std.fmt.bufPrint(buffer, "custom_providers.{s} in <state root>/config.json was not loaded: {s} is now built in; rename it to keep using it", .{ shadowed.id.slice(), shadowed.id.slice() }) catch null,
+            .provider_catalogs => std.fmt.bufPrint(buffer, "provider_catalogs.{s} in <state root>/config.json is no longer needed: {s} is built in (/login {s})", .{ shadowed.id.slice(), shadowed.id.slice(), shadowed.id.slice() }) catch null,
+        };
+    }
+
+    /// Record the first reason a startup stage did not apply. The first is the
+    /// most useful: later stages often fail *because* of it.
+    fn noteStartupWarning(self: *Host, err: anyerror) void {
+        if (self.startup_warning != null) return;
+        self.startup_warning = @errorName(err);
+    }
+
+    /// Load the durable document and seed the kernel with what it holds: the
+    /// config revision `selection.commit` compares against, and the global
+    /// selection a previous run committed.
+    ///
+    /// Best effort by design — a session must still start when `config.json`
+    /// is missing or unreadable. What must not happen is inventing a revision:
+    /// the store is the sole authority, so a failed read leaves the kernel at
+    /// its initial revision and a later commit conflicts loudly.
+    pub fn adoptDurableState(self: *Host, store: *const config_store.Store) void {
+        if (store.readText()) |text| {
+            defer self.allocator.free(text);
+            self.adoptCustomProviders(text) catch |err| self.noteStartupWarning(err);
+            self.ingestConfiguredCatalogs(text) catch |err| self.noteStartupWarning(err);
+        } else |err| self.noteStartupWarning(err);
+
+        var document = store.load() catch |err| return self.noteStartupWarning(err);
+        defer document.deinit();
+        self.kernel.adoptConfigRevision(document.config_revision);
+        self.applyProviderConfiguration(&document) catch |err| self.noteStartupWarning(err);
+        if (document.global_selection) |selection| {
+            self.kernel.seedGlobalSelection(selection);
+        }
+    }
+};
+
+test "the kernel sees the host's catalog and survives a refresh" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    const before = host.kernel.catalogSnapshot();
+    try std.testing.expect(before.items().len > 0);
+    const revision_before = host.kernel.catalogRevision();
+
+    try host.refresh();
+    const after = host.kernel.catalogSnapshot();
+    try std.testing.expect(after.items().len == before.items().len);
+    // A refresh must move the revision, or a client cannot tell its snapshot
+    // went stale.
+    try std.testing.expect(@intFromEnum(host.kernel.catalogRevision()) != @intFromEnum(revision_before));
+
+    // Offer ids are derived from the stable binding, so a rebuild reproduces
+    // them exactly — that is what makes a pin survive a refresh.
+    for (before.items(), after.items()) |old, new| {
+        try std.testing.expect(old.offer_id.eql(new.offer_id));
+    }
+}
+
+test "authenticated Metask catalog exposes both protocol routes" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("http://localhost:9000", "{\"object\":\"list\",\"data\":[{\"id\":\"metask-model\",\"display_name\":\"Gateway Model\",\"max_input_tokens\":32000,\"max_tokens\":2048,\"capabilities\":{\"thinking\":{\"supported\":true},\"image_input\":{\"supported\":false}}}]}", .messages_and_chat);
+    const profile = host.registry.find("metask").?;
+    const channel = profile.channel(Slug.lit("default")).?;
+    try std.testing.expectEqual(@as(usize, 1), channel.models.len);
+    try std.testing.expectEqualStrings("Gateway Model", channel.models[0].display_name);
+    try std.testing.expect(channel.route(.anthropic_messages) != null);
+    try std.testing.expect(channel.route(.openai_chat) != null);
+}
+
+test "an API-key Metask catalog offers each gateway model once, on the Messages route" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask(
+        "http://localhost:9000/",
+        "{\"data\":[{\"id\":\"glm-5.3-flash\"},{\"id\":\"kimi-k3\",\"display_name\":\"Kimi K3\"}]}",
+        .messages,
+    );
+    const channel = host.registry.find("metask").?.channel(Slug.lit("default")).?;
+    try std.testing.expect(channel.route(.anthropic_messages) != null);
+    try std.testing.expect(channel.route(.openai_chat) == null);
+
+    var metask_offers: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        metask_offers += 1;
+        try std.testing.expectEqualStrings("anthropic_messages", item.protocol);
+        try std.testing.expectEqualStrings("http://localhost:9000/v1/messages", item.endpoint_ref);
+        // The compiled Claude inventory is replaced, not extended.
+        try std.testing.expect(!std.mem.startsWith(u8, item.request_model_id, "claude-"));
+    }
+    try std.testing.expectEqual(@as(usize, 2), metask_offers);
+}
+
+test "the www gateway's catalog offers only the models it serves on /v1/messages, with their reasoning levels to choose" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("https://www.metask-ai.com",
+        \\{"object":"list","data":[
+        \\ {"id":"glm-5.3","capabilities":{"endpoints":{"messages":{"supported":true}},
+        \\   "reasoning":{"supported":true,"disable":{"supported":false},"efforts":["low","medium","high","max"]}}},
+        \\ {"id":"wan3.0-video-prime","capabilities":{"endpoints":{"messages":{"supported":false},"videos":{"supported":true}}}}
+        \\]}
+    , .messages_and_chat);
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        seen += 1;
+        // The video model is not offered on either route.
+        try std.testing.expectEqualStrings("glm-5.3", item.request_model_id);
+        try std.testing.expectEqual(offer_mod.Tri.supported, item.capabilities.get(.reasoning));
+        const spec = controls_mod.findSpec(item.controls, "reasoning_effort") orelse return error.NoReasoningControl;
+        try std.testing.expectEqual(@as(usize, 4), spec.allowed_values.len);
+        try std.testing.expectEqualStrings("low", spec.allowed_values[0]);
+        try std.testing.expectEqualStrings("max", spec.allowed_values[3]);
+    }
+    // One model, on the Messages and the Chat route.
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "a www gateway model that only switches thinking off and on is offered Thinking none or high" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("https://www.metask-ai.com",
+        \\{"object":"list","data":[
+        \\ {"id":"hy4","capabilities":{"endpoints":{"messages":{"supported":true}},
+        \\   "reasoning":{"disable":{"supported":true},"supported":true,"translated":true},
+        \\   "thinking":{"types":{"enabled":{"supported":true},"adaptive":{"supported":false}},"supported":true}}},
+        \\ {"id":"says-nothing","capabilities":{"endpoints":{"messages":{"supported":true}}}}
+        \\]}
+    , .messages);
+    var switched: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        if (std.mem.eql(u8, item.request_model_id, "says-nothing")) {
+            try std.testing.expect(controls_mod.findSpec(item.controls, "reasoning_effort") == null);
+            continue;
+        }
+        switched += 1;
+        try std.testing.expectEqualStrings("hy4", item.request_model_id);
+        const spec = controls_mod.findSpec(item.controls, "reasoning_effort") orelse return error.NoReasoningControl;
+        try std.testing.expectEqualStrings("Thinking", spec.label);
+        try std.testing.expectEqual(@as(usize, 2), spec.allowed_values.len);
+        try std.testing.expectEqualStrings("none", spec.allowed_values[0]);
+        try std.testing.expectEqualStrings("high", spec.allowed_values[1]);
+        try std.testing.expect(spec.default_value == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), switched);
+}
+
+test "two refreshes keep the retired catalog alive for one generation" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.refresh();
+    try std.testing.expect(host.retired != null);
+    try host.refresh();
+    try std.testing.expect(host.retired != null);
+}
+
+test "a configured provider joins the catalog beside the built-in ones" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const builtin_count = host.kernel.catalogSnapshot().items().len;
+
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {"house-relay": {
+        \\  "display_name": "House relay",
+        \\  "channels": [{"id":"primary","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\  "models": [{"request_model_id":"relay-pro","canonical_model_id":"zai/glm-4.6"}]}}}
+    );
+
+    const items = host.kernel.catalogSnapshot().items();
+    try std.testing.expectEqual(builtin_count + 1, items.len);
+
+    var found = false;
+    for (items) |candidate| {
+        if (!candidate.provider_id.eqlText("house-relay")) continue;
+        found = true;
+        // The relay's canonical mapping is display identity; the wire carries
+        // its own id, which is the property a relay exists to have.
+        try std.testing.expectEqualStrings("relay-pro", candidate.request_model_id);
+        try std.testing.expectEqualStrings("zai/glm-4.6", candidate.canonical_model_id.?);
+        try std.testing.expectEqualStrings("https://relay.example.com/v1/chat/completions", candidate.endpoint_ref);
+    }
+    try std.testing.expect(found);
+
+    // And it is selectable through the same kernel API as any built-in offer.
+    var page: std.ArrayList(control_plane.OfferSummary) = .empty;
+    defer page.deinit(a);
+    const listed = try host.kernel.modelList(.{}, .{ .provider_id = ids.Slug.lit("house-relay") }, a, &page);
+    try std.testing.expectEqual(@as(usize, 1), listed.offers.len);
+}
+
+test "a malformed custom section leaves the built-in providers working" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    try std.testing.expectError(
+        error.NoModels,
+        host.adoptCustomProviders(
+            \\{"custom_providers": {"broken": {
+            \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}]}}}
+        ),
+    );
+    // A bad definition must not take the session's working providers with it.
+    try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
+}
+
+test "durable state adoption survives a config file that does not exist" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var absent_buf: [512]u8 = undefined;
+    const absent = try std.fmt.bufPrint(&absent_buf, "{s}/cc-zig-provider-host-absent-{d}.json", .{ util_fs.testing.tmpRoot(&root_buf), @import("platform").process.currentPid() });
+    var store = try config_store.Store.initPath(a, absent);
+    defer store.deinit();
+    // Absent is not an error: a fresh installation has no control-plane state.
+    host.adoptDurableState(&store);
+    try std.testing.expect(host.kernel.catalogSnapshot().items().len > 0);
+}
+
+test "an ingested catalog becomes offers, and its prices and health become events" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+    // `since` returns events *after* the cursor, so the last already-emitted
+    // sequence is the right starting point.
+    const cursor = host.kernel.journal.next_sequence - 1;
+
+    try host.ingestOpenRouter(
+        Slug.lit("or-catalog"),
+        \\{"data": [{"id": "deepseek/deepseek-v4", "name": "DeepSeek V4", "context_length": 163840,
+        \\  "supported_parameters": ["tools"],
+        \\  "pricing": {"prompt": "0.0000004", "completion": "0.0000016"}}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4", "endpoints": [
+            \\  {"provider_name": "DeepInfra", "context_length": 131072, "status": 0,
+            \\   "pricing": {"prompt": "0.0000005", "completion": "0.0000018"}},
+            \\  {"provider_name": "Together AI", "status": -1}
+            \\]}}
+        },
+    );
+
+    // One model, two endpoints, two offers.
+    const items = host.kernel.catalogSnapshot().items();
+    try std.testing.expectEqual(before + 2, items.len);
+    var priced: usize = 0;
+    var inherited: usize = 0;
+    for (items) |item| {
+        if (!item.provider_id.eqlText("or-catalog")) continue;
+        try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.canonical_model_id.?);
+        // The route speaks OpenRouter's dialect, not DeepSeek's, although the
+        // name says deepseek: OpenRouter translates for its upstreams.
+        try std.testing.expectEqual(@import("vendor.zig").Vendor.openrouter, item.dialect.route.?);
+        if (item.quote.priced()) |price| {
+            priced += 1;
+            if (price.provenance.freshness == .inherited) inherited += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), priced);
+    // Together AI declared no price of its own, so it inherits the model's —
+    // and says so rather than claiming the endpoint confirmed it.
+    try std.testing.expectEqual(@as(usize, 1), inherited);
+
+    var buffer: std.ArrayList(control_plane.ControlPlaneEvent) = .empty;
+    defer buffer.deinit(a);
+    const replay = try host.kernel.replayEvents(cursor, a, &buffer);
+    var saw_catalog = false;
+    var saw_pricing = false;
+    var saw_degraded = false;
+    for (replay.events) |event| switch (event.event_type) {
+        .catalog_updated => saw_catalog = true,
+        .pricing_updated => saw_pricing = true,
+        .provider_degraded => saw_degraded = true,
+        else => {},
+    };
+    // These three event types had no producer before a catalog could be
+    // ingested; a declared type nothing emits is decoration.
+    try std.testing.expect(saw_catalog);
+    try std.testing.expect(saw_pricing);
+    try std.testing.expect(saw_degraded);
+}
+
+test "a Bedrock catalog becomes Converse offers that declare each model's dialect" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestBedrock(
+        Slug.lit("bedrock-us"),
+        "us-east-1",
+        bedrock_catalog.SAMPLE_FOUNDATION_MODELS,
+        bedrock_catalog.SAMPLE_INFERENCE_PROFILES,
+    );
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("bedrock-us")) continue;
+        seen += 1;
+        try std.testing.expectEqual(profile_mod.Protocol.Wire.bedrock_converse, item.wire.?);
+        try std.testing.expectEqualStrings("https://bedrock-runtime.us-east-1.amazonaws.com", item.endpoint_ref);
+        if (std.mem.eql(u8, item.request_model_id, "us.anthropic.claude-sonnet-4-6"))
+            try std.testing.expectEqual(@import("vendor.zig").Vendor.claude, item.dialect.model.?);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+    // A refresh replaces its own registration rather than failing on it.
+    try host.ingestBedrock(Slug.lit("bedrock-us"), "us-east-1", bedrock_catalog.SAMPLE_FOUNDATION_MODELS, null);
+    // The built-in profile's id cannot be taken over by a catalog.
+    try std.testing.expect(std.meta.isError(host.ingestBedrock(Slug.lit("bedrock"), "us-east-1", bedrock_catalog.SAMPLE_FOUNDATION_MODELS, null)));
+}
+
+test "a pinned offer survives an unrelated catalog ingest" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    const pinned = host.kernel.catalogSnapshot().items()[0];
+    const committed = host.kernel.selectionCommit(
+        .{},
+        selection_mod.RuntimeSelection.pinned(pinned.offer_id, pinned.offer_revision, .session),
+        .session,
+    );
+    try std.testing.expect(committed == .committed);
+
+    try host.ingestOpenRouter(
+        Slug.lit("or-catalog"),
+        \\{"data": [{"id": "x/y", "context_length": 1000}]}
+    ,
+        &.{
+            \\{"data": {"id": "x/y", "endpoints": [{"provider_name": "Alpha"}]}}
+        },
+    );
+
+    // The pin is derived from a stable binding, so a refresh reproduces the id
+    // and the selection still resolves — that is what makes a pin durable.
+    const resolved = host.kernel.selectionResolve().?;
+    try std.testing.expect(resolved == .ok);
+    try std.testing.expect(resolved.ok.offer_id.eql(pinned.offer_id));
+}
+
+fn stringField(value: ?std.json.Value) ?[]const u8 {
+    const found = value orelse return null;
+    return switch (found) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn readFile(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const pfs = @import("platform").fs;
+    const path_z = try arena.dupeZ(u8, path);
+    const fd = try pfs.openZ(path_z, .{ .ACCMODE = .RDONLY }, 0);
+    defer pfs.close(fd);
+    const info = try pfs.fileInfo(fd);
+    // Bounded: a catalog is user-pointed input, and an unbounded read of a path
+    // from a config file is a memory-exhaustion vector.
+    if (info.size > 8 * 1024 * 1024) return error.CatalogTooLarge;
+    const buffer = try arena.alloc(u8, @intCast(info.size));
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const n = try pfs.readZ(fd, buffer[filled..]);
+        if (n == 0) break;
+        filled += n;
+    }
+    return buffer[0..filled];
+}
+
+test "two accounts on one provider are two selectable routes" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    var entry = config_doc.ProviderEntry{ .id = Slug.lit("openai") };
+    try entry.credentials.append(.{
+        .id = Slug.lit("work"),
+        .env = try config_doc.AliasName.parse("OPENAI_API_KEY_WORK"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+        .priority = 0,
+    });
+    try entry.credentials.append(.{
+        .id = Slug.lit("personal"),
+        .env = try config_doc.AliasName.parse("OPENAI_API_KEY_PERSONAL"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+        .priority = 1,
+    });
+    try document.upsertProvider(entry);
+
+    try host.applyProviderConfiguration(&document);
+    const items = host.kernel.catalogSnapshot().items();
+
+    var work: usize = 0;
+    var personal: usize = 0;
+    var seen_ids: std.ArrayList(ids.OfferId) = .empty;
+    defer seen_ids.deinit(a);
+    for (items) |item| {
+        if (!item.provider_id.eqlText("openai")) continue;
+        const ref = item.credential_ref orelse continue;
+        if (ref.eqlText("work")) work += 1;
+        if (ref.eqlText("personal")) personal += 1;
+        for (seen_ids.items) |existing| try std.testing.expect(!existing.eql(item.offer_id));
+        try seen_ids.append(a, item.offer_id);
+    }
+    // Each account is its own route identity, so "switch to my work account" is
+    // a selectable offer rather than an invisible side effect of resolution.
+    try std.testing.expect(work > 0);
+    try std.testing.expectEqual(work, personal);
+    try std.testing.expect(host.kernel.catalogSnapshot().items().len > before);
+}
+
+test "the installation's OAuth client id is looked up per provider and follows the configuration" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try std.testing.expect(host.oauthClientIdFor(Slug.lit("openai")) == null);
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{
+        .id = Slug.lit("openai"),
+        .oauth_client_id = try config_doc.ClientIdText.parse("app_example_client"),
+    });
+    try host.applyProviderConfiguration(&document);
+    const configured = host.oauthClientIdFor(Slug.lit("openai")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("app_example_client", configured);
+    try std.testing.expect(host.oauthClientIdFor(Slug.lit("metask")) == null);
+
+    // Removing the key removes the lookup; the string a login in flight may
+    // still hold stays readable until the host goes away.
+    var without = config_doc.Document.init(a);
+    defer without.deinit();
+    try without.upsertProvider(.{ .id = Slug.lit("openai") });
+    try host.applyProviderConfiguration(&without);
+    try std.testing.expect(host.oauthClientIdFor(Slug.lit("openai")) == null);
+    try std.testing.expectEqualStrings("app_example_client", configured);
+}
+
+test "a provider with no configured pool keeps exactly its previous offers" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{ .id = Slug.lit("openai") });
+    // No credentials declared: an existing single-account setup must not gain
+    // or lose a single route.
+    try host.applyProviderConfiguration(&document);
+    try std.testing.expectEqual(before, host.kernel.catalogSnapshot().items().len);
+}
+
+test "a disabled provider keeps its configuration and produces no routes" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    var before: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openai")) before += 1;
+    }
+    try std.testing.expect(before > 0);
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{
+        .id = Slug.lit("openai"),
+        .enabled = false,
+        .credential_ref = Slug.lit("cred-openai"),
+    });
+    try host.applyProviderConfiguration(&document);
+
+    var after: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openai")) after += 1;
+    }
+    // Nothing can route to it, in every UI at once, because they all read the
+    // catalog.
+    try std.testing.expectEqual(@as(usize, 0), after);
+    // And the configuration survives — that is the difference between
+    // disabling and removing.
+    try std.testing.expect(document.provider(Slug.lit("openai")).?.credential_ref != null);
+
+    // Re-enabling restores exactly the routes it had.
+    try document.upsertProvider(.{ .id = Slug.lit("openai"), .enabled = true });
+    try host.applyProviderConfiguration(&document);
+    var restored: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openai")) restored += 1;
+    }
+    try std.testing.expectEqual(before, restored);
+}
+
+test "a catalog ingest keeps the applied configuration" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    var document = config_doc.Document.init(a);
+    defer document.deinit();
+    try document.upsertProvider(.{ .id = Slug.lit("gemini"), .enabled = false });
+    var entry = config_doc.ProviderEntry{ .id = Slug.lit("openai") };
+    try entry.credentials.append(.{
+        .id = Slug.lit("work"),
+        .env = try config_doc.AliasName.parse("OPENAI_KEY_WORK"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+    });
+    try entry.credentials.append(.{
+        .id = Slug.lit("personal"),
+        .env = try config_doc.AliasName.parse("OPENAI_KEY_PERSONAL"),
+        .kind = try @import("controls.zig").Bounded(32).parse("api_key"),
+    });
+    try document.upsertProvider(entry);
+    try host.applyProviderConfiguration(&document);
+
+    const Counts = struct {
+        fn of(catalog: *const OfferCatalog, provider: []const u8) usize {
+            var n: usize = 0;
+            for (catalog.items()) |item| {
+                if (item.provider_id.eqlText(provider)) n += 1;
+            }
+            return n;
+        }
+    };
+    const openai_before = Counts.of(host.kernel.catalogSnapshot(), "openai");
+    try std.testing.expect(openai_before > 0);
+    try std.testing.expectEqual(@as(usize, 0), Counts.of(host.kernel.catalogSnapshot(), "gemini"));
+
+    // A later ingest — or a plain refresh — must not resurrect the disabled
+    // provider or collapse the two accounts back into one offer. Catalog
+    // options are host state, not a per-call argument.
+    try host.ingestOpenRouter(
+        Slug.lit("or-catalog"),
+        \\{"data": [{"id": "x/y", "context_length": 1000}]}
+    ,
+        &.{
+            \\{"data": {"id": "x/y", "endpoints": [{"provider_name": "Alpha"}]}}
+        },
+    );
+    try std.testing.expectEqual(openai_before, Counts.of(host.kernel.catalogSnapshot(), "openai"));
+    try std.testing.expectEqual(@as(usize, 0), Counts.of(host.kernel.catalogSnapshot(), "gemini"));
+
+    try host.refresh();
+    try std.testing.expectEqual(openai_before, Counts.of(host.kernel.catalogSnapshot(), "openai"));
+    try std.testing.expectEqual(@as(usize, 0), Counts.of(host.kernel.catalogSnapshot(), "gemini"));
+}
+
+test "a failed rebuild restores the previous configuration exactly" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    var first = config_doc.Document.init(a);
+    defer first.deinit();
+    try first.upsertProvider(.{ .id = Slug.lit("gemini"), .enabled = false });
+    try host.applyProviderConfiguration(&first);
+    try std.testing.expectEqual(@as(usize, 1), host.config_exclusions.items.len);
+
+    var second = config_doc.Document.init(a);
+    defer second.deinit();
+    try second.upsertProvider(.{ .id = Slug.lit("openai"), .enabled = false });
+
+    // Fail after both new lists exist and the swap has happened, so the restore
+    // path runs while the host owns them. Getting that handoff wrong is a
+    // double free, not a wrong answer — the testing allocator is the detector.
+    // (Verified non-vacuous: asserting the success branch is unreachable makes
+    // this test fail.)
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 3 });
+    host.allocator = failing.allocator();
+    const result = host.applyProviderConfiguration(&second);
+    host.allocator = a;
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // The previous configuration is intact, not a freed shell of it, and the
+    // catalog still reflects it.
+    try std.testing.expectEqual(@as(usize, 1), host.config_exclusions.items.len);
+    try std.testing.expect(host.config_exclusions.items[0].eqlText("gemini"));
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        try std.testing.expect(!item.provider_id.eqlText("gemini"));
+    }
+}
+
+test "refreshing the same catalog twice replaces it instead of failing" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const before = host.kernel.catalogSnapshot().items().len;
+
+    const first_models =
+        \\{"data": [{"id": "x/y", "name": "First", "context_length": 1000}]}
+    ;
+    const first_endpoints =
+        \\{"data": {"id": "x/y", "endpoints": [{"provider_name": "Alpha"}]}}
+    ;
+    try host.ingestOpenRouter(Slug.lit("or-catalog"), first_models, &.{first_endpoints});
+    try std.testing.expectEqual(before + 1, host.kernel.catalogSnapshot().items().len);
+
+    // `/providers refresh` runs this again. A second registration used to fail
+    // with `DuplicateProviderId`, so refreshing simply did not work.
+    const second_models =
+        \\{"data": [{"id": "x/y", "name": "Second", "context_length": 2000}]}
+    ;
+    const second_endpoints =
+        \\{"data": {"id": "x/y", "endpoints": [
+        \\  {"provider_name": "Alpha"}, {"provider_name": "Beta"}]}}
+    ;
+    try host.ingestOpenRouter(Slug.lit("or-catalog"), second_models, &.{second_endpoints});
+
+    // The catalog reflects the *new* document, not a merge of both.
+    try std.testing.expectEqual(before + 2, host.kernel.catalogSnapshot().items().len);
+    var alpha: usize = 0;
+    var beta: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("or-catalog")) continue;
+        try std.testing.expectEqual(@as(?u32, 2000), item.limits.context_window);
+        if (item.channel_id.eqlText("alpha")) alpha += 1;
+        if (item.channel_id.eqlText("beta")) beta += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), alpha);
+    try std.testing.expectEqual(@as(usize, 1), beta);
+}
+
+test "re-adopting custom providers replaces them and drops the ones removed" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {
+        \\  "relay-a": {"channels":[{"id":"c","base_url":"https://a.example.com/v1","protocol":"openai_chat"}],
+        \\              "models":[{"request_model_id":"m-a"}]},
+        \\  "relay-b": {"channels":[{"id":"c","base_url":"https://b.example.com/v1","protocol":"openai_chat"}],
+        \\              "models":[{"request_model_id":"m-b"}]}}}
+    );
+    try std.testing.expect(host.registry.find("relay-a") != null);
+    try std.testing.expect(host.registry.find("relay-b") != null);
+
+    // The user edits the config: `relay-b` is gone and `relay-a` changed. A
+    // stale `relay-b` would keep pointing into the arena this call releases.
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {
+        \\  "relay-a": {"channels":[{"id":"c","base_url":"https://a2.example.com/v1","protocol":"openai_chat"}],
+        \\              "models":[{"request_model_id":"m-a2"}]}}}
+    );
+    try std.testing.expect(host.registry.find("relay-b") == null);
+    const updated = host.registry.find("relay-a").?;
+    try std.testing.expectEqualStrings("https://a2.example.com/v1", updated.channels[0].base_url);
+
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("relay-b")) return error.StaleProviderStillRouted;
+        if (item.provider_id.eqlText("relay-a")) {
+            seen += 1;
+            try std.testing.expectEqualStrings("m-a2", item.request_model_id);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
+test "a configured provider may not take over a built-in vendor's id" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    // Replacement is for a source's *own* registrations. Letting a config file
+    // silently redefine `openai` would change where an existing session's
+    // credentials go. The definition is passed over, and said so; the user's
+    // other providers in the same section still load — a provider that
+    // becomes built in (OpenRouter did) must not take them all down.
+    try host.adoptCustomProviders(
+        \\{"custom_providers": {"openai": {
+        \\  "channels":[{"id":"c","base_url":"https://evil.example.com/v1","protocol":"openai_chat"}],
+        \\  "models":[{"request_model_id":"m"}]},
+        \\ "house-relay": {
+        \\  "channels":[{"id":"c","base_url":"https://relay.example.com/v1","protocol":"openai_chat"}],
+        \\  "models":[{"request_model_id":"m"}]}}}
+    );
+    try std.testing.expectEqualStrings(
+        "https://api.openai.com/v1",
+        host.registry.find("openai").?.channels[0].base_url,
+    );
+    try std.testing.expect(host.registry.find("house-relay") != null);
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "custom_providers.openai in <state root>/config.json was not loaded: openai is now built in; rename it to keep using it",
+        host.shadowedNotice(&buffer).?,
+    );
+
+    // A catalog named like a built-in is passed over the same way.
+    const catalog_host = try Host.create(a);
+    defer catalog_host.destroy();
+    try catalog_host.ingestConfiguredCatalogs("{\"provider_catalogs\": {\"openrouter\": {\"models_file\": \"/nonexistent/models.json\"}}}");
+    try std.testing.expectEqualStrings(
+        "provider_catalogs.openrouter in <state root>/config.json is no longer needed: openrouter is built in (/login openrouter)",
+        catalog_host.shadowedNotice(&buffer).?,
+    );
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", catalog_host.registry.find("openrouter").?.channels[0].base_url);
+}
+
+test "a startup stage that does not apply records why" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try std.testing.expect(host.startup_warning == null);
+
+    // A broken section otherwise disappears, and surfaces much later as
+    // "unknown provider 'my-relay'" with nothing connecting the two.
+    host.adoptCustomProviders(
+        \\{"custom_providers": {"broken": {
+        \\  "channels": [{"id":"c","base_url":"https://x.example.com/v1","protocol":"openai_chat"}]}}}
+    ) catch |err| host.noteStartupWarning(err);
+    try std.testing.expectEqualStrings("NoModels", host.startup_warning.?);
+
+    // The first reason is kept: later stages often fail *because* of it, so the
+    // last one is the least useful to report.
+    host.noteStartupWarning(error.SomethingLater);
+    try std.testing.expectEqualStrings("NoModels", host.startup_warning.?);
+
+    // And the built-in providers still work.
+    try std.testing.expect(host.kernel.catalogSnapshot().items().len > 0);
+}
+
+/// Forwards to `child` but overwrites every freed block first, so a read of
+/// released memory sees 0xAA instead of the bytes it used to hold.
+const PoisonOnFree = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *PoisonOnFree) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return null;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        @memset(memory, 0xAA);
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "an ingested OpenRouter catalog owns its strings once the parse results are gone" {
+    // `ingestOpenRouter` releases the model and endpoint parse results before
+    // it returns. The channels used to borrow their strings from them, so the
+    // registry profile — and every offer built from it, now or on a later
+    // refresh — read 0xAA under this allocator.
+    var poison = PoisonOnFree{ .child = std.testing.allocator };
+    const a = poison.allocator();
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestOpenRouter(
+        Slug.lit("or-catalog"),
+        \\{"data": [{"id": "deepseek/deepseek-v4", "name": "DeepSeek V4", "context_length": 163840,
+        \\  "supported_parameters": ["tools", "reasoning"]}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4", "endpoints": [
+            \\  {"provider_name": "DeepInfra", "quantization": "fp8", "region": "us-east", "status": 0}]}}
+        },
+    );
+
+    const Check = struct {
+        fn offer(catalog: *const OfferCatalog) !ids.OfferId {
+            var found: ?ids.OfferId = null;
+            for (catalog.items()) |item| {
+                if (!item.provider_id.eqlText("or-catalog")) continue;
+                try std.testing.expect(found == null);
+                found = item.offer_id;
+                try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.request_model_id);
+                try std.testing.expectEqualStrings("DeepSeek V4", item.display_name);
+                try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.canonical_model_id.?);
+                try std.testing.expectEqualStrings("fp8", item.model_variant.?);
+                try std.testing.expectEqualStrings("us-east", item.region.?);
+                try std.testing.expectEqual(@as(usize, 1), item.controls.len);
+                try std.testing.expectEqualStrings("reasoning_effort", item.controls[0].id);
+                try std.testing.expectEqualStrings("medium", item.controls[0].allowed_values[1]);
+            }
+            return found orelse error.TestExpectedOffer;
+        }
+    };
+
+    const ingested = try Check.offer(host.kernel.catalogSnapshot());
+    const channel = host.registry.find("or-catalog").?.channel(Slug.lit("deepinfra")).?;
+    try std.testing.expectEqualStrings("DeepInfra", channel.display_name);
+
+    // A rebuild re-reads the profile, and the offer id is derived from its
+    // request model id: a borrowed one would change the id under a pin.
+    try host.refresh();
+    const refreshed = try Check.offer(host.kernel.catalogSnapshot());
+    try std.testing.expect(refreshed.eql(ingested));
+    _ = try Check.offer(&host.retired.?);
+}
+
+test "built OpenRouter channels copy every string the parse results held" {
+    // The ingest above can only observe what the parser produces, and the
+    // parser's control vocabulary is static text. This pins the rest of the
+    // contract: everything a model or endpoint row points at, overwritten in
+    // place once the channels exist — which is what releasing them does.
+    const a = std.testing.allocator;
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    var parsed = std.heap.ArenaAllocator.init(a);
+    defer parsed.deinit();
+
+    const Source = struct {
+        allocator: std.mem.Allocator,
+        held: std.ArrayList([]u8) = .empty,
+
+        fn text(self: *@This(), value: []const u8) ![]const u8 {
+            const copy = try self.allocator.dupe(u8, value);
+            try self.held.append(self.allocator, copy);
+            return copy;
+        }
+        fn release(self: *@This()) void {
+            for (self.held.items) |bytes| @memset(bytes, 0xAA);
+        }
+    };
+    var source = Source{ .allocator = parsed.allocator() };
+
+    const values = try source.allocator.alloc([]const u8, 2);
+    values[0] = try source.text("low");
+    values[1] = try source.text("high");
+    const controls = try source.allocator.alloc(@import("controls.zig").ControlSpec, 1);
+    controls[0] = .{
+        .id = try source.text("reasoning_effort"),
+        .label = try source.text("Reasoning"),
+        .kind = .enumeration,
+        .allowed_values = values,
+        .cost_latency_warning = try source.text("slower"),
+        .extension_data = try source.text("{\"x\":1}"),
+    };
+    const model = openrouter.CatalogModel{
+        .id = try source.text("x/y"),
+        .display_name = try source.text("X Y"),
+        .context_length = null,
+        .max_output_tokens = null,
+        .quote = .unknown,
+        .capabilities = .{},
+        .controls = controls,
+    };
+    const endpoint = openrouter.Endpoint{
+        .provider_name = try source.text("Alpha"),
+        .tag = try source.text("alpha/fp8"),
+        .channel_id = Slug.lit("alpha"),
+        .request_model_id = try source.text("x/y:fp8"),
+        .context_length = null,
+        .max_output_tokens = null,
+        .quote = .unknown,
+        .health = .{},
+        .availability = .unknown,
+        .quantization = try source.text("fp8"),
+        .region = try source.text("eu"),
+        .supports_zdr = .unknown,
+    };
+
+    const channels = try openrouter.buildChannels(retained.allocator(), model, &.{endpoint});
+    source.release();
+    @memset(std.mem.sliceAsBytes(values), 0xAA);
+    @memset(std.mem.sliceAsBytes(controls), 0xAA);
+
+    try std.testing.expectEqualStrings("Alpha", channels[0].display_name);
+    try std.testing.expectEqualStrings("eu", channels[0].region.?);
+    const entry = channels[0].models[0];
+    try std.testing.expectEqualStrings("x/y:fp8", entry.request_model_id);
+    try std.testing.expectEqualStrings("X Y", entry.display_name);
+    try std.testing.expectEqualStrings("x/y", entry.canonical_model_id.?);
+    try std.testing.expectEqualStrings("fp8", entry.model_variant.?);
+    try std.testing.expectEqual(@as(usize, 1), entry.controls.len);
+    const control = entry.controls[0];
+    try std.testing.expectEqual(@import("controls.zig").ValueKind.enumeration, control.kind);
+    try std.testing.expectEqualStrings("reasoning_effort", control.id);
+    try std.testing.expectEqualStrings("Reasoning", control.label);
+    try std.testing.expectEqual(@as(usize, 2), control.allowed_values.len);
+    try std.testing.expectEqualStrings("low", control.allowed_values[0]);
+    try std.testing.expectEqualStrings("high", control.allowed_values[1]);
+    try std.testing.expectEqualStrings("slower", control.cost_latency_warning.?);
+    try std.testing.expectEqualStrings("{\"x\":1}", control.extension_data.?);
+}
+
+test "the built-in OpenRouter takes an account's listing: one router offer per model with tools, stable across a refresh" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    const listing =
+        \\{"data": [
+        \\  {"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek: DeepSeek V4.1 Flash", "context_length": 1048576,
+        \\   "top_provider": {"max_completion_tokens": 65536},
+        \\   "pricing": {"prompt": "0.0000001", "completion": "0.0000004"},
+        \\   "supported_parameters": ["tools", "reasoning"]},
+        \\  {"id": "openrouter/auto", "name": "Auto Router", "pricing": {"prompt": "-1", "completion": "-1"},
+        \\   "supported_parameters": ["tools"]},
+        \\  {"id": "some/chat-only", "name": "No tools", "supported_parameters": ["temperature"]}
+        \\]}
+    ;
+    try std.testing.expectEqual(@as(usize, 2), try host.ingestOpenRouterBuiltin(listing));
+    var first: ?ids.OfferId = null;
+    var count: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        count += 1;
+        try std.testing.expect(item.channel_id.eqlText("auto"));
+        try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", item.endpoint_ref);
+        try std.testing.expect(!std.mem.eql(u8, item.request_model_id, "some/chat-only"));
+        if (std.mem.eql(u8, item.request_model_id, "deepseek/deepseek-v4.1-flash")) first = item.offer_id;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    // A refresh reproduces the offer: a pin on it resolves again.
+    _ = try host.ingestOpenRouterBuiltin(listing);
+    try std.testing.expect(host.kernel.catalogSnapshot().find(first.?) != null);
+
+    // A listing with nothing usable is refused, and the models stay.
+    try std.testing.expectError(error.InvalidDocument, host.ingestOpenRouterBuiltin("{\"data\": [{\"id\": \"x/y\", \"supported_parameters\": []}]}"));
+    try std.testing.expect(host.kernel.catalogSnapshot().find(first.?) != null);
+
+    // The development origin moves the listing's route with it.
+    try host.rebaseOrigin(Slug.lit("openrouter"), "https://openrouter.ai", "http://127.0.0.1:9");
+    _ = try host.ingestOpenRouterBuiltin(listing);
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("openrouter")) continue;
+        try std.testing.expectEqualStrings("http://127.0.0.1:9/api/v1/chat/completions", item.endpoint_ref);
+    }
+}
+
+test "two models served by one endpoint ingest as one channel holding both" {
+    // OpenRouter's endpoints are the same for every model they serve: Wafer's
+    // US endpoint serving two models is one channel with two models, not two
+    // channels with one id (which the registry refuses, failing the ingest).
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestOpenRouter(
+        Slug.lit("or-catalog"),
+        \\{"data": [{"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash"},
+        \\          {"id": "moonshotai/kimi-k3", "name": "Kimi K3"}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4.1-flash", "endpoints": [
+            \\  {"name": "Wafer | deepseek/deepseek-v4.1-flash-20260910", "provider_name": "Wafer", "tag": "wafer/us", "status": 0}]}}
+            ,
+            \\{"data": {"id": "moonshotai/kimi-k3", "endpoints": [
+            \\  {"name": "Wafer | moonshotai/kimi-k3", "provider_name": "Wafer", "tag": "wafer/us", "status": 0},
+            \\  {"name": "KT | moonshotai/kimi-k3", "provider_name": "KT", "tag": "kt", "status": 0}]}}
+        },
+    );
+    const profile = host.registry.find("or-catalog").?;
+    try std.testing.expectEqual(@as(usize, 2), profile.channels.len);
+    const wafer = profile.channel(Slug.lit("wafer-us")).?;
+    try std.testing.expectEqual(@as(usize, 2), wafer.models.len);
+    var seen: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("or-catalog")) continue;
+        seen += 1;
+        // The model, never the endpoint's display name.
+        try std.testing.expect(std.mem.indexOf(u8, item.request_model_id, "|") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "an ingest for one provider leaves another provider's ingested catalog intact" {
+    // A single shared arena slot used to release OpenRouter's channels when
+    // Metask's gateway catalog arrived, and the rebuild inside that same
+    // ingest walked them (a segfault on 0xAA under this allocator).
+    var poison = PoisonOnFree{ .child = std.testing.allocator };
+    const a = poison.allocator();
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestOpenRouter(
+        Slug.lit("or-catalog"),
+        \\{"data": [{"id": "deepseek/deepseek-v4", "name": "DeepSeek V4", "context_length": 163840}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4", "endpoints": [{"provider_name": "DeepInfra", "context_length": 131072, "status": 0}]}}
+        },
+    );
+    try host.ingestMetask("http://localhost:9000", "{\"object\":\"list\",\"data\":[{\"id\":\"metask-model\",\"display_name\":\"Gateway Model\"}]}", .messages);
+    try host.refresh();
+    var openrouter_seen = false;
+    var metask_seen = false;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("or-catalog")) {
+            openrouter_seen = true;
+            try std.testing.expectEqualStrings("openai_chat", item.protocol);
+            try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", item.endpoint_ref);
+        } else if (item.provider_id.eqlText("metask")) {
+            metask_seen = true;
+            try std.testing.expectEqualStrings("metask-model", item.request_model_id);
+            try std.testing.expectEqualStrings("Gateway Model", item.display_name);
+        }
+    }
+    try std.testing.expect(openrouter_seen and metask_seen);
+}
+
+test "a re-ingested Metask catalog leaves the retired generation readable" {
+    // An API-key switch replaces the inventory while the retired catalog (and
+    // a picker snapshot taken from it) still names the previous models.
+    var poison = PoisonOnFree{ .child = std.testing.allocator };
+    const a = poison.allocator();
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("http://localhost:9000", "{\"data\":[{\"id\":\"prod-model\",\"display_name\":\"Prod Model\"}]}", .messages);
+    try host.ingestMetask("http://localhost:9000", "{\"data\":[{\"id\":\"dev-model\"}]}", .messages);
+
+    var retired_seen = false;
+    for (host.retired.?.items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        retired_seen = true;
+        try std.testing.expectEqualStrings("prod-model", item.request_model_id);
+        try std.testing.expectEqualStrings("Prod Model", item.display_name);
+    }
+    try std.testing.expect(retired_seen);
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("metask")) try std.testing.expectEqualStrings("dev-model", item.request_model_id);
+    }
+}

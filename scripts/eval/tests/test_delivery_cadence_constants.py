@@ -15,7 +15,7 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
 
     def test_nudge_bound_is_identical_in_lean_zig_and_trace(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/DeliveryCadence.lean").read_text(encoding="utf-8")
-        zig = (ROOT / "src/core/delivery_cadence.zig").read_text(encoding="utf-8")
+        zig = (ROOT / "packages/coding/src/core/delivery_cadence.zig").read_text(encoding="utf-8")
         trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
         lean_bound = int(re.search(r"^def maxNudges : Nat := (\d+)", lean, re.M).group(1))
         zig_bound = int(re.search(r"pub const MAX_CADENCE_NUDGES: u8 = (\d+);", zig).group(1))
@@ -25,7 +25,7 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
 
     def test_progress_nudge_bound_is_identical_in_lean_zig_and_trace(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/ProgressUpdates.lean").read_text(encoding="utf-8")
-        zig = (ROOT / "src/core/progress_updates.zig").read_text(encoding="utf-8")
+        zig = (ROOT / "packages/coding/src/core/progress_updates.zig").read_text(encoding="utf-8")
         trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
         lean_bound = int(re.search(r"^def maxNudges : Nat := (\d+)", lean, re.M).group(1))
         zig_bound = int(re.search(r"pub const MAX_PROGRESS_NUDGES: u8 = (\d+);", zig).group(1))
@@ -35,7 +35,7 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
 
     def test_check_gate_bounds_are_identical_in_lean_zig_and_trace(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/CheckGate.lean").read_text(encoding="utf-8")
-        zig = (ROOT / "src/core/check_gate.zig").read_text(encoding="utf-8")
+        zig = (ROOT / "packages/coding/src/core/check_gate.zig").read_text(encoding="utf-8")
         trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
         lean_stop = int(re.search(r"^def maxStopBlocks : Nat := (\d+)", lean, re.M).group(1))
         zig_stop = int(re.search(r"pub const MAX_STOP_HOOK_BLOCKS: u8 = (\d+);", zig).group(1))
@@ -48,7 +48,7 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
 
     def test_test_integrity_budget_is_identical_in_lean_zig_and_trace(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/TestIntegrity.lean").read_text(encoding="utf-8")
-        zig = (ROOT / "src/core/test_integrity.zig").read_text(encoding="utf-8")
+        zig = (ROOT / "packages/coding/src/core/test_integrity.zig").read_text(encoding="utf-8")
         trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
         lean_bound = int(re.search(r"^def maxNudges : Nat := (\d+)", lean, re.M).group(1))
         zig_bound = int(re.search(r"pub const MAX_NUDGES: u8 = (\d+);", zig).group(1))
@@ -58,7 +58,7 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
 
     def test_stall_gate_constants_are_identical_in_lean_zig_and_trace(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/StallGate.lean").read_text(encoding="utf-8")
-        zig = (ROOT / "src/core/stall_gate.zig").read_text(encoding="utf-8")
+        zig = (ROOT / "packages/coding/src/core/stall_gate.zig").read_text(encoding="utf-8")
         trace = (ROOT / "scripts/eval/workbuddy/trace.py").read_text(encoding="utf-8")
         lean_bound = int(re.search(r"^def maxDecisions : Nat := (\d+)", lean, re.M).group(1))
         zig_bound = int(re.search(r"pub const MAX_STALL_DECISIONS: u8 = (\d+);", zig).group(1))
@@ -79,7 +79,7 @@ class DeliveryCadenceConstantsLockstepTest(unittest.TestCase):
 
     def test_meter_cap_is_identical_in_lean_and_zig(self):
         lean = (ROOT / "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean").read_text(encoding="utf-8")
-        zig = (ROOT / "src/core/host_injection_meter.zig").read_text(encoding="utf-8")
+        zig = (ROOT / "packages/coding/src/core/host_injection_meter.zig").read_text(encoding="utf-8")
         lean_cap = int(re.search(r"^def cap : Nat := (\d+)", lean, re.M).group(1))
         zig_cap = int(re.search(r"pub const MAX_HOST_INJECTIONS_PER_RUN: u8 = (\d+);", zig).group(1))
         self.assertEqual(lean_cap, zig_cap)

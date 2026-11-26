@@ -27,10 +27,10 @@ class DeclarationSensorTests(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path, dict]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        (root / "src/agents").mkdir(parents=True)
+        (root / "packages/coding/src/agents").mkdir(parents=True)
         (root / "tests/component").mkdir(parents=True)
         (root / "control-plane").mkdir(parents=True)
-        (root / "src/agents/def.zig").write_text(
+        (root / "packages/coding/src/agents/def.zig").write_text(
             "pub const AgentDef = struct {\n"
             "    name: []const u8,\n"
             "    model: []const u8,\n"
@@ -38,7 +38,7 @@ class DeclarationSensorTests(unittest.TestCase):
             "};\n",
             encoding="utf-8",
         )
-        (root / "src/tools.zig").write_text(
+        (root / "packages/coding/src/tools.zig").write_text(
             ".{\n"
             '    .name = "Task",\n'
             '    .input_schema = .{ .required = &.{"prompt"} },\n'
@@ -68,8 +68,8 @@ class DeclarationSensorTests(unittest.TestCase):
         registry = {
             "schema_version": 1,
             "sources": {
-                "agentdef": "src/agents/def.zig",
-                "task_registry": "src/tools.zig",
+                "agentdef": "packages/coding/src/agents/def.zig",
+                "task_registry": "packages/coding/src/tools.zig",
                 "build_graph": "build.zig",
             },
             "exclusions": [
@@ -166,35 +166,35 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        for directory in ("src/kg", "src/core", "src/tools", "tests/component", "apps/cli/tests/component"):
+        for directory in ("packages/coding/src/kg", "packages/coding/src/core", "packages/coding/src/tools", "tests/component", "apps/cli/tests/component"):
             (root / directory).mkdir(parents=True, exist_ok=True)
-        (root / "src/kg/scoped_recall.zig").write_text(
+        (root / "packages/coding/src/kg/scoped_recall.zig").write_text(
             'const line = std.fmt.allocPrint(a, "- [node_id={d}]", .{h.node_id});\n'
             'try out.appendSlice(a, retrieval_protocol.AUTO_RECALL_NOTE);\n'
             'const next = "KgContext(node_id)";\n',
             encoding="utf-8",
         )
-        (root / "src/kg/client.zig").write_text(
+        (root / "packages/coding/src/kg/client.zig").write_text(
             "pub fn nodeMetadataJson() void {}\n",
             encoding="utf-8",
         )
-        (root / "src/kg/retrieval_protocol.zig").write_text(
+        (root / "packages/coding/src/kg/retrieval_protocol.zig").write_text(
             'pub const SYSTEM_RULES = "Memory is a candidate, not a current fact; verified_by or evidences; '
             'deprecated_by, resolved_by, and contradiction; current code, git, tests, or external state";\n',
             encoding="utf-8",
         )
-        (root / "src/core/system_prompt.zig").write_text(
+        (root / "packages/coding/src/core/system_prompt.zig").write_text(
             "const section = kg_retrieval.SYSTEM_RULES;\n",
             encoding="utf-8",
         )
-        (root / "src/tools/kg_tools.zig").write_text(
+        (root / "packages/coding/src/tools/kg_tools.zig").write_text(
             'const metadata = kg.nodeMetadataJson(node_id, true);\n'
             'const governance = buildKnowledgeGovernance(parsed.value, node_id);\n'
             'try out.appendSlice(a, ",\\\"knowledge_governance\\\":");\n'
             'const schema = "metacodes-knowledge-governance-v1";\n',
             encoding="utf-8",
         )
-        (root / "src/tools.zig").write_text(
+        (root / "packages/coding/src/tools.zig").write_text(
             "const context = retrieval_protocol.CONTEXT_DESCRIPTION;\n",
             encoding="utf-8",
         )
@@ -245,7 +245,7 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
     def test_manifest_cannot_replace_missing_automatic_recall_node_identity(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/kg/scoped_recall.zig"
+        source = root / "packages/coding/src/kg/scoped_recall.zig"
         source.write_text(source.read_text(encoding="utf-8").replace("h.node_id", "0"), encoding="utf-8")
         observation = rule_control.observe_memory_evidence_governance(root)
         self.assertFalse(observation.sensor_ok)
@@ -254,7 +254,7 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
     def test_commented_governance_actuator_is_not_observed_as_runtime_wiring(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/tools/kg_tools.zig"
+        source = root / "packages/coding/src/tools/kg_tools.zig"
         source.write_text(
             "// buildKnowledgeGovernance knowledge_governance metacodes-knowledge-governance-v1\n",
             encoding="utf-8",
@@ -284,14 +284,14 @@ class ExecutionOntologySensorTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
         for relative in (
-            "src/core",
-            "src/kg",
-            "src/tools",
+            "packages/coding/src/core",
+            "packages/coding/src/kg",
+            "packages/coding/src/tools",
             "tests/component",
             "apps/cli/tests/component",
         ):
             (root / relative).mkdir(parents=True, exist_ok=True)
-        (root / "src/core/tool_exec.zig").write_text(
+        (root / "packages/coding/src/core/tool_exec.zig").write_text(
             "pub fn executeSlots() void {\n"
             "  if (slots[i].decision == .run and slots[i].prefetched)\n"
             "    observeSuccessfulExecutions(slots[i .. i + 1], base_ctx);\n"
@@ -304,7 +304,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
             "}\n",
             encoding="utf-8",
         )
-        (root / "src/core/task_store.zig").write_text(
+        (root / "packages/coding/src/core/task_store.zig").write_text(
             "pub fn uniqueActiveKgTaskId() ?u64 {\n"
             "  const node_id = std.fmt.parseInt(u64, task.id, 10) catch return null;\n"
             "  if (active != null) return null;\n"
@@ -312,13 +312,13 @@ class ExecutionOntologySensorTests(unittest.TestCase):
             "}\n",
             encoding="utf-8",
         )
-        (root / "src/kg/client.zig").write_text(
+        (root / "packages/coding/src/kg/client.zig").write_text(
             "pub fn observeSuccessfulExecution() void {\n"
             "  execution_ledger.observeSuccessfulTool(task_id, tool_name, input_json, project_dir);\n"
             "}\n",
             encoding="utf-8",
         )
-        (root / "src/kg/execution_knowledge.zig").write_text(
+        (root / "packages/coding/src/kg/execution_knowledge.zig").write_text(
             "pub fn observeSuccessfulTool() void {\n"
             "  const resource = resourceSpec(tool_name) orelse return;\n"
             "  const raw = extractStringField(input_json, resource.field);\n"
@@ -327,7 +327,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
             "}\n",
             encoding="utf-8",
         )
-        (root / "src/tools/task_tools.zig").write_text(
+        (root / "packages/coding/src/tools/task_tools.zig").write_text(
             "const ProjectionReport = struct { observed: usize, projected: usize, failed: usize, dropped: usize, retained: usize };\n"
             "fn writeClosureProjection() void {\n"
             "  const snapshot = executionKnowledgeSnapshot();\n"
@@ -386,7 +386,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
     def test_disconnected_tool_exec_sensor_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/core/tool_exec.zig"
+        source = root / "packages/coding/src/core/tool_exec.zig"
         source.write_text(
             source.read_text(encoding="utf-8").replace(
                 "kg.observeSuccessfulExecution(task_id, slot.name, slot.input, project_dir);",
@@ -401,7 +401,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
     def test_comment_or_manifest_words_cannot_replace_execution_sensor(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        (root / "src/core/tool_exec.zig").write_text(
+        (root / "packages/coding/src/core/tool_exec.zig").write_text(
             "// observeSuccessfulExecutions kg.observeSuccessfulExecution uniqueActiveKgTaskId slot.is_error\n",
             encoding="utf-8",
         )
@@ -412,7 +412,7 @@ class ExecutionOntologySensorTests(unittest.TestCase):
     def test_taskupdate_must_consume_projection(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/tools/task_tools.zig"
+        source = root / "packages/coding/src/tools/task_tools.zig"
         source.write_text(
             source.read_text(encoding="utf-8").replace(
                 "const projection = writeClosureProjection(ctx, kg, task, args);",
@@ -443,9 +443,9 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        for relative in ("src/core", "src/kg", "tests/component", "apps/cli/tests/component"):
+        for relative in ("packages/coding/src/core", "packages/coding/src/kg", "tests/component", "apps/cli/tests/component"):
             (root / relative).mkdir(parents=True, exist_ok=True)
-        (root / "src/kg/experience_packet.zig").write_text(
+        (root / "packages/coding/src/kg/experience_packet.zig").write_text(
             'const QUERY_BYTES = 400;\n'
             'const SEARCH_LIMIT = 8;\n'
             'const MAX_ACCEPTED_TASKS = 2;\n'
@@ -487,16 +487,16 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
             '}\n',
             encoding="utf-8",
         )
-        (root / "src/kg/client.zig").write_text(
+        (root / "packages/coding/src/kg/client.zig").write_text(
             'pub fn recallTasks(query, limit) void { return recallFiltered(query, limit, true, null, "task"); }\n'
             'fn searchSubtreeInto() void { if (kind_filter) |kind| argv.appendSlice(&.{ "--kind", kind }); }\n',
             encoding="utf-8",
         )
-        (root / "src/kg/retrieval_protocol.zig").write_text(
+        (root / "packages/coding/src/kg/retrieval_protocol.zig").write_text(
             'const RULE = "computes no embeddings or vector distance; 2-4 separate compact probes; host executes every declared member; merges by node_id";\n',
             encoding="utf-8",
         )
-        (root / "src/core/tool_exec.zig").write_text(
+        (root / "packages/coding/src/core/tool_exec.zig").write_text(
             'pub fn executeOne() void {\n'
             '  const experience_bytes = @import("../kg/experience_packet.zig").enrichClaimResult(a, kg, name, input, ok_bytes);\n'
             '  const unavailable = experience_packet.unavailableClaimResult(a, name, input, ok_bytes);\n'
@@ -505,7 +505,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
             '}\n',
             encoding="utf-8",
         )
-        (root / "src/kg/task_protocol.zig").write_text(
+        (root / "packages/coding/src/kg/task_protocol.zig").write_text(
             'const RULE = "experience_packet before any work; bounded exact lexical probe; tentative/confirmed state; LEXICAL EXPANSION: TinyKG has no vectors; before work actively infer 2-4 separate compact semantic variants; declare them once in lexical-query-plan-v3; host executes the fixed batch; Never combine the whole neighborhood into one keyword bag";\n',
             encoding="utf-8",
         )
@@ -570,14 +570,14 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
     def test_missing_retrieval_source_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        (root / "src/kg/experience_packet.zig").unlink()
+        (root / "packages/coding/src/kg/experience_packet.zig").unlink()
         observation = rule_control.observe_experience_feedback(root)
         self.assertFalse(observation.sensor_ok)
 
     def test_task_kind_filter_must_be_pushed_into_tinykg(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/kg/client.zig"
+        source = root / "packages/coding/src/kg/client.zig"
         source.write_text(
             source.read_text(encoding="utf-8").replace('"--kind"', '"--schema-type"'),
             encoding="utf-8",
@@ -589,7 +589,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
     def test_missing_semantic_expansion_contract_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        (root / "src/kg/retrieval_protocol.zig").write_text(
+        (root / "packages/coding/src/kg/retrieval_protocol.zig").write_text(
             'const RULE = "exact only";\n',
             encoding="utf-8",
         )
@@ -600,7 +600,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
     def test_weakened_lifecycle_or_evidence_gate_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/kg/experience_packet.zig"
+        source = root / "packages/coding/src/kg/experience_packet.zig"
         source.write_text(
             source.read_text(encoding="utf-8")
             .replace('"completed"', '"open"')
@@ -614,7 +614,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
     def test_disconnected_pre_work_actuator_is_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/core/tool_exec.zig"
+        source = root / "packages/coding/src/core/tool_exec.zig"
         source.write_text(source.read_text(encoding="utf-8").replace(".enrichClaimResult", ".ignorePacket"), encoding="utf-8")
         observation = rule_control.observe_experience_feedback(root)
         self.assertFalse(observation.sensor_ok)
@@ -623,7 +623,7 @@ class ExperienceFeedbackSensorTests(unittest.TestCase):
     def test_prompt_or_comment_words_cannot_replace_runtime_wiring(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        (root / "src/core/tool_exec.zig").write_text(
+        (root / "packages/coding/src/core/tool_exec.zig").write_text(
             "// experience_packet.zig .enrichClaimResult const result_bytes = experience_bytes orelse ok_bytes dupe(u8, result_bytes)\n",
             encoding="utf-8",
         )
@@ -1236,9 +1236,9 @@ class EvalBudgetCheckpointSensorTests(unittest.TestCase):
 
 class TreatmentActivationSensorTests(unittest.TestCase):
     RELATIVE_SOURCES = (
-        "src/kg/task_protocol.zig",
+        "packages/coding/src/kg/task_protocol.zig",
         "apps/cli/tests/component/prompt_tool_coupling_test.zig",
-        "src/core/conversation.zig",
+        "packages/kernel/src/conversation.zig",
         "tests/component/microcompact_test.zig",
         "scripts/eval/treatment_activation.py",
         "scripts/eval/model.py",
@@ -2083,7 +2083,7 @@ class DaemonTransportSensorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for relative in (
-                "src/kg/transport.zig", "src/kg/client.zig",
+                "packages/coding/src/kg/transport.zig", "packages/coding/src/kg/client.zig",
                 "tests/helpers/kg_daemon_transport_probe.zig",
                 "scripts/test_kg_daemon_transport.py", "build.zig",
             ):
@@ -2091,7 +2091,7 @@ class DaemonTransportSensorTests(unittest.TestCase):
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, target)
-            transport = root / "src/kg/transport.zig"
+            transport = root / "packages/coding/src/kg/transport.zig"
             transport.write_text(
                 transport.read_text(encoding="utf-8").replace(
                     "std.Io.Select(PostRace)", "DisconnectedDeadlineRace"
@@ -2106,7 +2106,7 @@ class DaemonTransportSensorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for relative in (
-                "src/kg/transport.zig", "src/kg/client.zig",
+                "packages/coding/src/kg/transport.zig", "packages/coding/src/kg/client.zig",
                 "tests/helpers/kg_daemon_transport_probe.zig",
                 "scripts/test_kg_daemon_transport.py", "build.zig",
             ):
@@ -2131,7 +2131,7 @@ class DaemonTransportSensorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for relative in (
-                "src/kg/transport.zig", "src/kg/client.zig",
+                "packages/coding/src/kg/transport.zig", "packages/coding/src/kg/client.zig",
                 "tests/helpers/kg_daemon_transport_probe.zig",
                 "scripts/test_kg_daemon_transport.py", "build.zig",
             ):
@@ -2154,7 +2154,7 @@ class DaemonTransportSensorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for relative in (
-                "src/kg/transport.zig", "src/kg/client.zig",
+                "packages/coding/src/kg/transport.zig", "packages/coding/src/kg/client.zig",
                 "tests/helpers/kg_daemon_transport_probe.zig",
                 "scripts/test_kg_daemon_transport.py", "build.zig",
             ):

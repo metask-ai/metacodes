@@ -1,0 +1,451 @@
+//! 兼容性 re-export shim。M0.6 已把实现拆到 permission/ 子目录。
+//! 保留此文件是为了让 agent_loop.zig / app.zig 的旧 import 继续工作。
+//! 后续里程碑会让调用方迁到新路径，再删除本文件。
+
+const std = @import("std");
+const types = @import("metacodes-ai").types;
+
+const mode_mod = @import("permission/mode.zig");
+const category_mod = @import("permission/category.zig");
+const decision_mod = @import("permission/decision.zig");
+const prompt_mod = @import("permission/prompt.zig");
+const rule_mod = @import("permission/rule.zig");
+const rule_matcher_mod = @import("permission/rule_matcher.zig");
+const settings_mod = @import("permission/settings.zig");
+const rule_spec_mod = @import("permission/rule_spec.zig");
+const lent_mod = @import("permission/lent.zig");
+
+// --- 旧 API 重导出 ---
+
+pub const PermissionResult = decision_mod.Decision;
+pub const ImportedPermissionDecision = decision_mod.ImportedDecision;
+pub const ImportedPermissionSource = decision_mod.ImportedSource;
+pub const PermissionDecisionOverride = decision_mod.DecisionOverride;
+pub const ToolCategory = category_mod.ToolCategory;
+pub const RiskLevel = category_mod.RiskLevel;
+pub const getToolCategory = category_mod.getToolCategory;
+pub const getRiskLevel = category_mod.getRiskLevel;
+pub const RuleSet = rule_matcher_mod.RuleSet;
+pub const Rule = rule_matcher_mod.Rule;
+pub const MergedSettings = settings_mod.MergedSettings;
+pub const MatchContext = rule_spec_mod.MatchContext;
+pub const LentPermissions = lent_mod.LentPermissions;
+
+/// How far an "allow always" answer reaches.
+pub const AlwaysAllowScope = enum {
+    /// This Session's `session_rules` only. Nothing is written to disk.
+    session,
+    /// Also appended to `<project>/.claude/settings.local.json` (or
+    /// `<home>/.claude/settings.json` outside a project), which the App's
+    /// settings loader reads on its next start.
+    settings_file,
+};
+
+/// 旧版 PermissionContext。新 decision.Context 更简洁，但此处保留字段兼容 agent_loop。
+pub const PermissionContext = struct {
+    /// 权限模式。跨线程读写(主线程 agent_loop 读 / 生成期 watcher 线程 Shift+Tab 写)
+    /// → 用原子保证可见性。读 modeValue()/写 setMode()。
+    mode: std.atomic.Value(types.PermissionMode) = std.atomic.Value(types.PermissionMode).init(.prompt),
+    allocator: std.mem.Allocator,
+    /// 可选的细粒度规则集；null 时只靠四模式兜底。
+    rules: ?*const rule_matcher_mod.RuleSet = null,
+    /// 当前激活 skill 的临时白/黑名单。激活 Skill 工具时设;next user message 清。
+    active_skill: ?*const @import("skills/active.zig").ActiveSkillState = null,
+    /// 5 层 settings 聚合(allow/ask/deny + additionalDirectories)。
+    settings: ?*const settings_mod.MergedSettings = null,
+    /// path / bash 匹配上下文(cwd / project_root / home)。
+    match_ctx: rule_spec_mod.MatchContext = .{},
+    /// Bash 工具实际使用的沙箱设置(与 ToolContext.sandbox 同一份,App 加载时挂)。
+    /// decision 据此判 autoAllowBashIfSandboxed:只放行真会被沙箱包裹的调用。
+    sandbox: ?*const @import("sandbox/config.zig").SandboxSettings = null,
+    /// PreToolUse hook 集合(从 settings.hooks.PreToolUse 解析)。
+    hooks: ?*const @import("permission/hooks.zig").HookSet = null,
+    /// memdir 绝对路径(通道 B 自动记忆;App init 时算,挂此处)。空串=禁用。
+    /// 写此子树内文件任何模式豁免(对齐 cc isAutoMemPath),deny/protected 仍优先。
+    memdir_abs: []const u8 = "",
+    /// Session 级权限记忆(always-allow / session-deny)。指针:*const ctx 仍可经它 remember。
+    /// null = 无记忆(单测/库消费者不接)→ 每次都问。每 session 一个实例(多 Session 不串台)。
+    session_rules: ?*@import("permission/session_rules.zig").SessionRules = null,
+    /// Another Session's rules and working directories this context decides
+    /// with instead of its own `settings` and `match_ctx.additional_dirs`
+    /// (#445: a swarm member under its lead's permissions,
+    /// `AgentSession.inheritPermissions`). Read under its lock, as they are
+    /// at each decision; see permission/lent.zig for the locking rule.
+    /// `scopedDerive` copies it, so a member's scoped copies follow too.
+    inherited: ?*LentPermissions = null,
+    /// Where an "allow always" answer is remembered beyond `session_rules`.
+    /// The default keeps it in the Session: an embedding Host owns its
+    /// permission store and imports rules through
+    /// `AgentSession.updatePermissionRules`. Only a product that reads the
+    /// settings files back (App, via permission/loader.zig) opts into
+    /// `settings_file`.
+    always_allow: AlwaysAllowScope = .session,
+    /// Optional consumer-owned decision seam. AgentCore uses it; CLI/App leave
+    /// it null so their existing Permission behavior is unchanged.
+    decision_override: ?PermissionDecisionOverride = null,
+    /// UI 请求 runner(权限框经它让前端渲染)。重构前是 prompt.zig 的 g_ui_runner 全局
+    /// (多 Session 会串台 + 指向已失效 TuiBackend 的 UAF)。现挂 per-session ctx。
+    /// null = 无 runner → ask 退回文字 prompt。见 UiRequester。
+    ui_requester: ?@import("core/protocol/ui_request.zig").UiRequester = null,
+    /// **非交互强制拒**:true 时 requester 可以明确回答，但 unavailable、pending、取消或
+    /// callback error 都直接 deny，**绝不**回落到 process answer queue / fd 0。用于
+    /// UI-neutral library Session 和共享进程 stdin 的 swarm teammate。
+    no_interactive_prompt: bool = false,
+    /// Per-call confirmation demanded by a principal outside the decision
+    /// chain (a sealed Skill's `confirm: true`, doc/SEALED_SKILL_PROTOCOL.md
+    /// §6.2). Consulted by agent_loop after the ordinary decision; it can only
+    /// turn an `.allow` into an `.ask` whose prompt skips "allow always"
+    /// memory. Copied into scoped children like every other field.
+    confirm_gate: ?@import("permission/confirm_gate.zig").ConfirmGate = null,
+    /// 本 ctx 归属的会话(权限对话框路由到对应 session 视图)。默认 .single(N=1)。
+    /// **M6 待办**:这与 ToolContext.session 是同一概念的两份拷贝(权限路径走 PermissionContext,
+    /// 工具路径走 ToolContext)。M6 拆 SessionContext 后,两者都从 SessionContext.id 取,这俩
+    /// 字段消失。在此之前 M6 必须**同时**填这俩,否则权限框/工具框路由到不同 session(不一致)。
+    session: @import("metacodes-kernel").session_id.SessionId = @import("metacodes-kernel").session_id.SessionId.single,
+
+    /// **配置变更事件出口(U4)**:permission_mode 是 setMode 单写侧(model/dirs/reasoning
+    /// 各在 App 方法 emit)。App 只给 `app.permission_ctx` 设 sink;setMode 有 sink 才 emit,
+    /// 故任何直写 ctx.setMode 的 mode 变更都自动广播。
+    /// **scoped 值拷贝(subagent/agent_loop/agent)必须 null sink**——用 scopedDerive() 单 seam
+    /// 保证(不手工 null N 点,清单会漏)。null = 不 emit(无 UI / 单测 / scoped 拷贝)。
+    event_sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink = null,
+
+    /// 读 mode(acquire:看到其它线程的 setMode release 写)。
+    pub fn modeValue(self: *const PermissionContext) types.PermissionMode {
+        return self.mode.load(.acquire);
+    }
+    /// 写 mode(release:让读线程 acquire 时看到)。**U4 单写侧**:有 event_sink 则 emit
+    /// mode_changed(读回 store 后的值,保证事件与状态一致)。
+    pub fn setMode(self: *PermissionContext, m: types.PermissionMode) void {
+        self.mode.store(m, .release);
+        if (self.event_sink) |sink| sink.emit(.{ .mode = m });
+    }
+
+    /// Whether the settings let a session switch into `m`. `disableBypassPermissionsMode`
+    /// and `disableAutoMode` (any layer) are hard constraints: App init downgrades a
+    /// session that starts in such a mode, and every later switch must ask here first
+    /// (SessionService.setPermMode, the web/daemon message's `permission_mode`,
+    /// AgentSession.setPermissionMode, an AgentDef's or forked Skill's `permissionMode`
+    /// at spawn). Historical aliases are judged by what they mean (`bypass` is
+    /// bypass_permissions). No settings loaded → every mode is allowed.
+    pub fn modeAllowed(self: *const PermissionContext, m: types.PermissionMode) bool {
+        if (self.inherited) |lent| {
+            lent.mutex.lock();
+            defer lent.mutex.unlock();
+            const settings = lent.borrowedSettings() orelse return true;
+            return settings.allowsMode(m);
+        }
+        const settings = self.settings orelse return true;
+        return settings.allowsMode(m);
+    }
+
+    /// The mode permission decisions run under now: `modeValue()`, or `default` when
+    /// the settings disable it (decision.effectiveMode, the backstop). A reader that
+    /// changes behaviour by mode outside decision.zig reads this, not `modeValue()`;
+    /// `modeValue()` stays the stored value for display and state round trips.
+    pub fn effectiveMode(self: *const PermissionContext) types.PermissionMode {
+        if (self.inherited) |lent| {
+            lent.mutex.lock();
+            defer lent.mutex.unlock();
+            return decision_mod.effectiveMode(self.modeValue(), lent.borrowedSettings());
+        }
+        return decision_mod.effectiveMode(self.modeValue(), self.settings);
+    }
+
+    /// **scoped 派生的唯一入口(U4)**:值拷贝本 ctx + **null 掉 event_sink**(scoped ctx 不是
+    /// session ctx,其 mode override 绝不 emit 到 session sink),可选覆盖 mode。所有"值拷贝
+    /// permission_ctx 做 override"必须走它(subagent/agent_loop prefetch·nohooks/agent)。
+    /// grep-guard(S4):src 里除本函数外无裸 `permission_ctx.*` / `perm.*` 值拷贝——null 逻辑
+    /// 塌成一处不可能漏(手工枚举 N 点已被证伪漏 4 个)。
+    pub fn scopedDerive(self: *const PermissionContext, mode_override: ?types.PermissionMode) PermissionContext {
+        var derived = self.*;
+        derived.event_sink = null; // scoped 拷贝绝不 emit 到 session sink
+        if (mode_override) |m| derived.mode = std.atomic.Value(types.PermissionMode).init(m);
+        return derived;
+    }
+};
+
+pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) PermissionContext {
+    return .{ .mode = std.atomic.Value(types.PermissionMode).init(mode), .allocator = allocator };
+}
+
+pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, args: []const u8) PermissionResult {
+    return checkPermissionClassified(ctx, tool_name, args, null);
+}
+
+pub fn checkPermissionClassified(
+    ctx: *const PermissionContext,
+    tool_name: []const u8,
+    args: []const u8,
+    category: ?ToolCategory,
+) PermissionResult {
+    // B1 防御:规则匹配器(matchesPathDual)用 match_ctx.alloc 做路径 canonicalize
+    // (unescape + 折叠 ..)。生产里 App.loadSettings 已填 .alloc,但那与 settings!=null 是
+    // 隐式耦合;此处兜底——PermissionContext.allocator 非可选,恒填,消除"某路径设了 settings
+    // 却漏填 match_ctx.alloc → 规则匹配退回原始字节被 .. 绕过"的窗口。
+    var mctx = ctx.match_ctx;
+    if (mctx.alloc == null) mctx.alloc = ctx.allocator;
+    var settings = ctx.settings;
+    // #445: a borrower decides with the lender's rules and directories as
+    // they are now, holding the lender's lock for the whole decision so
+    // neither is freed or swapped under it (permission/lent.zig).
+    const lender = ctx.inherited;
+    if (lender) |lent| {
+        lent.mutex.lock();
+        settings = lent.borrowedSettings();
+        mctx.additional_dirs = lent.additional_dirs;
+    }
+    defer if (lender) |lent| lent.mutex.unlock();
+    const d_ctx = decision_mod.Context{
+        .mode = ctx.modeValue(),
+        .rules = ctx.rules,
+        .active_skill = ctx.active_skill,
+        .settings = settings,
+        .session_rules = ctx.session_rules,
+        .decision_override = ctx.decision_override,
+        .match_ctx = mctx,
+        .sandbox = ctx.sandbox,
+        .hooks = ctx.hooks,
+        .hook_allocator = ctx.allocator,
+        .memdir_abs = ctx.memdir_abs,
+        .memdir_allocator = ctx.allocator,
+        .path_check_allocator = ctx.allocator,
+    };
+    return decision_mod.checkClassified(&d_ctx, tool_name, args, category);
+}
+
+/// Why a permission prompt ended with nobody's answer; see `prompt.Unanswered`.
+pub const PromptUnanswered = prompt_mod.Unanswered;
+
+/// 询问用户(有副作用:写 session 记忆 / 落盘)。ctx 非 const,见 prompt.ask 线程契约。
+/// `false` is a person's deny; a `PromptUnanswered` error is a deny nobody gave.
+pub fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool {
+    return prompt_mod.ask(ctx, tool_name, args);
+}
+
+/// A confirmation the `confirm_gate` demanded: the same prompt, but a
+/// remembered "allow always" for the tool does not answer it (a remembered
+/// deny still does). See permission/confirm_gate.zig.
+pub fn promptUserForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) PromptUnanswered!bool {
+    return prompt_mod.askForced(ctx, tool_name, args);
+}
+
+pub const ConfirmGate = @import("permission/confirm_gate.zig").ConfirmGate;
+
+test {
+    _ = &mode_mod;
+    _ = &category_mod;
+    _ = &decision_mod;
+    _ = &rule_mod;
+    _ = &prompt_mod;
+    _ = &@import("permission/bash_readonly.zig");
+    _ = &@import("permission/confirm_gate.zig");
+    _ = &lent_mod;
+}
+
+test "shim checkPermission bypass" {
+    const ctx = PermissionContext{ .mode = .init(.bypass), .allocator = std.testing.allocator };
+    try std.testing.expect(checkPermission(&ctx, "Bash", "rm -rf /") == .allow);
+}
+
+test "shim createContext + check dont_ask" {
+    const ctx = createContext(.dont_ask, std.testing.allocator);
+    try std.testing.expect(checkPermission(&ctx, "Write", "") == .deny);
+    try std.testing.expect(checkPermission(&ctx, "Bash", "{\"command\":\"ls\"}") == .deny);
+}
+
+test "optional decision override is inert by default and receives imported action" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var last_imported: ImportedPermissionDecision = .deny;
+
+        fn decide(
+            _: *anyopaque,
+            _: []const u8,
+            _: []const u8,
+            imported: ImportedPermissionDecision,
+        ) ?PermissionResult {
+            calls += 1;
+            last_imported = imported;
+            return .deny;
+        }
+    };
+    var marker: u8 = 0;
+    var ctx = createContext(.default, std.testing.allocator);
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&ctx, "Read", "{}"));
+    Probe.calls = 0;
+    ctx.decision_override = .{
+        .ctx = &marker,
+        .decideFn = Probe.decide,
+    };
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Read", "{}"));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(ImportedPermissionDecision.undecided, Probe.last_imported);
+}
+
+test "inherited decisions keep the published rule header until the next publication" {
+    var owned = try settings_mod.buildRuleSet(std.testing.allocator, .{ .deny = &.{"Write"} }, .{});
+    defer owned.deinit();
+    var owner_header = owned;
+    var lent: LentPermissions = .{};
+    lent.publish(&owner_header, &.{});
+    var ctx = createContext(.bypass_permissions, std.testing.allocator);
+    ctx.inherited = &lent;
+    const args = "{\"file_path\":\"ordinary.txt\"}";
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Write", args));
+
+    // AgentSession replaces its optional header before publish takes the
+    // lender lock. A decision still observes the last published deny set.
+    owner_header.layers = &.{};
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Write", args));
+    lent.publish(&owner_header, &.{});
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&ctx, "Write", args));
+}
+
+test "PermissionContext.mode 原子跨线程 write-read(无撕裂,release-acquire 可见)" {
+    var ctx = createContext(.default, std.testing.allocator);
+    const Writer = struct {
+        fn run(c: *PermissionContext) void {
+            // 另一线程连写多个 mode(模拟生成期 watcher Shift+Tab)。
+            var i: usize = 0;
+            while (i < 1000) : (i += 1) {
+                c.setMode(.auto);
+                c.setMode(.accept_edits);
+                c.setMode(.default);
+            }
+            c.setMode(.auto); // 末态确定为 auto
+        }
+    };
+    var th = try std.Thread.spawn(.{}, Writer.run, .{&ctx});
+    // 主线程并发读:每次 load 必是合法 enum(无撕裂);不崩。
+    var j: usize = 0;
+    while (j < 1000) : (j += 1) {
+        const m = ctx.modeValue();
+        // 合法枚举值之一(原子读不会读到半更新的垃圾)。
+        try std.testing.expect(m == .auto or m == .accept_edits or m == .default);
+    }
+    th.join();
+    try std.testing.expectEqual(types.PermissionMode.auto, ctx.modeValue()); // 末态可见
+}
+
+test "U4 A2: setMode 有 sink 则 emit mode_changed;无 sink 不 emit" {
+    const ui_event = @import("core/protocol/ui_event.zig");
+    const Recorder = struct {
+        got: ?ui_event.ConfigChange = null,
+        fn emit(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.got = ev;
+        }
+    };
+    var rec = Recorder{};
+    var ctx = PermissionContext{ .allocator = std.testing.allocator };
+    // 无 sink:setMode 不 emit
+    ctx.setMode(.auto);
+    try std.testing.expect(rec.got == null);
+    // 挂 sink:setMode emit mode_changed，值=store 后的 mode
+    ctx.event_sink = .{ .ctx = @ptrCast(&rec), .emitFn = &Recorder.emit };
+    ctx.setMode(.accept_edits);
+    try std.testing.expect(rec.got != null);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, rec.got.?.mode);
+    // 关键:任何直写 ctx.setMode 的路径同样 emit(task#14 的事件源是 setMode 本身,不是调用方)
+    ctx.setMode(.auto);
+    try std.testing.expectEqual(types.PermissionMode.auto, rec.got.?.mode);
+}
+
+test "modeAllowed: disableBypassPermissionsMode / disableAutoMode, aliases, no settings" {
+    const no_rules: []const settings_mod.Rule = &.{};
+    var ctx = PermissionContext{ .allocator = std.testing.allocator };
+    // No settings: nothing is forbidden.
+    inline for (std.meta.fields(types.PermissionMode)) |f| {
+        try std.testing.expect(ctx.modeAllowed(@enumFromInt(f.value)));
+    }
+
+    // A later layer disables bypass, another disables auto: any layer counts.
+    const layers = [_]settings_mod.Layer{
+        .{ .source = .user, .allow = no_rules, .ask = no_rules, .deny = no_rules },
+        .{ .source = .cli, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true },
+    };
+    const bypass_off = settings_mod.MergedSettings{ .layers = &layers, .allocator = std.testing.allocator };
+    ctx.settings = &bypass_off;
+    try std.testing.expect(!ctx.modeAllowed(.bypass_permissions));
+    try std.testing.expect(!ctx.modeAllowed(.bypass)); // historical alias of the same mode
+    try std.testing.expect(ctx.modeAllowed(.auto));
+    try std.testing.expect(ctx.modeAllowed(.default));
+    try std.testing.expect(ctx.modeAllowed(.prompt));
+    try std.testing.expect(ctx.modeAllowed(.accept_edits));
+    try std.testing.expect(ctx.modeAllowed(.dont_ask));
+
+    const auto_layers = [_]settings_mod.Layer{
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_auto_mode = true },
+    };
+    const auto_off = settings_mod.MergedSettings{ .layers = &auto_layers, .allocator = std.testing.allocator };
+    ctx.settings = &auto_off;
+    try std.testing.expect(!ctx.modeAllowed(.auto));
+    try std.testing.expect(ctx.modeAllowed(.bypass_permissions));
+    try std.testing.expect(ctx.modeAllowed(.accept_edits));
+}
+
+test "a scopedDerive override into a disabled mode keeps the settings and decides as default" {
+    const no_rules: []const settings_mod.Rule = &.{};
+    const layers = [_]settings_mod.Layer{
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true },
+    };
+    const bypass_off = settings_mod.MergedSettings{ .layers = &layers, .allocator = std.testing.allocator };
+    var session_ctx = createContext(.default, std.testing.allocator);
+    session_ctx.settings = &bypass_off;
+    const write = "{\"file_path\":\"/proj/a.txt\",\"content\":\"x\"}";
+
+    // An AgentDef/Skill override, or any later store, that the setters never saw.
+    const derived = session_ctx.scopedDerive(.bypass_permissions);
+    try std.testing.expect(derived.settings == session_ctx.settings);
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, derived.modeValue()); // stored as asked
+    try std.testing.expectEqual(types.PermissionMode.default, derived.effectiveMode()); // decided as default
+    try std.testing.expectEqual(PermissionResult.ask, checkPermission(&derived, "Write", write));
+    try std.testing.expectEqual(PermissionResult.ask, checkPermission(&derived, "Bash", "{\"command\":\"npm install\"}"));
+    var stored = createContext(.default, std.testing.allocator);
+    stored.settings = &bypass_off;
+    stored.mode.store(.bypass, .release); // the historical alias, written past every setter
+    try std.testing.expectEqual(PermissionResult.ask, checkPermission(&stored, "Write", write));
+
+    // Twin: no switch → the override is bypass in force.
+    var free_ctx = createContext(.default, std.testing.allocator);
+    const plain_layers = [_]settings_mod.Layer{.{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules }};
+    const plain = settings_mod.MergedSettings{ .layers = &plain_layers, .allocator = std.testing.allocator };
+    free_ctx.settings = &plain;
+    const free_derived = free_ctx.scopedDerive(.bypass_permissions);
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, free_derived.effectiveMode());
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&free_derived, "Write", write));
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&free_derived, "Bash", "{\"command\":\"npm install\"}"));
+}
+
+test "U4 A2: scopedDerive null 掉 sink(scoped 拷贝的 override 绝不 emit 到 session sink)" {
+    const ui_event = @import("core/protocol/ui_event.zig");
+    const Recorder = struct {
+        count: usize = 0,
+        fn emit(ctx: *anyopaque, _: ui_event.ConfigChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var rec = Recorder{};
+    var session_ctx = PermissionContext{ .allocator = std.testing.allocator };
+    session_ctx.event_sink = .{ .ctx = @ptrCast(&rec), .emitFn = &Recorder.emit };
+
+    // scopedDerive:值拷贝 + null sink + 可选 override。
+    var derived = session_ctx.scopedDerive(.bypass_permissions);
+    try std.testing.expect(derived.event_sink == null); // sink 被 null
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, derived.modeValue()); // override 生效
+    // derived.setMode 不 emit 到 session sink（scoped override 不污染 session 事件）
+    derived.setMode(.auto);
+    try std.testing.expectEqual(@as(usize, 0), rec.count);
+    // **task#15 核心:mode 隔离**——derived(后台 subagent/teammate)改 mode 绝不回灌 lead。
+    // scopedDerive 值拷贝 → derived.mode 是独立 atomic,session_ctx.mode 不受影响(仍默认 .prompt)。
+    try std.testing.expectEqual(types.PermissionMode.prompt, session_ctx.modeValue());
+    // 对照:session_ctx.setMode 才 emit
+    session_ctx.setMode(.auto);
+    try std.testing.expectEqual(@as(usize, 1), rec.count);
+    // scopedDerive(null):无 override，保留原 mode，仍 null sink
+    var derived2 = session_ctx.scopedDerive(null);
+    try std.testing.expect(derived2.event_sink == null);
+    try std.testing.expectEqual(session_ctx.modeValue(), derived2.modeValue());
+}

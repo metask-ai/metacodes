@@ -656,12 +656,12 @@ def observe_memory_evidence_governance(repo: Path) -> Observation:
     remain connected while feedback executes.
     """
     source_relatives = {
-        "scoped": "src/kg/scoped_recall.zig",
-        "client": "src/kg/client.zig",
-        "protocol": "src/kg/retrieval_protocol.zig",
-        "system": "src/core/system_prompt.zig",
-        "context": "src/tools/kg_tools.zig",
-        "tools": "src/tools.zig",
+        "scoped": "packages/coding/src/kg/scoped_recall.zig",
+        "client": "packages/coding/src/kg/client.zig",
+        "protocol": "packages/coding/src/kg/retrieval_protocol.zig",
+        "system": "packages/coding/src/core/system_prompt.zig",
+        "context": "packages/coding/src/tools/kg_tools.zig",
+        "tools": "packages/coding/src/tools.zig",
         "test": "apps/cli/tests/component/kg_integration_test.zig",
         "build": "build.zig",
     }
@@ -801,11 +801,11 @@ def observe_memory_evidence_governance(repo: Path) -> Observation:
 def observe_execution_ontology_feedback(repo: Path) -> Observation:
     """Observe execution sensor -> task-close actuator -> focused L2 feedback."""
     source_relatives = {
-        "tool_exec": "src/core/tool_exec.zig",
-        "task_store": "src/core/task_store.zig",
-        "client": "src/kg/client.zig",
-        "ledger": "src/kg/execution_knowledge.zig",
-        "task_tools": "src/tools/task_tools.zig",
+        "tool_exec": "packages/coding/src/core/tool_exec.zig",
+        "task_store": "packages/coding/src/core/task_store.zig",
+        "client": "packages/coding/src/kg/client.zig",
+        "ledger": "packages/coding/src/kg/execution_knowledge.zig",
+        "task_tools": "packages/coding/src/tools/task_tools.zig",
         "test": "apps/cli/tests/component/kg_integration_test.zig",
         "build": "build.zig",
     }
@@ -988,11 +988,11 @@ def observe_execution_ontology_feedback(repo: Path) -> Observation:
 def observe_experience_feedback(repo: Path) -> Observation:
     """Observe prior execution retrieval -> governed pre-work decision feedback."""
     source_relatives = {
-        "experience": "src/kg/experience_packet.zig",
-        "client": "src/kg/client.zig",
-        "retrieval_protocol": "src/kg/retrieval_protocol.zig",
-        "tool_exec": "src/core/tool_exec.zig",
-        "task_protocol": "src/kg/task_protocol.zig",
+        "experience": "packages/coding/src/kg/experience_packet.zig",
+        "client": "packages/coding/src/kg/client.zig",
+        "retrieval_protocol": "packages/coding/src/kg/retrieval_protocol.zig",
+        "tool_exec": "packages/coding/src/core/tool_exec.zig",
+        "task_protocol": "packages/coding/src/kg/task_protocol.zig",
         "test": "apps/cli/tests/component/kg_integration_test.zig",
         "build": "build.zig",
     }
@@ -2057,9 +2057,9 @@ def observe_treatment_activation(repo: Path) -> Observation:
         "multi_invocation_and_compaction_evidence_integrity",
     ]
     relative_sources = {
-        "prompt": "src/kg/task_protocol.zig",
+        "prompt": "packages/coding/src/kg/task_protocol.zig",
         "prompt_test": "apps/cli/tests/component/prompt_tool_coupling_test.zig",
-        "conversation": "src/core/conversation.zig",
+        "conversation": "packages/kernel/src/conversation.zig",
         "microcompact_test": "tests/component/microcompact_test.zig",
         "attester": "scripts/eval/treatment_activation.py",
         "model": "scripts/eval/model.py",
@@ -3910,8 +3910,8 @@ def observe_paid_budget_journal(repo: Path) -> Observation:
 def observe_daemon_transport(repo: Path) -> Observation:
     """Observe authenticated TinyKG daemon routing and its native feedback."""
     source_relatives = {
-        "transport": "src/kg/transport.zig",
-        "client": "src/kg/client.zig",
+        "transport": "packages/coding/src/kg/transport.zig",
+        "client": "packages/coding/src/kg/client.zig",
         "probe": "tests/helpers/kg_daemon_transport_probe.zig",
         "runtime": "scripts/test_kg_daemon_transport.py",
         "build": "build.zig",

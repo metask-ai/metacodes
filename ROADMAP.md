@@ -8,7 +8,7 @@ milestones can be mirrored to GitHub milestones/issues; this file remains the
 source of truth.
 
 Current version: pre-1.0, declared by `build.zig.zon` (code copy in
-`src/version.zig`, agreement enforced by `zig build test`). Repository is
+`packages/base/src/version.zig`, agreement enforced by `zig build test`). Repository is
 pre-publication; see [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
 The table below is the single status ledger; section headings stay stable.
 

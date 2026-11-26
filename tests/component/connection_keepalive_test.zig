@@ -391,10 +391,10 @@ test "L2 #573 ④: a 204 answer is reported at once, not read to the end of a co
 /// ask the server to keep the connection open, or std writes
 /// `connection: close` for it.
 const MODEL_CLIENT_FILES = [_][]const u8{
-    "src/client.zig",
-    "src/api/openai_client.zig",
-    "src/api/gemini_client.zig",
-    "src/api/bedrock_client.zig",
+    "packages/ai/src/client.zig",
+    "packages/ai/src/api/openai_client.zig",
+    "packages/ai/src/api/gemini_client.zig",
+    "packages/ai/src/api/bedrock_client.zig",
 };
 
 /// Occurrences of `needle` outside whole-line comments.

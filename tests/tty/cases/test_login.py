@@ -59,7 +59,7 @@ def test_login_unknown_provider(bin_path):
 _ANSI = re.compile(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[=>78]")
 _CODEX_PARAMS = ("id_token_add_organizations=true", "codex_cli_simplified_flow=true", "originator=metacodes")
 _CODEX_NOTICE = "ChatGPT (Codex): This sign-in is unofficial and may stop working at any time."
-# Every browser sign-in waits on 1455 first, then 1457 (src/core/auth.zig); Codex's
+# Every browser sign-in waits on 1455 first, then 1457 (packages/ai/src/core/auth.zig); Codex's
 # client registered those two only. A sign-in running beside these cases would take
 # the port they assert on, so `run_tty_tests.py --jobs` runs them alone.
 _CALLBACK_PORTS = "the fixed OAuth callback ports 1455 and 1457"
@@ -93,7 +93,7 @@ def _codex_sign_in(bin_path, env=None):
 @runs_alone(_CALLBACK_PORTS)
 def test_login_chatgpt_codex_waits_on_its_registered_port_with_the_codex_parameters(bin_path):
     # The dialog signs in on a worker thread, from the worker's copy of the
-    # profile (src/api/login_worker.zig). A copy that dropped the fields added
+    # profile (packages/ai/src/api/login_worker.zig). A copy that dropped the fields added
     # after it was written sent the browser to port 1456 without the Codex
     # client's parameters, and never said the sign-in is unofficial (#550).
     free = _hold(1455)

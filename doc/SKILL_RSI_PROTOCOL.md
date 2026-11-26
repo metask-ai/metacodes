@@ -5,7 +5,7 @@ candidate-specific ridge router. It is independently switchable from
 [HarnessMM runtime reuse](HARNESSMM_PROTOCOL.md). This protocol covers short
 procedural instructions, not executable `SKILL.md` packages or EDG execution.
 The offline host is `scripts/eval/skill_rsi.py`; the frozen product reader is
-`src/skills/rsi.zig`. Neither feature replaces the AgentLoop or changes tool,
+`packages/coding/src/skills/rsi.zig`. Neither feature replaces the AgentLoop or changes tool,
 permission, sandbox, formal-verdict, TinyKG or artifact authority.
 The design follows the instruction/router branch of
 [HarnessMM](https://arxiv.org/abs/2610.32813), with a native metacodes artifact

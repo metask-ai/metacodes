@@ -16,14 +16,14 @@ make-work list.
 
 | You like… | Start here | Good first contributions |
 |---|---|---|
-| Systems programming in Zig | [doc/CORE_REFERENCE.md](doc/CORE_REFERENCE.md), `src/core/`, `src/tools/` | Tool edge cases, error messages, Windows/Linux portability fixes, allocation audits on hot paths |
+| Systems programming in Zig | [doc/CORE_REFERENCE.md](doc/CORE_REFERENCE.md), `packages/coding/src/core/`, `packages/coding/src/tools/` | Tool edge cases, error messages, Windows/Linux portability fixes, allocation audits on hot paths |
 | Embedding and language bindings | [doc/API.md](doc/API.md), [sdk/README.md](sdk/README.md), [sdk/python](sdk/python/README.md), [sdk/node](sdk/node/README.md) | A Go binding; the Windows port of the Node addon; wrapping Skills, MCP, checkpoints and goals in the Python and Node packages; a 30-line "hello agent" in C |
 | Formal methods and Lean (experimental) | [control-plane/README.md](control-plane/README.md), `control-plane/lean/` | New rule obligations, counterexamples that break an existing rule, proof cleanup |
 | Agent quality and evals | [doc/BENCHMARKS.md](doc/BENCHMARKS.md), [evals/README.md](evals/README.md) | Reproduce a benchmark failure offline, write a zero-cost regression fixture, analyze a Security-subset trajectory |
 | Memory and knowledge graphs | [doc/MEMORY_SYSTEM_DESIGN.md](doc/MEMORY_SYSTEM_DESIGN.md), [doc/TINYKG_INTEGRATION.md](doc/TINYKG_INTEGRATION.md) | Recall quality probes, a Markdown-memory or vector-RAG comparison arm, degraded-mode UX |
-| Models and providers | [doc/PROVIDER_OFFER_ARCHITECTURE.md](doc/PROVIDER_OFFER_ARCHITECTURE.md), `src/api/model_adapter.zig` | A model-family adapter, a local-model (Ollama, llama.cpp, vLLM) recipe, dialect conformance tests |
+| Models and providers | [doc/PROVIDER_OFFER_ARCHITECTURE.md](doc/PROVIDER_OFFER_ARCHITECTURE.md), `packages/ai/src/api/model_adapter.zig` | A model-family adapter, a local-model (Ollama, llama.cpp, vLLM) recipe, dialect conformance tests |
 | Plugins and tools | [doc/PLUGIN_ARCHITECTURE.md](doc/PLUGIN_ARCHITECTURE.md), [doc/PLUGIN_PROCESS_PROTOCOL.md](doc/PLUGIN_PROCESS_PROTOCOL.md) | A process plugin in any language, a plugin template, a sample Skill pack |
-| Sandboxing and security | `src/sandbox/`, `src/permission/`, [SECURITY.md](SECURITY.md) | A Windows sandbox backend, per-host network filtering, protected-path coverage, permission-rule fuzzing |
+| Sandboxing and security | `packages/guard/src/sandbox/`, `packages/guard/src/permission/`, [SECURITY.md](SECURITY.md) | A Windows sandbox backend, per-host network filtering, protected-path coverage, permission-rule fuzzing |
 | Docs and translation | [doc/README.md](doc/README.md) | Tutorials, diagrams, keeping [README.zh-CN.md](README.zh-CN.md) and the English README in step |
 
 Issues labelled

@@ -6,7 +6,7 @@ handler installed without SA_RESTART. Unlike SIG_IGN, a handler gets the signal
 delivered, so a SIGPIPE (on macOS a write to a closed socket signals the whole
 process) turns any thread's blocked recv/poll/accept/waitpid into EINTR.
 ``threadedIo`` keeps SIGPIPE ignored where the process asked for that (see
-src/platform/signal.zig); one direct ``init`` call is enough to undo it.
+packages/base/src/platform/signal.zig); one direct ``init`` call is enough to undo it.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 # The wrapper itself, plus its control tests that show what std does alone.
-ALLOWED = {Path("src/platform/signal.zig")}
+ALLOWED = {Path("packages/base/src/platform/signal.zig")}
 # Third-party trees are not ours to change.
 THIRD_PARTY_DIRS = {"deps", "vendor", "node_modules"}
 # Tool and build output. The scan must not even list these directories: the
@@ -95,7 +95,7 @@ class IoThreadedDisciplineTest(unittest.TestCase):
             violations(ROOT),
             [],
             "create std.Io.Threaded with @import(\"platform\").signal.threadedIo "
-            "(see src/platform/signal.zig)",
+            "(see packages/base/src/platform/signal.zig)",
         )
 
     def test_scanner_reports_direct_and_aliased_calls_but_not_comments(self):

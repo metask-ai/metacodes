@@ -49,9 +49,9 @@ network policies; a domain list is not a working allowlist on both platforms.
 
 ## Native filesystem operations
 
-`src/sandbox/filesystem.zig` routes enabled native file access through
+`packages/coding/src/sandbox/filesystem.zig` routes enabled native file access through
 `metacodes-fs-helper`. The helper is built from
-`src/sandbox_helper_root.zig` and installed in `bin/` for both the CLI and the
+`packages/guard/src/sandbox_helper_root.zig` and installed in `bin/` for both the CLI and the
 AgentCore bundle. Build it with `zig build sandbox:helper`.
 
 The helper opens the target and, for Write, creates missing parent directories
@@ -78,7 +78,7 @@ policy. The policy is assembled by the controller before launching the helper.
 
 ## External harness workers
 
-`src/sandbox/worker.zig` prepares a whole-process launch for arbitrary argv.
+`packages/guard/src/sandbox/worker.zig` prepares a whole-process launch for arbitrary argv.
 The Claude Code seat driver uses it for `--version`, `--help` and the actual
 worker invocation. Each argument is quoted independently, and the enabled
 sandbox must produce a confined launch. A missing or unusable backend stops

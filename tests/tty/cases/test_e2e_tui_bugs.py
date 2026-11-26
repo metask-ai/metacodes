@@ -136,7 +136,7 @@ def test_e2e_bug4_auto_background_neutral_icon(bin_path):
 # #6 用的 prompt:启动后台 Explore subagent,做多个工具调用(数 .zig + 读一个),TaskOutput 轮询。
 _BUG6_PROMPT = (
     "Launch a background subagent (run_in_background) using the Task tool with subagent_type "
-    "Explore to do these steps: first list the .zig files under src/core, then read one of them. "
+    "Explore to do these steps: first list the .zig files under packages/coding/src/core, then read one of them. "
     "After launching, keep checking its progress with TaskOutput."
 )
 
@@ -187,7 +187,7 @@ def test_e2e_bug8_task_start_card_visible(bin_path):
         raw, home, uses = run_e2e_tool(
             bin_path,
             "Use the Task tool to launch a general-purpose subagent that counts "
-            "the .zig files under src/core.",
+            "the .zig files under packages/coding/src/core.",
             "Task", required_keys=[], wait_s=22,
         )
         if not any_tool_called(uses, ["Task", "Agent"]):

@@ -2,7 +2,7 @@
 
 Status: implemented 2026-10-25 (§12 records the decisions). Code:
 `apps/cli/src/app/update.zig`, `apps/cli/src/app/release_fetch.zig`, `apps/cli/src/app/unit_archive.zig`,
-`apps/cli/src/app/release_source.zig`, `src/platform/process_scan.zig`. Builds on [INSTALL_DESIGN.md](INSTALL_DESIGN.md) §4 (the installer
+`apps/cli/src/app/release_source.zig`, `packages/base/src/platform/process_scan.zig`. Builds on [INSTALL_DESIGN.md](INSTALL_DESIGN.md) §4 (the installer
 and `install.sh`) and [RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md)
 (what a published release contains).
 
@@ -382,8 +382,8 @@ inode, but it reaches the runtime assets again by path:
 | Asset | When it is checked | An old session after the swap |
 |---|---|---|
 | `bin/metacodes` | — | keeps running the old image |
-| formal kernel | hashed against the compiled pin on **every** invocation (`src/formal/runtime.zig:324`) | next formal check fails closed: `checker_hash_mismatch` |
-| project kernel | hashed on every invocation; an active rule bundle re-attests it **every turn** (`src/core/project_rule_bundle.zig:489`) | the next turn is refused: "The project rules refused to start this turn" (`apps/cli/src/repl/loop.zig:985`) |
+| formal kernel | hashed against the compiled pin on **every** invocation (`packages/guard/src/formal/runtime.zig:324`) | next formal check fails closed: `checker_hash_mismatch` |
+| project kernel | hashed on every invocation; an active rule bundle re-attests it **every turn** (`packages/coding/src/core/project_rule_bundle.zig:489`) | the next turn is refused: "The project rules refused to start this turn" (`apps/cli/src/repl/loop.zig:985`) |
 | tinykg CLI, rg | path resolved once, not hash-checked | silently runs the new binary |
 | kgd + tinykgd | hashed once, at service start | keeps serving the old binaries |
 
@@ -395,7 +395,7 @@ has them open.
 
 ### 6.2 Policy
 
-- **Scan.** `src/platform/process_scan.zig` lists processes whose physical
+- **Scan.** `packages/base/src/platform/process_scan.zig` lists processes whose physical
   executable is under `<prefix>/`, each with its parent pid:
 
   | Platform | Process list | Executable path | Parent pid |
@@ -420,7 +420,7 @@ has them open.
 - **The TinyKG service:** stop it, then wait up to 10 s for both of its
   processes to exit, and refuse if either is still alive.
   - POSIX: SIGTERM to the kgd process. Its supervisor handles that by taking
-    tinykgd down cleanly (`src/kg/kgd/runtime.zig:177-180`).
+    tinykgd down cleanly (`packages/coding/src/kg/kgd/runtime.zig:177-180`).
   - Windows: kgd runs windowless, so no console control event reaches it.
     It is ended with `TerminateProcess`, and tinykgd follows on its own when
     its stdin closes. That the real tinykgd exits on stdin EOF was observed on
@@ -445,7 +445,7 @@ has them open.
 
 A session trusts the service whose `expected_build_id` sits in
 `<state>/kg/daemon.json`. The id is a hash over the tinykg and tinykgd
-binaries, among other inputs (`src/kg/kgd/identity.zig`). The installer never
+binaries, among other inputs (`packages/coding/src/kg/kgd/identity.zig`). The installer never
 rewrites it.
 
 Once a release changes the TinyKG bundle, the restarted service reports a new
@@ -550,7 +550,7 @@ under the lock.
 | `apps/cli/src/app/update.zig` | options, `planRelease`, `planCheckout`, orchestration. The prefix is injected, so tests need no installed executable |
 | `apps/cli/src/app/release_fetch.zig` | the curl invocations (latest tag, SHA256SUMS, archives) with their policy, the exit-code mapping, SHA256SUMS parsing and asset selection |
 | `apps/cli/src/app/unit_archive.zig` | the restricted tar.gz and zip extractor |
-| `src/platform/process_scan.zig` | the scan from §6.2 on macOS, Linux and Windows, and the stop from §6.2 |
+| `packages/base/src/platform/process_scan.zig` | the scan from §6.2 on macOS, Linux and Windows, and the stop from §6.2 |
 | `apps/cli/src/app/install.zig` | `update_source` with `--release-base` and `--checkout`; make `isOlder`, the manifest readers and the `intact` measurement public |
 | `apps/cli/src/main.zig` | the subcommand, its usage text and error hints, and the new install options |
 | `scripts/install.sh`, `scripts/install.ps1` | pass `--release-base`, `--checkout` and `-ReleaseBase` to units that know them |

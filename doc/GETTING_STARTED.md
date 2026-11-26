@@ -130,7 +130,7 @@ Each built-in vendor reads its key from its own variable — `DEEPSEEK_API_KEY`,
 or `KIMI_API_KEY` (the Kimi Code subscription, `kimi-code`),
 `DASHSCOPE_API_KEY`, `MINIMAX_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock
 API key) — and its integration notes (endpoints, thinking parameters, known
-differences, sources) are the header of `src/api/dialects/<vendor>.zig`.
+differences, sources) are the header of `packages/ai/src/api/dialects/<vendor>.zig`.
 `KIMI_API_KEY` belongs to Kimi Code: the open-platform profile reads
 `MOONSHOT_API_KEY` only.
 

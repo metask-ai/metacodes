@@ -208,7 +208,7 @@ def test_e2e_task_subagent(bin_path):
     import shutil as _shutil
 
     prompt = ("Launch a background subagent with the Task tool (run_in_background true, "
-              "subagent_type Explore) to count the .zig files under src/core. Then poll with "
+              "subagent_type Explore) to count the .zig files under packages/coding/src/core. Then poll with "
               "TaskOutput until it finishes and report the count.")
     last_done = None
     homes = []
@@ -268,7 +268,7 @@ def test_e2e_agent_tree_onscreen(bin_path):
     import shutil as _shutil
 
     prompt = ("Launch a background subagent with the Task tool (run_in_background true, "
-              "subagent_type Explore) to count the .zig files under src/core. Then poll with "
+              "subagent_type Explore) to count the .zig files under packages/coding/src/core. Then poll with "
               "TaskOutput until it finishes and report the count.")
     homes = []
     last_diag = "?"

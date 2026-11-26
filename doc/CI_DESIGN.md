@@ -333,7 +333,7 @@ The rules that keep the split from dropping coverage:
   `product` and `checks` legs set `METACODES_TEST_IDS_DIR` before their
   suites. Every Zig test binary records the tests it runs: the sharded
   suites through `scripts/sharded_test_runner.zig`, all the others, and the
-  native `zig test src/platform/platform.zig` step, through
+  native `zig test packages/base/src/platform/platform.zig` step, through
   `scripts/recording_test_runner.zig`, which speaks the build runner's
   protocol as Zig's default runner does, so `--test-timeout` still applies.
   `METACODES_TEST_ROOT` tells both where the binary's root file lives, so a

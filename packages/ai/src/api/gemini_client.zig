@@ -1,0 +1,1794 @@
+//! GeminiClient:讲 Google Gemini generateContent 协议的 Provider 实现(多 Provider 重构 C3)。
+//!
+//! 证明点:这是**第三个**真 provider——它验证缓存扩展点的"有状态对象"范式(区别于 Anthropic 显式
+//! 断点、OpenAI 全自动前缀)。同一个 agent_loop / Conversation / 中立 IR / provider.zig 一行不改跑通。
+//!
+//! 协议差异(本文件锁住的脏活,与 Anthropic/OpenAI 都不同):
+//!   - URL:{base}/v1beta/models/{model}:streamGenerateContent?alt=sse
+//!   - 认证:x-goog-api-key header(非 Authorization)
+//!   - 请求 body:{systemInstruction:{parts}, contents:[{role:user|model, parts:[{text}|{functionCall}
+//!     |{functionResponse}]}], tools:[{function_declarations:[...]}], cachedContent:"<name>"?}
+//!   - 角色:assistant→"model"(非 "assistant");tool_result→ user 角色的 functionResponse part
+//!   - SSE:data: {candidates:[{content:{parts:[{text}|{functionCall:{name,args}}]}, finishReason}],
+//!     usageMetadata:{promptTokenCount,candidatesTokenCount,cachedContentTokenCount}}
+//!
+//! **缓存范式 = 有状态对象(stateful_object)**:Gemini 显式缓存是 createCachedContent 建一个有
+//! `name` 句柄、有 TTL、会 404 过期的远程对象。本 client 持一张 {prefix_hash → CacheEntry} 句柄表,
+//! prepareCache 时查表:命中且未过期 → 请求带 cachedContent 引用;未命中/过期 → (MVP)走隐式缓存
+//! (不主动 createCachedContent,留扩展点)。这张表是 GeminiClient **私有**,不上浮中立契约。
+//!
+//! **诚实登记——以下未做(文件头,别假装支持)**:
+//!   - **显式 createCachedContent**:MVP 只实现句柄表机制 + 隐式缓存读命中(cachedContentTokenCount)。
+//!     主动建缓存对象(POST cachedContents)+ 404 重建留 hook(prepareCacheExplicit 签名留,不实现)。
+//!   - **并行 functionCall(P0.1 已实现)**:一个 chunk 的 parts 多个 functionCall 全部 emit
+//!     (首个返回、其余排队 drain);functionResponse.name 按 tool_use_id 从全量消息找回真实工具名
+//!     配对(Gemini 靠 name 配对)。见 parseChunk functionCall 循环 / serializeGeminiContent。
+//!   - **非流式 / thinking(thought parts)**:未做。(建连重试已做,issue #434:pSendStreamRetry
+//!     跑与 Anthropic 同一个 `client_mod.ConnectRetryFor`;非 200 按同一张 HTTP 分类表出错名;
+//!     等响应头时被取消是 error.Aborted。)(多模态 inline_data 的
+//!     图像**输入**已做——user 消息 image block 经 GeminiDialect.serializeImagePart 发
+//!     inline_data part,issue #10;图像 **tool_result**(Read 工具)也已做——Gemini 3 系发
+//!     官方 multimodal functionResponse,旧世代发同级 inline_data part,见
+//!     serializeGeminiContent;图像输出/其它媒体仍未做。)
+//!   - **max_tokens/context_window**:output 保持原生 8192 默认(序列化器不发送 max_output_tokens,所以不接 `--max-tokens` override);context window 按 ModelContext 解析,未命中以 1M 兜底。
+//!
+//! 取舍登记:keep_alive=false(每请求新连接)——牺牲真后端连接池(省 TLS 握手)换稳定性;
+//! 流式请求被长流独占,池化收益本就小,且当前 per-job client 用法几乎不复用连接。
+
+const std = @import("std");
+const http = std.http;
+const connection_gate = @import("connection_gate.zig");
+const ResponseStatus = @import("http_status.zig").ResponseStatus;
+const http_status = @import("http_status.zig");
+const http_connection = @import("http_connection.zig");
+const no_redirects = http_status.no_redirects;
+const log = @import("metacodes-base").util.log;
+const types = @import("../types.zig");
+const json_mod = @import("../json.zig");
+const util_json = @import("metacodes-base").util.json;
+const api_stream = @import("stream.zig");
+const provider_mod = @import("provider.zig");
+const client_mod = @import("../client.zig");
+const model_error = @import("model_error.zig");
+const liveness_reader = @import("liveness_reader.zig");
+const capability = @import("capability.zig");
+const cache = @import("cache.zig");
+const request_overrides = @import("request_overrides.zig");
+const dialect_mod = @import("dialect.zig");
+const catalog_mod = @import("catalog.zig");
+const image_capability = @import("image_capability.zig");
+const gemini_signatures = @import("gemini_signatures.zig");
+const credential_mod = @import("credential_cell.zig");
+const error_class = @import("error_class.zig");
+const secure = @import("metacodes-base").util.secure;
+const AbortSignal = @import("metacodes-base").util.abort.AbortSignal;
+const model_context_mod = @import("model_context.zig");
+
+const StreamEvent = api_stream.StreamEvent;
+const StreamHandle = api_stream.StreamHandle;
+const StopReason = api_stream.StopReason;
+const UsageDelta = api_stream.UsageDelta;
+
+/// 默认 Gemini 端点基址(不含 model + :streamGenerateContent,doStream 拼)。
+pub const DEFAULT_GEMINI_BASE = "https://generativelanguage.googleapis.com";
+
+/// 有状态缓存句柄表的一项:prefix 哈希 → 远程 cache 对象名 + 过期时刻。
+/// **Gemini 缓存范式的核心**:与 Anthropic/OpenAI 的"无状态前缀哈希"不同,Gemini 显式缓存是
+/// 远程对象,客户端必须持句柄并管理生命周期。
+/// **时钟语义**:expire_mono_ms 是**单调时钟毫秒**(util/time.nowMs 同源),非 wall-clock epoch。
+/// TTL 当作 duration 用:registerCache 时传 `nowMonoMs() + ttl_ms`。单调时钟做 TTL 更稳(不受系统
+/// 改时间影响)。**切勿传 std.time.timestamp()(wall epoch≈1.7e9)→ 与单调 now 比永不过期 = bug**。
+pub const CacheEntry = struct {
+    prefix_hash: u64,
+    cache_name: []const u8, // "cachedContents/abc123";owned
+    expire_mono_ms: i64, // 过期时刻(单调时钟毫秒);<=now 视为过期,需重建
+};
+
+/// 合成 functionCall id 的进程级单调序号(Gemini 不回传 tool id)。
+/// dispatch_id 要求会话内全局唯一;u64 不 wrap,原子递增线程安全。
+var g_call_serial = std.atomic.Value(u64).init(1);
+
+pub const GeminiClient = struct {
+    allocator: std.mem.Allocator,
+    /// Read when each request's header is built (see `client_mod.Client.credential`).
+    credential: credential_mod.Credential,
+    base_url: []const u8, // 基址(可指向 MockServer);doStream 拼 model + :streamGenerateContent
+    model: []const u8,
+    http_client: http.Client,
+    abort_registry: provider_mod.RequestAbortRegistry = .{},
+    /// 收头阶段空闲上限,见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS;init 时从 env 取,测试可直接改字段。
+    stream_idle_timeout_ms: u64 = client_mod.DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    /// 正文阶段空闲上限的平覆盖;null = 按 max_tokens 自动(client.zig bodyIdleLimitMs)。
+    stream_body_idle_timeout_ms: ?u64 = null,
+    max_tokens: u32 = 8192,
+    model_context: ?*const model_context_mod.ModelContext = null,
+    context_window: u32 = 1_048_576, // Gemini 1.5/2.x 默认 1M(保守;未按 model 区分)
+    /// thinking 控制(effort 档位)。null = 自适应(Gemini 2.5 默认开 thinking,无需显式)。
+    /// 非null → serializeGeminiRequest 经 GeminiDialect.serializeThinking 翻成
+    /// generation_config.thinking_level(low/high)。
+    reasoning_effort: ?types.ReasoningEffort = null,
+    /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
+    overrides: request_overrides.RequestOverrides = .{},
+    dialect_resolver: dialect_mod.Resolver = .{},
+    /// The dialect the route declares (`ModelOffer.dialect`): the bound model's
+    /// entry declaration applies to `model` only, the route's to any model a
+    /// request names. Empty infers it from the model name. Set with the route,
+    /// like `auth_scheme`.
+    declared_dialect: dialect_mod.DialectDeclaration = .{},
+    /// The provider's model catalog, when the caller has one (owned). Its
+    /// image_input declarations override the family table (issue #273).
+    catalog: ?catalog_mod.Catalog = null,
+    /// Host declarations about models' image input; they outrank the catalog
+    /// (issue #273). Owned; empty by default.
+    host_capabilities: image_capability.Declarations = .{},
+
+    /// Thought signatures of the function calls this client received, by the
+    /// ids it minted for them; each goes back into the part it came from
+    /// (`gemini_signatures.zig`).
+    thought_signatures: gemini_signatures.Store,
+
+    /// 有状态缓存句柄表(GeminiClient 私有,不上浮中立契约)。
+    /// prepareCache 据 system+tools 的 prefix 哈希查表命中则引用,未命中/过期则(MVP)走隐式。
+    cache_table: std.ArrayList(CacheEntry) = .empty,
+    /// Numbers the last head-phase overflow body carried (cleared on the next
+    /// accepted response), for the agent loop's context recovery.
+    last_context_window_numbers: error_class.ContextWindowNumbers = .{},
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) GeminiClient {
+        return .{
+            .allocator = allocator,
+            .credential = .{ .fixed = api_key },
+            .base_url = base_url orelse DEFAULT_GEMINI_BASE,
+            .model = model,
+            .http_client = http.Client{ .allocator = allocator, .io = io },
+            .stream_idle_timeout_ms = client_mod.streamIdleTimeoutMsFromEnv(),
+            .stream_body_idle_timeout_ms = client_mod.streamBodyIdleTimeoutMsFromEnv(),
+            .thought_signatures = gemini_signatures.Store.init(allocator),
+        };
+    }
+    pub fn deinit(self: *GeminiClient) void {
+        self.abort_registry.deinit(self.allocator);
+        self.thought_signatures.deinit();
+        for (self.cache_table.items) |e| self.allocator.free(e.cache_name);
+        self.cache_table.deinit(self.allocator);
+        self.http_client.deinit();
+        if (self.catalog) |*catalog| catalog.deinit();
+        self.host_capabilities.deinit();
+    }
+
+    // ── 有状态缓存查表(Gemini 范式核心)──────────────────────────────────────
+    /// 据 prefix 哈希查句柄表:命中且未过期 → 返回 cache_name(请求带 cachedContent 引用);
+    /// 未命中/过期 → 返回 null(MVP 走隐式缓存,不主动建对象)。过期项原地剔除(模拟 404 失效处理)。
+    /// now_mono_ms:单调时钟毫秒(nowMonoMs())。
+    pub fn lookupCache(self: *GeminiClient, prefix_hash: u64, now_mono_ms: i64) ?[]const u8 {
+        var i: usize = 0;
+        while (i < self.cache_table.items.len) {
+            const e = self.cache_table.items[i];
+            if (e.prefix_hash == prefix_hash) {
+                if (e.expire_mono_ms > now_mono_ms) return e.cache_name;
+                // 过期:剔除句柄(对齐 Gemini 404 CachedContent not found → 删本地引用)。
+                self.allocator.free(e.cache_name);
+                _ = self.cache_table.swapRemove(i);
+                return null;
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    /// 注册一个缓存句柄(模拟 createCachedContent 成功后存句柄;真显式缓存的写侧扩展点)。
+    /// MVP 不在 doStream 里自动调用——留给"显式 createCachedContent"扩展(诚实登记未做)。
+    /// expire_mono_ms:单调时钟毫秒过期时刻,传 `nowMonoMs() + ttl_ms`(切勿传 wall epoch)。
+    pub fn registerCache(self: *GeminiClient, prefix_hash: u64, cache_name: []const u8, expire_mono_ms: i64) !void {
+        const owned = try self.allocator.dupe(u8, cache_name);
+        errdefer self.allocator.free(owned);
+        try self.cache_table.append(self.allocator, .{
+            .prefix_hash = prefix_hash,
+            .cache_name = owned,
+            .expire_mono_ms = expire_mono_ms,
+        });
+    }
+
+    // ── Provider vtable ──────────────────────────────────────────────────────
+    pub fn provider(self: *GeminiClient) provider_mod.Provider {
+        return .{
+            .ctx = @ptrCast(self),
+            .modelFn = &pModel,
+            .sendStreamFn = &pSendStream,
+            .sendStreamRetryFn = &pSendStreamRetry,
+            .sendFn = &pSend,
+            .cancelFn = &pCancel,
+            .maxTokensFn = &pMaxTokens,
+            .maxInputTokensFn = &pMaxInputTokens,
+            .maxTokensForFn = &pMaxTokensFor,
+            .maxInputTokensForFn = &pMaxInputTokensFor,
+            .reasoningEffortFn = &pReasoningEffort,
+            .requestOverridesFn = &pRequestOverrides,
+            .setRequestOverridesFn = &pSetRequestOverrides,
+            .supportsFn = &pSupports,
+            .supportsForModelFn = &pSupportsForModel,
+            .imageInputFn = &pImageInput,
+            .visionModelsFn = &pVisionModels,
+            .routeFn = &pRoute,
+            .lastContextWindowNumbersFn = &pLastContextWindowNumbers,
+            .endpointIdFn = &pEndpointId,
+        };
+    }
+    fn pLastContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {
+        return cast(ctx).last_context_window_numbers;
+    }
+    fn pEndpointId(ctx: *anyopaque) []const u8 {
+        return cast(ctx).base_url;
+    }
+    inline fn cast(ctx: *anyopaque) *GeminiClient {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn pModel(ctx: *anyopaque) []const u8 {
+        return cast(ctx).model;
+    }
+    fn pRoute(ctx: *anyopaque) ?provider_mod.ProviderRoute {
+        const self = cast(ctx);
+        return .{
+            .kind = .gemini,
+            .base_url = self.base_url,
+            .model = self.model,
+            // A replaceable credential is never lent: no delegable route.
+            .credential = self.credential.lendable() orelse return null,
+        };
+    }
+    /// Provider.requestOverrides() 返回 Client.overrides;镜像 reasoning_effort 兜底。
+    fn pRequestOverrides(ctx: *anyopaque) request_overrides.RequestOverrides {
+        const self = cast(ctx);
+        var o = self.overrides;
+        if (o.reasoning_effort == null) o.reasoning_effort = self.reasoning_effort;
+        return o;
+    }
+    fn pSetRequestOverrides(ctx: *anyopaque, o: request_overrides.RequestOverrides) void {
+        cast(ctx).overrides = o;
+        if (o.reasoning_effort) |e| cast(ctx).reasoning_effort = e;
+    }
+    fn pMaxTokens(ctx: *anyopaque) u32 {
+        const self = cast(ctx);
+        return pMaxTokensFor(ctx, self.model);
+    }
+    fn pMaxInputTokens(ctx: *anyopaque) u32 {
+        const self = cast(ctx);
+        return pMaxInputTokensFor(ctx, self.model);
+    }
+    fn pMaxTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        const self = cast(ctx);
+        _ = model; // Gemini does not serialize max_output_tokens; an override would desync local budgeting.
+        return self.max_tokens;
+    }
+    fn pMaxInputTokensFor(ctx: *anyopaque, model: []const u8) u32 {
+        const self = cast(ctx);
+        if (self.model_context) |mc| if (mc.windowFor(model)) |w| return w;
+        return self.context_window;
+    }
+    fn pReasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+    fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
+        return cast(ctx).supportsForModel(cap, cast(ctx).model);
+    }
+    fn pSupportsForModel(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
+        return cast(ctx).supportsForModel(cap, model);
+    }
+    fn pImageInput(ctx: *anyopaque, model: []const u8) image_capability.Resolution {
+        const profile = cast(ctx).dialectFor(model).profileFor(.gemini, model);
+        return .{ .supported = profile.supports_image_input, .source = profile.image_input_source };
+    }
+    fn pVisionModels(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const []const u8 {
+        const catalog = &(cast(ctx).catalog orelse return try allocator.alloc([]const u8, 0));
+        return catalog.visionModels(allocator);
+    }
+
+    /// The dialect for `model` with the Host's or the catalog's image_input
+    /// declaration applied (Host first) - the one profile the serializer's
+    /// gate and every capability query read, as in the Anthropic client.
+    pub fn dialectFor(self: *const GeminiClient, model: []const u8) dialect_mod.Dialect {
+        var dialect = self.dialect_resolver.resolve(.gemini, self.declared_dialect.vendorFor(self.model, model), model);
+        const from_catalog: ?bool = if (self.catalog) |*catalog| catalog.imageInputFor(model) else null;
+        dialect.declareImageInput(self.host_capabilities.imageInputFor(model), from_catalog);
+        return dialect;
+    }
+
+    pub fn supportsForModel(self: *const GeminiClient, cap: provider_mod.Capability, model: []const u8) bool {
+        return switch (cap) {
+            .image_input => self.dialectFor(model).profileFor(.gemini, model).supports_image_input,
+            else => capability.supports(.gemini, model, cap),
+        };
+    }
+    fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
+        _ = ctx;
+        _ = messages;
+        _ = system;
+        _ = tools;
+        _ = model_override;
+        return error.NotImplemented; // 非流式未实现(compact 退 keep-recent)
+    }
+    fn pCancel(ctx: *anyopaque, signal: *const AbortSignal) void {
+        cast(ctx).abort_registry.cancel(signal);
+    }
+    fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?provider_mod.RetryReporter, user_query: []const u8) anyerror!StreamHandle {
+        _ = user_query;
+        // The Messages client's connect retry (issue #434): the request is
+        // serialized once, so every attempt sends the same bytes to the same
+        // model's URL.
+        var retry = ConnectRetry.init(max_retries, retry_base_ms, reporter, abort);
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, &retry);
+    }
+    fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!StreamHandle {
+        _ = user_query;
+        return cast(ctx).sendStreamWith(messages, system, tools, abort, model_override, tool_choice, null);
+    }
+
+    const ConnectRetry = client_mod.ConnectRetryFor("gemini");
+
+    /// Serializes the request once and sends it: one attempt when `retry` is
+    /// null, else as many as `retry` allows.
+    fn sendStreamWith(self: *GeminiClient, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, retry: ?*ConnectRetry) anyerror!StreamHandle {
+        const model = model_override orelse self.model;
+        // prepareCache(写侧):查句柄表,命中未过期则请求带 cachedContent 引用。
+        // 哈希 key 含 model:Gemini 缓存对象 model-specific,不含 model 会让 model_override 路径
+        // 误命中别的 model 的句柄 → 发 400/404(C 修复)。
+        const prefix_hash = hashPrefix(model, system, tools);
+        const cached_ref = self.lookupCache(prefix_hash, nowMonoMs());
+        var overrides = self.overrides;
+        if (overrides.reasoning_effort == null) overrides.reasoning_effort = self.reasoning_effort;
+        overrides.tool_choice = tool_choice;
+        const dialect = self.dialectFor(model);
+        // 图像 tool_result 定案(原生块 / 占位)由序列化器实际报告,随流句柄回传。
+        var report = json_mod.SerializationReport{};
+        defer report.deinit(self.allocator);
+        const body = try serializeGeminiRequestSigned(
+            self.allocator,
+            messages,
+            system,
+            tools,
+            cached_ref,
+            model,
+            overrides,
+            dialect,
+            &report,
+            &self.thought_signatures,
+        );
+        defer self.allocator.free(body);
+        // Owned here until a stream takes it: every failed attempt leaves it
+        // for the next one.
+        const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(placeholder_ids);
+        while (true) {
+            var retry_hint = client_mod.RetryHint{};
+            if (self.doStream(model, body, abort, placeholder_ids, &retry_hint)) |handle| {
+                return handle;
+            } else |err| {
+                const policy = retry orelse return err;
+                try policy.afterFailure(err, retry_hint.delay_ms);
+            }
+        }
+    }
+
+    /// 发 HTTP POST + 包成中立 StreamHandle。URL 拼 model + :streamGenerateContent?alt=sse。
+    /// `image_placeholder_ids` 成功后归 GeminiStream;失败时仍归调用方(下一次尝试还要用)。
+    fn doStream(self: *GeminiClient, model: []const u8, body: []const u8, abort: ?*const AbortSignal, image_placeholder_ids: []const []const u8, retry_hint: *client_mod.RetryHint) !StreamHandle {
+        const rid = log.genRequestId();
+        // {base}/v1beta/models/{model}:streamGenerateContent?alt=sse
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/v1beta/models/{s}:streamGenerateContent?alt=sse", .{ self.base_url, model });
+        defer self.allocator.free(url);
+        log.infoId("gemini", rid, "POST {s} body_bytes={d} cache_mode={s}", .{ url, body.len, cache.modeFor(.gemini).label() });
+        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+
+        const req_ptr = try self.allocator.create(http.Client.Request);
+        errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径都靠它(不手动 destroy,否则 double-free)
+        var connection_lease = try connection_gate.acquire(abort);
+        defer connection_lease.release();
+        // This request's own copy of the key, read with the connection slot
+        // held, right before the request opens (see client_mod.Client.doRequest),
+        // and erased once the request is set up.
+        const auth = self.credential.header(self.allocator, .{ .api_key_header = "x-goog-api-key" }) catch |err| {
+            log.errId("gemini", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return credential_mod.requestError(err);
+        };
+        defer secure.free(self.allocator, auth.value);
+        req_ptr.* = self.http_client.request(.POST, uri, .{
+            // 每请求独立连接:不复用 pooled 连接，避免"干净 EOF→连接入池→复用已弃连接
+            // →HttpConnectionClosing"；process-wide connection_gate 负责限制握手洪峰。
+            .keep_alive = false,
+            // The key rides in a header; a 3xx is reported, not followed.
+            .redirect_behavior = no_redirects,
+            // The body is read raw (`response.reader`), so ask for it
+            // uncompressed: std's default offers gzip, and a server that
+            // takes the offer (DeepSeek, #467) sends bytes the SSE parser
+            // cannot read.
+            .headers = .{ .accept_encoding = .omit },
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = auth.name, .value = auth.value },
+            },
+        }) catch |err| {
+            // errdefer destroy(req_ptr);req_ptr.* 未初始化, 无需 deinit
+            return client_mod.requestSetupFailure("gemini", rid, err);
+        };
+        // Ask the server to keep the connection open; `keep_alive = false`
+        // still closes it once the answer is read (#573).
+        http_connection.keepServerOpen(req_ptr);
+        var registered = false;
+        errdefer {
+            if (registered) self.abort_registry.unregister(req_ptr);
+            req_ptr.deinit();
+        }
+        // 总是登记:abort 路由(有 signal 时)+ 空闲监视(见 client.zig DEFAULT_STREAM_IDLE_TIMEOUT_MS)。
+        try self.abort_registry.registerMonitored(
+            self.allocator,
+            abort,
+            req_ptr,
+            shutdownRequest,
+            self.stream_idle_timeout_ms,
+        );
+        registered = true;
+        req_ptr.transfer_encoding = .{ .content_length = body.len };
+        http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
+            // 取消优先于传输层错误分类:cancel 关闭了 socket,写才失败的。
+            if (client_mod.cancelled(abort)) return error.Aborted;
+            return client_mod.requestTransportFailure("gemini", rid, "sendBody", err);
+        };
+        const response = http_connection.receiveHead(req_ptr, &.{}) catch |err| {
+            // 等响应头时被取消:cancel 关闭了 socket,不是网络故障(issue #434)。
+            if (client_mod.cancelled(abort)) {
+                log.warnId("gemini", rid, "receiveHead failed after cancel ({s}) → Aborted", .{@errorName(err)});
+                return error.Aborted;
+            }
+            if (self.abort_registry.stalled(req_ptr)) |stall| {
+                client_mod.reportHeadStall("gemini", rid, stall);
+                return error.TransientNetwork;
+            }
+            return client_mod.requestTransportFailure("gemini", rid, "receiveHead", err);
+        };
+        const status = ResponseStatus.capture(&response);
+        client_mod.noteResponseHead(status.code, response.head, auth.value);
+        connection_lease.release();
+        if (!status.isOk()) {
+            // Read from the head before the body read below reuses its bytes.
+            retry_hint.delay_ms = client_mod.retryAfterFromHead(response.head);
+            var location_buf: [http_status.REDIRECT_LOCATION_BYTES]u8 = undefined;
+            if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
+                client_mod.reportRedirect("gemini", rid, status, location, auth.value);
+                self.last_context_window_numbers = .{};
+                return error.HttpError;
+            }
+            var err_body: [4096]u8 = undefined;
+            const preview = client_mod.readErrorBody(req_ptr, response.head, &err_body);
+            client_mod.reportHttpFailure("gemini", rid, status, preview, err_body.len, auth.value);
+            // The Messages client's classification (issue #434): 429 and 5xx are
+            // retried, an overflow is ContextWindowExceeded with its numbers kept.
+            // Gemini has no token refresh, so a token_expired 401 stays Unauthorized.
+            var info = client_mod.errorBodyInfo(status.code, preview);
+            info.token_expired = false;
+            self.last_context_window_numbers = info.context_window_numbers;
+            return client_mod.httpFailureError(status.code, info);
+        }
+        client_mod.noteRequestAccepted();
+        self.last_context_window_numbers = .{};
+        // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
+        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
+        // receiveHead 成功后,req_ptr.* 是个开着连接的完整 Request。到 heap 转移所有权之前若出错
+        // (create(GeminiStream) OOM),必须 deinit 它(否则泄漏 socket fd + 连接状态,非纯字节)。
+        // errdefer LIFO:此 deinit 先跑、顶部 destroy 后跑 = 正确的 deinit()→destroy() 顺序。
+        const heap = try self.allocator.create(GeminiStream);
+        // create 成功 → 所有权转移给 GeminiStream(其 deinit 负责 req_ptr.deinit()+destroy);
+        // 正常返回,两个 errdefer 都不触发。
+        heap.* = .{
+            .allocator = self.allocator,
+            .image_placeholder_ids = image_placeholder_ids,
+            .request = req_ptr,
+            .response = response,
+            .abort = abort,
+            .abort_registry = &self.abort_registry,
+            .id = rid,
+            .credential = client_mod.credentialPrint(auth.value),
+            .signatures = &self.thought_signatures,
+        };
+        return heap.handle();
+    }
+};
+
+/// Gemini 流式响应:逐行 SSE 解析,翻译 candidates[].content.parts → 中立 StreamEvent。
+const GeminiStream = struct {
+    allocator: std.mem.Allocator,
+    request: *http.Client.Request,
+    response: http.Client.Response,
+    transfer_buf: [8192]u8 = undefined,
+    reader: ?*std.Io.Reader = null,
+    /// 字节级活性适配器(见 liveness_reader.zig):首次 next 时包在 body reader 外;heap 分配,地址稳定。
+    liveness: liveness_reader.LivenessReader = undefined,
+    liveness_buf: [8192]u8 = undefined,
+    abort: ?*const AbortSignal = null,
+    abort_registry: ?*provider_mod.RequestAbortRegistry = null,
+    id: log.RequestId,
+    /// What an error frame in this stream must not repeat.
+    credential: ?model_error.SecretPrint,
+    /// 序列化时走占位的图像 tool_result id(owned),随 StreamHandle 回传。
+    image_placeholder_ids: []const []const u8 = &.{},
+    done: bool = false,
+    last_stop: StopReason = .unknown,
+    /// 流报告过"怎么停的":候选的 `finishReason`(含本端不认识的值),或整条请求被拒的
+    /// `promptFeedback.blockReason`。Gemini 流没有 `[DONE]` 之类的帧尾——末块的
+    /// finishReason 就是终止标记;没有它的 EOF 是断流,丢的可能正是 MAX_TOKENS(issue #269)。
+    stop_reported: bool = false,
+    fc_counter: u32 = 0, // functionCall 计数(Gemini 无 id,自生成 call_N)
+    /// 并行 functionCall 队列(P0.1):一个 Gemini chunk 的 parts 可含多个 functionCall。
+    /// 一次 next() 只能吐一个事件,故首个直接返回、其余排队,后续 next() 逐个 drain。
+    fc_queue: std.ArrayList(StreamEvent) = .empty,
+    fc_pos: usize = 0,
+    /// Where the signatures of the calls this stream emits are kept (the
+    /// client's store); null keeps none.
+    signatures: ?*gemini_signatures.Store = null,
+    /// pending usage 槽:Gemini 常把 usageMetadata 与末 content chunk 合并(text+finishReason+usage 同 chunk)。
+    /// 一个 chunk 只能 emit 一个 StreamEvent,故先 emit 内容、把 usage 存这里,下次 next() 先吐它。
+    /// 不这样做 → usage 在最常见的"内容+usage 同 chunk"路径被静默丢(E 类 bug)。
+    pending_usage: ?UsageDelta = null,
+    /// 本响应已报告的 usage:usageMetadata 是截至该 chunk 的累计值,且可能出现在多个
+    /// chunk 上。经 cursor 只发新增部分。
+    usage_reports: api_stream.UsageReportCursor = .{},
+
+    fn handle(self: *GeminiStream) StreamHandle {
+        return .{ .ctx = @ptrCast(self), .image_placeholder_ids = self.image_placeholder_ids, .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
+    }
+    fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
+        return @as(*GeminiStream, @ptrCast(@alignCast(ctx))).next();
+    }
+    fn hDeinit(ctx: *anyopaque) void {
+        const s: *GeminiStream = @ptrCast(@alignCast(ctx));
+        const a = s.allocator;
+        s.deinit();
+        a.destroy(s);
+    }
+    fn hStop(ctx: *anyopaque) StopReason {
+        return @as(*GeminiStream, @ptrCast(@alignCast(ctx))).last_stop;
+    }
+    fn hRid(ctx: *anyopaque) log.RequestId {
+        return @as(*GeminiStream, @ptrCast(@alignCast(ctx))).id;
+    }
+    fn deinit(self: *GeminiStream) void {
+        self.allocator.free(self.image_placeholder_ids);
+        // 未 drain 的并行 functionCall 事件持 owned id/name/input_json → 释放防泄漏。
+        for (self.fc_queue.items[self.fc_pos..]) |ev| freeToolUseStart(self.allocator, ev);
+        self.fc_queue.deinit(self.allocator);
+        if (self.abort_registry) |registry| registry.unregister(self.request);
+        self.request.deinit();
+        self.allocator.destroy(self.request);
+    }
+
+    /// 注册表对这条请求的 stall 判定(null = 没被监视线程 shutdown 过,读错误另有原因)。
+    fn stalledVerdict(self: *GeminiStream) ?provider_mod.RequestAbortRegistry.Stall {
+        const registry = self.abort_registry orelse return null;
+        return registry.stalled(self.request);
+    }
+
+    /// 一条非保活 SSE 行 = 模型在产出 → 续正文空闲时钟。
+    fn touchProgress(self: *GeminiStream) void {
+        const registry = self.abort_registry orelse return;
+        registry.touch(self.request);
+    }
+
+    /// 一条保活行(注释 / ping)= 端点在沉默中开口 → 注册表学习保活节奏(见 provider.zig)。
+    fn touchKeepalive(self: *GeminiStream) void {
+        const registry = self.abort_registry orelse return;
+        registry.touchKeepalive(self.request);
+    }
+
+    fn next(self: *GeminiStream) anyerror!?StreamEvent {
+        // 并行 functionCall 队列优先 drain(一个 chunk 多个 functionCall 的其余)。
+        if (self.fc_pos < self.fc_queue.items.len) {
+            const ev = self.fc_queue.items[self.fc_pos];
+            self.fc_pos += 1;
+            return ev;
+        }
+        // pending usage 优先吐(上一个 chunk 内容+usage 合并时存的)。
+        if (self.pending_usage) |u| {
+            self.pending_usage = null;
+            return StreamEvent{ .usage = u };
+        }
+        if (self.done) return null;
+        if (self.reader == null) {
+            const raw = http_connection.bodyReader(&self.response, &self.transfer_buf);
+            // 字节级续命:每次 recv 到字节就 touch(见 liveness_reader.zig)。
+            // 传输层字节只记"最近字节"时间戳;进展按非保活行续(下方)。
+            self.reader = if (self.abort_registry) |registry| blk: {
+                self.liveness = liveness_reader.LivenessReader.init(raw, registry, self.request, &self.liveness_buf, .transport_only);
+                break :blk &self.liveness.interface;
+            } else raw;
+        }
+        const r = self.reader.?;
+        while (true) {
+            if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
+            const line_opt = r.takeDelimiter('\n') catch |err| {
+                self.done = true;
+                // 取消优先:cancel 关掉了 socket,读才失败的——是 Aborted,不是 API 错误。
+                if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
+                if (self.stalledVerdict()) |stall| {
+                    client_mod.reportBodyStall("gemini", self.id, stall);
+                    return error.StreamStalled;
+                }
+                log.warnId("gemini", self.id, "stream read failed: {s} ({f})", .{ @errorName(err), client_mod.ReadFailure.of(self.request, &self.response.head) });
+                return api_stream.midStreamReadError(err);
+            };
+            const line = line_opt orelse {
+                self.done = true;
+                // 干净 EOF:cancel 关掉的连接也可能这样醒来——是取消,不是收尾。
+                if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
+                // 连接若是被监视线程 shutdown 的,这是 stall 而非正常收尾。
+                if (self.stalledVerdict()) |stall| {
+                    client_mod.reportBodyStall("gemini", self.id, stall);
+                    return error.StreamStalled;
+                }
+                // 没报告停止原因就结束 = 断流,不是收尾。pending usage 一并作废:调用方把这次
+                // 尝试当流内失败,其 usage 本来也不计入(见 agent_loop report_usage)。
+                if (!self.stop_reported) {
+                    client_mod.reportStreamIncomplete("gemini", self.id);
+                    return error.StreamIncomplete;
+                }
+                // 流尽:若还有 pending usage(末 chunk 只含内容+usage,内容已 emit),吐它。
+                if (self.pending_usage) |u| {
+                    self.pending_usage = null;
+                    return StreamEvent{ .usage = u };
+                }
+                return null;
+            };
+            // 进展记账:非保活行才续正文空闲时钟(ping/注释行不算,见 stream.zig);
+            // 保活行只交给注册表学习端点的保活节奏。
+            switch (api_stream.classifyLine(line)) {
+                .progress => self.touchProgress(),
+                .keepalive => self.touchKeepalive(),
+                .separator => {},
+            }
+            const trimmed = std.mem.trim(u8, line, " \r\n");
+            if (trimmed.len == 0) continue;
+            if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+            const data = std.mem.trim(u8, trimmed[5..], " ");
+            if (try self.parseChunk(data)) |ev| return ev;
+            // 该 chunk 无可 emit 内容(纯 usage/finishReason)→ parseChunk 已可能直接返回 usage;
+            // 否则继续读下一行。
+        }
+    }
+
+    /// 解析一个 Gemini SSE chunk(完整 GenerateContentResponse JSON)→ 中立 StreamEvent。
+    fn parseChunk(self: *GeminiStream, data: []const u8) !?StreamEvent {
+        // 流中途的服务端报错:`data: {"error":{"code":…,"message":…,"status":…}}`,没有候选。
+        // 旧实现当空 chunk 跳过,随后没收尾就结束 → StreamIncomplete,答复被当成断流。
+        if (util_json.topLevelObjectField(data, "error")) |err_obj| {
+            self.done = true;
+            return client_mod.reportServerError("gemini", self.id, err_obj, self.credential);
+        }
+        const report = stopReport(data);
+        if (report.finish_reason) |fr| {
+            self.last_stop = mapGeminiFinish(fr);
+            self.stop_reported = true;
+        }
+        // 整条 prompt 被拒:没有候选、也就没有 finishReason,但流确实说清了它为什么停。
+        if (report.blocked) self.stop_reported = true;
+
+        // usageMetadata → 中立 UsageDelta(含 cachedContentTokenCount → cache_read,经 cache.zig)。
+        // **关键(E 修复)**:Gemini 常把 usageMetadata 与末 content chunk(text+finishReason)合并。
+        // 一个 chunk 只能返回一个 StreamEvent,故:先把 usage 算好存进 pending_usage;若本 chunk 还有
+        // 内容(text/functionCall)→ 下面 emit 内容,usage 由 next() 下次吐;若本 chunk 无内容 → 直接吐 usage。
+        // 这保证"内容+usage 同 chunk"时 usage 不被静默丢(旧逻辑只在无内容 chunk emit usage = 丢)。
+        // 只认**值为 object** 的顶层 usageMetadata,数值只从该对象读:`"usageMetadata":null`
+        // 若按 substring 判存在,会发一个全零 usage,把"未计量"报成"已计量为 0"
+        // (同 OpenAI issue #258 的判定错误)。
+        if (util_json.topLevelObjectField(data, "usageMetadata")) |usage_obj| {
+            const cu = cache.parseGeminiCacheUsage(usage_obj);
+            // 语义归一(Anthropic-exclusive):Gemini 的 promptTokenCount **包含**
+            // cachedContentTokenCount;中立 UsageDelta 的 input_tokens 不含 cache,
+            // 消费方按 in+cache_r+cache_w 求和(usage 锚点/成本)——不减会双计。
+            const usage = self.usage_reports.increment(.{
+                .input_tokens = util_json.extractIntField(usage_obj, "promptTokenCount") -| cu.read_tokens,
+                .output_tokens = util_json.extractIntField(usage_obj, "candidatesTokenCount"),
+                .cache_read_input_tokens = cu.read_tokens,
+                .cache_creation_input_tokens = cu.creation_tokens,
+            });
+            const has_text = util_json.extractStringField(data, "text") != null;
+            const has_fc = std.mem.indexOf(u8, data, "\"functionCall\"") != null;
+            if (!has_text and !has_fc) return StreamEvent{ .usage = usage }; // 纯 usage chunk → 直接吐
+            self.pending_usage = usage; // 内容+usage 同 chunk → 存,内容先 emit(见下),next() 再吐 usage
+        }
+
+        // functionCall → 中立 tool_use_start。Gemini: parts:[{functionCall:{name,args:{...}}}]
+        // P0.1 并行:一个 chunk 的 parts 可含多个 functionCall,**全部** emit(首个返回、其余排队)。
+        if (std.mem.indexOf(u8, data, "\"functionCall\"") != null) {
+            var first_ev: ?StreamEvent = null;
+            // OOM 时释放已建首事件(未入队、未返回)——不留孤儿 owned 分配(Linus #2)。
+            errdefer if (first_ev) |ev| freeToolUseStart(self.allocator, ev);
+            // The k-th signature belongs to the k-th functionCall of this chunk.
+            const chunk_signatures: ?[]?[]u8 = if (self.signatures != null and std.mem.indexOf(u8, data, "\"thoughtSignature\"") != null)
+                try gemini_signatures.chunkSignatures(self.allocator, data)
+            else
+                null;
+            defer if (chunk_signatures) |list| gemini_signatures.freeChunkSignatures(self.allocator, list);
+            var call_index: usize = 0;
+            var search: usize = 0;
+            while (std.mem.indexOfPos(u8, data, search, "\"functionCall\":")) |fc_at| {
+                // 取 "functionCall": 后的 {...} 对象(括号配平),拿到对象文本 + 结束偏移。
+                const bo = braceObject(data, fc_at + "\"functionCall\":".len) orelse {
+                    search = fc_at + 1;
+                    continue;
+                };
+                search = bo.end; // 跳过本对象继续找下一个 functionCall
+                const obj = bo.obj;
+                const name = util_json.extractStringField(obj, "name") orelse continue;
+                const args = extractArgsObject(obj) orelse "{}";
+                self.fc_counter += 1;
+                // dispatch_id 是观察日志/规则门/审计的全局身份,重复 = trace
+                // fail-closed + journal 封死(2026-08-17 harness review 发射侧 #1)。
+                // GeminiStream 每请求新建,fc_counter 每轮归零,裸 call_N 跨轮必撞;
+                // RequestId 只含 seq 低 16 位,65536 次请求后也会 wrap(生成器自述
+                // "够 grep 用,不是密码学 ID")。唯一性由进程级单调 u64 承担
+                // (2^64 不 wrap);rid 仍掺入,供与请求日志对账。
+                const serial = g_call_serial.fetchAdd(1, .monotonic);
+                var id_buf: [64]u8 = undefined;
+                const id_str = std.fmt.bufPrint(
+                    &id_buf,
+                    "call_{s}_{d}_{d}",
+                    .{ self.id.asSlice(), serial, self.fc_counter },
+                ) catch unreachable; // 5+12+1+20+1+10 = 49 < 64,编译期可证
+
+                // 逐段 dupe + 逐段 errdefer:任一 dupe/append 失败都释放本迭代已 owned 的段(无泄漏)。
+                const id_dup = try self.allocator.dupe(u8, id_str);
+                errdefer self.allocator.free(id_dup);
+                const name_dup = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(name_dup);
+                const args_dup = try self.allocator.dupe(u8, args);
+                errdefer self.allocator.free(args_dup);
+                if (chunk_signatures) |list| {
+                    if (call_index < list.len) if (list[call_index]) |signature| try self.signatures.?.put(id_dup, signature);
+                }
+                call_index += 1;
+                const ev = StreamEvent{ .tool_use_start = .{ .id = id_dup, .name = name_dup, .input_json = args_dup } };
+                if (first_ev == null) first_ev = ev else try self.fc_queue.append(self.allocator, ev);
+            }
+            if (first_ev) |ev| return ev;
+        }
+        // text part → 中立 text。Gemini: parts:[{text:"..."}]
+        if (util_json.extractStringField(data, "text")) |text| {
+            if (text.len > 0) {
+                // text 是 raw escaped(JSON 内层)→ 反转义成真文本(对齐 Anthropic/OpenAI 的 owned text)。
+                const owned = try util_json.unescapeString(text, self.allocator);
+                return StreamEvent{ .text = owned };
+            }
+        }
+        return null;
+    }
+};
+
+fn shutdownRequest(raw: *anyopaque) void {
+    const request: *http.Client.Request = @ptrCast(@alignCast(raw));
+    provider_mod.abortHttpRequest(request);
+}
+
+fn mapGeminiFinish(fr: []const u8) StopReason {
+    // 工具调用也以 STOP 收尾(没有单独的 "tool_calls" 值);上层据 tool_use 是否非空续轮。
+    if (std.mem.eql(u8, fr, "STOP")) return .end_turn;
+    if (std.mem.eql(u8, fr, "MAX_TOKENS")) return .max_tokens;
+    // CONTINUATION:"reached the per-request token limit, but generation is not yet
+    // complete"——同样是被截断的回答。归 unknown 会把它当完成交上去(issue #269 同类);
+    // 归 max_tokens 让 agent_loop 的续写安全网接着要(不依赖 continuationToken)。
+    if (std.mem.eql(u8, fr, "CONTINUATION")) return .max_tokens;
+    // 其余(SAFETY/RECITATION/MALFORMED_FUNCTION_CALL/…)是报告过的终止,只是本端不细分。
+    return .unknown;
+}
+
+/// 释放一个 tool_use_start 事件的 owned 字段(id/name/input_json)。其它变体 no-op。
+fn freeToolUseStart(allocator: std.mem.Allocator, ev: StreamEvent) void {
+    switch (ev) {
+        .tool_use_start => |tu| {
+            allocator.free(tu.id);
+            allocator.free(tu.name);
+            allocator.free(tu.input_json);
+        },
+        else => {},
+    }
+}
+
+/// 一个 chunk 里的停止报告,**按结构读**:候选级 `candidates[i].finishReason`(首个有值的
+/// 候选)与请求级 `promptFeedback.blockReason`。不能子串扫描整个 chunk——`functionCall.args`
+/// 是未转义的 JSON 对象,参数里同名的键会被当成停止报告,断流的 EOF 就被放行成完整回答
+/// (issue #269 review)。空值与 FINISH_REASON_UNSPECIFIED("Default value. This value is
+/// unused.")都不算:规范写明 finishReason 为空即"模型还没停"。
+const StopReport = struct {
+    finish_reason: ?[]const u8 = null,
+    blocked: bool = false,
+};
+
+fn stopReport(data: []const u8) StopReport {
+    var report = StopReport{};
+    if (util_json.topLevelField(data, "candidates")) |candidates| if (candidates[0] == '[') {
+        var pos: usize = 1;
+        while (pos < candidates.len) {
+            while (pos < candidates.len and (candidates[pos] == ',' or candidates[pos] == ' ' or
+                candidates[pos] == '\t' or candidates[pos] == '\n' or candidates[pos] == '\r')) : (pos += 1)
+            {}
+            const candidate = braceObject(candidates, pos) orelse break;
+            pos = candidate.end;
+            if (jsonString(util_json.topLevelField(candidate.obj, "finishReason"))) |fr| {
+                if (fr.len == 0 or std.mem.eql(u8, fr, "FINISH_REASON_UNSPECIFIED")) continue;
+                report.finish_reason = fr;
+                break;
+            }
+        }
+    };
+    if (util_json.topLevelObjectField(data, "promptFeedback")) |feedback| {
+        if (jsonString(util_json.topLevelField(feedback, "blockReason"))) |reason| report.blocked = reason.len != 0;
+    }
+    return report;
+}
+
+/// `topLevelField` 的原始值若是 JSON 字符串,返回去掉引号的内容(枚举值无转义);否则 null。
+fn jsonString(raw: ?[]const u8) ?[]const u8 {
+    const value = raw orelse return null;
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return null;
+    return value[1 .. value.len - 1];
+}
+
+/// 从 `from` 起跳空白,取一个 {...} 对象(括号配平,跳字符串)。返回对象文本 + 结束偏移(供续找)。
+fn braceObject(data: []const u8, from: usize) ?struct { obj: []const u8, end: usize } {
+    var i = from;
+    while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == '\n' or data[i] == '\r')) : (i += 1) {}
+    if (i >= data.len or data[i] != '{') return null;
+    const start = i;
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (in_str) {
+            // 正确的转义状态机(对齐 OpenAI 侧):区分 `\"` 与 `\\"`,否则尾随反斜杠的字符串误闭合。
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true else if (c == '{') depth += 1 else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return .{ .obj = data[start .. i + 1], .end = i + 1 };
+        }
+    }
+    return null;
+}
+
+/// 提取 functionCall.args 的对象文本(`"args":{...}` 的 {...} 部分,含嵌套)。null=无。
+/// 简易括号配平(args 值是 JSON 对象);够 MVP 用,复杂嵌套/字符串内含括号未完全鲁棒(诚实登记)。
+fn extractArgsObject(data: []const u8) ?[]const u8 {
+    const key = "\"args\":";
+    const idx = std.mem.indexOf(u8, data, key) orelse return null;
+    var i = idx + key.len;
+    while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+    if (i >= data.len or data[i] != '{') return null;
+    const start = i;
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (in_str) {
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true else if (c == '{') depth += 1 else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return data[start .. i + 1];
+        }
+    }
+    return null;
+}
+
+/// prefix 哈希(model + system + tool 名做 FNV-1a)。缓存查表 key——model+system+tools 稳定则哈希稳定。
+/// **含 model**:Gemini 缓存对象 model-specific,不含 model 会让 model_override 误命中别的 model 句柄。
+fn hashPrefix(model: []const u8, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    const fnv = struct {
+        fn mix(hash: *u64, bytes: []const u8) void {
+            for (bytes) |b| {
+                hash.* ^= b;
+                hash.* *%= 0x100000001b3;
+            }
+        }
+    };
+    fnv.mix(&h, model);
+    if (system) |s| fnv.mix(&h, s);
+    if (tools) |tl| for (tl) |t| fnv.mix(&h, t.name);
+    return h;
+}
+
+/// 测试辅助:暴露 hashPrefix 给组件测试,验证缓存句柄命中(测试需用同样哈希注册)。
+pub fn hashPrefixForTest(model: []const u8, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition) u64 {
+    return hashPrefix(model, system, tools);
+}
+
+/// 当前单调时钟毫秒(缓存 TTL 过期判断)。走 util/time 统一时钟。
+/// **单调时钟**(非 wall epoch):TTL 当 duration 用,registerCache 传 nowMonoMs()+ttl_ms。
+fn nowMonoMs() i64 {
+    return @import("metacodes-base").util.time.nowMs();
+}
+
+/// 中立 Conversation/tools → Gemini generateContent 请求 body。caller free。
+/// cached_ref 非 null → 请求带 cachedContent 引用(有状态缓存命中)。
+/// model 用于查 dialect(GeminiDialect)翻译 tool_choice + thinking_level。
+/// tool_choice 由 dialect.serializeToolChoice 翻成 tool_config.function_calling_config。
+/// reasoning_effort 非 null → dialect.serializeThinking 翻成 generation_config.thinking_level。
+pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, cached_ref: ?[]const u8, model: []const u8, tool_choice: ?json_mod.ToolChoice, reasoning_effort: ?types.ReasoningEffort) ![]u8 {
+    // Legacy wrapper:包成 RequestOverrides 转给 WithOverrides 版。
+    return serializeGeminiRequestWithOverrides(allocator, messages, system, tools, cached_ref, model, .{
+        .reasoning_effort = reasoning_effort,
+        .tool_choice = tool_choice,
+    });
+}
+
+/// 完整方言字段入口的序列化(stage 3 接线 + stage 5 扩展)。
+/// overrides 非 null 字段 = 显式覆盖;null = dialect 按 profile 静态推断。
+/// Gemini 协议支持:thinking_level(thinking)/response_mime_type(response_format)/temperature/top_p。
+/// 不支持:prompt_cache_key(Gemini 用 cachedContent 机制)/parallel_tool_calls(无此概念)→ 忽略。
+pub fn serializeGeminiRequestWithOverrides(allocator: std.mem.Allocator, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, cached_ref: ?[]const u8, model: []const u8, overrides: request_overrides.RequestOverrides) ![]u8 {
+    return serializeGeminiRequestWithOverridesAndDialect(
+        allocator,
+        messages,
+        system,
+        tools,
+        cached_ref,
+        model,
+        overrides,
+        dialect_mod.dialectFor(.gemini, model),
+    );
+}
+
+pub fn serializeGeminiRequestWithOverridesAndDialect(
+    allocator: std.mem.Allocator,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    cached_ref: ?[]const u8,
+    model: []const u8,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+) ![]u8 {
+    var scratch = json_mod.SerializationReport{};
+    defer scratch.deinit(allocator);
+    return serializeGeminiRequestWithOverridesAndDialectReport(allocator, messages, system, tools, cached_ref, model, overrides, dialect, &scratch);
+}
+
+/// 同上,并把图像 tool_result 的实际序列化决定写入 `report`(见 request.SerializationReport)。
+pub fn serializeGeminiRequestWithOverridesAndDialectReport(
+    allocator: std.mem.Allocator,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    cached_ref: ?[]const u8,
+    model: []const u8,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    report: *json_mod.SerializationReport,
+) ![]u8 {
+    return serializeGeminiRequestSigned(allocator, messages, system, tools, cached_ref, model, overrides, dialect, report, null);
+}
+
+/// The request with the thought signatures this client holds put back into
+/// the model functionCall parts they arrived on. A model that validates them
+/// (`ModelProfile.requires_thought_signatures`) gets the documented
+/// placeholder on a step's first call when the signature is unknown.
+pub fn serializeGeminiRequestSigned(
+    allocator: std.mem.Allocator,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    cached_ref: ?[]const u8,
+    model: []const u8,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    report: *json_mod.SerializationReport,
+    signatures: ?*const gemini_signatures.Store,
+) ![]u8 {
+    const profile = dialect.profileFor(.gemini, model);
+    const visible_capabilities = dialect_mod.visibleCapabilities(tools);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '{');
+    var first_top = true;
+    // cachedContent 引用(有状态缓存命中时)。
+    if (cached_ref) |cn| {
+        try out.appendSlice(allocator, "\"cachedContent\":");
+        try util_json.serializeString(cn, &out, allocator);
+        first_top = false;
+    }
+    // systemInstruction:{parts:[{text}]}. Capability activation is typed and
+    // deterministic; ordinary Gemini dialects keep the default no-op.
+    var system_buf: std.ArrayList(u8) = .empty;
+    defer system_buf.deinit(allocator);
+    if (system) |sys| try system_buf.appendSlice(allocator, sys);
+    try dialect.injectSystemMods(profile, overrides.reasoning_effort, &system_buf, allocator);
+    try dialect.activateCapabilities(
+        profile,
+        visible_capabilities,
+        &system_buf,
+        allocator,
+    );
+    if (system_buf.items.len != 0) {
+        if (!first_top) try out.append(allocator, ',');
+        first_top = false;
+        try out.appendSlice(allocator, "\"systemInstruction\":{\"parts\":[{\"text\":");
+        try util_json.serializeString(system_buf.items, &out, allocator);
+        try out.appendSlice(allocator, "}]}");
+    }
+    // contents:[{role, parts:[...]}]
+    if (!first_top) try out.append(allocator, ',');
+    try out.appendSlice(allocator, "\"contents\":[");
+    var first_msg = true;
+    for (messages, 0..) |m, mi| {
+        if (!first_msg) try out.append(allocator, ',');
+        first_msg = false;
+        try serializeGeminiContent(allocator, &out, m, mi, messages, dialect, profile, report, signatures);
+    }
+    try out.append(allocator, ']');
+    // tools:[{function_declarations:[...]}]
+    if (tools) |tl| {
+        if (tl.len > 0) {
+            try out.appendSlice(allocator, ",\"tools\":[{\"function_declarations\":[");
+            for (tl, 0..) |t, i| {
+                if (i > 0) try out.append(allocator, ',');
+                try serializeGeminiTool(allocator, &out, t);
+            }
+            try out.appendSlice(allocator, "]}]");
+        }
+    }
+    // tool_choice:委托给 GeminiDialect 翻成 tool_config.function_calling_config。
+    const route_already_invoked = if (visible_capabilities.required_first) |route|
+        route.satisfied or dialect_mod.hasSuccessfulRequiredFirst(messages, route)
+    else
+        false;
+    const effective_tool_choice = dialect.routeToolChoice(
+        profile,
+        visible_capabilities,
+        route_already_invoked,
+        overrides.tool_choice,
+    );
+    if (effective_tool_choice) |tc| {
+        _ = try dialect.serializeToolChoice(profile, tc, &out, allocator);
+    }
+    // generation_config:合并 thinking_level + response_mime_type + temperature + top_p。
+    // 片段函数用"若 gen_cfg 非空则加前导逗号"策略,调用顺序无关。
+    var gen_cfg: std.ArrayList(u8) = .empty;
+    defer gen_cfg.deinit(allocator);
+    // thinking_level:dialect.serializeThinking 输出 "thinking_level":"low" 片段。
+    try dialect.serializeThinking(profile, overrides.reasoning_effort, &gen_cfg, allocator);
+    // response_format:dialect.serializeResponseFormat 输出 "response_mime_type":... 片段。
+    if (overrides.response_format) |rf| {
+        _ = try dialect.serializeResponseFormat(profile, rf, &gen_cfg, allocator);
+    }
+    // temperature/top_p:通用采样参数,进 generation_config(Gemini 协议支持)。
+    if (overrides.temperature) |t| {
+        if (gen_cfg.items.len > 0) try gen_cfg.append(allocator, ',');
+        try gen_cfg.appendSlice(allocator, "\"temperature\":");
+        try util_json.serializeNumber(t, &gen_cfg, allocator);
+    }
+    if (overrides.top_p) |p| {
+        if (gen_cfg.items.len > 0) try gen_cfg.append(allocator, ',');
+        try gen_cfg.appendSlice(allocator, "\"top_p\":");
+        try util_json.serializeNumber(p, &gen_cfg, allocator);
+    }
+    // 注:prompt_cache_key / parallel_tool_calls Gemini 协议不支持,忽略(能力守门)。
+    if (gen_cfg.items.len > 0) {
+        try out.appendSlice(allocator, ",\"generation_config\":{");
+        try out.appendSlice(allocator, gen_cfg.items);
+        try out.append(allocator, '}');
+    }
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+/// Gemini 3 multimodal functionResponse 的 `parts[].inlineData` 只收 PNG/JPEG/WebP(官方
+/// function-calling 文档);白名单里的其它 MIME(GIF)走旧世代的同级 `inline_data` part——
+/// 普通图像输入支持它们,functionResponse 内嵌不支持。
+fn functionResponseInlineDataSupports(media_type: []const u8) bool {
+    return std.mem.eql(u8, media_type, "image/png") or
+        std.mem.eql(u8, media_type, "image/jpeg") or
+        std.mem.eql(u8, media_type, "image/webp");
+}
+
+/// 从**最近一条 model(assistant)消息**里按 tool_use_id 找回原 functionCall 的真实 name
+/// (Gemini functionResponse 靠 name 配对)。与 message_repair 的顺序配对同口径:结果只答复
+/// 紧邻的上一轮,后一轮复用同一 id 时不能拿到前一轮的名字。找不到 → null(调用方退回用 id)。
+fn findToolUseName(messages: []const types.ApiMessage, msg_index: usize, id: []const u8) ?[]const u8 {
+    var i = msg_index;
+    while (i > 0) {
+        i -= 1;
+        const mm = messages[i];
+        if (mm.role != .assistant) continue;
+        for (mm.content) |c| switch (c) {
+            .tool_use => |tu| if (std.mem.eql(u8, tu.id, id)) return tu.name,
+            else => {},
+        };
+        return null;
+    }
+    return null;
+}
+
+fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, msg_index: usize, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile, report: *json_mod.SerializationReport, signatures: ?*const gemini_signatures.Store) !void {
+    // tool_result → user 角色的 functionResponse part(Gemini 特有)。
+    var has_tool_result = false;
+    for (m.content) |c| if (c == .tool_result) {
+        has_tool_result = true;
+    };
+    if (has_tool_result) {
+        // 同 OpenAI:tool_result 消息先投影 functionResponse parts;同消息内的 text 块
+        // (agent_loop 追加的 PostToolUse additionalContext、验证检查点等)作为同一 user
+        // content 的收尾 text parts 补发——此前被静默丢弃。一等 image 块仍是 issue #10
+        // 铁律下的防御性显式报错(正常路径经 merge 守护永不产出)。
+        for (m.content) |c| if (c == .image) return error.ImageWithToolResultUnsupported;
+        // P0.1 并行:一轮多个 tool_result → **全部**作为同一 user content 的多个 functionResponse
+        // parts(旧版只发首个 → 并行回合下一次请求缺 functionResponse 配对)。
+        // functionResponse.name 必须是**原 functionCall 的真实名**(Gemini 靠 name 配对,非 id);
+        // 从全量消息按 tool_use_id 找回真名,找不到才退回 id 占位。
+        //
+        // 图像 tool_result(Read 工具,dialect.extractImageResult 命中):
+        //   - Gemini 3 系(profile.supports_multimodal_function_response):官方 multimodal
+        //     functionResponse——图像嵌在 functionResponse.parts[].inlineData(camelCase,
+        //     照 v1beta discovery doc / function-calling#multimodal 的 REST 例),原生配对。
+        //   - 旧世代(2.5 等):functionResponse.response.result 发短指向文本,图像本体作
+        //     **同一 user content 的同级 inline_data part** 收尾(生产验证形态;functionResponse
+        //     part 数与上一轮 functionCall 数必须相等,同级 part 不计入)。
+        //   - 方言返 false(非 vision,防御分支):result 发短占位文本。
+        // 三种情况都绝不把 MB 级 base64 原文塞进 response.result 字符串。
+        try out.appendSlice(allocator, "{\"role\":\"user\",\"parts\":[");
+        var sibling_parts: std.ArrayList(u8) = .empty; // 旧世代图像的同级 parts(含前导逗号)
+        defer sibling_parts.deinit(allocator);
+        var first_fr = true;
+        for (m.content) |c| switch (c) {
+            .tool_result => |tr| {
+                if (!first_fr) try out.append(allocator, ',');
+                first_fr = false;
+                const fname = findToolUseName(all_messages, msg_index, tr.tool_use_id) orelse tr.tool_use_id;
+                try out.appendSlice(allocator, "{\"functionResponse\":{\"name\":");
+                try util_json.serializeString(fname, out, allocator);
+                try out.appendSlice(allocator, ",\"response\":{\"result\":");
+                if (dialect_mod.extractImageResult(tr.content)) |img| {
+                    report.image_results += 1;
+                    // Gemini 3 官方 multimodal functionResponse 直接内嵌 inlineData,但发不发图
+                    // 仍由方言定案(插件方言可拒绝):先让 serializeImagePart 在 scratch 里裁决,
+                    // 拒绝则与旧世代同路走占位。
+                    var gemini3_native = false;
+                    if (profile.supports_multimodal_function_response and functionResponseInlineDataSupports(img.media_type)) {
+                        var probe: std.ArrayList(u8) = .empty;
+                        defer probe.deinit(allocator);
+                        gemini3_native = try dialect.serializeImagePart(profile, img, &probe, allocator);
+                    }
+                    if (gemini3_native) {
+                        var pointer: std.ArrayList(u8) = .empty;
+                        defer pointer.deinit(allocator);
+                        try pointer.appendSlice(allocator, "[image (");
+                        try pointer.appendSlice(allocator, img.media_type);
+                        try pointer.appendSlice(allocator, ") attached]");
+                        try util_json.serializeString(pointer.items, out, allocator);
+                        // response(必填)收口后嵌官方 parts:FunctionResponsePart.inlineData
+                        // (FunctionResponseBlob 与 Blob 字段名一致;camelCase 照官方例)。
+                        try out.appendSlice(allocator, "},\"parts\":[{\"inlineData\":{\"mimeType\":");
+                        try util_json.serializeString(img.media_type, out, allocator);
+                        try out.appendSlice(allocator, ",\"data\":");
+                        try util_json.serializeString(img.data, out, allocator);
+                        try out.appendSlice(allocator, "}}]}}");
+                    } else {
+                        // 旧世代:先 scratch 渲染同级 label+image part;方言返回值是
+                        // 指向文本/占位文本的唯一分支决策点,两者不可能不一致。
+                        const mark = sibling_parts.items.len;
+                        try sibling_parts.appendSlice(allocator, ",{\"text\":");
+                        var label: std.ArrayList(u8) = .empty;
+                        defer label.deinit(allocator);
+                        try label.appendSlice(allocator, "Image result of ");
+                        try label.appendSlice(allocator, fname);
+                        try label.append(allocator, ':');
+                        try util_json.serializeString(label.items, &sibling_parts, allocator);
+                        try sibling_parts.appendSlice(allocator, "},");
+                        const emitted = try dialect.serializeImagePart(profile, img, &sibling_parts, allocator);
+                        var result_text: std.ArrayList(u8) = .empty;
+                        defer result_text.deinit(allocator);
+                        if (emitted) {
+                            try result_text.appendSlice(allocator, "[image (");
+                            try result_text.appendSlice(allocator, img.media_type);
+                            try result_text.appendSlice(allocator, ") attached in this message]");
+                        } else {
+                            sibling_parts.shrinkRetainingCapacity(mark);
+                            try report.notePlaceholder(allocator, tr.tool_use_id);
+                            try dialect_mod.appendImageOmittedPlaceholder(img.media_type, &result_text, allocator);
+                        }
+                        try util_json.serializeString(result_text.items, out, allocator);
+                        try out.appendSlice(allocator, "}}}");
+                    }
+                } else {
+                    try util_json.serializeString(tr.content, out, allocator);
+                    try out.appendSlice(allocator, "}}}");
+                }
+            },
+            else => {},
+        };
+        try out.appendSlice(allocator, sibling_parts.items);
+        for (m.content) |c| switch (c) {
+            .text => |t| {
+                try out.appendSlice(allocator, ",{\"text\":");
+                try util_json.serializeString(t, out, allocator);
+                try out.append(allocator, '}');
+            },
+            else => {},
+        };
+        try out.appendSlice(allocator, "]}");
+        return;
+    }
+    // role:assistant→"model",user→"user"
+    const role_str = switch (m.role) {
+        .user => "user",
+        .assistant => "model",
+    };
+    try out.appendSlice(allocator, "{\"role\":\"");
+    try out.appendSlice(allocator, role_str);
+    try out.appendSlice(allocator, "\",\"parts\":[");
+    var first_part = true;
+    // One model message is one step; its first functionCall is the part a
+    // validating model checks.
+    var first_call = true;
+    for (m.content) |c| switch (c) {
+        .text => |t| {
+            if (!first_part) try out.append(allocator, ',');
+            first_part = false;
+            try out.appendSlice(allocator, "{\"text\":");
+            try util_json.serializeString(t, out, allocator);
+            try out.append(allocator, '}');
+        },
+        .tool_use => |tu| {
+            if (!first_part) try out.append(allocator, ',');
+            first_part = false;
+            try out.appendSlice(allocator, "{\"functionCall\":{\"name\":");
+            try util_json.serializeString(tu.name, out, allocator);
+            try out.appendSlice(allocator, ",\"args\":");
+            // tu.input 是 JSON 字符串(args 对象);直接内联(已是合法 JSON 对象)。
+            try out.appendSlice(allocator, if (tu.input.len > 0) tu.input else "{}");
+            try out.append(allocator, '}');
+            const known = if (signatures) |store| store.get(tu.id) else null;
+            const signature: ?[]const u8 = known orelse
+                (if (m.role == .assistant and first_call and profile.requires_thought_signatures) gemini_signatures.PLACEHOLDER else null);
+            if (signature) |value| {
+                try out.appendSlice(allocator, ",\"thoughtSignature\":");
+                try util_json.serializeString(value, out, allocator);
+            }
+            try out.append(allocator, '}');
+            first_call = false;
+        },
+        .image => |img| {
+            // 一等图像内容(issue #10):inline_data part,wire 形态委托方言。
+            // 方言返 false = 该 model 不支持图像输入 → 显式能力错误,绝不静默丢图。
+            if (!first_part) try out.append(allocator, ',');
+            first_part = false;
+            const emitted = try dialect.serializeImagePart(profile, img, out, allocator);
+            if (!emitted) return error.ImageInputUnsupported;
+        },
+        else => {},
+    };
+    // 空 parts 兜底(Gemini 要求 parts 非空)。
+    if (first_part) try out.appendSlice(allocator, "{\"text\":\"\"}");
+    try out.appendSlice(allocator, "]}");
+}
+
+fn serializeGeminiTool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: json_mod.ToolDefinition) !void {
+    try out.appendSlice(allocator, "{\"name\":");
+    try util_json.serializeString(t.name, out, allocator);
+    try out.appendSlice(allocator, ",\"description\":");
+    try util_json.serializeString(t.description, out, allocator);
+    try out.appendSlice(allocator, ",\"parameters\":");
+    try @import("request.zig").serializeInputSchema(t.input_schema, out, allocator);
+    try out.append(allocator, '}');
+}
+
+// ── 测试 ──────────────────────────────────────────────────────────────────
+test "Gemini 请求翻译:中立 → generateContent body" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, "you are helpful", null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"systemInstruction\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"contents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+}
+
+test "Gemini 缓存命中:cachedContent 引用进请求体" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "q" }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, "cachedContents/abc123", "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cachedContent\":\"cachedContents/abc123\"") != null);
+}
+
+// ── M3:Gemini tool_choice 端到端字节断言(声明=接线=测试 DoD)─────────────────────
+
+test "M3 Gemini: tool_choice=auto → function_calling_config.mode AUTO" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "auto" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_config\":{\"function_calling_config\":{\"mode\":\"AUTO\"}}") != null);
+}
+
+test "M3 Gemini: tool_choice=any → mode ANY" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "any" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"ANY\"") != null);
+}
+
+test "M3 Gemini: tool_choice=tool+name → ANY + allowed_function_names" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = "web_search" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"ANY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"allowed_function_names\":[\"web_search\"]") != null);
+}
+
+test "M3 Gemini: tool_choice=none → mode NONE" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "none" };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"NONE\"") != null);
+}
+
+test "M3 Gemini: tool_choice=tool 缺 name → ANY(强制选一个,不指定)" {
+    // tool 类型但 name=null,Gemini 输出 mode=ANY 但不发 allowed_function_names。
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = null };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", tc, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mode\":\"ANY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "allowed_function_names") == null);
+}
+
+test "M3 Gemini: tool_choice=null 不发 tool_config" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_config") == null);
+}
+
+// ── M7:Gemini thinking_level 端到端字节断言(声明=接线=测试 DoD)─────────────────
+
+test "M7 Gemini: reasoning_effort=high → generation_config.thinking_level high" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", null, .high);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"generation_config\":{\"thinking_level\":\"high\"}") != null);
+}
+
+test "M7 Gemini: reasoning_effort=low → thinking_level low" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", null, .low);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking_level\":\"low\"") != null);
+}
+
+test "M7 Gemini: reasoning_effort=null 不发 generation_config(自适应)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "go" }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "generation_config") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "thinking_level") == null);
+}
+
+test "Gemini 有状态缓存句柄表:命中/过期/剔除" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = GeminiClient.init(a, io_rt.io(), "k", "gemini-2.5-flash", "http://localhost");
+    defer client.deinit();
+
+    try client.registerCache(12345, "cachedContents/x", 1000); // 过期时刻 mono_ms=1000
+    // now=500 < 1000 → 命中。
+    try std.testing.expectEqualStrings("cachedContents/x", client.lookupCache(12345, 500).?);
+    // now=2000 > 1000 → 过期 → null + 剔除。
+    try std.testing.expect(client.lookupCache(12345, 2000) == null);
+    // 再查已被剔除。
+    try std.testing.expect(client.lookupCache(12345, 500) == null);
+    try std.testing.expectEqual(@as(usize, 0), client.cache_table.items.len);
+}
+
+test "extractArgsObject 嵌套对象" {
+    const data = "{\"functionCall\":{\"name\":\"f\",\"args\":{\"a\":1,\"b\":{\"c\":2}}}}";
+    const args = extractArgsObject(data).?;
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":{\"c\":2}}", args);
+}
+
+test "braceObject/extractArgsObject 转义状态机:值尾随转义反斜杠不误闭合(Linus #1)" {
+    // args 值 = "a\\"(JSON 里 a + 一个反斜杠):闭合 `"` 前一字节是 `\`,旧启发式 data[i-1]!='\\'
+    // 会误判成转义引号 → 字符串不闭合 → 括号跑到 EOF → functionCall 被丢/args 变 {}。
+    // 字面量字节:{"functionCall":{"name":"w","args":{"p":"a\\"}}}
+    const chunk = "{\"functionCall\":{\"name\":\"w\",\"args\":{\"p\":\"a\\\\\"}}}";
+    const fc = std.mem.indexOf(u8, chunk, "\"functionCall\":").?;
+    const bo = braceObject(chunk, fc + "\"functionCall\":".len).?;
+    // functionCall 对象完整闭合(含 args 的两层 }),不跑到 EOF。
+    try std.testing.expect(std.mem.endsWith(u8, bo.obj, "}"));
+    try std.testing.expectEqualStrings("w", util_json.extractStringField(bo.obj, "name").?);
+    // args 对象完整提取,尾随反斜杠保留。
+    const args = extractArgsObject(bo.obj).?;
+    try std.testing.expectEqualStrings("{\"p\":\"a\\\\\"}", args);
+}
+
+// ── issue #10:一等图像输入 ────────────────────────────────────────────────────
+
+test "Gemini: 含 image 的 user 消息 → inline_data part(text/image 按序)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .text = "看图" },
+            .{ .image = .{ .media_type = "image/png", .data = "UE5HREFUQQ==" } },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    const seq = std.mem.indexOf(u8, body, "{\"text\":\"看图\"},{\"inline_data\":{\"mime_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}");
+    try std.testing.expect(seq != null);
+}
+
+test "Gemini: image 在 text 前时顺序保持" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .image = .{ .media_type = "image/jpeg", .data = "SlBFRw==" } },
+            .{ .text = "以上是截图" },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    const img = std.mem.indexOf(u8, body, "\"inline_data\"").?;
+    const txt = std.mem.indexOf(u8, body, "以上是截图").?;
+    try std.testing.expect(img < txt);
+}
+
+test "Gemini: tool_result 消息混入 image → 显式错误(防 functionResponse 投影静默丢图)" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } },
+            .{ .image = .{ .media_type = "image/png", .data = "QUJD" } },
+        } },
+    };
+    try std.testing.expectError(
+        error.ImageWithToolResultUnsupported,
+        serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null),
+    );
+}
+
+// ── 图像 tool_result(Read 工具形态)────────────────────────────────────────────
+
+const IMG_TOOL_RESULT_JSON = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}";
+
+fn imageToolResultMsgs() [2]types.ApiMessage {
+    return .{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{\"file_path\":\"a.png\"}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+}
+
+test "Gemini 3: 图像 tool_result → 官方 multimodal functionResponse(嵌套 parts.inlineData)" {
+    const a = std.testing.allocator;
+    const msgs = imageToolResultMsgs();
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-3-flash", null, null);
+    defer a.free(body);
+    // 官方形态(function-calling#multimodal / v1beta discovery doc):图像嵌在
+    // functionResponse.parts,response(必填)只留短指向文本。字节级锁定。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached]\"},\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}]}}") != null);
+    // base64 只出现在 inlineData,绝不作为转义文本重复。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "Gemini 2.5: 图像 tool_result → functionResponse 指向文本 + 同级 inline_data part" {
+    const a = std.testing.allocator;
+    const msgs = imageToolResultMsgs();
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    // 旧世代无 multimodal functionResponse:图像作同一 user content 的同级 part 收尾
+    // (生产验证形态),label 文本配对函数名。字节级锁定完整序列。
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached in this message]\"}}},{\"text\":\"Image result of Read:\"},{\"inline_data\":{\"mime_type\":\"image/png\",\"data\":\"UE5HREFUQQ==\"}}]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inlineData") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\\\"type\\\":\\\"image\\\"") == null);
+}
+
+test "Gemini: tool_result 消息里的同消息 text(hook 上下文/检查点)作为收尾 text part 补发" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .tool_use = .{ .id = "t1", .name = "Bash", .input = "{}" } }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } },
+            .{ .text = "[PostToolUse hook]\npost-check ok" },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Bash\",\"response\":{\"result\":\"ok\"}}},{\"text\":\"[PostToolUse hook]\\npost-check ok\"}]}") != null);
+}
+
+test "Gemini 3: fail-closed 方言拒绝发图时 functionResponse 只带占位,不内嵌 inlineData,报告计占位" {
+    const a = std.testing.allocator;
+    const tool_use = [_]types.ApiContent{.{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{}" } }};
+    const png = [_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}" } }};
+    const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &png } };
+    var report = json_mod.SerializationReport{};
+    defer report.deinit(a);
+    const body = try serializeGeminiRequestWithOverridesAndDialectReport(a, &msgs, null, null, null, "gemini-3-flash", .{}, .{ .ctx = undefined }, &report);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inlineData") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inline_data") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted") != null);
+    try std.testing.expectEqual(@as(usize, 1), report.image_placeholders);
+}
+
+test "Gemini 3: GIF 图像结果不进 functionResponse.inlineData,走同级 inline_data part" {
+    const a = std.testing.allocator;
+    const tool_use = [_]types.ApiContent{.{ .tool_use = .{ .id = "t1", .name = "Read", .input = "{}" } }};
+    const gif = [_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/gif\",\"data\":\"R0lGODlh\"}" } }};
+    const msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &gif } };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-3-flash", null, null);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parts\":[{\"inlineData\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"inline_data\":{\"mime_type\":\"image/gif\"") != null);
+    // PNG 仍走官方 multimodal functionResponse。
+    const png = [_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "t1", .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}" } }};
+    const png_msgs = [_]types.ApiMessage{ .{ .role = .assistant, .content = &tool_use }, .{ .role = .user, .content = &png } };
+    const png_body = try serializeGeminiRequest(a, &png_msgs, null, null, null, "gemini-3-flash", null, null);
+    defer a.free(png_body);
+    try std.testing.expect(std.mem.indexOf(u8, png_body, "\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\"") != null);
+}
+
+test "Gemini functionResponse.name 按最近一轮配对:后轮复用 id 不取前轮的名字" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .tool_use = .{ .id = "call_0", .name = "Read", .input = "{}" } }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_0", .content = "r1" } }} },
+        .{ .role = .assistant, .content = &[_]types.ApiContent{.{ .tool_use = .{ .id = "call_0", .name = "Grep", .input = "{}" } }} },
+        .{ .role = .user, .content = &[_]types.ApiContent{.{ .tool_result = .{ .tool_use_id = "call_0", .content = "r2" } }} },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    const first = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\"").?;
+    const second = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Grep\"").?;
+    try std.testing.expect(first < second);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "{\"functionResponse\":{\"name\":"));
+}
+
+test "Gemini 2.5 并行: 文本+图像 tool_result → functionResponse 数保持,图像同级 part 收尾" {
+    const a = std.testing.allocator;
+    const msgs = [_]types.ApiMessage{
+        .{ .role = .assistant, .content = &[_]types.ApiContent{
+            .{ .tool_use = .{ .id = "t1", .name = "Bash", .input = "{}" } },
+            .{ .tool_use = .{ .id = "t2", .name = "Read", .input = "{}" } },
+        } },
+        .{ .role = .user, .content = &[_]types.ApiContent{
+            .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok" } },
+            .{ .tool_result = .{ .tool_use_id = "t2", .content = IMG_TOOL_RESULT_JSON } },
+        } },
+    };
+    const body = try serializeGeminiRequest(a, &msgs, null, null, null, "gemini-2.5-pro", null, null);
+    defer a.free(body);
+    // 文本 tool_result 字节不变;两个 functionResponse 相邻(配对数与 functionCall 相等),
+    // 图像同级 part 在**所有** functionResponse 之后。
+    const fr_bash = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Bash\",\"response\":{\"result\":\"ok\"}}}").?;
+    const fr_read = std.mem.indexOf(u8, body, "{\"functionResponse\":{\"name\":\"Read\",\"response\":{\"result\":\"[image (image/png) attached in this message]\"}}}").?;
+    const sibling = std.mem.indexOf(u8, body, "{\"text\":\"Image result of Read:\"},{\"inline_data\":").?;
+    try std.testing.expect(fr_bash < fr_read);
+    try std.testing.expect(fr_read < sibling);
+}
+
+test "Gemini 防御分支: 方言不支持图像输入 → functionResponse 占位文本,无 base64" {
+    const a = std.testing.allocator;
+    const msgs = imageToolResultMsgs();
+    // defaultDialect 的 serializeImagePart 恒返 false(fail-closed),但 profileFor 仍是
+    // 内建 Gemini profile——覆盖"profile 声称支持、方言拒绝"的插件方言防御路径。
+    // 报告必须反映这个实际决定:profile 说支持不算数。
+    var report = json_mod.SerializationReport{};
+    defer report.deinit(a);
+    const body = try serializeGeminiRequestWithOverridesAndDialectReport(a, &msgs, null, null, null, "gemini-2.5-pro", .{}, .{ .ctx = undefined }, &report);
+    defer a.free(body);
+    try std.testing.expectEqual(@as(usize, 1), report.image_results);
+    try std.testing.expectEqual(@as(usize, 1), report.image_placeholders);
+    try std.testing.expect(!report.imagesNative());
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "inline_data") == null);
+}
+
+// ── issue #269:Gemini 流没有帧尾,末块的 finishReason 就是终止标记 ───────────────
+
+/// 用固定 reader 直驱 GeminiStream(不建 HTTP 请求),逐个吐事件直到 null 或出错。
+/// 返回收到的文本(caller free)。
+fn replayGemini(a: std.mem.Allocator, sse: []const u8, stop: *StopReason) ![]u8 {
+    var stream = GeminiStream{
+        .allocator = a,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
+    };
+    defer {
+        for (stream.fc_queue.items[stream.fc_pos..]) |ev| freeToolUseStart(a, ev);
+        stream.fc_queue.deinit(a);
+    }
+    var body = std.Io.Reader.fixed(sse);
+    stream.reader = &body;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(a);
+    while (stream.next() catch |err| {
+        try std.testing.expect((try stream.next()) == null); // 失败即终态
+        return err;
+    }) |ev| switch (ev) {
+        .text => |t| {
+            defer a.free(t);
+            try text.appendSlice(a, t);
+        },
+        .thinking, .reasoning_item, .web_search_query => |bytes| a.free(bytes),
+        .tool_use_start => freeToolUseStart(a, ev),
+        .web_search_result => |w| {
+            a.free(w.ui_text);
+            a.free(w.content_json);
+        },
+        .usage, .done => {},
+    };
+    stop.* = stream.last_stop;
+    return text.toOwnedSlice(a);
+}
+
+/// Replays one Gemini SSE response and returns the usage events it emitted.
+fn replayGeminiUsage(a: std.mem.Allocator, sse: []const u8, out: []UsageDelta) ![]UsageDelta {
+    var stream = GeminiStream{
+        .allocator = a,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+        .credential = null,
+    };
+    defer {
+        for (stream.fc_queue.items[stream.fc_pos..]) |ev| freeToolUseStart(a, ev);
+        stream.fc_queue.deinit(a);
+    }
+    var body = std.Io.Reader.fixed(sse);
+    stream.reader = &body;
+    var n: usize = 0;
+    while (try stream.next()) |ev| switch (ev) {
+        .text => |t| a.free(t),
+        .thinking, .reasoning_item, .web_search_query => |bytes| a.free(bytes),
+        .tool_use_start => freeToolUseStart(a, ev),
+        .web_search_result => |w| {
+            a.free(w.ui_text);
+            a.free(w.content_json);
+        },
+        .usage => |u| {
+            out[n] = u;
+            n += 1;
+        },
+        .done => {},
+    };
+    return out[0..n];
+}
+
+test "Gemini: usageMetadata repeated on several chunks is a running total, events carry increments" {
+    var buf: [4]UsageDelta = undefined;
+    try std.testing.expectEqualSlices(UsageDelta, &.{
+        .{ .input_tokens = 10, .output_tokens = 1 },
+        .{ .output_tokens = 3 },
+    }, try replayGeminiUsage(
+        std.testing.allocator,
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hel\"}],\"role\":\"model\"},\"index\":0}]," ++
+            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1}}\n\n" ++
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}]," ++
+            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":4}}\n\n",
+        &buf,
+    ));
+}
+
+test "issue #269 Gemini: EOF before any finishReason is StreamIncomplete" {
+    var stop: StopReason = .unknown;
+    try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}],\"role\":\"model\"},\"index\":0}]}\n\n", &stop));
+}
+
+test "issue #269 Gemini: the finishReason chunk ends the stream, MAX_TOKENS survives" {
+    var stop: StopReason = .unknown;
+    const text = try replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}],\"role\":\"model\"},\"index\":0}]}\n\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}],\"role\":\"model\"},\"finishReason\":\"MAX_TOKENS\",\"index\":0}]," ++
+        "\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2}}\n\n", &stop);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("cut", text);
+    try std.testing.expectEqual(StopReason.max_tokens, stop);
+}
+
+test "issue #269 Gemini: CONTINUATION is a truncated answer, so it drives the continuation" {
+    var stop: StopReason = .unknown;
+    const text = try replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}],\"role\":\"model\"},\"finishReason\":\"CONTINUATION\",\"index\":0}]}\n\n", &stop);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(StopReason.max_tokens, stop);
+}
+
+test "issue #269 Gemini: FINISH_REASON_UNSPECIFIED is not a stop report" {
+    var stop: StopReason = .unknown;
+    try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}],\"role\":\"model\"},\"finishReason\":\"FINISH_REASON_UNSPECIFIED\",\"index\":0}]}\n\n", &stop));
+}
+
+test "issue #269 Gemini: a finishReason key inside functionCall.args is not a stop report" {
+    // args is an unescaped JSON object, so a substring scan would read this
+    // tool argument as the candidate's terminal status and accept the EOF.
+    var stop: StopReason = .unknown;
+    try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"report\"," ++
+        "\"args\":{\"finishReason\":\"STOP\",\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}}}],\"role\":\"model\"},\"index\":0}]}\n\n", &stop));
+}
+
+test "issue #269 Gemini: a blocked prompt reports why it stopped without any candidate" {
+    var stop: StopReason = .unknown;
+    const text = try replayGemini(std.testing.allocator, "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"},\"usageMetadata\":{\"promptTokenCount\":3}}\n\n", &stop);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+    try std.testing.expectEqual(StopReason.unknown, stop);
+}
+
+test "GeminiClient: catalog then Host declarations answer image input, Host first (issue #273)" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = GeminiClient.init(a, io_rt.io(), "k", "gemini-2.5-flash", "http://localhost");
+    defer client.deinit();
+    const p = client.provider();
+    // The family table alone.
+    try std.testing.expectEqual(true, p.supports(.image_input));
+    try std.testing.expectEqual(
+        if (true) image_capability.Source.model_family else image_capability.Source.unknown,
+        p.imageInput(null).source,
+    );
+    // A catalog declaration overrides the family table, in both directions.
+    var catalog = catalog_mod.Catalog.init(a);
+    try catalog.loadFromModelsListJson("{\"data\":[{\"id\":\"gemini-2.5-flash\",\"capabilities\":{\"image_input\":{\"supported\":false}}}]}");
+    client.catalog = catalog;
+    try std.testing.expectEqual(!true, p.supports(.image_input));
+    try std.testing.expectEqual(image_capability.Source.catalog, p.imageInput(null).source);
+    try std.testing.expectEqual(!true, client.dialectFor("gemini-2.5-flash").profileFor(.gemini, "gemini-2.5-flash").supports_image_input);
+    // A Host declaration outranks the catalog, for this and any named model.
+    client.host_capabilities = try image_capability.Declarations.init(a, &.{.{ .model = "gemini-2.5-flash", .image_input = true }});
+    try std.testing.expectEqual(true, p.supports(.image_input));
+    try std.testing.expectEqual(image_capability.Source.host, p.imageInput(null).source);
+    // Every name on the Gemini wire is a Gemini-family model.
+    try std.testing.expectEqual(image_capability.Source.model_family, p.imageInput("vendor-unlisted").source);
+}

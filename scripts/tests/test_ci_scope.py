@@ -165,7 +165,7 @@ class ClassifyTest(unittest.TestCase):
 
     def test_markdown_outside_doc_and_the_top_level_is_an_input(self) -> None:
         # Prompt templates are @embedFile'd; agent and Skill fixtures are read by tests.
-        for path in ("src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
+        for path in ("packages/coding/src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
             with self.subTest(path=path):
                 self.assertEqual(ci_scope.classify([path])[0], "full")
 
@@ -427,9 +427,9 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, changes, layout)
                 self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
                 self.assertTrue(chosen.product and chosen.tty)
-        self.assertEqual(layout.owner("src/core/conversation.zig"), "kernel")
-        self.assertEqual(layout.owner("src/core/agent_loop.zig"), "coding")
-        self.assertEqual(layout.owner("src/core/tools_extra.zig"), "coding")
+        self.assertEqual(layout.owner("packages/kernel/src/conversation.zig"), "kernel")
+        self.assertEqual(layout.owner("packages/coding/src/core/agent_loop.zig"), "coding")
+        self.assertEqual(layout.owner("packages/coding/src/core/tools_extra.zig"), "coding")
         self.assertEqual(layout.owner("tests/helpers/x.zig"), "testing")
 
     def test_a_package_is_charged_for_each_baseline_entry_it_is_part_of(self) -> None:
@@ -690,8 +690,8 @@ class PackageScopeMainTest(unittest.TestCase):
         self.assertTrue(json.loads(record.read_text(encoding="utf-8"))["fast_path"])
 
     def test_core_changes_keep_offline_evaluation_without_a_provider_report(self) -> None:
-        (self.repo / "src/core/kernel").mkdir(parents=True)
-        self.edit("src/core/kernel/loop.zig")
+        (self.repo / "packages/kernel/src").mkdir(parents=True)
+        self.edit("packages/kernel/src/loop.zig")
         self.commit("loop")
         for event in ("pull_request", "merge_group"):
             got = self.run_main("--event", event, "--base", "HEAD^1")
@@ -1266,6 +1266,23 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, [])
         self.assertIn("relevant=true", output)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_native_gate_follows_moved_core_and_isolated_roots(self) -> None:
+        for path in (
+            "packages/ai/src/core/auth.zig",
+            "packages/kernel/src/loop.zig",
+            "packages/guard/src/core/goal.zig",
+            "packages/coding/src/core/agent_loop.zig",
+            "packages/session/src/core/session_host.zig",
+            "packages/coding/src/lsp_test_root.zig",
+            "packages/base/src/platform/platform.zig",
+            "packages/base/src/root.zig",
+        ):
+            with self.subTest(path=path):
+                proc, _, output = self.run_step("pull_request", path)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("relevant=true", output)
 
     def test_native_steps_read_relevance(self) -> None:
         steps = self.workflow["jobs"]["native-windows-gate"]["steps"]
