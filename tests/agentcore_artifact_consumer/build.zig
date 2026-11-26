@@ -233,7 +233,7 @@ pub fn build(b: *std.Build) void {
     // source-free link attestation lives in the `link` step's probes, which
     // build from the installed bundle alone.
     app.addImport("platform", b.createModule(.{
-        .root_source_file = b.path("../../src/platform/platform.zig"),
+        .root_source_file = b.path("../../packages/base/src/platform/platform.zig"),
         .target = target,
         .optimize = optimize,
     }));

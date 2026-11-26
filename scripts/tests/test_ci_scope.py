@@ -1343,6 +1343,23 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIn("relevant=true", output)
 
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_native_gate_follows_moved_core_and_isolated_roots(self) -> None:
+        for path in (
+            "packages/ai/src/core/auth.zig",
+            "packages/kernel/src/loop.zig",
+            "packages/guard/src/core/goal.zig",
+            "packages/coding/src/core/agent_loop.zig",
+            "packages/session/src/core/session_host.zig",
+            "packages/coding/src/lsp_test_root.zig",
+            "packages/base/src/platform/platform.zig",
+            "packages/base/src/root.zig",
+        ):
+            with self.subTest(path=path):
+                proc, _, output = self.run_step("pull_request", path)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("relevant=true", output)
+
     def test_native_steps_read_relevance(self) -> None:
         steps = self.workflow["jobs"]["native-windows-gate"]["steps"]
         for step in steps:
