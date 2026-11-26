@@ -840,6 +840,12 @@ def observe_execution_ontology_feedback(repo: Path) -> Observation:
         )
 
     execute_slots = zig_function_slice(sources["tool_exec"], "executeSlots") or ""
+    dispatches_batches = re.search(
+        r"try\s+kernel\.executor\.dispatchBatches\(\s*slots,\s*dispatch,\s*"
+        r"SlotDispatch\.mode,\s*SlotDispatch\.executeBatch,\s*true\s*\)",
+        execute_slots,
+    )
+    execute_batch = zig_function_slice(sources["tool_exec"], "executeBatch") or ""
     observe_success = zig_function_slice(
         sources["tool_exec"], "observeSuccessfulExecutions"
     ) or ""
@@ -855,11 +861,17 @@ def observe_execution_ontology_feedback(repo: Path) -> Observation:
 
     execution_checks = {
         "successful batches invoke the sensor": (
-            "observeSuccessfulExecutions(slots[i..j], base_ctx)" in execute_slots
+            dispatches_batches and re.search(
+                r"}\s*observeSuccessfulExecutions\(batch,\s*self\.ctx\);\s*}\s*$",
+                execute_batch,
+            )
         ),
         "accepted prefetch invokes the sensor": (
-            "slots[i].decision == .run" in execute_slots
-            and "observeSuccessfulExecutions(slots[i .. i + 1], base_ctx)" in execute_slots
+            dispatches_batches and re.search(
+                r"if\s*\(batch\[0\]\.decision == \.run and batch\[0\]\.prefetched\)\s*"
+                r"observeSuccessfulExecutions\(batch,\s*self\.ctx\);",
+                execute_batch,
+            )
         ),
         "denied, pending, errors, and empty results are excluded": all(
             marker in observe_success
