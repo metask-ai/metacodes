@@ -219,6 +219,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     // 逐条取出作为后续 input 续发,直到队空(对齐 Claude Code commandQueue)。
     var msg_queue = msg_queue_mod.MsgQueue.init(allocator);
     defer msg_queue.deinit();
+    defer if (g_idle_lead_report) |report| {
+        g_idle_lead_report = null;
+        allocator.free(report);
+    };
     var unsent_draft: ?input.LineEditor = null;
     defer if (unsent_draft) |*draft| draft.deinit();
 
@@ -256,8 +260,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         try fireDueCrons(&turn_host);
 
         // Swarm lead 邮箱轮询(turn 边界):teammate 的回复/idle 通知在两轮之间拉进来,
-        // 入队当作下一轮 user input(idle→立即;有 draft→排在队尾)。**SW5 债**:idle 阻塞在
-        // readLineRaw 时的实时注入需接进输入 poll 循环(见 readLineRaw poll,当前需按回车触发)。
+        // 入队当作下一轮 user input(idle→立即;有 draft→排在队尾)。
+        if (g_idle_lead_report) |report| {
+            g_idle_lead_report = null;
+            _ = msg_queue.push(report);
+            allocator.free(report);
+        }
         if (app.swarm.hasTeam()) {
             if (@import("metacodes-internal").swarm.tools.pollLeadInbox(allocator, &app.swarm) catch null) |pulled| {
                 _ = msg_queue.push(pulled);
@@ -285,7 +293,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 // The double-press exits leave quietly, as Claude Code does;
                 // only `/exit` says goodbye.
                 error.Eof, error.ExitRequested, error.TerminateRequested => break,
-                error.ScheduledPromptDue => continue,
+                error.ScheduledPromptDue, error.LeadReportArrived => continue,
                 else => return err,
             }
         else
@@ -1642,6 +1650,13 @@ var g_winch = std.atomic.Value(bool).init(false);
 /// Windows resize 轮询的上次尺寸(无 SIGWINCH,poll 超时 tick 比对;仅 REPL 单线程读写)。
 var g_last_ws: ?platform_term.TermSize = null;
 
+var g_idle_lead_report: ?[]u8 = null;
+
+fn idleLeadReport(allocator: std.mem.Allocator, swarm: *@import("metacodes-internal").swarm.context.SwarmContext, prompt_idle: bool) ?[]u8 {
+    if (!prompt_idle or !swarm.hasTeam()) return null;
+    return @import("metacodes-internal").swarm.tools.pollLeadInbox(allocator, swarm) catch null;
+}
+
 fn onWinch() void {
     g_winch.store(true, .release);
 }
@@ -1994,9 +2009,13 @@ fn readLineRaw(
             // 一个周期没有输入 = 输入静默过:此后的 Ctrl+O 不再算上一串的连发(Ctrl+O 去抖)。
             if (rc == 0) {
                 region.noteInputIdle();
-                if (wake_for_timers and app.cron_registry.count() != 0 and app.unbound() == null and
-                    !parser.pendingEsc() and editor.view().len == 0 and !region.escapeClosesOverlay() and
-                    app.cron_registry.dueCount() != 0) return error.ScheduledPromptDue;
+                const prompt_idle = wake_for_timers and app.unbound() == null and
+                    !parser.pendingEsc() and editor.view().len == 0 and !region.escapeClosesOverlay();
+                if (prompt_idle and app.cron_registry.count() != 0 and app.cron_registry.dueCount() != 0) return error.ScheduledPromptDue;
+                if (idleLeadReport(allocator, &app.swarm, prompt_idle)) |report| {
+                    g_idle_lead_report = report;
+                    return error.LeadReportArrived;
+                }
             }
             // A double-press window that ran out takes its hint with it.
             if (rc <= 0 and region.expirePress(util_time.nowMs())) redraw(region, &editor, app);
@@ -6469,4 +6488,80 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     try std.testing.expectEqualStrings(sid.asSlice(), app.permission_ctx.session.asSlice()); // 路由键同步
     try std.testing.expectEqualStrings(app.activeModel(), app.transcript_writer.?.model);
     try std.testing.expect(!app.agentJobScope().contains(old_id));
+}
+
+const LeadInboxFixture = struct {
+    home_buf: [256]u8 = undefined,
+    home: []const u8 = "",
+    swarm: @import("metacodes-internal").swarm.context.SwarmContext = undefined,
+    lease: @import("metacodes-internal").core.session_id.SessionId = undefined,
+
+    fn init(self: *LeadInboxFixture) !void {
+        const internal = @import("metacodes-internal");
+        const a = testing.allocator;
+        self.home = internal.util.fs.testing.uniqueDir(&self.home_buf, "cc-zig-lead-wake");
+        try internal.util.fs.mkdirParents(self.home);
+        self.swarm = .{ .allocator = a, .state_root = self.home, .api_key = "k", .model = "m" };
+        const ctx = internal.tools.context.ToolContext{ .allocator = a, .swarm = &self.swarm };
+        a.free(try internal.swarm.tools.executeTeamCreate(&ctx, "{\"name\":\"proj\"}"));
+        var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cfg_path = self.swarm.configPath(&cfg_buf);
+        var seeded = internal.swarm.team.load(a, cfg_path) orelse return error.NoTeamConfig;
+        defer seeded.deinit();
+        self.lease = internal.core.session_id.gen();
+        try seeded.addMember(.{
+            .agent_id = "bob@proj",
+            .name = "bob",
+            .cwd = "/tmp",
+            .session_id = self.swarm.session.asSlice(),
+            .lease_id = self.lease.asSlice(),
+        });
+        try internal.swarm.team.save(a, &seeded, cfg_path);
+    }
+
+    fn deinit(self: *LeadInboxFixture) void {
+        self.swarm.deinit();
+        @import("metacodes-internal").util.fs.testing.rmrfBestEffort(self.home);
+    }
+
+    fn deliver(self: *LeadInboxFixture, text: []const u8) !void {
+        var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const inbox = @import("metacodes-internal").swarm.team.inboxPath(self.home, "proj", "team-lead", &inbox_buf);
+        try @import("metacodes-internal").swarm.mailbox.deliverWithIdentity(testing.allocator, inbox, "bob", text, null, null, self.swarm.session.asSlice(), self.lease.asSlice());
+    }
+
+    fn unread(self: *LeadInboxFixture) !usize {
+        var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const inbox = @import("metacodes-internal").swarm.team.inboxPath(self.home, "proj", "team-lead", &inbox_buf);
+        var list = try @import("metacodes-internal").swarm.mailbox.readUnread(testing.allocator, inbox);
+        defer list.deinit();
+        return list.items.items.len;
+    }
+};
+
+test "an idle prompt takes a teammate's report from the lead inbox; a prompt being typed in leaves it there" {
+    var fx: LeadInboxFixture = .{};
+    try fx.init();
+    defer fx.deinit();
+    try fx.deliver("here is my result");
+
+    try testing.expect(idleLeadReport(testing.allocator, &fx.swarm, false) == null);
+    try testing.expectEqual(@as(usize, 1), try fx.unread());
+
+    const report = idleLeadReport(testing.allocator, &fx.swarm, true) orelse return error.NoReport;
+    defer testing.allocator.free(report);
+    try testing.expect(std.mem.indexOf(u8, report, "here is my result") != null);
+    try testing.expectEqual(@as(usize, 0), try fx.unread());
+    try testing.expect(idleLeadReport(testing.allocator, &fx.swarm, true) == null);
+}
+
+test "a protocol message left unread in the lead inbox does not wake the idle prompt" {
+    var fx: LeadInboxFixture = .{};
+    try fx.init();
+    defer fx.deinit();
+    try fx.deliver("{\"type\":\"permission_request\",\"request_id\":\"r1\"}");
+
+    try testing.expect(idleLeadReport(testing.allocator, &fx.swarm, true) == null);
+    try testing.expect(idleLeadReport(testing.allocator, &fx.swarm, true) == null);
+    try testing.expectEqual(@as(usize, 1), try fx.unread());
 }

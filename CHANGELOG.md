@@ -450,6 +450,14 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **A teammate's report reaches an idle team lead without a key press.**
+  When a teammate finished while the lead's prompt was waiting for input,
+  its report sat in the lead's inbox until the user pressed Enter. The idle
+  prompt now picks it up within a fifth of a second and starts the lead's
+  next turn with it, under the same conditions as a scheduled prompt that
+  falls due: a model is set up and the box is empty, so a draft being typed
+  is never interrupted.
+
 - **Picking the current model again no longer drops the compaction a
   switch queued.** A switch to a model with a smaller context window queues a
   compaction for the next turn. Choosing the same model again in `/model`
