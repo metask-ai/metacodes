@@ -6,7 +6,8 @@
 //! are unit-tested. `replay` carries the plan out through the live paths:
 //! prompts through `user_echo`, each assistant message as one stream and its
 //! tool calls and results as the CoreEvents agent_loop emits, into a
-//! `TuiBackend`. Nothing here renders a turn a second way.
+//! `TuiBackend`; the rest of a reply cut at the output limit carries on the
+//! stream before it, as live. Nothing here renders a turn a second way.
 //!
 //! What the live view never showed is not replayed either: messages the
 //! runtime wrote itself (`Message.Origin.host`: notices, nudges, continuation
@@ -18,6 +19,7 @@ const std = @import("std");
 const msg = @import("metacodes-internal").core.message;
 const Conversation = @import("metacodes-internal").core.conversation.Conversation;
 const host_injection_meter = @import("metacodes-internal").core.host_injection_meter;
+const agent_loop = @import("metacodes-internal").core.agent_loop;
 const SessionId = @import("metacodes-internal").core.session_id.SessionId;
 const session_service = @import("../session_service.zig");
 const user_echo = @import("user_echo.zig");
@@ -57,6 +59,7 @@ pub const Step = union(enum) {
     tool_result: ToolOutcome,
     /// A round's results are in (the live turn clears its current tool).
     end_round,
+    continuation,
 };
 
 /// What replaying `messages` writes, in order (owned slice; the steps borrow
@@ -70,7 +73,12 @@ pub fn plan(allocator: std.mem.Allocator, messages: []const msg.Message) error{O
     errdefer steps.deinit(allocator);
     const start = windowStart(messages);
     if (start > 0) try steps.append(allocator, .{ .elided = start });
-    for (messages[start..]) |m| {
+    for (messages[start..], start..) |m, i| {
+        if (isContinuationRequest(m)) {
+            const after_stream = steps.items.len > 0 and steps.items[steps.items.len - 1] == .stream;
+            if (after_stream and continuesWithText(messages[i + 1 ..])) try steps.append(allocator, .continuation);
+            continue;
+        }
         if (m.origin == .host) continue;
         switch (m.role) {
             .assistant => {
@@ -120,6 +128,18 @@ pub fn plan(allocator: std.mem.Allocator, messages: []const msg.Message) error{O
 /// typed prompt among the last `MAX_REPLAYED_MESSAGES`, so the replay opens
 /// at a turn; failing that, the first assistant message among them, so no
 /// result appears without its call.
+fn isContinuationRequest(m: msg.Message) bool {
+    return m.blocks.len == 1 and m.blocks[0] == .text and std.mem.eql(u8, m.blocks[0].text, agent_loop.CONTINUE_AFTER_TRUNCATION);
+}
+
+fn continuesWithText(rest: []const msg.Message) bool {
+    for (rest) |m| {
+        if (m.origin == .host) continue;
+        return m.role == .assistant and (hasBlock(m, .text) or hasBlock(m, .thinking));
+    }
+    return false;
+}
+
 fn windowStart(messages: []const msg.Message) usize {
     if (messages.len <= MAX_REPLAYED_MESSAGES) return 0;
     const earliest = messages.len - MAX_REPLAYED_MESSAGES;
@@ -227,6 +247,7 @@ pub fn replay(allocator: std.mem.Allocator, target: Target, conversation: *Conve
             ui.emitEvent(session, .{ .tool_result = .{ .id = r.id, .name = r.name, .input = r.input, .content = r.content, .is_error = r.is_error } });
         },
         .end_round => ui.emitEvent(session, .clear_current_tool),
+        .continuation => ui.emitEvent(session, .{ .output_segment_end = .{ .index = 0, .turn = 0, .group = 0, .disposition = .continued, .bytes = 0 } }),
     };
     for (open_calls.items) |id| target.region.clearToolCard(id);
     ui.emitEvent(session, .clear_current_tool);
@@ -346,6 +367,37 @@ test "plan: a long conversation replays its last turns from a typed prompt and s
     const short = try plan(testing.allocator, messages[0..3]);
     defer testing.allocator.free(short);
     try testing.expect(short[0] == .prompt);
+}
+
+test "plan: the rest of a reply cut at the output limit carries on its stream; any other host message between two replies does not" {
+    var conv = Conversation.init(testing.allocator);
+    defer conv.deinit();
+    try conv.appendText(.user, "typed");
+    try conv.appendText(.assistant, "The word is PELICAN");
+    try conv.appendHostText(agent_loop.CONTINUE_AFTER_TRUNCATION);
+    try conv.appendText(.assistant, " and that is all.");
+    try conv.appendHostText("[job notification] the background job finished");
+    try conv.appendText(.assistant, "noted");
+    const steps = try plan(testing.allocator, conv.messages.items);
+    defer testing.allocator.free(steps);
+    try testing.expectEqual(@as(usize, 5), steps.len);
+    try testing.expect(steps[0] == .prompt);
+    try testing.expect(steps[1] == .stream);
+    try testing.expect(steps[2] == .continuation);
+    try testing.expectEqualStrings(" and that is all.", steps[3].stream[0].text);
+    try testing.expectEqualStrings("noted", steps[4].stream[0].text);
+
+    var first = [_]msg.Block{.{ .text = "first half" }};
+    var request = [_]msg.Block{.{ .text = agent_loop.CONTINUE_AFTER_TRUNCATION }};
+    var call = [_]msg.Block{.{ .tool_use = .{ .id = "t", .name = "Bash", .input = "{}" } }};
+    const tool_only = [_]msg.Message{
+        .{ .role = .assistant, .blocks = &first },
+        .{ .role = .user, .blocks = &request, .origin = .host },
+        .{ .role = .assistant, .blocks = &call },
+    };
+    const tool_steps = try plan(testing.allocator, &tool_only);
+    defer testing.allocator.free(tool_steps);
+    for (tool_steps) |step| try testing.expect(step != .continuation);
 }
 
 test "plan: a resumed transcript's host messages stay hidden end to end" {
