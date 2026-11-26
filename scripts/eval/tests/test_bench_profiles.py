@@ -1095,6 +1095,24 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn(left['submission'], {group, ended['items'][2]['submission']})
         self.assertEqual([i['suite'] for i in replay['items'][-2:]], [i['suite'] for i in first['items']])
 
+    def test_delete_last_submission_preserves_legacy_profile_concurrency(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        created = self.client.request('api/profiles/run', self.request())
+        pid = created['id']
+        command = {'id': pid, 'submission': created['items'][0]['submission']}
+        self.client.request('api/profile/submission', {**command, 'action': 'cancel'})
+        record = self.manager.profiles.get(pid)
+        del record['concurrency']
+        record['items'][-1]['concurrency'] = 1
+        self.manager.profiles.save(record)
+        self.client.request('api/profile/submission', {**command, 'action': 'delete'})
+        reloaded = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(reloaded['items'], [])
+        self.assertEqual(reloaded['concurrency'], 1)
+        queued = self.client.request('api/profiles/run', self.request(profile=pid))
+        self.assertEqual([item['concurrency'] for item in queued['items']], [1, 1])
+
     def test_delete_submission_preserves_other_item_handles(self):
         self.manager.profiles.stop()
         self.manager.profiles._thread.join()

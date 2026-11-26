@@ -526,6 +526,7 @@ class ProfileManager:
             elif action == "delete":
                 if any(item["status"] not in ITEM_DONE for item in items):
                     raise ValueError("请先取消作业，等所有评测结束后再删除")
+                record["concurrency"] = profile_concurrency(record)
                 record.setdefault("next_item_index", len(record["items"]))
                 record["items"] = [item for item in record["items"] if item["submission"] != submission]
                 self.save(record)
