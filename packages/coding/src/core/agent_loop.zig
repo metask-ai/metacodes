@@ -5608,47 +5608,7 @@ fn buildApiMessagesWithFeatures(
             if ((!notes.harnessmm and std.mem.startsWith(u8, text, harnessmm_mod.AUTHOR_MARKER)) or
                 (!notes.rsi and std.mem.startsWith(u8, text, @import("../skills/rsi.zig").PREFIX))) continue;
         }
-        // thinking 块随消息投影,由方言决定是否上 wire(`ModelProfile.echoes_reasoning_content`):
-        // DeepSeek 要求回传历史思考,Claude 拒收无签名的 thinking 块,其余方言忽略它。
-        // 它和 reasoning_item 一样**不足以**撑起一条消息。
-        var n_actual: usize = 0;
-        // reasoning_item 是 provider 私有的续传状态,不是"内容":只有 OpenAI
-        // Responses 序列化器会用它,别的方言整块跳过。它单独存在时**不足以**
-        // 撑起一条消息(Anthropic 的 content 数组会空),故不计入实质 block。
-        // 本进程写出的会话不会有这种消息(见上方 turn_has_content 不变式);
-        // 这里是针对外部/未来版本 transcript 的防线,而不是热路径。
-        var n_substantive: usize = 0;
-        for (m.blocks) |b| switch (b) {
-            .thinking, .reasoning_item => n_actual += 1,
-            else => {
-                n_actual += 1;
-                n_substantive += 1;
-            },
-        };
-        // max_tokens 可能恰好截断在 thinking 末尾：Conversation 会保留该
-        // thinking block 供本地审计，但 provider-visible 投影不能生成
-        // `content: []` 的空 assistant 消息。跳过后，紧随的 continuation user
-        // 会由 normalizeApiMessages 与前一条 user 合并，维持合法角色/content。
-        if (n_substantive == 0) continue;
-        const contents = try allocator.alloc(types.ApiContent, n_actual);
-        var idx: usize = 0;
-        for (m.blocks) |b| {
-            const c: types.ApiContent = switch (b) {
-                .text => |t| .{ .text = t }, // 借用，不 dupe——lifetime 绑定 conversation
-                .tool_use => |tu| .{ .tool_use = .{ .id = tu.id, .name = tu.name, .input = tu.input } },
-                .tool_result => |tr| .{ .tool_result = .{
-                    .tool_use_id = tr.tool_use_id,
-                    .content = tr.content,
-                    .is_error = tr.is_error,
-                } },
-                .image => |img| .{ .image = .{ .media_type = img.media_type, .data = img.data } },
-                .reasoning_item => |item| .{ .reasoning_item = .{ .model = item.model, .json = item.json } },
-                .thinking => |t| .{ .thinking = t }, // 借用;是否上 wire 由方言决定
-            };
-            contents[idx] = c;
-            idx += 1;
-        }
-        try out.append(allocator, .{ .role = m.role, .content = contents });
+        try @import("metacodes-kernel").loop.appendHistoryMessage(&out, allocator, m);
     }
     if (synthetic_user_input) |synthetic_text| {
         if (synthetic_text.len > 0) {

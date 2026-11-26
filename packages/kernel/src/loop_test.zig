@@ -503,6 +503,26 @@ test "a history message with only thinking is kept locally but not sent" {
     try std.testing.expectEqual(@as(usize, 4), harness.conversation.messages.items.len);
 }
 
+test "projecting mixed history retains block order and releases allocations on failure" {
+    try std.testing.checkAllAllocationFailures(gpa, struct {
+        fn project(allocator: std.mem.Allocator) !void {
+            var blocks = [_]@import("message.zig").Block{
+                .{ .thinking = "draft" },
+                .{ .text = "answer" },
+            };
+            var messages: std.ArrayList(ai.ApiMessage) = .empty;
+            defer messages.deinit(allocator);
+            try kernel.loop.appendHistoryMessage(&messages, allocator, .{ .role = .assistant, .blocks = &blocks });
+            const projected = messages.items[0];
+            defer allocator.free(projected.content);
+            try std.testing.expectEqual(.assistant, projected.role);
+            try std.testing.expectEqual(@as(usize, 2), projected.content.len);
+            try std.testing.expectEqualStrings("draft", projected.content[0].thinking);
+            try std.testing.expectEqualStrings("answer", projected.content[1].text);
+        }
+    }.project, .{});
+}
+
 test "a tool withdrawn from the request does not run even when the model calls it" {
     var harness = try Harness.init();
     defer harness.deinit();
