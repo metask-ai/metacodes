@@ -53,7 +53,29 @@ def main():
                     page.get_by_role('button', name='创建作业', exact=True).click()
                     page.get_by_role('button', name='清空', exact=True).click()
                     page.get_by_role('checkbox', name='fix-git', exact=True).check()
+                    page.locator('[name=name]').fill('draft profile')
+                    page.locator('[name=attempts]').fill('2')
+                    page.get_by_role('link', name='配置模型 Provider').click()
+                    page.wait_for_url('**/#/settings/providers')
+                    page.get_by_role('heading', name='系统配置', exact=True).wait_for()
+                    page.go_back()
+                    assert page.locator('[name=name]').input_value() == 'draft profile'
+                    assert page.locator('[name=attempts]').input_value() == '2'
+                    assert page.get_by_role('checkbox', name='fix-git', exact=True).is_checked()
                     page.locator('[name=attempts]').fill('1')
+                    pending = []
+                    page.route('**/api/profiles/run', lambda route: pending.append(route))
+                    page.locator('.form-submit button').click()
+                    page.wait_for_selector('dialog[aria-busy=true]')
+                    page.keyboard.press('Escape')
+                    assert page.get_by_role('dialog').is_visible()
+                    assert page.get_by_role('button', name='关闭', exact=True).is_disabled()
+                    page.locator('.run-form').evaluate('form => form.requestSubmit()')
+                    assert len(pending) == 1
+                    pending[0].fulfill(status=503, json={'error': 'test queue failure'})
+                    page.get_by_text('test queue failure', exact=True).wait_for()
+                    assert page.locator('[name=name]').input_value() == 'draft profile'
+                    page.unroute('**/api/profiles/run')
                     page.locator('.form-submit button').click()
                     page.wait_for_url('**/#/profile/*')
                     profile = page.url.split('/profile/')[1]
@@ -136,6 +158,7 @@ def main():
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
                     page.get_by_role('button', name='创建作业', exact=True).click()
                     page.locator('.form-submit button').wait_for()
+                    assert page.get_by_role('dialog').evaluate('d => d.scrollWidth <= d.clientWidth'), 'dialog overflow'
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'mobile overflow'
                     assert not errors, errors
                     browser.close()

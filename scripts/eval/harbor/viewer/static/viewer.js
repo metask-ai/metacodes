@@ -695,23 +695,23 @@ const RUNNERS = { 'harbor-registry': 'Harbor 注册表', 'harbor-local': '本地
 const judgeText = (j) => '评委 ' + j.model + (j.via === 'metask' ? '（Metask 网关）' : j.via === 'host_env' ? '（执行机器环境变量）' : '');
 
 function openRunDialog() {
+  if (document.querySelector('.run-dialog[open]')) return;
   const dialog = h('dialog', { class: 'run-dialog', 'aria-label': '创建作业' });
   const content = h('div', { text: '读取中…' });
-  dialog.append(h('button', { class: 'button', onclick: () => dialog.close() }, '关闭'), content);
+  const close = h('button', { class: 'button', onclick: () => dialog.close() }, '关闭');
+  dialog.append(close, content);
+  dialog.oncancel = (event) => { if (dialog.ariaBusy === 'true') event.preventDefault(); };
   document.body.append(dialog);
   dialog.addEventListener('close', () => {
     dialog.remove();
-    state.runDraft = null;
-    state.taskWanted = null;
-    state.suitePick = null;
-    state.pickBundle = null;
+    if (!dialog.returnValue) clearRunDraft();
   }, { once: true });
   dialog.showModal();
   async function refreshForm() {
-    if (!dialog.open) return;
+    if (!dialog.open || close.disabled) return;
     try {
       const config = await api('/api/workbench');
-      if (dialog.open) content.replaceChildren(runForm(config, refreshForm, dialog));
+      if (dialog.open && !close.disabled) content.replaceChildren(runForm(config, refreshForm, dialog, close));
     } catch (error) {
       content.textContent = error.message;
     }
@@ -719,7 +719,14 @@ function openRunDialog() {
   refreshForm();
 }
 
-function runForm(c, refreshForm, dialog) {
+function clearRunDraft() {
+  state.runDraft = null;
+  state.taskWanted = null;
+  state.suitePick = null;
+  state.pickBundle = null;
+}
+
+function runForm(c, refreshForm, dialog, close) {
   const suites = c.suites || [];
   const byId = new Map(suites.map((s) => [s.id, s]));
   // Selected suites, in the order picked: id -> {tasks, defaults, selected, error, loaded}.
@@ -822,7 +829,7 @@ function runForm(c, refreshForm, dialog) {
     }
     if (!c.can_run) reasons.push('只读模式，不能发起评测');
     if (!fixed && !bundles.length) reasons.push('还没有可用的 metacodes 版本');
-    submit.disabled = reasons.length > 0;
+    submit.disabled = close.disabled || reasons.length > 0;
     blocked.textContent = reasons.length ? '无法开始：' + reasons.join('；') : '';
     const modelText = chosenModels.size > 1 ? ` · ${chosenModels.size} 个模型` : '';
     submit.textContent = picked.length ? `创建作业（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '创建作业';
@@ -923,7 +930,7 @@ function runForm(c, refreshForm, dialog) {
     if (modelMissing) notes.push(`上次的模型 ${modelMissing} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
-        state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; refreshForm();
+        clearRunDraft(); refreshForm();
       } }, '改为新的Profile')));
   }
   form.append(
@@ -946,6 +953,10 @@ function runForm(c, refreshForm, dialog) {
     h('div', { class: 'form-submit' }, submit, blocked, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    if (close.disabled) return;
+    close.disabled = true;
+    dialog.ariaBusy = 'true';
+    form.inert = true;
     submit.disabled = true;
     feedback.textContent = fixed ? '正在排队…' : '正在冻结 metacodes 版本并排队…';
     try {
@@ -960,13 +971,13 @@ function runForm(c, refreshForm, dialog) {
       }
       if (executorsList.length) request.executor = executor.value;
       const record = await api('/api/profiles/run', request);
-      state.suitePick = null;
-      state.runDraft = null;
-      state.taskWanted = null;
       dialog.close();
       if (location.hash === profileHref(record)) render();
       else location.hash = profileHref(record);
     } catch (error) {
+      close.disabled = false;
+      dialog.ariaBusy = 'false';
+      form.inert = false;
       feedback.textContent = error.message;
       syncSubmit();
     }
@@ -2314,7 +2325,26 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#create-run').addEventListener('click', openRunDialog);
   $('#refresh').addEventListener('click', () => { state.countdown = REFRESH_S; render(); });
   $('#auto').addEventListener('click', (e) => { state.auto = !state.auto; e.currentTarget.setAttribute('aria-pressed', String(state.auto)); tick(); });
-  window.addEventListener('hashchange', () => { document.querySelector('.run-dialog[open]')?.close(); state.countdown = REFRESH_S; window.scrollTo(0, 0); render(); });
+  window.addEventListener('hashchange', (event) => {
+    const dialog = document.querySelector('.run-dialog[open]');
+    if (dialog && dialog.ariaBusy !== 'true') {
+      if (new URL(event.newURL).hash.startsWith('#/settings/')) {
+        state.savedRun = { url: event.oldURL, runDraft: state.runDraft, taskWanted: state.taskWanted,
+          suitePick: state.suitePick, pickBundle: state.pickBundle, executor: state.executor };
+      }
+      clearRunDraft();
+      dialog.close('navigation');
+    }
+    if (!dialog && state.savedRun?.url === event.newURL) {
+      const { url, ...draft } = state.savedRun;
+      state.savedRun = null;
+      Object.assign(state, draft);
+      openRunDialog();
+    }
+    state.countdown = REFRESH_S;
+    window.scrollTo(0, 0);
+    render();
+  });
   render();
   state.timer = setInterval(tick, 1000);
 });
