@@ -6919,19 +6919,14 @@ fn announceRetractedAttempt(
 /// The wait between a `retry_notice` and the re-issue it announced (#461).
 /// False when the Run was cancelled before or during it: nothing more is sent.
 fn waitStreamRetryBackoff(abort: ?*const AbortSignal, delay_ms: u32) bool {
-    const aborted = struct {
-        fn check(signal: ?*const AbortSignal) bool {
-            return if (signal) |a| a.isAborted() else false;
-        }
-    }.check;
-    var left: u32 = delay_ms;
-    while (left > 0) {
-        if (aborted(abort)) return false;
-        const step = @min(left, 10);
-        util_time.sleepMs(step);
-        left -= step;
+    const deadline = util_time.nowNs() + @as(i128, delay_ms) * std.time.ns_per_ms;
+    while (!client_mod.cancelled(abort)) {
+        const remaining_ns = deadline - util_time.nowNs();
+        if (remaining_ns <= 0) return true;
+        const remaining_ms: u64 = @intCast(@divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        util_time.sleepMs(if (abort != null) @min(remaining_ms, 10) else remaining_ms);
     }
-    return !aborted(abort);
+    return false;
 }
 
 fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {
