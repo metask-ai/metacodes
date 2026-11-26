@@ -406,6 +406,11 @@ jobs:
           sandbox=(--unshare-all --die-with-parent --new-session --proc /proc --dev /dev --tmpfs /tmp)
           runtime=(--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64)
           bwrap "${sandbox[@]}" "${runtime[@]}" /bin/true
+      - name: Create a private temporary directory for macOS tests
+        if: runner.os == 'macOS' && matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false'
+        run: |
+          test_tmp=$(mktemp -d "${RUNNER_TEMP}/mc.XXXXXX")
+          echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
       # PyYAML for scripts/eval/workbuddy and its tests (requirements-dev.txt).
       # --break-system-packages: the hosted images' system Python is PEP 668
       # "externally managed"; the runner is ephemeral so there is nothing to

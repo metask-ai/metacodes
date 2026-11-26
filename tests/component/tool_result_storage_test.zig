@@ -635,7 +635,15 @@ test "L2 BashOutput paging schema fields drive bounded registry dispatch" {
     var jobs = try cc.job_registry.JobRegistry.init(allocator);
     defer jobs.deinit();
     const job = try jobs.spawnBackground("printf 'ABCDEFGHIJ'; exit 0", null);
-    cc.util_time.sleepMs(200);
+    var remaining: usize = 1000;
+    while (remaining > 0) : (remaining -= 1) {
+        jobs.reapExited();
+        const current = jobs.get(job.id[0..]) orelse return error.MissingJob;
+        if (current.status != .running) break;
+        cc.util_time.sleepMs(10);
+    }
+    const completed = jobs.get(job.id[0..]) orelse return error.MissingJob;
+    try std.testing.expectEqual(cc.job_registry.JobStatus.exited, completed.status);
     var ctx = cc.tools.ToolContext{ .allocator = allocator, .jobs = &jobs };
     var input_buffer: [256]u8 = undefined;
     const input = try std.fmt.bufPrint(

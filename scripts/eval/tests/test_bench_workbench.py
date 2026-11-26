@@ -10,6 +10,7 @@ import ast
 import json
 import concurrent.futures
 import io
+import http.client
 import os
 import socket
 import sys
@@ -1545,5 +1546,21 @@ class LayeringTest(unittest.TestCase):
                     self.assertIn(f'@embedFile("eval/harbor/{package}/{path.name}")', assets)
 
 
+class StopServiceConnectionTest(unittest.TestCase):
+    def test_shutdown_accepts_a_truncated_response(self):
+        from unittest.mock import Mock
+        from scripts.eval.harbor.cli import stop_service
+
+        client = Mock()
+        client.request.side_effect = [{}, http.client.IncompleteRead(b"", 100)]
+        stop_service(client)
+        self.assertEqual(client.request.call_args_list, [
+            unittest.mock.call("api/stop", {}),
+            unittest.mock.call("api/workbench"),
+        ])
+
+
 if __name__ == '__main__':
     unittest.main()
+
+

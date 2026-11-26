@@ -24,7 +24,8 @@ const REFRESH_S = 10;
 const PROFILE_COLORS = ['#6a9dd9', '#71b69e', '#d8af65', '#a99be0', '#eb7c8e', '#5cb8c8', '#c76f5e'];
 const profileColor = (index) => PROFILE_COLORS[index % PROFILE_COLORS.length];
 
-const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, live: false,
+const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, overviewDirty: false, live: false,
+
   jobFilter: 'all', jobSearch: '', suite: null, comparisons: new Map(), sort: { key: 'task', dir: 1 }, selected: new Set(),
   suitePick: null, profileSuite: 'all', profileModel: 'all', taskFilter: 'all', taskSearch: '', taskSort: 'default',
   profileId: null, profileExpanded: false, selectedTaskKey: null, drawerClosed: false,
@@ -204,7 +205,7 @@ async function render() {
     setConnection(false, '读取失败：' + e.message + '（保留上一次的数据）');
   } finally {
     state.busy = false;
-    if (hash !== location.hash) render();
+    if (hash !== location.hash || (state.overviewDirty && r.view === 'overview')) render();
   }
 }
 
@@ -268,6 +269,19 @@ async function deleteProfile(b, button) {
   state.selected.delete(b.id);
   return true;
 }
+function deleteProfileButton(b) {
+  return h('button', { type: 'button', class: 'button', onclick: async (event) => {
+    event.stopPropagation();
+    if (!await deleteProfile(b, event.currentTarget)) return;
+    const current = route();
+    if (current.view === 'overview') {
+      state.overviewDirty = true;
+      render();
+    } else if (current.view === 'profile' && current.profile === b.id) {
+      location.hash = '#/';
+    }
+  } }, '删除 Profile');
+}
 async function deleteJob(j, button) {
   const impact = j.result_owner ? `工作台会删除运行记录和汇总，作业详情保留在 ${j.result_owner}。` : '工作台会删除运行记录、日志和评测结果，不能恢复。';
   if (!confirm(`删除评测结果 ${j.name}？${impact}`)) return;
@@ -310,10 +324,7 @@ function profileActions(b) {
       ? h('button', { type: 'button', class: 'button', title: '只选最新结果里有无效尝试的题（网络波动、环境故障等导致）', onclick: keep(() => runAgain(b, true)) }, '重跑无效的题') : null,
     profileActive(b)
       ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, '停止队列')
-      : h('button', { type: 'button', class: 'button', onclick: keep(async (button) => {
-        if (!await deleteProfile(b, button)) return;
-        if (route().view === 'overview') render(); else location.hash = '#/';
-      }) }, '删除 Profile'),
+      : deleteProfileButton(b),
   ];
 }
 function progressText(b) {
@@ -485,6 +496,7 @@ function multiProfileCompareDock(chosen) {
 }
 
 async function renderOverview() {
+  state.overviewDirty = false;
   navCurrent('overview');
   $('#title').textContent = 'Profiles';
   crumbs([]);
@@ -570,12 +582,14 @@ async function renderOverview() {
           h('div', {}, h('span', { text: '作业数' }), h('b', { text: groupedItems(p).length + ' 作业' }))),
         h('div', { class: 'pcard-foot' },
           h('span', { class: active ? 'acc mono' : null, text: active ? progressText(p) : '最近：' + when(p.last_run_at) }),
-          h('span', { class: 'acc', text: '进入详情 →' })));
+          h('span', { class: 'acc', text: '进入详情 →' }),
+          canRun && !active ? deleteProfileButton(p) : null));
     }));
   }
   drawCards();
   const table = (heads, rows) => h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, heads.map((head) => h('th', { text: head })))), h('tbody', {}, rows)));
+
   const owned = new Set(profiles.flatMap((p) => p.items.map((i) => i.run)));
   const localRuns = new Set(runs.map((r) => r.name));
   const loose = jobs.filter((j) => !owned.has(j.name));
