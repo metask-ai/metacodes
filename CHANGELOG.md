@@ -459,6 +459,9 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **A reply continued after the output limit stays under one bullet.** The
+  part after the limit started a second ⏺, as if it were another reply.
+
 - **AskUserQuestion's Other answer no longer offers Ctrl+G.** The footer
   said `ctrl+g to edit in Vim`, which does nothing while typing an Other
   answer; Ctrl+G opens the editor only for a note.

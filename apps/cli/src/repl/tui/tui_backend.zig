@@ -132,6 +132,7 @@ pub const TuiBackend = struct {
     verbose: bool = false,
     /// retry 提示是否显示(前台 agent_depth==0 才 true;门控见 .retry_notice)。
     show_retry: bool = false,
+    continue_assistant: bool = false,
     /// usage 累加目标(L1:usage 走 CoreEvent.usage 总线;TuiBackend 累加进 app.usage)。
     /// 指向 &app.usage(core UsageTotals)。null = 不累加(测试/无 App)。
     usage_acc: ?*@import("metacodes-internal").core.usage.UsageTotals = null,
@@ -223,7 +224,9 @@ pub const TuiBackend = struct {
             .stream_begin => {
                 // 助手文本走 markdown 渲染路径(beginGenAssistant 重置状态 + 标记段首)。
                 // markdown 渲染器自带颜色,故不再裹 colorize 绿色括号。
-                self.region.beginGenAssistant();
+                if (self.continue_assistant) {
+                    self.continue_assistant = false;
+                } else self.region.beginGenAssistant();
             },
             .text_chunk => |t| self.region.writeGenAssistantText(t),
             .thinking_chunk => |t| self.region.writeGenAssistantText(t), // TUI 暂与 text 同渲染(后续可折叠)
@@ -366,9 +369,11 @@ pub const TuiBackend = struct {
             // 文件修改契约:TUI 的 diff 工具卡走既有 tool_result 渲染路径(见 tool_card),
             // 这条是给进程外/程序化消费者的证据流,TUI no-op。
             .file_changes => {},
-            // 输出语义定性:TUI 边流边渲染,已把文字写进 scrollback,不需要事后重标;
-            // 这两条是给需要区分 commentary/final 的消费者(web/headless/评测)的。
-            .output_segment_begin, .output_segment_end => {},
+            // 输出语义定性:TUI 边流边渲染,已把文字写进 scrollback,不事后重标;只用
+            // output_segment_end 的 continued:续写接在同一个 ⏺ 里。区分 commentary/final
+            // 的是 web/headless/评测。
+            .output_segment_begin => {},
+            .output_segment_end => |e| self.continue_assistant = e.disposition == .continued,
             // #452: only a Run with retractable re-issues emits it; the REPL
             // never sets them (output already in scrollback cannot be taken back).
             .thinking_discarded => {},

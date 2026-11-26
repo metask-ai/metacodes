@@ -49,6 +49,21 @@ fn twoToolUsesSse(a: std.mem.Allocator, name: []const u8, first_json: []const u8
     );
 }
 
+fn textSse(a: std.mem.Allocator, id: []const u8, text: []const u8, stop_reason: []const u8) ![]u8 {
+    const quoted = try std.json.Stringify.valueAlloc(a, text, .{});
+    defer a.free(quoted);
+    return std.fmt.allocPrint(
+        a,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{s}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{ id, quoted, stop_reason },
+    );
+}
+
 const EnvGuard = struct {
     name: [*:0]const u8,
     previous: ?[:0]u8,
@@ -138,6 +153,8 @@ const Fixture = struct {
         var tui = cc.tui_backend.TuiBackend.init(&t.region);
         tui.theme = &t.region.theme;
         tui.alloc = gpa;
+        tui.colorize = true;
+        tui.show_retry = true;
         const backend = tui.backend();
         try app.conversation.appendText(.user, "go");
         var options = cc.session_service.buildRunOptions(app, null);
@@ -198,6 +215,25 @@ test "L2 an ApplyPatch call reaches the TUI as a tool line naming the file, then
     const tool_row = std.mem.indexOf(u8, screen, "⏺ ApplyPatch").?;
     const reply_row = std.mem.indexOf(u8, screen, "all done") orelse return error.TestExpectedEqual;
     try std.testing.expect(tool_row < reply_row);
+}
+
+test "L2 a reply cut at max_tokens and continued stays one reply in the TUI, under one bullet" {
+    const cut = try textSse(gpa, "m1", "first half of the answer\nstill the first", "max_tokens");
+    defer gpa.free(cut);
+    const rest = try textSse(gpa, "m2", "and the second half", "end_turn");
+    defer gpa.free(rest);
+    const bodies = [_][]const u8{ cut, rest };
+
+    var fx: Fixture = undefined;
+    try fx.init(&bodies);
+    defer fx.deinit();
+    const screen = try fx.drawnTurn();
+    defer gpa.free(screen);
+
+    try expectLine(screen, "⏺ first half of the answer");
+    try expectLine(screen, "  still the first");
+    try expectLine(screen, "  and the second half");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, screen, "⏺"));
 }
 
 test "L2 two ScheduleWakeup calls in one reply each show their own result before the next call's line" {
