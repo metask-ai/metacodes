@@ -257,7 +257,7 @@ pub fn render(
         try out.appendSlice(alloc, "ctrl+g to edit in Vim · Esc to cancel"); // note 编辑态(实录)
     } else if (selected == real_n) {
         // Other 选中=输入态:强调可直接打字(bug1:旧文案"Enter to select"误导,像还在选项导航)。
-        try out.appendSlice(alloc, "Type your answer · Enter to submit · ctrl+g to edit in Vim · Esc to cancel");
+        try out.appendSlice(alloc, "Type your answer · Enter to submit · Esc to cancel");
     } else if (has_preview) {
         try out.appendSlice(alloc, "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel");
     } else {
@@ -931,7 +931,8 @@ test "render: Other 项显示已输入文本(other_text)" {
     const r = try render(testing.allocator, th, q, null, 2, &.{ false, false, false, false }, "purple", .{}, 80);
     defer testing.allocator.free(r.frame);
     try capture.expectContains(r.frame, "3. purple"); // Other label = 输入文本
-    try capture.expectContains(r.frame, "ctrl+g to edit in Vim"); // 选中 Other 提示行变化
+    try capture.expectContains(r.frame, "Type your answer · Enter to submit · Esc to cancel"); // 选中 Other 提示行变化
+    try testing.expect(std.mem.indexOf(u8, r.frame, "ctrl+g") == null);
 }
 
 test "render: rows == frame 内换行数(供回顶)" {

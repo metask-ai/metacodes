@@ -1506,6 +1506,7 @@ pub const McpClient = struct {
             if (bounded and inspect_frames) {
                 const line = try capture.readRangeAlloc(self.allocator, 0, @intCast(capture.bytes));
                 defer self.allocator.free(line);
+                _ = result_stream.replaceLoneSurrogates(line);
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 switch (try wire.classifyFrame(arena.allocator(), line)) {

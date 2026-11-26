@@ -100,7 +100,7 @@ test "L2 redirect: the Messages client reports a redirect instead of taking its 
         try hop.expectHeld();
         // The user is told where it pointed: that URL is the fix.
         const said = takeLastError(&summary);
-        try std.testing.expect(std.mem.indexOf(u8, said, "端点重定向") != null);
+        try std.testing.expect(std.mem.indexOf(u8, said, "Endpoint redirect") != null);
         try std.testing.expect(std.mem.indexOf(u8, said, "/elsewhere") != null);
     }
 }
@@ -145,7 +145,7 @@ test "L2 redirect: the OpenAI and Gemini clients name the redirect and keep thei
         _ = takeLastError(&summary);
         try expectRefused(client.provider().sendStream(&MESSAGES, null, null, null, null, null, ""));
         try hop.expectHeld();
-        try std.testing.expect(std.mem.indexOf(u8, takeLastError(&summary), "端点重定向") != null);
+        try std.testing.expect(std.mem.indexOf(u8, takeLastError(&summary), "Endpoint redirect") != null);
     }
     {
         var hop = try Hop.start(arena, "HTTP/1.1 307 Temporary Redirect");
@@ -156,7 +156,7 @@ test "L2 redirect: the OpenAI and Gemini clients name the redirect and keep thei
         _ = takeLastError(&summary);
         try expectRefused(client.provider().sendStream(&MESSAGES, null, null, null, null, null, ""));
         try hop.expectHeld();
-        try std.testing.expect(std.mem.indexOf(u8, takeLastError(&summary), "端点重定向") != null);
+        try std.testing.expect(std.mem.indexOf(u8, takeLastError(&summary), "Endpoint redirect") != null);
     }
 }
 
@@ -318,7 +318,7 @@ test "L2 redirect: a Location cut at the bound is quoted in neither the log nor 
         try expectAbsent(reported.logged(), lead);
         try expectAbsent(reported.summary(), lead);
         try expectPresent(reported.logged(), "too long to report");
-        try expectPresent(reported.summary(), "地址过长");
+        try expectPresent(reported.summary(), "too long to show");
     }
 }
 
@@ -338,7 +338,7 @@ test "L2 echoed credential: an error frame reaches neither the log nor the error
         try expectAbsent(reported.summary(), SECRET);
         // The rest of what the server said is still there to act on.
         try expectPresent(reported.logged(), "bad tenant [REDACTED] rejected");
-        try expectPresent(reported.summary(), "API 错误帧");
+        try expectPresent(reported.summary(), "API error frame");
         try expectPresent(reported.summary(), "bad tenant [REDACTED] rejected");
     }
 }

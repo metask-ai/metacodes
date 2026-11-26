@@ -1408,7 +1408,7 @@ pub const EventIterator = struct {
                     var masked: model_error.MaskedFailure = .{};
                     const shown = model_error.maskFailure(&masked, err_obj, self.credential);
                     self.logWarn("API error event: {s}", .{shown});
-                    @import("last_error.zig").recordNamed("API 错误帧", shown);
+                    @import("last_error.zig").recordNamed("API error frame", shown);
                     // The whole frame: its top-level `request_id` is outside `error`.
                     model_error.noteStreamError(data);
                     self.done_flag = true;

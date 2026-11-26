@@ -5437,7 +5437,7 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |v| {
                 if (v.len > 0 and v[0] == '@') {
                     config.resume_response = readFileAll(allocator, v[1..]) catch |e| blk: {
-                        std.debug.print("error: 读 --resume-response 文件失败: {s}\n", .{@errorName(e)});
+                        std.debug.print("error: could not read the --resume-response file: {s}\n", .{@errorName(e)});
                         break :blk null;
                     };
                 } else {

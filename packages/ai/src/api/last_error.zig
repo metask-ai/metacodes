@@ -12,10 +12,10 @@
 //! headless 不需要:log.errId 直接落 stderr,现场本来可见。
 //!
 //! 写侧还有:client.reportHeadStall / reportBodyStall(空闲监视 shutdown 连接,2026-09-11 起
-//!       正文阶段 stall 也记,TUI 打"正文空闲超时: N ms 内无任何字节(上限 M ms)…";2026-10-24 起
-//!       按学到的保活节奏判死的连接记为"连接已断: …连 keepalive 也没有…");以及
+//!       正文阶段 stall 也记,TUI 打"Response body timeout: no byte for N ms (limit M ms)…";2026-10-24 起
+//!       按学到的保活节奏判死的连接记为"Connection dead: … not even a keepalive …");以及
 //!       client.reportServerError(OpenAI chat / Responses / Gemini 流内的服务端报错,与 Anthropic
-//!       错误帧同名"API 错误帧")。
+//!       错误帧同名"API error frame")。
 //!
 //! 写入前调用方已按本次请求的凭据掩码(client.reportHttpFailure / reportServerError /
 //! reportRedirect、stream error_event):这里只洗控制字节,不认识密钥。
@@ -35,7 +35,7 @@ const sync = @import("platform").sync;
 const BODY_CAP = 512;
 const KIND_CAP = 48;
 
-/// take() 输出缓冲的保证够用长度:前缀("HTTP 65535(重试 N 次后放弃): "/kind)+ body。
+/// take() 输出缓冲的保证够用长度:前缀("HTTP 65535 (gave up after N attempts): "/kind)+ body。
 /// 读侧用它声明栈 buf,别自己拍魔数。
 pub const SUMMARY_BUF_LEN = KIND_CAP + BODY_CAP + 80;
 
@@ -66,7 +66,7 @@ pub fn recordHttp(status: u16, body: []const u8) void {
     body_len = copySanitized(&body_buf, body);
 }
 
-/// 记录非 HTTP 状态错误。kind 如 "连接失败"/"API 错误帧",detail 为错误名或错误 JSON。
+/// 记录非 HTTP 状态错误。kind 如 "Connection failed"/"API error frame",detail 为错误名或错误 JSON。
 pub fn recordNamed(kind: []const u8, detail: []const u8) void {
     lock();
     defer unlock();
@@ -104,13 +104,13 @@ pub fn take(out: *[SUMMARY_BUF_LEN]u8) ?[]const u8 {
     const body = body_buf[0..body_len];
     if (status_code != 0) {
         if (attempts > 1) {
-            return std.fmt.bufPrint(out, "HTTP {d}(重试 {d} 次后放弃): {s}", .{ status_code, attempts, body }) catch unreachable;
+            return std.fmt.bufPrint(out, "HTTP {d} (gave up after {d} attempts): {s}", .{ status_code, attempts, body }) catch unreachable;
         }
         return std.fmt.bufPrint(out, "HTTP {d}: {s}", .{ status_code, body }) catch unreachable;
     }
     const kind = kind_buf[0..kind_len];
     if (attempts > 1) {
-        return std.fmt.bufPrint(out, "{s}(重试 {d} 次后放弃): {s}", .{ kind, attempts, body }) catch unreachable;
+        return std.fmt.bufPrint(out, "{s} (gave up after {d} attempts): {s}", .{ kind, attempts, body }) catch unreachable;
     }
     return std.fmt.bufPrint(out, "{s}: {s}", .{ kind, body }) catch unreachable;
 }
@@ -171,11 +171,11 @@ test "recordHttp + take formats status and body" {
 }
 
 test "recordNamed + noteAttempts formats retry exhaustion" {
-    recordNamed("连接失败", "ConnectionRefused");
+    recordNamed("Connection failed", "ConnectionRefused");
     noteAttempts(10);
     var out: [SUMMARY_BUF_LEN]u8 = undefined;
     const s = take(&out).?;
-    try std.testing.expectEqualStrings("连接失败(重试 10 次后放弃): ConnectionRefused", s);
+    try std.testing.expectEqualStrings("Connection failed (gave up after 10 attempts): ConnectionRefused", s);
 }
 
 test "recordHttp + noteAttempts formats http retry exhaustion" {
@@ -183,14 +183,14 @@ test "recordHttp + noteAttempts formats http retry exhaustion" {
     noteAttempts(10);
     var out: [SUMMARY_BUF_LEN]u8 = undefined;
     const s = take(&out).?;
-    try std.testing.expectEqualStrings("HTTP 503(重试 10 次后放弃): overloaded", s);
+    try std.testing.expectEqualStrings("HTTP 503 (gave up after 10 attempts): overloaded", s);
 }
 
 test "recordNamed single attempt has no retry suffix" {
-    recordNamed("连接失败", "RequestFailed");
+    recordNamed("Connection failed", "RequestFailed");
     var out: [SUMMARY_BUF_LEN]u8 = undefined;
     const s = take(&out).?;
-    try std.testing.expectEqualStrings("连接失败: RequestFailed", s);
+    try std.testing.expectEqualStrings("Connection failed: RequestFailed", s);
 }
 
 test "noteAttempts without record is a no-op" {

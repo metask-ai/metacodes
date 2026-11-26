@@ -337,7 +337,7 @@ fn drawScreen(lines: []const []const u8, top: usize, view_rows: usize, rows: usi
     // footer 提示行(对齐 napicc v2.1.170 金标准全文)。
     writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{rows}) catch "");
     writeAll(1, th.dim);
-    writeAll(1, "  Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · q quit");
+    writeAll(1, "  Showing detailed transcript · ctrl+x ctrl+o to toggle · ↑↓ scroll · q quit");
     writeAll(1, th.reset);
 }
 

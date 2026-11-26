@@ -207,55 +207,6 @@ def test_picker_takes_a_paste_during_a_reply_as_one_filter_edit_and_applies_noth
     assert OPEN in text and "Model  /zai" in text, "粘贴后 picker 应仍开着、过滤词还在:\n" + text
 
 
-def test_picker_takes_the_keys_with_vim_on_and_esc_twice_closes_it(bin_path):
-    from slow_mock_server import SlowMockServer, simple_text
-
-    with SlowMockServer([simple_text("SHOULD_NOT_REACH")]) as srv:
-        raw = run(
-            bin_path,
-            submit("/vim", "Editor mode: vim") + submit("/model", OPEN) + [
-                "type:zai", wait_for("Model  /zai"),
-                "key:esc", wait_for("esc cancel"),
-                "key:esc", wait_for("kept "),
-                "key:enter", "sleep:0.8",
-            ],
-            base_url=srv.url,
-            env={"ZAI_API_KEY": "tty-dummy-zai-key"},
-            per_key_drain=0.08,
-        )
-        requests = list(srv.requests)
-    a, text = _screen(raw)
-    frames = _frames(a)
-    filtered = [sc for sc in frames if "Model  /zai" in sc]
-    assert filtered and "Z.AI GLM Coding Plan" in filtered[-1], "vim 开着时过滤词没到 picker:\n" + text
-    assert not any("❯ zai" in sc for sc in frames), "过滤词进了输入框:\n" + text
-    assert "kept claude" in text and "enter apply" not in text, "两次 Esc 没有先清过滤再关掉 picker:\n" + text
-    assert not requests and "SHOULD_NOT_REACH" not in text, f"什么都不该提交:{requests!r}\n" + text
-    a.assert_input_echo("")
-
-
-def test_picker_enter_applies_the_model_with_vim_on(bin_path):
-    from slow_mock_server import SlowMockServer, simple_text
-
-    with SlowMockServer([simple_text("SHOULD_NOT_REACH")]) as srv:
-        raw = run(
-            bin_path,
-            submit("/vim", "Editor mode: vim") + submit("/model", OPEN) + [
-                "type:glm-5.3", wait_for("Reasoning effort"),
-                "key:enter", wait_for("switched to glm-5.3"), "sleep:0.4",
-            ],
-            base_url=srv.url,
-            env={"ZAI_API_KEY": "tty-dummy-zai-key"},
-            term_size=(30, 120),
-            per_key_drain=0.1,
-        )
-        requests = list(srv.requests)
-    a, text = _screen(raw, rows=30, cols=120)
-    assert "switched to glm-5.3" in " ".join(text.split()), "vim 开着时 Enter 没有应用光标处的模型:\n" + text
-    assert not requests and "SHOULD_NOT_REACH" not in text, f"Enter 把输入框当提示词发出去了:{requests!r}\n" + text
-    a.assert_input_echo("")
-
-
 def test_picker_ctrl_c_closes_it_and_keeps_the_draft(bin_path):
     raw = run(
         bin_path,

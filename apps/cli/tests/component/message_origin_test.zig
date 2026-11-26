@@ -99,11 +99,12 @@ test "L2 message origin: a max-token continuation request is the host's, reaches
     try std.testing.expectEqual(Origin.host, resumed.messages.items[2].origin);
 
     // ...and the resumed session's replay shows the prompt and both halves
-    // of the answer, never the host's request in the user's voice.
+    // of the answer as one reply, never the host's request in the user's voice.
     const steps = try cc.repl_replay.plan(a, resumed.messages.items);
     defer a.free(steps);
-    try std.testing.expectEqual(@as(usize, 3), steps.len);
+    try std.testing.expectEqual(@as(usize, 4), steps.len);
     try std.testing.expectEqualStrings("do the work", steps[0].prompt[0].text);
     try std.testing.expectEqualStrings("first half ", steps[1].stream[0].text);
-    try std.testing.expectEqualStrings("second half", steps[2].stream[0].text);
+    try std.testing.expect(steps[2] == .continuation);
+    try std.testing.expectEqualStrings("second half", steps[3].stream[0].text);
 }

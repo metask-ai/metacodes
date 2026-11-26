@@ -1191,8 +1191,7 @@ by its path.
 The picker is modal for the keyboard and not for the session. Plain characters
 are its filter, so the draft in the input box is untouched and a reply keeps
 streaming; a commit during a reply changes the next turn, not the one in flight.
-With `/vim` on it takes the keys all the same, and vim's keymap returns when
-it closes (#606). At the prompt `Ctrl+C` closes it whatever it shows, like a
+At the prompt `Ctrl+C` closes it whatever it shows, like a
 cancel (`kept …`), and leaves the draft; the next `Ctrl+C` arms the exit as
 usual (#607). `Ctrl+D`, and `Ctrl+C` during a reply, deliberately pass through,
 so there is always an exit that does not depend on the picker's own state

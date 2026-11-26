@@ -25,6 +25,7 @@ const term = @import("../term.zig");
 const render_mod = @import("../../render.zig");
 const highlight = @import("metacodes-internal").highlight.highlight;
 const hl_adapter = @import("metacodes-internal").highlight.hl_adapter;
+const mcp_naming = @import("metacodes-internal").mcp.naming;
 const Theme = theme_mod.Theme;
 
 pub const RenderOpts = struct {
@@ -70,12 +71,13 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     if (std.mem.eql(u8, tool_name, "Skill")) return .hidden;
     // 有专用 summary 渲染器的工具(renderResultBody 分发到 diff/搜索/Read/WebFetch 渲染器)。
     const summary_tools = [_][]const u8{
-        "Bash",     "BashOutput", "Edit",  "Write", "Read", "Grep", "Glob",
-        "WebFetch", "WebSearch",  "Agent",
+        "Bash",     "BashOutput", "Edit",  "Write",      "Read", "Grep", "Glob",
+        "WebFetch", "WebSearch",  "Agent", "ApplyPatch",
     };
     for (summary_tools) |t| {
         if (std.mem.eql(u8, tool_name, t)) return .summary;
     }
+    if (isMcpTool(tool_name) or isGenericCardTool(tool_name)) return .summary;
     // 有副作用、返回 JSON 的工具:有人话渲染器(renderJsonToolSummary)→ summary。
     // 否则 hidden 会让 agent_loop 连 ⏺ 起始卡都跳过(工具被调用时 TUI 完全无感,
     // 2026-06-04 实测过的 WebSearch bug)。
@@ -141,10 +143,16 @@ pub fn hasProgressCard(tool_name: []const u8) bool {
 
 /// 类A(查询/执行类):执行期整张卡活在底部动态重绘区(自然语言进行时标题),
 /// 完成后 **commit 进 scrollback**(过去式标题)。对齐 cc 2.1.165 工具卡两态。
+/// MCP、ApplyPatch 和通用卡工具也走这里:完成时把调用行和结果一起 commit。
 /// 与 hasProgressCard(WebSearch:完成只移除,结果走助手文本)互斥。
 pub fn usesLiveCard(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Read") or
-        std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob");
+        std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob") or
+        commitsCallWithResult(tool_name);
+}
+
+fn commitsCallWithResult(tool_name: []const u8) bool {
+    return isMcpTool(tool_name) or isGenericCardTool(tool_name) or std.mem.eql(u8, tool_name, "ApplyPatch");
 }
 
 /// tool_start 时是否占用动态区那张卡(addToolCard)。两类(WebSearch progress + 类A live)统称。
@@ -382,11 +390,19 @@ pub fn renderLiveDone(
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
+    if (commitsCallWithResult(tool_name)) {
+        const head = try renderStart(alloc, th, tool_name, input);
+        defer alloc.free(head);
+        const body = try renderResult(alloc, th, tool_name, input, content, kind, elapsed_ms, opts);
+        defer alloc.free(body);
+        try out.appendSlice(alloc, head);
+        try out.appendSlice(alloc, body);
+        return try out.toOwnedSlice(alloc);
+    }
+
     // 行1:⏺ <done title>。**不显右对齐耗时**——对齐 cc 2.1.165:committed scrollback 卡
     // 只有 `⏺ Ran 1 shell command` 标题,无 `✓ 0.1s`(耗时仅在运行中动态卡/spinner 上,
     // 不进历史)。kind 的成功/失败由 ⎿ body 体现(错误结果走 renderResultBody 红字)。
-    _ = kind;
-    _ = elapsed_ms;
     const title = try toolDoneTitle(alloc, tool_name, input, content);
     defer alloc.free(title);
     try out.appendSlice(alloc, th.accent);
@@ -539,6 +555,12 @@ fn renderResultBody(
     kind: ResultKind,
     elapsed_ms: u64,
 ) !void {
+    if (isMcpTool(tool_name)) {
+        return renderMcpResult(alloc, th, output_text, out, opts, kind);
+    }
+    if (isGenericCardTool(tool_name)) {
+        return renderGenericToolResult(alloc, th, output_text, out, opts, kind);
+    }
     if (kind == .err) {
         return renderErrorBody(alloc, th, output_text, out, opts);
     }
@@ -1395,6 +1417,8 @@ fn jsonUnescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 /// 对齐 cc:Write/Edit→文件 basename;Bash→命令首行;Read→basename;Grep/Glob→pattern;
 /// WebFetch→域名;WebSearch→"query";其余→空(标题不带括号)。caller free。
 fn headerArg(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
+    if (isMcpTool(tool_name) or isGenericCardTool(tool_name)) return argSummary(alloc, args);
+    if (std.mem.eql(u8, tool_name, "ApplyPatch")) return patchFilesSummary(alloc, args);
     if (std.mem.eql(u8, tool_name, "Bash")) {
         if (extractField(args, "command")) |cmd| {
             const dec = try jsonUnescape(alloc, cmd);
@@ -1453,6 +1477,7 @@ pub fn toolPreviewPub(alloc: std.mem.Allocator, tool_name: []const u8, args: []c
 /// 根据工具名和参数 JSON 生成单行预览("$ cmd" / "📄 path" / 等)。caller free。
 /// 不识别的工具 → 返回空 slice(预览行省略)。
 fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
+    if (commitsCallWithResult(tool_name)) return headerArg(alloc, tool_name, args);
     if (std.mem.eql(u8, tool_name, "Bash")) {
         if (extractField(args, "command")) |cmd| {
             // command 含 shell 操作符(&&、>、换行),JSON 里被转义成 && 等;
@@ -1613,6 +1638,290 @@ fn extractRawField(args: []const u8, key: []const u8) ?[]const u8 {
     while (p < args.len and args[p] != ',' and args[p] != '}' and args[p] != ' ') : (p += 1) {}
     if (p == start) return null;
     return args[start..p];
+}
+
+fn isMcpTool(tool_name: []const u8) bool {
+    return std.mem.startsWith(u8, tool_name, mcp_naming.PREFIX);
+}
+
+const ARG_SUMMARY_COLS: usize = 60;
+const PATCH_FILE_MARKERS = [_][]const u8{ "*** Add File: ", "*** Update File: ", "*** Delete File: " };
+
+fn patchFilesSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, args, .{}) catch return alloc.dupe(u8, "");
+    defer parsed.deinit();
+    if (parsed.value != .object) return alloc.dupe(u8, "");
+    const patch = parsed.value.object.get("patch") orelse return alloc.dupe(u8, "");
+    if (patch != .string) return alloc.dupe(u8, "");
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, patch.string, '\n');
+    while (lines.next()) |line| {
+        const path = for (PATCH_FILE_MARKERS) |marker| {
+            if (std.mem.startsWith(u8, line, marker)) break std.mem.trim(u8, line[marker.len..], " \t\r");
+        } else continue;
+        if (names.items.len > 0) try names.appendSlice(alloc, ", ");
+        try appendPrintable(alloc, &names, basename(path));
+    }
+    const shown = try layout.truncate(alloc, names.items, ARG_SUMMARY_COLS, "…");
+    defer if (shown.ptr != names.items.ptr) alloc.free(shown);
+    return alloc.dupe(u8, shown);
+}
+const REPLACEMENT_CHAR = "\u{FFFD}";
+
+fn argSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, args, .{}) catch return alloc.dupe(u8, "");
+    defer parsed.deinit();
+    if (parsed.value != .object) return alloc.dupe(u8, "");
+    var summary: std.ArrayList(u8) = .empty;
+    defer summary.deinit(alloc);
+    var fields = parsed.value.object.iterator();
+    while (fields.next()) |field| {
+        if (summary.items.len > 0) try summary.appendSlice(alloc, ", ");
+        try appendPrintable(alloc, &summary, field.key_ptr.*);
+        try summary.appendSlice(alloc, ": ");
+        const value = try std.json.Stringify.valueAlloc(alloc, field.value_ptr.*, .{});
+        defer alloc.free(value);
+        try summary.appendSlice(alloc, value);
+    }
+    const shown = try layout.truncate(alloc, summary.items, ARG_SUMMARY_COLS, "…");
+    defer if (shown.ptr != summary.items.ptr) alloc.free(shown);
+    return alloc.dupe(u8, shown);
+}
+
+fn appendPrintable(alloc: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            try out.appendSlice(alloc, REPLACEMENT_CHAR);
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) {
+            try out.appendSlice(alloc, REPLACEMENT_CHAR);
+            return;
+        }
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            try out.appendSlice(alloc, REPLACEMENT_CHAR);
+            i += 1;
+            continue;
+        };
+        if (cp == '\r' and i + 1 < text.len and text[i + 1] == '\n') {
+            i += 1;
+            continue;
+        }
+        const control = (cp < 0x20 and cp != '\n' and cp != '\t') or (cp >= 0x7f and cp < 0xa0);
+        try out.appendSlice(alloc, if (control) REPLACEMENT_CHAR else text[i .. i + len]);
+        i += len;
+    }
+}
+
+fn mcpResultText(alloc: std.mem.Allocator, output_text: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, output_text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const content = parsed.value.object.get("content") orelse return null;
+    if (content != .array) return null;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        if (text.items.len > 0 and text.items[text.items.len - 1] != '\n') try text.append(alloc, '\n');
+        const kind: []const u8 = if (item.object.get("type")) |t| (if (t == .string) t.string else "content") else "content";
+        if (std.mem.eql(u8, kind, "text")) {
+            if (item.object.get("text")) |t| if (t == .string) {
+                try appendPrintable(alloc, &text, t.string);
+                continue;
+            };
+        }
+        try text.append(alloc, '[');
+        try appendPrintable(alloc, &text, kind);
+        try text.append(alloc, ']');
+    }
+    return try text.toOwnedSlice(alloc);
+}
+
+fn renderMcpResult(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    output_text: []const u8,
+    out: *std.ArrayList(u8),
+    opts: RenderOpts,
+    kind: ResultKind,
+) !void {
+    if (kind == .err) return renderMcpError(alloc, th, output_text, out, opts);
+    const text = (try mcpResultText(alloc, output_text)) orelse {
+        const trimmed = std.mem.trim(u8, output_text, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] == '{' or trimmed[0] == '[') return;
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(alloc);
+        try appendPrintable(alloc, &plain, output_text);
+        return renderFoldedText(alloc, th, plain.items, out, opts);
+    };
+    defer alloc.free(text);
+    return renderFoldedText(alloc, th, text, out, opts);
+}
+
+fn renderMcpError(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    const text = (try mcpErrorText(alloc, output_text)) orelse return renderErrorBody(alloc, th, output_text, out, opts);
+    defer alloc.free(text);
+    const line = firstLine(text);
+    if (line.len == 0) return renderErrorBody(alloc, th, output_text, out, opts);
+    return appendLine(alloc, out, th.danger, line, th.reset);
+}
+
+const MCP_TRUNCATION_NOTE = "\n[MCP error truncated: original_bytes=";
+
+fn mcpErrorText(alloc: std.mem.Allocator, output_text: []const u8) !?[]u8 {
+    if (try mcpResultText(alloc, output_text)) |direct| return direct;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, output_text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const failure = parsed.value.object.get("error") orelse return null;
+    if (failure != .object) return null;
+    const detail_value = failure.object.get("detail") orelse return null;
+    if (detail_value != .string) return null;
+    var detail = detail_value.string;
+    if (std.mem.lastIndexOf(u8, detail, MCP_TRUNCATION_NOTE)) |at| detail = detail[0..at];
+    if (try mcpResultText(alloc, detail)) |text| return text;
+    return mcpFirstTextOfCutResult(alloc, detail);
+}
+
+fn mcpFirstTextOfCutResult(alloc: std.mem.Allocator, detail: []const u8) !?[]u8 {
+    if (!std.mem.startsWith(u8, std.mem.trimStart(u8, detail, " \t\r\n"), "{")) return null;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, detail, search, "\"text\"")) |at| {
+        search = at + "\"text\"".len;
+        var p = search;
+        while (p < detail.len and (detail[p] == ' ' or detail[p] == '\t')) p += 1;
+        if (p >= detail.len or detail[p] != ':') continue;
+        p += 1;
+        while (p < detail.len and (detail[p] == ' ' or detail[p] == '\t')) p += 1;
+        if (p >= detail.len or detail[p] != '"') continue;
+        return try jsonStringFirstLine(alloc, detail[p + 1 ..]);
+    }
+    return null;
+}
+
+fn jsonStringFirstLine(alloc: std.mem.Allocator, escaped: []const u8) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    var i: usize = 0;
+    while (i < escaped.len) {
+        const c = escaped[i];
+        if (c == '"') break;
+        if (c != '\\') {
+            try raw.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= escaped.len) break;
+        const e = escaped[i + 1];
+        i += 2;
+        switch (e) {
+            'n' => break,
+            'r' => try raw.append(alloc, '\r'),
+            't' => try raw.append(alloc, '\t'),
+            'b' => try raw.append(alloc, 0x08),
+            'f' => try raw.append(alloc, 0x0c),
+            'u' => {
+                if (i + 4 > escaped.len) break;
+                const unit = std.fmt.parseInt(u16, escaped[i .. i + 4], 16) catch break;
+                i += 4;
+                const cp: u21 = joined: {
+                    if (!std.unicode.utf16IsHighSurrogate(unit) or i + 6 > escaped.len or !std.mem.startsWith(u8, escaped[i..], "\\u")) break :joined unit;
+                    const low = std.fmt.parseInt(u16, escaped[i + 2 .. i + 6], 16) catch break :joined unit;
+                    const pair = std.unicode.utf16DecodeSurrogatePair(&.{ unit, low }) catch break :joined unit;
+                    i += 6;
+                    break :joined pair;
+                };
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch {
+                    try raw.appendSlice(alloc, REPLACEMENT_CHAR);
+                    continue;
+                };
+                try raw.appendSlice(alloc, buf[0..n]);
+            },
+            else => try raw.append(alloc, e),
+        }
+    }
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    try appendPrintable(alloc, &text, raw.items);
+    return text.toOwnedSlice(alloc);
+}
+
+const GENERIC_CARD_TOOLS = [_][]const u8{
+    "ScheduleWakeup", "CodeMap",    "FindSymbol",  "ReadArtifact",
+    "TeamCreate",     "TeamDelete", "SendMessage", "ExecuteCode",
+};
+const GUTTER_COLS: usize = 5;
+
+fn isGenericCardTool(tool_name: []const u8) bool {
+    for (GENERIC_CARD_TOOLS) |name| if (std.mem.eql(u8, tool_name, name)) return true;
+    return false;
+}
+
+fn renderGenericToolResult(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    output_text: []const u8,
+    out: *std.ArrayList(u8),
+    opts: RenderOpts,
+    kind: ResultKind,
+) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    if (kind == .err) {
+        if (extractField(output_text, "detail") != null or extractField(output_text, "message") != null)
+            return renderErrorBody(alloc, th, output_text, out, opts);
+        try appendPrintable(alloc, &text, std.mem.trim(u8, output_text, " \t\r\n"));
+        const line = firstLine(text.items);
+        if (line.len == 0) return renderErrorBody(alloc, th, output_text, out, opts);
+        return appendLine(alloc, out, th.danger, line, th.reset);
+    }
+    try appendReadable(alloc, &text, output_text);
+    return renderFoldedText(alloc, th, text.items, out, opts);
+}
+
+fn appendReadable(alloc: std.mem.Allocator, out: *std.ArrayList(u8), output_text: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, output_text, .{}) catch return appendPrintable(alloc, out, output_text);
+    defer parsed.deinit();
+    if (parsed.value != .object) return appendPrintable(alloc, out, output_text);
+    var fields = parsed.value.object.iterator();
+    while (fields.next()) |field| {
+        if (out.items.len > 0) try out.append(alloc, '\n');
+        try appendPrintable(alloc, out, field.key_ptr.*);
+        try out.appendSlice(alloc, ": ");
+        switch (field.value_ptr.*) {
+            .string => |value| {
+                const first = firstLine(value);
+                try appendPrintable(alloc, out, first);
+                if (first.len < value.len) try out.appendSlice(alloc, " …");
+            },
+            else => {
+                const value = try std.json.Stringify.valueAlloc(alloc, field.value_ptr.*, .{});
+                defer alloc.free(value);
+                try out.appendSlice(alloc, value);
+            },
+        }
+    }
+}
+
+fn renderFoldedText(alloc: std.mem.Allocator, th: Theme, text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    if (opts.cols <= GUTTER_COLS + 1 or opts.verbose or opts.transcript) return renderGenericFold(alloc, th, text, out, opts);
+    var capped: std.ArrayList(u8) = .empty;
+    defer capped.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try capped.append(alloc, '\n');
+        first = false;
+        const shown = try layout.truncate(alloc, line, opts.cols - GUTTER_COLS, "…");
+        defer if (shown.ptr != line.ptr) alloc.free(shown);
+        try capped.appendSlice(alloc, shown);
+    }
+    return renderGenericFold(alloc, th, capped.items, out, opts);
 }
 
 /// 这些工具有副作用、返回 JSON,需提关键字段拼人话(绝不裸吐 JSON),由 renderJsonToolSummary 处理。
@@ -2459,4 +2768,269 @@ test "actionLabel: 超长 CJK 参数按显示宽截断且不切碎 UTF-8" {
     // 形如 Read(...…)。
     try testing.expect(std.mem.startsWith(u8, s, "Read("));
     try testing.expect(std.mem.endsWith(u8, s, ")"));
+}
+
+test "an MCP tool gets a start line and a result body, as a built-in tool does" {
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("mcp__plc__echo"));
+    try testing.expect(showStartCard("mcp__plc__echo"));
+    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("plc__echo"));
+}
+
+test "an MCP start line names the tool and summarizes its arguments in one line" {
+    const a = testing.allocator;
+    const s = try renderStart(a, theme_mod.monochrome, "mcp__plc__echo", "{\"message\":\"set line 3 to 900 rpm\",\"line\":3,\"dry_run\":false}");
+    defer a.free(s);
+    try testing.expectEqualStrings("* mcp__plc__echo(message: \"set line 3 to 900 rpm\", line: 3, dry_run: false)\n", s);
+
+    const long = try renderStart(a, theme_mod.monochrome, "mcp__plc__echo", "{\"message\":\"" ++ "x" ** 120 ++ "\"}");
+    defer a.free(long);
+    try testing.expect(std.mem.indexOf(u8, long, "…)") != null);
+    try testing.expect(term.displayWidth(long) < 90);
+
+    const bare = try renderStart(a, theme_mod.monochrome, "mcp__plc__status", "{}");
+    defer a.free(bare);
+    try testing.expectEqualStrings("* mcp__plc__status\n", bare);
+
+    const escaped = try renderStart(a, theme_mod.monochrome, "mcp__plc__echo", "{\"message\":\"a\\u001b[2Jb\\nc\"}");
+    defer a.free(escaped);
+    try testing.expect(std.mem.indexOfScalar(u8, escaped, 0x1b) == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, escaped, "\n"));
+}
+
+test "an MCP result shows the server's text, folded like any tool output" {
+    const a = testing.allocator;
+    const content = "{\"content\":[{\"type\":\"text\",\"text\":\"line 3 set\\nspeed 900\"},{\"type\":\"image\",\"data\":\"AAAA\",\"mimeType\":\"image/png\"}]}";
+    const s = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", content, .ok, 0, .{});
+    defer a.free(s);
+    try capture.expectContains(s, "line 3 set");
+    try capture.expectContains(s, "speed 900");
+    try capture.expectContains(s, "[image]");
+    try testing.expect(std.mem.indexOf(u8, s, "\"content\"") == null);
+
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(a);
+    try many.appendSlice(a, "{\"content\":[{\"type\":\"text\",\"text\":\"");
+    for (0..15) |i| try many.print(a, "row {d}\\n", .{i});
+    try many.appendSlice(a, "\"}]}");
+    const folded = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", many.items, .ok, 0, .{});
+    defer a.free(folded);
+    try capture.expectContains(folded, "row 9");
+    try testing.expect(std.mem.indexOf(u8, folded, "row 10") == null);
+    try capture.expectContains(folded, "… +5 lines");
+}
+
+test "an MCP result never writes the server's control characters to the terminal" {
+    const a = testing.allocator;
+    const content = "{\"content\":[{\"type\":\"text\",\"text\":\"ok\\u001b]0;title\\u0007\\r\\nnext\\u009b2J\"}]}";
+    const s = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", content, .ok, 0, .{});
+    defer a.free(s);
+    try testing.expect(std.mem.indexOfScalar(u8, s, 0x1b) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, s, 0x07) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, s, '\r') == null);
+    try testing.expect(std.mem.indexOf(u8, s, "\u{9b}") == null);
+    try capture.expectContains(s, "ok" ++ REPLACEMENT_CHAR ++ "]0;title" ++ REPLACEMENT_CHAR);
+    try capture.expectContains(s, "next" ++ REPLACEMENT_CHAR ++ "2J");
+}
+
+test "an MCP error, wrapped as the tool error the pipeline reports, shows the server's first line of text, not its JSON" {
+    const a = testing.allocator;
+    const result = "{\"content\":[{\"type\":\"text\",\"text\":\"line 3 is locked\\ncall the operator\"}],\"isError\":true}";
+    const wrapped = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = result, .recoverable = true } }, .{});
+    defer a.free(wrapped);
+    const s = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", wrapped, .err, 0, .{});
+    defer a.free(s);
+    try capture.expectContains(s, "line 3 is locked");
+    try testing.expect(std.mem.indexOf(u8, s, "call the operator") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "isError") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "content") == null);
+
+    const cut_detail = "{\"content\":[{\"type\":\"text\",\"text\":\"disk \\u001b[2J full\\nfirst block goes on and o" ++ "\n[MCP error truncated: original_bytes=70000]";
+    const cut = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = cut_detail, .recoverable = true } }, .{});
+    defer a.free(cut);
+    const truncated = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", cut, .err, 0, .{});
+    defer a.free(truncated);
+    try capture.expectContains(truncated, "disk " ++ REPLACEMENT_CHAR ++ "[2J full");
+    try testing.expect(std.mem.indexOfScalar(u8, truncated, 0x1b) == null);
+    try testing.expect(std.mem.indexOf(u8, truncated, "first block") == null);
+    try testing.expect(std.mem.indexOf(u8, truncated, "truncated") == null);
+
+    const paired_detail = "{\"content\":[{\"type\":\"text\",\"text\":\"build \\ud83d\\ude00 failed; lone \\ud83d, \\ude00; doubled \\ud83d\\ud83d\\ude00\\nmore text goes o" ++ "\n[MCP error truncated: original_bytes=70000]";
+    const paired = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = paired_detail, .recoverable = true } }, .{});
+    defer a.free(paired);
+    const emoji = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", paired, .err, 0, .{});
+    defer a.free(emoji);
+    try capture.expectContains(emoji, "build \u{1F600} failed; lone " ++ REPLACEMENT_CHAR ++ ", " ++ REPLACEMENT_CHAR ++ "; doubled " ++ REPLACEMENT_CHAR ++ "\u{1F600}");
+    try testing.expect(std.mem.indexOf(u8, emoji, "more text") == null);
+
+    const cut_pair_detail = "{\"content\":[{\"type\":\"text\",\"text\":\"ends in \\ud83d\\ude" ++ "\n[MCP error truncated: original_bytes=70000]";
+    const cut_pair = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = cut_pair_detail, .recoverable = true } }, .{});
+    defer a.free(cut_pair);
+    const half = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", cut_pair, .err, 0, .{});
+    defer a.free(half);
+    try capture.expectContains(half, "ends in " ++ REPLACEMENT_CHAR);
+
+    const direct = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", result, .err, 0, .{});
+    defer a.free(direct);
+    try capture.expectContains(direct, "line 3 is locked");
+    try testing.expect(std.mem.indexOf(u8, direct, "call the operator") == null);
+
+    const structured = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", "{\"error\":{\"code\":\"other\",\"detail\":\"server went away\"}}", .err, 0, .{});
+    defer a.free(structured);
+    try capture.expectContains(structured, "server went away");
+}
+
+test "MCP calls, ApplyPatch and the generic-card tools run as a live card and commit their call line with their own result" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "mcp__plc__echo", "ApplyPatch", "ScheduleWakeup", "ReadArtifact", "ExecuteCode" }) |name| {
+        try testing.expect(usesLiveCard(name));
+        try testing.expect(usesDynamicCard(name));
+    }
+    try testing.expect(!usesLiveCard("Edit"));
+    try testing.expect(!usesLiveCard("Write"));
+
+    const input = "{\"message\":\"hi\"}";
+    const preview = try toolPreviewPub(a, "mcp__plc__echo", input);
+    defer a.free(preview);
+    try testing.expectEqualStrings("message: \"hi\"", preview);
+
+    const output = "{\"content\":[{\"type\":\"text\",\"text\":\"hi back\"}]}";
+    for ([_]ResultKind{ .ok, .err }) |kind| {
+        const done = try renderLiveDone(a, theme_mod.monochrome, "mcp__plc__echo", input, output, kind, 0, .{});
+        defer a.free(done);
+        const start = try renderStart(a, theme_mod.monochrome, "mcp__plc__echo", input);
+        defer a.free(start);
+        const body = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", input, output, kind, 0, .{});
+        defer a.free(body);
+        try testing.expect(body.len > 0);
+        try testing.expect(std.mem.startsWith(u8, done, start));
+        try testing.expectEqualStrings(body, done[start.len..]);
+    }
+}
+
+test "ApplyPatch gets a start line naming the files it touches, and its result shows the counts and the diff" {
+    const a = testing.allocator;
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ApplyPatch"));
+    try testing.expect(showStartCard("ApplyPatch"));
+
+    const patch = "{\"patch\":\"*** Begin Patch\\n*** Add File: /tmp/w/hello.txt\\n+hi\\n*** Update File: src/app.py\\n@@\\n-a\\n+b\\n*** Delete File: old.txt\\n*** End Patch\"}";
+    const start = try renderStart(a, theme_mod.monochrome, "ApplyPatch", patch);
+    defer a.free(start);
+    try testing.expectEqualStrings("* ApplyPatch(hello.txt, app.py, old.txt)\n", start);
+
+    const result = "{\"success\":true,\"added\":1,\"modified\":1,\"deleted\":1,\"gitDiff\":\"--- /dev/null\\n+++ b/hello.txt\\n@@ -0,0 +1 @@\\n+hi\\n\"}";
+    const body = try renderResult(a, theme_mod.monochrome, "ApplyPatch", patch, result, .ok, 0, .{});
+    defer a.free(body);
+    try capture.expectContains(body, "Applied patch: 1 added, 1 modified, 1 deleted");
+    try capture.expectContains(body, "+hi");
+    try testing.expect(std.mem.indexOf(u8, body, "gitDiff") == null);
+}
+
+test "an ApplyPatch start line keeps file names on one line and out of the terminal's control" {
+    const a = testing.allocator;
+    const many = try renderStart(a, theme_mod.monochrome, "ApplyPatch", "{\"patch\":\"*** Begin Patch\\n" ++ "*** Add File: a_rather_long_file_name.txt\\n+x\\n" ** 6 ++ "*** End Patch\"}");
+    defer a.free(many);
+    try testing.expect(std.mem.indexOf(u8, many, "…)") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, many, "\n"));
+
+    const hostile = try renderStart(a, theme_mod.monochrome, "ApplyPatch", "{\"patch\":\"*** Add File: a\\u001b[2Jb.txt\\n+x\"}");
+    defer a.free(hostile);
+    try testing.expect(std.mem.indexOfScalar(u8, hostile, 0x1b) == null);
+    try capture.expectContains(hostile, "ApplyPatch(a" ++ REPLACEMENT_CHAR ++ "[2Jb.txt)");
+
+    const empty = try renderStart(a, theme_mod.monochrome, "ApplyPatch", "{}");
+    defer a.free(empty);
+    try testing.expectEqualStrings("* ApplyPatch\n", empty);
+}
+
+test "the tools that drew nothing get a start line naming the tool and its arguments" {
+    const a = testing.allocator;
+    for (GENERIC_CARD_TOOLS) |name| {
+        try testing.expectEqual(ResultRenderMode.summary, resultRenderMode(name));
+        try testing.expect(showStartCard(name));
+    }
+    const start = try renderStart(a, theme_mod.monochrome, "ScheduleWakeup", "{\"delaySeconds\":300,\"prompt\":\"check CI\",\"reason\":\"CI takes five minutes\",\"noop\":false}");
+    defer a.free(start);
+    try capture.expectContains(start, "* ScheduleWakeup(delaySeconds: 300, prompt: \"check CI\", reason: ");
+    try capture.expectContains(start, "…)\n");
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, start, "\n"));
+
+    const team = try renderStart(a, theme_mod.monochrome, "TeamCreate", "{\"name\":\"release\"}");
+    defer a.free(team);
+    try testing.expectEqualStrings("* TeamCreate(name: \"release\")\n", team);
+}
+
+test "a tool's JSON result reads as one field per line, never as raw JSON" {
+    const a = testing.allocator;
+    const wakeup = try renderResult(a, theme_mod.monochrome, "ScheduleWakeup", "{}", "{\"scheduledFor\":1795708800000,\"clampedDelaySeconds\":300,\"wasClamped\":false,\"reason\":\"CI takes five minutes\",\"noop\":false}", .ok, 0, .{});
+    defer a.free(wakeup);
+    try capture.expectContains(wakeup, "scheduledFor: 1795708800000");
+    try capture.expectContains(wakeup, "clampedDelaySeconds: 300");
+    try capture.expectContains(wakeup, "wasClamped: false");
+    try capture.expectContains(wakeup, "reason: CI takes five minutes");
+    try testing.expect(std.mem.indexOf(u8, wakeup, "{\"") == null);
+
+    const artifact = try renderResult(a, theme_mod.monochrome, "ReadArtifact", "{}", "{\"artifact_id\":\"sha256:ab\",\"returned_bytes\":17,\"data\":\"line one\\nline two\"}", .ok, 0, .{});
+    defer a.free(artifact);
+    try capture.expectContains(artifact, "data: line one …");
+    try testing.expect(std.mem.indexOf(u8, artifact, "line two") == null);
+}
+
+test "a plain-text tool result is folded, and in the live view a long line is cut to the terminal" {
+    const a = testing.allocator;
+    var outline: std.ArrayList(u8) = .empty;
+    defer outline.deinit(a);
+    for (0..15) |i| try outline.print(a, "fn symbol_{d}() line {d}\n", .{ i, i });
+    const folded = try renderResult(a, theme_mod.monochrome, "CodeMap", "{\"path\":\"src\"}", outline.items, .ok, 0, .{});
+    defer a.free(folded);
+    try capture.expectContains(folded, "fn symbol_9() line 9");
+    try testing.expect(std.mem.indexOf(u8, folded, "symbol_10") == null);
+    try capture.expectContains(folded, "… +5 lines");
+
+    const wide = "x" ** 200;
+    const cut = try renderResult(a, theme_mod.monochrome, "ExecuteCode", "{}", wide, .ok, 0, .{ .cols = 40 });
+    defer a.free(cut);
+    try testing.expect(std.mem.indexOf(u8, cut, wide) == null);
+    try capture.expectContains(cut, "x…");
+    var rows = std.mem.splitScalar(u8, std.mem.trimEnd(u8, cut, "\n"), '\n');
+    while (rows.next()) |row| try testing.expect(term.displayWidth(row) <= 40);
+
+    const full = try renderResult(a, theme_mod.monochrome, "ExecuteCode", "{}", wide, .ok, 0, .{ .cols = 40, .transcript = true });
+    defer a.free(full);
+    try capture.expectContains(full, wide);
+}
+
+test "a failed tool shows the error's detail or its first line, in the error colour" {
+    const a = testing.allocator;
+    const text = try renderResult(a, theme_mod.monochrome, "FindSymbol", "{}", "no language server for .foo\nsecond line", .err, 0, .{});
+    defer a.free(text);
+    try capture.expectContains(text, "no language server for .foo");
+    try testing.expect(std.mem.indexOf(u8, text, "second line") == null);
+
+    const structured = try renderResult(a, theme_mod.monochrome, "SendMessage", "{}", "{\"error\":{\"code\":\"other\",\"category\":\"system_error\",\"detail\":\"no such teammate\"}}", .err, 0, .{});
+    defer a.free(structured);
+    try capture.expectContains(structured, "no such teammate");
+    try testing.expect(std.mem.indexOf(u8, structured, "system_error") == null);
+}
+
+test "control characters in a tool's arguments or result never reach the terminal" {
+    const a = testing.allocator;
+    const start = try renderStart(a, theme_mod.monochrome, "SendMessage", "{\"to\\u001b[2J\":\"lead\",\"message\":\"hi\\u001b]0;x\\u0007\"}");
+    defer a.free(start);
+    try testing.expect(std.mem.indexOfScalar(u8, start, 0x1b) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, start, 0x07) == null);
+
+    const raw = try renderResult(a, theme_mod.monochrome, "ExecuteCode", "{}", "ok\x1b]0;x\x07done", .ok, 0, .{});
+    defer a.free(raw);
+    try testing.expect(std.mem.indexOfScalar(u8, raw, 0x1b) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, raw, 0x07) == null);
+    try capture.expectContains(raw, "ok" ++ REPLACEMENT_CHAR ++ "]0;x" ++ REPLACEMENT_CHAR ++ "done");
+
+    const decoded = try renderResult(a, theme_mod.monochrome, "TeamCreate", "{}", "{\"team\":\"a\\u001b[2Jb\"}", .ok, 0, .{});
+    defer a.free(decoded);
+    try testing.expect(std.mem.indexOfScalar(u8, decoded, 0x1b) == null);
+    try capture.expectContains(decoded, "team: a" ++ REPLACEMENT_CHAR ++ "[2Jb");
+
+    const failed = try renderResult(a, theme_mod.monochrome, "CodeMap", "{}", "bad\x1b[31m path", .err, 0, .{});
+    defer a.free(failed);
+    try testing.expect(std.mem.indexOf(u8, failed, "\x1b[31m path") == null);
 }

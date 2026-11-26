@@ -522,6 +522,91 @@ pub fn project(
     has_output_schema: bool,
     require_content: bool,
 ) error{OutOfMemory}!Outcome {
+    const outcome = try projectCapture(allocator, capture, artifact_root, expected_id, era, limits, budget, has_output_schema, require_content);
+    if (outcome != .diagnostic or outcome.diagnostic.code != .invalid_json) return outcome;
+    var cleaned = artifact_store.Capture.begin(allocator, artifact_root, capture.max_bytes) catch return outcome;
+    defer cleaned.deinit();
+    const replaced = copyReplacingLoneSurrogates(capture, &cleaned) catch return outcome;
+    if (replaced == 0) return outcome;
+    cleaned.seal() catch return outcome;
+    return projectCapture(allocator, &cleaned, artifact_root, expected_id, era, limits, budget, has_output_schema, require_content);
+}
+
+fn copyReplacingLoneSurrogates(source: *artifact_store.Capture, destination: *artifact_store.Capture) !usize {
+    try source.rewind();
+    var buffer: [32 * 1024]u8 = undefined;
+    var held: usize = 0;
+    var replaced: usize = 0;
+    while (true) {
+        const count = try source.read(buffer[held..]);
+        const end = held + count;
+        const settled = replaceLoneSurrogateEscapes(buffer[0..end], count == 0, &replaced);
+        try destination.write(buffer[0..settled]);
+        if (count == 0) return replaced;
+        held = end - settled;
+        std.mem.copyForwards(u8, buffer[0..held], buffer[settled..end]);
+    }
+}
+
+pub fn replaceLoneSurrogates(bytes: []u8) usize {
+    var replaced: usize = 0;
+    _ = replaceLoneSurrogateEscapes(bytes, true, &replaced);
+    return replaced;
+}
+
+fn replaceLoneSurrogateEscapes(bytes: []u8, at_end: bool, replaced: *usize) usize {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (bytes[i] != '\\') {
+            i += 1;
+            continue;
+        }
+        if (i + 2 > bytes.len) return if (at_end) bytes.len else i;
+        if (bytes[i + 1] != 'u') {
+            i += 2;
+            continue;
+        }
+        if (i + 6 > bytes.len) return if (at_end) bytes.len else i;
+        const unit = hex4(bytes[i + 2 .. i + 6]) orelse {
+            i += 2;
+            continue;
+        };
+        if (std.unicode.utf16IsHighSurrogate(unit)) {
+            if (i + 12 > bytes.len and !at_end) return i;
+            if (i + 12 <= bytes.len and bytes[i + 6] == '\\' and bytes[i + 7] == 'u') {
+                if (hex4(bytes[i + 8 .. i + 12])) |low| if (std.unicode.utf16IsLowSurrogate(low)) {
+                    i += 12;
+                    continue;
+                };
+            }
+        } else if (!std.unicode.utf16IsLowSurrogate(unit)) {
+            i += 6;
+            continue;
+        }
+        @memcpy(bytes[i + 2 .. i + 6], "FFFD");
+        replaced.* += 1;
+        i += 6;
+    }
+    return i;
+}
+
+fn hex4(digits: []const u8) ?u16 {
+    var value: u16 = 0;
+    for (digits) |c| value = value * 16 + (std.fmt.charToDigit(c, 16) catch return null);
+    return value;
+}
+
+fn projectCapture(
+    allocator: std.mem.Allocator,
+    capture: *artifact_store.Capture,
+    artifact_root: []const u8,
+    expected_id: u64,
+    era: Era,
+    limits: Limits,
+    budget: result_budget.Budget,
+    has_output_schema: bool,
+    require_content: bool,
+) error{OutOfMemory}!Outcome {
     capture.rewind() catch return .{ .diagnostic = Diagnostic.init(.resource_limit) };
     var scanner = std.json.Scanner.initStreaming(allocator);
     defer scanner.deinit();
@@ -717,6 +802,47 @@ pub fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) 
     if (fd < 0) return error.QuotaFixtureOpenFailed;
     defer _ = pfs.close(fd);
     try pfs.setSize(fd, artifact_store.MAX_SESSION_BYTES);
+}
+
+test "an escape naming half a surrogate pair becomes U+FFFD; a whole pair and an escaped backslash stay" {
+    var bytes = "a \\ud83d b \\udc80 c \\ud83d\\ude00 d \\\\ud83d e \\ud83d\\ud83d\\ude00 f \\u0041".*;
+    var replaced: usize = 0;
+    try std.testing.expectEqual(bytes.len, replaceLoneSurrogateEscapes(&bytes, true, &replaced));
+    try std.testing.expectEqualStrings("a \\uFFFD b \\uFFFD c \\ud83d\\ude00 d \\\\ud83d e \\uFFFD\\ud83d\\ude00 f \\u0041", &bytes);
+    try std.testing.expectEqual(@as(usize, 3), replaced);
+
+    var cut_pair = "x \\ud83d\\ude".*;
+    replaced = 0;
+    try std.testing.expectEqual(@as(usize, 2), replaceLoneSurrogateEscapes(&cut_pair, false, &replaced));
+    try std.testing.expectEqual(@as(usize, 0), replaced);
+    try std.testing.expectEqual(cut_pair.len, replaceLoneSurrogateEscapes(&cut_pair, true, &replaced));
+    try std.testing.expectEqualStrings("x \\uFFFD\\ude", &cut_pair);
+}
+
+test "an MCP result with a lone surrogate escape reaches the model as text with U+FFFD, also when the escape spans two reads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const prefix = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"";
+    for ([_]usize{ 0, 32 * 1024 - prefix.len - 4 }) |padding| {
+        var capture = try artifact_store.Capture.begin(allocator, root, MAX_RESPONSE_BYTES);
+        defer capture.deinit();
+        try capture.write(prefix);
+        var filled: usize = 0;
+        while (filled < padding) : (filled += 1) try capture.write("p");
+        try capture.write("a \\ud83d b \\udc80 c\"}]}}");
+        try capture.seal();
+
+        var outcome = try project(allocator, &capture, root, 7, .modern_2026_07_28, .{}, result_budget.Budget.fromModel(1_000_000), false, true);
+        defer if (outcome == .result) outcome.result.deinit(allocator);
+        try std.testing.expect(outcome == .result);
+        try std.testing.expect(outcome.result == .@"inline");
+        const text = outcome.result.@"inline".bytes;
+        try std.testing.expect(std.mem.indexOf(u8, text, "a \\uFFFD b \\uFFFD c") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\\ud83d") == null);
+    }
 }
 
 test "stream projector publishes above caller per-result budget" {

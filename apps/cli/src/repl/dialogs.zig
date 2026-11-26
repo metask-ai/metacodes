@@ -1915,7 +1915,7 @@ test "help: the command list scrolls inside its window" {
     try testing.expectEqual(complete.SLASH_COMMAND_TABLE.len - visible, moved);
     const tail = try renderPlain(&help, 100);
     defer testing.allocator.free(tail);
-    try testing.expect(std.mem.indexOf(u8, tail, "/vim") != null);
+    try testing.expect(std.mem.indexOf(u8, tail, "/transcript") != null);
     try testing.expect(std.mem.indexOf(u8, tail, "/add-dir") == null);
 }
 

@@ -702,11 +702,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             try handleRecap(app, allocator);
             continue;
         }
-        if (std.mem.eql(u8, trimmed, "/vim")) {
-            const o = svc.toggleVim(); // U11:经 service,渲染留此
-            cmd_output.print("Editor mode: {s}\n", .{if (o.data.vim) "vim" else "emacs"});
-            continue;
-        }
         if (std.mem.eql(u8, trimmed, "/agents")) {
             printReport(app, writeAgentsReport);
             continue;

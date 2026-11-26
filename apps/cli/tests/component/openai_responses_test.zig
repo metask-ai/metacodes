@@ -501,7 +501,7 @@ test "Responses(d): response.incomplete reason=max_output_tokens → stopReason=
 // 服务端声明的失败是答复,不是断连:RequestFailed 只留给流中途断连(stream.zig
 // midStreamReadError 的名字约定),agent_loop 据此不为它兜底重发。
 
-test "Responses(e): response.failed 与流级 error 事件都上抛 ApiError,并记 API 错误帧现场" {
+test "Responses(e): response.failed 与流级 error 事件都上抛 ApiError,并记 API error frame 现场" {
     const a = std.testing.allocator;
     const cassettes = [_][]const u8{ RESPONSES_FAILED_SSE, RESPONSES_ERROR_SSE };
     for (cassettes) |sse| {
@@ -531,7 +531,7 @@ test "Responses(e): response.failed 与流级 error 事件都上抛 ApiError,并
         _ = cc.api_last_error.take(&last);
         try std.testing.expectError(error.ApiError, drainAll(a, &handle, &out));
         const detail = cc.api_last_error.take(&last) orelse return error.TestExpectedLastError;
-        try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧: "));
+        try std.testing.expect(std.mem.startsWith(u8, detail, "API error frame: "));
         // The server's own words reach the user: the nested error of response.failed,
         // or the event itself for a stream-level error.
         try std.testing.expect(std.mem.indexOf(u8, detail, "boom") != null or std.mem.indexOf(u8, detail, "slow down") != null);

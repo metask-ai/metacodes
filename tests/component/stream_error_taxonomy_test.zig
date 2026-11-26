@@ -1,7 +1,7 @@
 //! 流中途错误的名字约定 L2(api/stream.zig `midStreamReadError`):四条 wire 上
 //!   - `RequestFailed` **只**表示连接在流中途断了;
 //!   - 服务端在流里声明的失败一律是 `ApiError`(Anthropic 错误帧、OpenAI chat 兼容端与 Gemini 的
-//!     顶层 `error` 对象、Responses 的 `response.failed`),并写"API 错误帧"现场;过载除外,它是
+//!     顶层 `error` 对象、Responses 的 `response.failed`),并写"API error frame"现场;过载除外,它是
 //!     `ServiceUnavailable`,与 HTTP 503/529 同名;
 //! 以及它对 agent_loop 每个请求自带的那次重发(`STREAM_RETRIES_PER_REQUEST`,#461)的后果,TUI 默认(不配重试):
 //!   ① 服务端报错、零可见输出 → 不重发,api_error(答复不能被重发盖掉);
@@ -226,7 +226,7 @@ const ServerError = struct {
         try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
         var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
         const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
-        try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧: "));
+        try std.testing.expect(std.mem.startsWith(u8, detail, "API error frame: "));
         try std.testing.expect(std.mem.indexOf(u8, detail, "model not found") != null);
     }
     fn handle(_: std.mem.Allocator, provider: cc.api_provider.Provider) anyerror!void {
@@ -423,7 +423,7 @@ const Overloaded = struct {
         try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
         var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
         const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
-        try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+        try std.testing.expect(std.mem.startsWith(u8, detail, "API error frame (gave up after 2 attempts): "));
         try std.testing.expect(std.mem.indexOf(u8, detail, "overloaded") != null);
     }
 };
@@ -540,7 +540,7 @@ test "L2 stream errors ⑤: exhausted overload retries do not fall through to th
     try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
-    try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+    try std.testing.expect(std.mem.startsWith(u8, detail, "API error frame (gave up after 2 attempts): "));
 }
 
 test "L2 stream errors ⑤: an overload after a tool call started is not re-sent, even under the headless Run allowance" {
@@ -581,7 +581,7 @@ test "L2 stream errors ⑤: an HTTP 529 and an in-stream overload share one atte
     try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
-    try std.testing.expect(std.mem.startsWith(u8, detail, "API 错误帧(重试 2 次后放弃): "));
+    try std.testing.expect(std.mem.startsWith(u8, detail, "API error frame (gave up after 2 attempts): "));
 }
 
 test "L2 stream errors ⑤: an in-stream overload waits the Retry-After of its response head" {

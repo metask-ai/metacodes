@@ -304,6 +304,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The TUI no longer offers `/vim`.** It is gone from the slash menu,
+  completion and `/help`, and typing it reports an unknown command like any
+  other mistyped name. Web and daemon hosts that send `/vim` through
+  `POST /command` are not affected.
+
+- **API failure notices are in English.** The line under `API request
+  failed` mixed Chinese into an English screen, e.g. `HTTP 429(重试 4 次后放弃):
+  …`. It now reads `HTTP 429 (gave up after 4 attempts): …`, and the named
+  failures are `Connection setup failed`, `Connection failed`,
+  `Response head timeout`, `Response body timeout`, `Connection dead`,
+  `Endpoint redirect`, `API error frame` and `Incomplete stream`, with English
+  details. The number is the requests sent, the first one included. The
+  headless `--resume-response` errors are in English too.
+
 - Removed the Glob and Grep built-in tools from the CLI
   and AgentCore. Embedded hosts that explicitly select them must update
   their tool lists. Use Bash for filename and text searches. The CLI keeps
@@ -450,6 +464,50 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+
+- **A reply that broke off and is sent again says so.** The text that was
+  shown stays, with a dim line under it saying the reply broke off, is
+  discarded and is being retried. The first retry showed nothing.
+
+- **A reply continued after the output limit stays under one bullet.** The
+  part after the limit started a second ⏺, as if it were another reply.
+
+- **AskUserQuestion's Other answer no longer offers Ctrl+G.** The footer
+  said `ctrl+g to edit in Vim`, which does nothing while typing an Other
+  answer; Ctrl+G opens the editor only for a note.
+
+- **An MCP result with half a surrogate pair in its text is read, with
+  U+FFFD for that half.** It was rejected as invalid JSON, so the call
+  failed and the model never saw the text.
+
+- **Calls in one reply show each result under its own call.** When one
+  reply called several MCP tools, or several of ApplyPatch, ScheduleWakeup,
+  CodeMap, FindSymbol, ReadArtifact, TeamCreate, TeamDelete, SendMessage
+  and ExecuteCode, their call lines came first and their results after
+  them. Each call now shows while it runs and goes into the scrollback
+  together with its result, as Bash and Read do.
+
+- **Hints name Ctrl+X Ctrl+O as the transcript key.** The dim line a long
+  resumed conversation starts with and the transcript's footer said
+  Ctrl+O, which opens `/model`.
+
+- **The TUI draws ScheduleWakeup, CodeMap, FindSymbol, ReadArtifact,
+  TeamCreate, TeamDelete, SendMessage and ExecuteCode calls.** They ran with
+  nothing on screen. Each now gets `⏺ <tool>(<arguments>)` and its result:
+  a JSON result one field per line, text folded after 10 lines, an error's
+  first line. In the live view a result line wider than the terminal is cut
+  with `…`; the transcript view (Ctrl+O) shows it whole.
+
+- **The TUI draws an ApplyPatch call.** A patch changed files without a line
+  on screen. It now gets a start line naming the files it touches and, under
+  it, the added/modified/deleted counts and the diff.
+
+- **The TUI draws an MCP tool call.** A call to an MCP tool ran and its
+  result reached the model, but nothing of it appeared on screen. It now gets
+  the line a built-in tool gets, `⏺ mcp__<server>__<tool>(<arguments>)`, with
+  the text the server returned under it, folded after 10 lines; an error
+  shows its first line. The transcript view (Ctrl+O) and `--resume` show the
+  call as well.
 
 - **`bench pull` also pulls verifier and sidecar images.** It took only the
   first `docker_image` of a task's `task.toml`, which in the FrontierHarness

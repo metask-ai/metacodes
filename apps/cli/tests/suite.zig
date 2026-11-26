@@ -43,6 +43,8 @@ comptime {
     _ = @import("component/mcp_background_startup_test.zig");
     _ = @import("component/bounded_exit_test.zig");
     _ = @import("component/mcp_permission_test.zig");
+    _ = @import("component/mcp_tool_line_test.zig");
+    _ = @import("component/tool_lines_test.zig");
     _ = @import("component/mcp_unavailable_notice_test.zig");
     _ = @import("component/mcp_reconnect_test.zig");
     _ = @import("component/mcp_hotplug_test.zig");

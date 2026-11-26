@@ -121,3 +121,23 @@ def test_mcp_tool_call_runs_after_y(bin_path):
     text = _result_text(result)
     if result.get("is_error") or MESSAGE not in text:
         a._fail(f"y should return the server's echo to the model: {text!r}")
+
+
+def _all_lines(a):
+    screen = a.final
+    lines = ["".join(cell.ch for cell in cells).rstrip() for cells, _ in screen.history]
+    return lines + [line.rstrip() for line in screen.lines()]
+
+
+def test_mcp_tool_call_that_ran_is_drawn_as_a_tool_line(bin_path):
+    a, result, calls = _answer(bin_path, "y")
+    if calls != 1:
+        a._fail(f"y should run the call once; the server received {calls} tools/call")
+    lines = _all_lines(a)
+    header = f'⏺ {TOOL}(message: "{MESSAGE}")'
+    if header not in lines:
+        a._fail(f"the call should leave a tool line naming the tool and its argument: {header!r}\n" + "\n".join(lines))
+    if f"  ⎿  {MESSAGE}" not in lines:
+        a._fail("the tool line should show what the server returned under it\n" + "\n".join(lines))
+    if lines.index(header) > lines.index(f"  ⎿  {MESSAGE}"):
+        a._fail("the result belongs under its tool line\n" + "\n".join(lines))
