@@ -17,6 +17,7 @@ const platform_signal = @import("metacodes-internal").platform.signal;
 const process = @import("metacodes-internal").platform.process;
 const shutdown = @import("metacodes-internal").core.shutdown;
 const bg_probe = @import("tui/bg_probe.zig");
+const util_time = @import("metacodes-internal").util.time;
 
 // ============================================================================
 // Key 抽象
@@ -103,9 +104,9 @@ pub fn pastedByte(key: Key) ?u8 {
 ///
 /// 支持的 CSI 序列：
 ///   ESC [ A/B/C/D     ↑↓→←
-///   ESC [ H / F       Home / End
+///   ESC [ H / F、ESC [ 1/7 ~ / 4/8 ~   Home / End
 ///   ESC [ 3 ~         Delete
-///   ESC [ 1;<mod> A–D/H/F、ESC [ 3/5/6;<mod> ~   <mod> 只带 Caps Lock(64)/Num Lock(128) 时同不带 <mod>
+///   ESC [ 1;<mod> A–D/H/F、ESC [ 1/3/4/5/6/7/8;<mod> ~   <mod> 只带 Caps Lock(64)/Num Lock(128) 时同不带 <mod>
 ///   ESC [ <num>;<mod> u   CSI u（kitty 键盘协议）
 ///   ESC [ 27;<mod>;<num> ~  xterm modifyOtherKeys,与 CSI u 同一张表(decodeModifiedKey)
 ///     - 9;2 = Shift+Tab
@@ -135,6 +136,8 @@ pub const KeyParser = struct {
     // 待定 ESC 读进来时,后面的字节是否已在输入队列里(feedRead 查 waitReadable(fd, 0))。终端把
     // Meta+Return 一次写出 ESC CR,读到 ESC 时 CR 已在队列;人先按 Esc 再按 Enter 是两次输入。
     esc_burst: bool = false,
+    in_bracketed_paste: bool = false,
+    burst: Burst = .{},
 
     // ']' + 3 位数字 + 截断它的那个键。
     const queue_capacity = 5;
@@ -220,6 +223,53 @@ pub const KeyParser = struct {
     /// ESC CR(VS Code 的绑定)经 ConPTY 原样是两个字节,照旧算。
     pub fn feedRead(self: *KeyParser, fd: c_int, b: u8) ?Key {
         return self.feedQueued(b, b == 0x1b and !platform_term.lastReadWasKeyRecord() and platform_term.waitReadable(fd, 0) > 0);
+    }
+
+    pub fn feedEditorRead(self: *KeyParser, fd: c_int, b: u8) ?Key {
+        const now_ns = util_time.nowNs();
+        const gap_ms = self.burst.gapMs(now_ns);
+        const queued = platform_term.waitReadable(fd, 0) > 0;
+        var lookahead: FdLookahead = .{ .fd = fd, .queued_after = queued };
+        const key = self.feedArrived(b, gap_ms, b == 0x1b and !platform_term.lastReadWasKeyRecord() and queued, &lookahead);
+        self.burst.last_ns = util_time.nowNs();
+        self.burst.next_queued = lookahead.queued_after;
+        return key;
+    }
+
+    fn feedTimed(self: *KeyParser, b: u8, gap_ms: u64, next: ?NextArrival) ?Key {
+        var lookahead: GapLookahead = .{ .next = next };
+        return self.feedArrived(b, gap_ms, if (next) |n| n.gap_ms == 0 else false, &lookahead);
+    }
+
+    fn feedArrived(self: *KeyParser, b: u8, gap_ms: u64, more_queued: bool, lookahead: anytype) ?Key {
+        const fast = gap_ms <= paste_burst_gap_ms;
+        if (!fast) self.burst.newline_seen = false;
+        const lf_closes_newline = self.burst.lf_closes_newline;
+        self.burst.lf_closes_newline = false;
+        const outside_paste_markers = self.state == .normal and !self.in_bracketed_paste;
+        const key = self.feedQueued(b, more_queued) orelse return null;
+        if (!outside_paste_markers or key != .enter or (b != '\r' and b != '\n')) return key;
+        if (b == '\n' and fast and lf_closes_newline) return null;
+        const pasted = (fast and self.burst.newline_seen) or lookahead.moreInputAfter(b, paste_burst_gap_ms);
+        self.burst.lf_closes_newline = b == '\r' and !lookahead.tookLf();
+        self.burst.newline_seen = pasted;
+        if (lookahead.carried()) |next| self.feedCarried(next, lookahead.escQueued());
+        return if (pasted) .shift_enter else key;
+    }
+
+    fn feedCarried(self: *KeyParser, b: u8, more_queued: bool) void {
+        self.burst.lf_closes_newline = b == '\r';
+        if (self.state == .normal and !self.in_bracketed_paste and (b == '\r' or b == '\n')) {
+            self.push(.shift_enter);
+            return;
+        }
+        if (self.feedQueued(b, more_queued)) |key| self.push(key);
+    }
+
+    fn pasteMarker(self: *KeyParser, marker: Key) Key {
+        self.in_bracketed_paste = marker == .paste_begin;
+        self.burst = .{};
+        return marker;
     }
 
     /// feedRead 去掉终端:`more_queued` = 这个字节读进来时后面已有字节在等(仅对 ESC 有意义)。
@@ -319,8 +369,8 @@ pub const KeyParser = struct {
                 self.state = .normal;
                 if (b == '~') {
                     return switch (self.num1) {
-                        200 => .paste_begin,
-                        201 => .paste_end,
+                        200 => self.pasteMarker(.paste_begin),
+                        201 => self.pasteMarker(.paste_end),
                         else => tildeKey(self.num1),
                     };
                 }
@@ -367,7 +417,7 @@ pub const KeyParser = struct {
                 if (b == 'R') return .{ .cursor_position = .{ .row = saturate16(self.num1), .col = saturate16(self.num2) } };
                 const modifier = KeyModifier.fromParam(self.num2);
                 if (b == 'u') return decodeModifiedKey(self.num1, modifier);
-                if (modifier != .none) return .unknown;
+                if (modifier != KeyModifier.none) return .unknown;
                 if (b == '~') return tildeKey(self.num1);
                 return if (self.num1 == 1) cursorKey(b) else .unknown;
             },
@@ -483,57 +533,148 @@ pub const KeyParser = struct {
     }
 };
 
+pub const paste_burst_gap_ms: u64 = 10;
+
+const Burst = struct {
+    last_ns: ?util_time.Nanos = null,
+    next_queued: bool = false,
+    newline_seen: bool = false,
+    lf_closes_newline: bool = false,
+
+    fn gapMs(self: Burst, now_ns: util_time.Nanos) u64 {
+        const last = self.last_ns orelse return std.math.maxInt(u64);
+        if (self.next_queued) return 0;
+        return @intCast(@divTrunc(@max(now_ns - last, 0), std.time.ns_per_ms));
+    }
+};
+
+const FdLookahead = struct {
+    fd: c_int,
+    queued_after: bool,
+    took_lf: bool = false,
+    carried_byte: ?u8 = null,
+    esc_queued: bool = false,
+
+    fn moreInputAfter(self: *FdLookahead, b: u8, ms: u64) bool {
+        if (platform_term.waitReadable(self.fd, @intCast(ms)) <= 0) return false;
+        self.queued_after = true;
+        if (b != '\r') return true;
+        var next: [1]u8 = undefined;
+        if (platform_term.readInput(self.fd, &next) != 1) return true; // no EINTR: waitReadable reported data
+        if (next[0] != '\n') {
+            self.carried_byte = next[0];
+            self.queued_after = platform_term.waitReadable(self.fd, 0) > 0;
+            self.esc_queued = next[0] == 0x1b and !platform_term.lastReadWasKeyRecord() and self.queued_after;
+            return true;
+        }
+        self.took_lf = true;
+        self.queued_after = platform_term.waitReadable(self.fd, @intCast(ms)) > 0;
+        return self.queued_after;
+    }
+
+    fn tookLf(self: *const FdLookahead) bool {
+        return self.took_lf;
+    }
+
+    fn carried(self: *const FdLookahead) ?u8 {
+        return self.carried_byte;
+    }
+
+    fn escQueued(self: *const FdLookahead) bool {
+        return self.esc_queued;
+    }
+};
+
+const NextArrival = struct { byte: u8, gap_ms: u64, after_gap_ms: ?u64 };
+
+const GapLookahead = struct {
+    next: ?NextArrival,
+
+    fn moreInputAfter(self: *GapLookahead, b: u8, ms: u64) bool {
+        const next = self.next orelse return false;
+        if (next.gap_ms > ms) return false;
+        if (b == '\r' and next.byte == '\n') return if (next.after_gap_ms) |gap| gap <= ms else false;
+        return true;
+    }
+
+    fn tookLf(_: *const GapLookahead) bool {
+        return false;
+    }
+
+    fn carried(_: *const GapLookahead) ?u8 {
+        return null;
+    }
+
+    fn escQueued(_: *const GapLookahead) bool {
+        return false;
+    }
+};
+
 fn saturate16(value: u32) u16 {
     return @intCast(@min(value, std.math.maxInt(u16)));
 }
 
-const KeyModifier = enum {
-    none,
-    shift,
-    alt,
-    ctrl,
-    other,
+const KeyModifier = packed struct(u32) {
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+    super: bool = false,
+    hyper: bool = false,
+    meta: bool = false,
+    caps_lock: bool = false,
+    num_lock: bool = false,
+    unassigned: u24 = 0,
+
+    const none: KeyModifier = .{};
+    const shift_only: KeyModifier = .{ .shift = true };
+    const alt_only: KeyModifier = .{ .alt = true };
+    const ctrl_only: KeyModifier = .{ .ctrl = true };
+    const ctrl_shift: KeyModifier = .{ .ctrl = true, .shift = true };
 
     fn fromParam(param: u32) KeyModifier {
-        if (param <= 1) return .none;
-        const lock_bits: u32 = 64 | 128;
-        return switch ((param - 1) & ~lock_bits) {
-            0 => .none,
-            1 => .shift,
-            2 => .alt,
-            4 => .ctrl,
-            else => .other,
-        };
+        var modifier: KeyModifier = @bitCast(param -| 1);
+        modifier.caps_lock = false;
+        modifier.num_lock = false;
+        return modifier;
     }
 };
+
+fn printableKey(codepoint: u32) Key {
+    return if (codepoint >= 0x20 and codepoint <= 0x7e) Key{ .char = @intCast(codepoint) } else .unknown;
+}
 
 fn decodeModifiedKey(codepoint: u32, modifier: KeyModifier) Key {
     return switch (codepoint) {
         9 => switch (modifier) {
-            .none => .tab,
-            .shift => .shift_tab,
+            KeyModifier.none => .tab,
+            KeyModifier.shift_only => .shift_tab,
             else => .unknown,
         },
-        13 => switch (modifier) {
-            .shift => .shift_enter,
-            .ctrl => .ctrl_enter,
+        13 => if (modifier.alt) .shift_enter else switch (modifier) {
+            KeyModifier.shift_only => .shift_enter,
+            KeyModifier.ctrl_only => .ctrl_enter,
             else => .enter,
         },
         // 带修饰的 Esc(Shift/Ctrl+Esc)仍是 Esc:取消、关闭对它的每个使用方都一样
         // (反向搜索、transcript viewer 旧的自解码 CSI-u 就只看 codepoint 27)。
         27 => .esc,
+        127 => switch (modifier) {
+            KeyModifier.none, KeyModifier.shift_only => .backspace,
+            else => .unknown,
+        },
         else => switch (modifier) {
             // ASCII 可打印 → char(兼容把纯文本也 CSI-u 编码的终端)。
-            .none => if (codepoint >= 0x20 and codepoint <= 0x7e) Key{ .char = @intCast(codepoint) } else .unknown,
-            .ctrl => ctrlLetterKey(codepoint),
+            KeyModifier.none, KeyModifier.shift_only => printableKey(codepoint),
+            KeyModifier.ctrl_only => ctrlLetterKey(codepoint),
+            KeyModifier.ctrl_shift => if (codepoint == '-') .ctrl_underscore else .unknown,
             // Alt+字母:Kitty disambiguate 把 Alt+B/Alt+F 编成 CSI-u(旧编码 ESC b
             // 与"ESC 再按 b"有歧义),不认的话开了协议的终端上词跳转就没了。
-            .alt => switch (codepoint) {
+            KeyModifier.alt_only => switch (codepoint) {
                 98, 66 => .alt_b,
                 102, 70 => .alt_f,
                 else => .unknown,
             },
-            .shift, .other => .unknown,
+            else => .unknown,
         },
     };
 }
@@ -559,6 +700,11 @@ fn ctrlLetterKey(codepoint: u32) Key {
         119, 87 => .ctrl_w, // 'w'
         121, 89 => .ctrl_y, // 'y'
         95 => .ctrl_underscore, // '_' — undo
+        47 => .ctrl_underscore,
+        104, 72 => .backspace,
+        105, 73 => .tab,
+        106, 74, 109, 77 => .enter,
+        91 => .esc,
         else => .unknown,
     };
 }
@@ -577,7 +723,9 @@ fn cursorKey(final: u8) Key {
 
 fn tildeKey(number: u32) Key {
     return switch (number) {
+        1, 7 => .home,
         3 => .delete,
+        4, 8 => .end,
         5 => .page_up,
         6 => .page_down,
         else => .unknown,
@@ -837,8 +985,15 @@ fn nonEmptyEnv(name: [*:0]const u8) bool {
     return if (envValue(name)) |v| v.len > 0 else false;
 }
 
+pub const no_keyboard_enhancement_env = "METACODES_NO_KEYBOARD_ENHANCEMENT";
+
+pub fn keyboardEnhancementOptedOut() bool {
+    return envValue(no_keyboard_enhancement_env) != null;
+}
+
 /// 读真实 env 调 classifyKittyKeyboard。
 pub fn keyboardPolicy() KeyboardPolicy {
+    if (keyboardEnhancementOptedOut()) return .disable;
     const term = envValue("TERM");
     const multiplexer: Multiplexer = if (nonEmptyEnv("TMUX"))
         .tmux
@@ -869,7 +1024,8 @@ pub fn shouldEnableKittyKeyboard() bool {
 }
 
 /// 当前终端的换行方式提示(对齐真 cc getNewlineInstructions,但按 cc-zig 实际能力):
-/// - 发了 Kitty 协议(认得出的终端、或探测答了)→ Shift+Enter 真换行 → "shift + ⏎ for newline"
+/// - 发了 Kitty 协议(认得出的终端、或探测答了)→ Shift+Enter 真换行 → "shift + ⏎ for newline";
+///   tmux 里照发,但 tmux 默认不转发 extended keys,Shift+Enter 到这里仍是 \r,所以不算
 /// - 没发(deny-list 的 Apple Terminal 等、探测说不支持或没答,Shift+Enter 发裸 \r=Enter 会提交)
 ///   → "\ + ⏎ for newline"(cc-zig 无 macOS 原生 modifier 检测,故 Apple Terminal 只能靠
 ///   backslash 续行,不能照抄真 cc 对 Apple 的 "shift+⏎" 文案——那会误导)。
@@ -879,8 +1035,15 @@ pub fn shouldEnableKittyKeyboard() bool {
 ///   一行时出现,那时用户已经敲过字,所以这条判据不会晚。
 /// - 终端自己把 Shift+Enter 绑成了 ESC CR(/terminal-setup,#386;recordNewlineBinding)→ 也是 shift。
 pub fn newlineHint() []const u8 {
-    const shift_newline = shouldEnableKittyKeyboard() or platform_term.keyRecordsTypeText() or g_newline_binding.load(.acquire);
+    const protocol_newline = shouldEnableKittyKeyboard() and !nonEmptyEnv("TMUX");
+    const shift_newline = protocol_newline or platform_term.keyRecordsTypeText() or g_newline_binding.load(.acquire);
     return if (shift_newline) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
+}
+
+pub fn keyboardSummary() []const u8 {
+    if (keyboardEnhancementOptedOut()) return "off · " ++ no_keyboard_enhancement_env ++ " is set";
+    if (shouldEnableKittyKeyboard()) return "on (Kitty protocol, modifyOtherKeys) · " ++ no_keyboard_enhancement_env ++ "=1 turns it off";
+    return "off";
 }
 
 /// 终端配置里的 Shift+Enter 绑定(发 ESC CR,KeyParser 读成 .shift_enter)此刻生效与否:启动时据
@@ -1828,8 +1991,8 @@ test "KeyParser: CSI Delete still works" {
 
 test "KeyParser: CSI u with unknown mod falls back to Enter" {
     var p = KeyParser{};
-    // ESC [ 13 ; 3 u  (mod=3 = Alt，我们不关心)
-    for ([_]u8{ 0x1b, '[', '1', '3', ';', '3' }) |b| try testing.expect(p.feed(b) == null);
+    // ESC [ 13 ; 9 u  (mod=9 = Super，我们不关心)
+    for ([_]u8{ 0x1b, '[', '1', '3', ';', '9' }) |b| try testing.expect(p.feed(b) == null);
     try testing.expect(p.feed('u').? == .enter);
 }
 
@@ -2009,6 +2172,54 @@ test "KeyParser: modifyOtherKeys CSI 27;mod;key~ decodes through the CSI u table
     try expectSequence("\x1b[27;3;102~", .alt_f);
 }
 
+fn expectBothEncodings(codepoint: u32, modifier: u32, expected: Key) !void {
+    var buf: [32]u8 = undefined;
+    for ([_]u32{ 0, 64, 128, 192 }) |locks| {
+        try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[{d};{d}u", .{ codepoint, modifier + locks }), expected);
+        try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[27;{d};{d}~", .{ modifier + locks, codepoint }), expected);
+    }
+}
+
+test "KeyParser: Ctrl+_, Shift+Backspace, Ctrl+H/I/J/M/[ and Shift+Space decode in CSI u and modifyOtherKeys as their legacy bytes do" {
+    const cases = [_]struct { u32, u32, u8 }{
+        .{ 45, 6, 0x1f },
+        .{ 47, 5, 0x1f },
+        .{ 95, 5, 0x1f },
+        .{ 127, 2, 0x7f },
+        .{ 127, 1, 0x7f },
+        .{ 104, 5, 0x08 },
+        .{ 72, 5, 0x08 },
+        .{ 105, 5, '\t' },
+        .{ 106, 5, '\n' },
+        .{ 109, 5, '\r' },
+        .{ 32, 2, ' ' },
+        .{ 32, 5, 0x00 },
+    };
+    for (cases) |c| try expectBothEncodings(c[0], c[1], byteToKey(c[2]));
+    try expectBothEncodings(91, 5, .esc);
+    var buf: [8]Key = undefined;
+    try testing.expectEqualSlices(Key, &.{.esc}, parseAll("\x1b", &buf));
+}
+
+test "KeyParser: Enter with the Alt bit is Shift+Enter in CSI u and modifyOtherKeys, as ESC CR is" {
+    for ([_]u32{ 3, 4, 7, 8 }) |modifier| try expectBothEncodings(13, modifier, .shift_enter);
+    var p = KeyParser{};
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expectEqual(Key.shift_enter, p.feedQueued('\r', false).?);
+    try expectBothEncodings(13, 2, .shift_enter);
+    try expectBothEncodings(13, 5, .ctrl_enter);
+    try expectBothEncodings(13, 1, .enter);
+    try expectBothEncodings(13, 6, .enter);
+    try expectBothEncodings(13, 9, .enter);
+}
+
+test "KeyParser: a printable key with only Shift is that character in CSI u and modifyOtherKeys" {
+    try expectBothEncodings(65, 2, .{ .char = 'A' });
+    try expectBothEncodings(95, 2, .{ .char = '_' });
+    try expectBothEncodings(126, 2, .{ .char = '~' });
+    try expectBothEncodings(31, 2, .unknown);
+}
+
 test "KeyParser: unknown modifyOtherKeys combos are one .unknown and leave no characters" {
     var buf: [16]Key = undefined;
     const keys = parseAll("a\x1b[27;5;9~b\x1b[27;2;8~c\x1b[28;2;9~d\x1b[27;2;9uf\x1b[27;2;9;1~g", &buf);
@@ -2018,7 +2229,7 @@ test "KeyParser: unknown modifyOtherKeys combos are one .unknown and leave no ch
 
 test "KeyParser: cursor and editing keys with only Caps Lock or Num Lock on are the plain keys" {
     const finals = [_]struct { u8, Key }{ .{ 'A', .up }, .{ 'B', .down }, .{ 'C', .right }, .{ 'D', .left }, .{ 'H', .home }, .{ 'F', .end } };
-    const tildes = [_]struct { u32, Key }{ .{ 3, .delete }, .{ 5, .page_up }, .{ 6, .page_down } };
+    const tildes = [_]struct { u32, Key }{ .{ 1, .home }, .{ 3, .delete }, .{ 4, .end }, .{ 5, .page_up }, .{ 6, .page_down }, .{ 7, .home }, .{ 8, .end } };
     var buf: [16]u8 = undefined;
     for ([_]u32{ 1, 65, 129, 193 }) |modifier| {
         for (finals) |f| try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[1;{d}{c}", .{ modifier, f[0] }), f[1]);
@@ -2029,8 +2240,20 @@ test "KeyParser: cursor and editing keys with only Caps Lock or Num Lock on are 
     try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .left, .{ .char = 'b' }, .delete, .{ .char = 'c' } }, keys);
 }
 
+test "KeyParser: Home and End as tmux, GNU screen, the Linux console and rxvt send them" {
+    try expectSequence("\x1b[1~", .home);
+    try expectSequence("\x1b[7~", .home);
+    try expectSequence("\x1b[4~", .end);
+    try expectSequence("\x1b[8~", .end);
+    try expectSequence("\x1b[1;1~", .home);
+    try expectSequence("\x1b[4;1~", .end);
+    var buf: [16]Key = undefined;
+    const keys = parseAll("abc\x1b[1~X\x1b[4~Y\x1b[7~Z\x1b[8~", &buf);
+    try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .{ .char = 'b' }, .{ .char = 'c' }, .home, .{ .char = 'X' }, .end, .{ .char = 'Y' }, .home, .{ .char = 'Z' }, .end }, keys);
+}
+
 test "KeyParser: Shift, Alt or Ctrl next to a lock still keeps a cursor or editing key from being the plain key" {
-    for ([_][]const u8{ "\x1b[1;2A", "\x1b[1;66A", "\x1b[1;5D", "\x1b[1;133D", "\x1b[1;3H", "\x1b[1;67F", "\x1b[3;130~", "\x1b[5;69~", "\x1b[6;2~" }) |seq| {
+    for ([_][]const u8{ "\x1b[1;2A", "\x1b[1;66A", "\x1b[1;5D", "\x1b[1;133D", "\x1b[1;3H", "\x1b[1;67F", "\x1b[3;130~", "\x1b[5;69~", "\x1b[6;2~", "\x1b[1;2~", "\x1b[4;5~", "\x1b[7;66~", "\x1b[8;3~" }) |seq| {
         try expectSequence(seq, .unknown);
     }
 }
@@ -2480,7 +2703,76 @@ test "shouldEnableKittyKeyboard: 要探测的终端只在答了 Kitty flags 时�
             .probe => answered,
         };
         try testing.expectEqual(expected, shouldEnableKittyKeyboard());
-        try testing.expectEqualStrings(if (expected) shift else backslash, newlineHint());
+        try testing.expectEqualStrings(if (expected and !nonEmptyEnv("TMUX")) shift else backslash, newlineHint());
+    }
+}
+
+fn savedEnv(name: [*:0]const u8) !?[:0]u8 {
+    return if (std.c.getenv(name)) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+}
+
+fn restoreEnv(name: [*:0]const u8, saved: ?[:0]u8) void {
+    if (saved) |value| {
+        ppaths.setEnv(name, value.ptr);
+        testing.allocator.free(value);
+    } else ppaths.unsetEnv(name);
+}
+
+const SavedEnv = struct {
+    name: [*:0]const u8,
+    value: ?[:0]u8,
+
+    fn set(name: [*:0]const u8, value: ?[*:0]const u8) !SavedEnv {
+        const previous = if (std.c.getenv(name)) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+        if (value) |v| ppaths.setEnv(name, v) else ppaths.unsetEnv(name);
+        return .{ .name = name, .value = previous };
+    }
+
+    fn restore(self: SavedEnv) void {
+        if (self.value) |v| {
+            ppaths.setEnv(self.name, v.ptr);
+            testing.allocator.free(v);
+        } else ppaths.unsetEnv(self.name);
+    }
+};
+
+test "newlineHint: inside tmux the keyboard protocol stays on, but the hint is \\ + ⏎: tmux sends Shift+Enter as Enter unless extended-keys forwards it" {
+    defer recordNewlineBinding(false);
+    recordNewlineBinding(false);
+    const envs = [_]SavedEnv{
+        try SavedEnv.set("TMUX", "/tmp/tmux-0/default,1,0"),
+        try SavedEnv.set("TERM", "xterm-256color"),
+        try SavedEnv.set(no_keyboard_enhancement_env, null),
+    };
+    defer for (envs) |saved| saved.restore();
+    try testing.expect(shouldEnableKittyKeyboard());
+    if (platform_term.keyRecordsTypeText()) return;
+    try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
+}
+
+test "keyboardPolicy: METACODES_NO_KEYBOARD_ENHANCEMENT keeps the protocol off for every terminal, and keyboardSummary says why" {
+    const previous_answer = g_kitty_answered.load(.acquire);
+    defer recordKeyboardProbe(previous_answer);
+    const saved_term = try savedEnv("TERM");
+    defer restoreEnv("TERM", saved_term);
+    const saved_opt_out = try savedEnv(no_keyboard_enhancement_env);
+    defer restoreEnv(no_keyboard_enhancement_env, saved_opt_out);
+    ppaths.setEnv("TERM", "xterm-kitty");
+
+    ppaths.unsetEnv(no_keyboard_enhancement_env);
+    try testing.expect(!keyboardEnhancementOptedOut());
+    try testing.expectEqual(KeyboardPolicy.enable, keyboardPolicy());
+    try testing.expect(shouldEnableKittyKeyboard());
+    try testing.expectEqualStrings("on (Kitty protocol, modifyOtherKeys) · METACODES_NO_KEYBOARD_ENHANCEMENT=1 turns it off", keyboardSummary());
+
+    ppaths.setEnv(no_keyboard_enhancement_env, "1");
+    for ([_]bool{ true, false }) |answered| {
+        recordKeyboardProbe(answered);
+        try testing.expect(keyboardEnhancementOptedOut());
+        try testing.expectEqual(KeyboardPolicy.disable, keyboardPolicy());
+        try testing.expect(!shouldEnableKittyKeyboard());
+        try testing.expectEqualStrings("off · METACODES_NO_KEYBOARD_ENHANCEMENT is set", keyboardSummary());
+        try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
     }
 }
 
@@ -2531,6 +2823,435 @@ fn parseAll(stream: []const u8, out: []Key) []Key {
         }
     }
     return out[0..n];
+}
+
+fn parseChunks(stream: []const u8, cuts: []const usize, out: []Key) []Key {
+    var p = KeyParser{};
+    var n: usize = 0;
+    var start: usize = 0;
+    for (0..cuts.len + 1) |i| {
+        const end = if (i < cuts.len) cuts[i] else stream.len;
+        const chunk = stream[start..end];
+        for (chunk, 0..) |b, j| {
+            if (p.feedQueued(b, j + 1 < chunk.len)) |k| {
+                out[n] = k;
+                n += 1;
+            }
+            while (p.drain()) |k| {
+                out[n] = k;
+                n += 1;
+            }
+        }
+        start = end;
+    }
+    if (p.flushEsc()) |k| {
+        out[n] = k;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "KeyParser: a stream of legacy, CSI u and modifyOtherKeys keys decodes the same however the reads split it" {
+    const stream = "a\x1b[1~\x1b[4~\x1b[7~\x1b[8~\x1b[1;65A\x1b[3;129~" ++
+        "\x1b[45;6u\x1b[27;6;45~\x1b[47;5u\x1b[27;5;95~\x1f" ++
+        "\x1b[127;2u\x1b[27;2;127~\x1b[104;5u\x7f\x08" ++
+        "\x1b[106;5u\x1b[27;5;109~\x1b[105;5u\t\x1b[91;5u" ++
+        "\x1b[13;3u\x1b[27;3;13~\x1b[13;2u\x1b[27;2;32~\x1b[32;66u" ++
+        "\x1b[9;2u\x1b[Z\x1b[99;5u\x1b[98;3u\x1bf\x1b\x1b[B" ++
+        "\x1b[200~x\x1b[201~\x1b[12;40R\x1b[1;2A\x1b[27;7;120~z";
+    const expected = [_]Key{ .{ .char = 'a' }, .home, .end, .home, .end, .up, .delete } ++
+        [_]Key{.ctrl_underscore} ** 5 ++
+        [_]Key{.backspace} ** 5 ++
+        [_]Key{ .enter, .enter, .tab, .tab, .esc } ++
+        [_]Key{.shift_enter} ** 3 ++ [_]Key{.{ .char = ' ' }} ** 2 ++
+        [_]Key{ .shift_tab, .shift_tab, .ctrl_c, .alt_b, .alt_f, .esc, .down } ++
+        [_]Key{ .paste_begin, .{ .char = 'x' }, .paste_end, .{ .cursor_position = .{ .row = 12, .col = 40 } }, .unknown, .unknown, .{ .char = 'z' } };
+    var buf: [64]Key = undefined;
+    try testing.expectEqualSlices(Key, &expected, parseChunks(stream, &.{}, &buf));
+    try testing.expectEqualSlices(Key, &expected, parseAll(stream, &buf));
+
+    for (1..stream.len) |cut| {
+        errdefer std.debug.print("one cut at byte {d}\n", .{cut});
+        try testing.expectEqualSlices(Key, &expected, parseChunks(stream, &.{cut}, &buf));
+    }
+    var cuts: [stream.len]usize = undefined;
+    for (1..stream.len) |size| {
+        errdefer std.debug.print("reads of {d} bytes\n", .{size});
+        var n: usize = 0;
+        var at = size;
+        while (at < stream.len) : (at += size) {
+            cuts[n] = at;
+            n += 1;
+        }
+        try testing.expectEqualSlices(Key, &expected, parseChunks(stream, cuts[0..n], &buf));
+    }
+    var prng = std.Random.DefaultPrng.init(0x6b657973);
+    const random = prng.random();
+    for (0..500) |round| {
+        errdefer std.debug.print("random split round {d}\n", .{round});
+        var n: usize = 0;
+        var at: usize = 0;
+        while (true) {
+            at += random.intRangeAtMost(usize, 1, 12);
+            if (at >= stream.len) break;
+            cuts[n] = at;
+            n += 1;
+        }
+        try testing.expectEqualSlices(Key, &expected, parseChunks(stream, cuts[0..n], &buf));
+    }
+}
+
+const TimedWrite = struct { bytes: []const u8, after_ms: u64 };
+
+fn parseTimed(writes: []const TimedWrite, out: []Key) []Key {
+    var bytes: [1024]u8 = undefined;
+    var gaps: [1024]u64 = undefined;
+    var total: usize = 0;
+    var pending_gap: u64 = std.math.maxInt(u64);
+    for (writes) |write| {
+        pending_gap = @min(pending_gap, write.after_ms);
+        for (write.bytes) |b| {
+            bytes[total] = b;
+            gaps[total] = pending_gap;
+            pending_gap = 0;
+            total += 1;
+        }
+        if (write.bytes.len > 0) pending_gap = std.math.maxInt(u64);
+    }
+    var p = KeyParser{};
+    var n: usize = 0;
+    for (bytes[0..total], 0..) |b, i| {
+        const next: ?NextArrival = if (i + 1 < total) .{
+            .byte = bytes[i + 1],
+            .gap_ms = gaps[i + 1],
+            .after_gap_ms = if (i + 2 < total) gaps[i + 2] else null,
+        } else null;
+        if (p.feedTimed(b, gaps[i], next)) |k| {
+            out[n] = k;
+            n += 1;
+        }
+        while (p.drain()) |k| {
+            out[n] = k;
+            n += 1;
+        }
+    }
+    if (p.flushEsc()) |k| {
+        out[n] = k;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn typedText(keys: []const Key, out: []u8) []const u8 {
+    var n: usize = 0;
+    for (keys) |k| {
+        const c: ?u8 = switch (k) {
+            .char => |c| c,
+            .shift_enter => '\n',
+            .enter => '\r',
+            else => null,
+        };
+        if (c) |byte| {
+            out[n] = byte;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+fn expectTimedText(writes: []const TimedWrite, expected: []const u8) !void {
+    var keys: [512]Key = undefined;
+    var text: [512]u8 = undefined;
+    try testing.expectEqualStrings(expected, typedText(parseTimed(writes, &keys), &text));
+}
+
+test "paste burst: a multi-line paste without bracketed paste markers gives line breaks, never Enter" {
+    try expectTimedText(&.{.{ .bytes = "one two\rthree\rfour", .after_ms = 1000 }}, "one two\nthree\nfour");
+    try expectTimedText(&.{.{ .bytes = "one\rtwo\r", .after_ms = 1000 }}, "one\ntwo\n");
+    try expectTimedText(&.{.{ .bytes = "a\rb", .after_ms = 1000 }}, "a\nb");
+    try expectTimedText(&.{.{ .bytes = "a\rb\r", .after_ms = 1000 }}, "a\nb\n");
+    try expectTimedText(&.{.{ .bytes = "unix\nline feeds\n", .after_ms = 1000 }}, "unix\nline feeds\n");
+    try expectTimedText(&.{.{ .bytes = "a1\r\nb2\r\nc3\r\n", .after_ms = 1000 }}, "a1\nb2\nc3\n");
+    try expectTimedText(&.{.{ .bytes = "blank\r\rline", .after_ms = 1000 }}, "blank\n\nline");
+}
+
+test "paste burst: one line written together with its Enter is sent, as a script or tmux send-keys writes it" {
+    try expectTimedText(&.{.{ .bytes = "hello\r", .after_ms = 1000 }}, "hello\r");
+    try expectTimedText(&.{.{ .bytes = "hello\n", .after_ms = 1000 }}, "hello\r");
+    try expectTimedText(&.{.{ .bytes = "hello\r\n", .after_ms = 1000 }}, "hello\r");
+    try expectTimedText(&.{.{ .bytes = "a longer line of text, written at once\r", .after_ms = 1000 }}, "a longer line of text, written at once\r");
+    try expectTimedText(&.{ .{ .bytes = "hello\r", .after_ms = 1000 }, .{ .bytes = "next\r", .after_ms = 300 } }, "hello\rnext\r");
+}
+
+test "paste burst: a newline at the start of the terminal's next chunk is still a line break" {
+    try expectTimedText(&.{ .{ .bytes = "first part of it", .after_ms = 1000 }, .{ .bytes = "\rnext", .after_ms = 3 } }, "first part of it\nnext");
+    try expectTimedText(&.{ .{ .bytes = "abc", .after_ms = 1000 }, .{ .bytes = "\rdef", .after_ms = 40 } }, "abc\ndef");
+}
+
+test "paste burst: typing at human speed, fast typing with rollover and a lone Enter all submit" {
+    try expectTimedText(&.{ .{ .bytes = "h", .after_ms = 1000 }, .{ .bytes = "e", .after_ms = 90 }, .{ .bytes = "l", .after_ms = 120 }, .{ .bytes = "l", .after_ms = 80 }, .{ .bytes = "o", .after_ms = 100 }, .{ .bytes = "\r", .after_ms = 150 } }, "hello\r");
+    try expectTimedText(&.{ .{ .bytes = "f", .after_ms = 1000 }, .{ .bytes = "a", .after_ms = 25 }, .{ .bytes = "s", .after_ms = 12 }, .{ .bytes = "t", .after_ms = 30 }, .{ .bytes = "\r", .after_ms = 40 } }, "fast\r");
+    try expectTimedText(&.{ .{ .bytes = "o", .after_ms = 1000 }, .{ .bytes = "k", .after_ms = 4 }, .{ .bytes = "\r", .after_ms = 5 } }, "ok\r");
+    try expectTimedText(&.{.{ .bytes = "\r", .after_ms = 1000 }}, "\r");
+}
+
+test "paste burst: an IME committing several CJK characters at once, then Enter 150 ms later, submits" {
+    try expectTimedText(&.{ .{ .bytes = "你好世界", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 150 } }, "你好世界\r");
+    try expectTimedText(&.{ .{ .bytes = "中文", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 20 } }, "中文\r");
+}
+
+test "paste burst: the 10 ms limit, before the input after an Enter and inside a burst" {
+    try testing.expectEqual(@as(u64, 10), paste_burst_gap_ms);
+    try expectTimedText(&.{ .{ .bytes = "abc", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 500 }, .{ .bytes = "x", .after_ms = 10 } }, "abc\nx");
+    try expectTimedText(&.{ .{ .bytes = "abc", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 500 }, .{ .bytes = "x", .after_ms = 11 } }, "abc\rx");
+    try expectTimedText(&.{ .{ .bytes = "one\rtwo", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 10 } }, "one\ntwo\n");
+    try expectTimedText(&.{ .{ .bytes = "one\rtwo", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 11 } }, "one\ntwo\r");
+    try expectTimedText(&.{ .{ .bytes = "one\rtwo", .after_ms = 1000 }, .{ .bytes = "!", .after_ms = 11 }, .{ .bytes = "\r", .after_ms = 0 } }, "one\ntwo!\r");
+}
+
+test "paste burst: keys that send several bytes at once, then Enter, still submit" {
+    var buf: [16]Key = undefined;
+    try testing.expectEqualSlices(Key, &.{ .up, .enter }, parseTimed(&.{ .{ .bytes = "\x1b[A", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 50 } }, &buf));
+    try testing.expectEqualSlices(Key, &.{ .ctrl_c, .enter }, parseTimed(&.{ .{ .bytes = "\x1b[99;5u", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 60 } }, &buf));
+    try testing.expectEqualSlices(Key, &.{.shift_enter}, parseTimed(&.{.{ .bytes = "\x1b\r", .after_ms = 1000 }}, &buf));
+    try testing.expectEqualSlices(Key, &.{ .esc, .enter }, parseTimed(&.{ .{ .bytes = "\x1b", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 100 } }, &buf));
+}
+
+test "paste burst: bracketed paste markers win, and the Enter after them submits" {
+    var buf: [32]Key = undefined;
+    const keys = parseTimed(&.{ .{ .bytes = "\x1b[200~one\rtwo\x1b[201~", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 5 } }, &buf);
+    try testing.expectEqualSlices(Key, &.{ .paste_begin, .{ .char = 'o' }, .{ .char = 'n' }, .{ .char = 'e' }, .enter, .{ .char = 't' }, .{ .char = 'w' }, .{ .char = 'o' }, .paste_end, .enter }, keys);
+}
+
+test "paste burst: a bracketed paste ends the burst before it, so an Enter right after the paste submits" {
+    var buf: [32]Key = undefined;
+    const keys = parseTimed(&.{ .{ .bytes = "a\rb\r\x1b[200~x\x1b[201~", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 5 } }, &buf);
+    try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .shift_enter, .{ .char = 'b' }, .shift_enter, .paste_begin, .{ .char = 'x' }, .paste_end, .enter }, keys);
+}
+
+test "paste burst: splitting a write into back-to-back writes anywhere never changes the keys" {
+    const writes = [_]TimedWrite{
+        .{ .bytes = "h", .after_ms = 1000 },                        .{ .bytes = "i", .after_ms = 90 },                                .{ .bytes = "\r", .after_ms = 150 },
+        .{ .bytes = "one two\r\nthree\rfour\r", .after_ms = 2000 }, .{ .bytes = "\r", .after_ms = 400 },
+        .{ .bytes = "你好世界", .after_ms = 1000 },
+        .{ .bytes = "\r", .after_ms = 150 },                        .{ .bytes = "\x1b[200~pasted\rtext\x1b[201~", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 5 },
+        .{ .bytes = "\x1b[A", .after_ms = 1000 },                   .{ .bytes = "\r", .after_ms = 50 },                               .{ .bytes = "\x1b\r", .after_ms = 1000 },
+        .{ .bytes = "abc", .after_ms = 1000 },                      .{ .bytes = "\rdef", .after_ms = 40 },                            .{ .bytes = "\r", .after_ms = 300 },
+    };
+    var expected_buf: [256]Key = undefined;
+    const expected = parseTimed(&writes, &expected_buf);
+    var split: [128]TimedWrite = undefined;
+    var buf: [256]Key = undefined;
+    for (writes, 0..) |write, w| {
+        for (1..write.bytes.len) |cut| {
+            errdefer std.debug.print("write {d} cut at byte {d}\n", .{ w, cut });
+            var n: usize = 0;
+            for (writes, 0..) |other, o| {
+                if (o == w) {
+                    split[n] = .{ .bytes = other.bytes[0..cut], .after_ms = other.after_ms };
+                    split[n + 1] = .{ .bytes = other.bytes[cut..], .after_ms = 0 };
+                    n += 2;
+                } else {
+                    split[n] = other;
+                    n += 1;
+                }
+            }
+            try testing.expectEqualSlices(Key, expected, parseTimed(split[0..n], &buf));
+        }
+    }
+    var prng = std.Random.DefaultPrng.init(0x62757273);
+    const random = prng.random();
+    for (0..300) |round| {
+        errdefer std.debug.print("random split round {d}\n", .{round});
+        var n: usize = 0;
+        for (writes) |write| {
+            var start: usize = 0;
+            var first = true;
+            while (start < write.bytes.len) {
+                const left = write.bytes.len - start;
+                const len = if (left > 1 and random.boolean()) random.intRangeAtMost(usize, 1, left - 1) else left;
+                split[n] = .{ .bytes = write.bytes[start .. start + len], .after_ms = if (first) write.after_ms else 0 };
+                first = false;
+                n += 1;
+                start += len;
+            }
+        }
+        try testing.expectEqualSlices(Key, expected, parseTimed(split[0..n], &buf));
+    }
+}
+
+fn readEditorKey(fd: c_int, parser: *KeyParser) !Key {
+    if (parser.drain()) |key| return key;
+    while (true) {
+        if (platform_term.waitReadable(fd, 2000) <= 0) return error.TestUnexpectedResult;
+        var b: [1]u8 = undefined;
+        if (platform_term.readInput(fd, &b) != 1) return error.TestUnexpectedResult; // no EINTR: waitReadable reported data
+        if (parser.feedEditorRead(fd, b[0])) |key| return key;
+    }
+}
+
+fn readKeys(fd: c_int, parser: *KeyParser, count: usize, out: []Key) ![]Key {
+    for (out[0..count]) |*slot| slot.* = try readEditorKey(fd, parser);
+    return out[0..count];
+}
+
+test "feedRead: outside the prompt's editor keys written together each count, Enter included" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var parser = KeyParser{};
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[B\x1b[B\x1b[B\rabc\r"));
+    var keys: [8]Key = undefined;
+    for (&keys) |*slot| {
+        const read = readKey(fds[0], &parser);
+        if (read != .key) return error.TestUnexpectedResult;
+        slot.* = read.key;
+    }
+    try testing.expectEqualSlices(Key, &.{ .down, .down, .down, .enter, .{ .char = 'a' }, .{ .char = 'b' }, .{ .char = 'c' }, .enter }, &keys);
+
+    var editor = KeyParser{};
+    try testing.expect(pfs.writeAll(fds[1], "a\rb\r"));
+    var buf: [4]Key = undefined;
+    try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .shift_enter, .{ .char = 'b' }, .shift_enter }, try readKeys(fds[0], &editor, 4, &buf));
+}
+
+test "feedRead: a multi-line burst written at once gives line breaks, and Enter 60 ms later submits" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var parser = KeyParser{};
+    var buf: [32]Key = undefined;
+    var text: [32]u8 = undefined;
+    try testing.expect(pfs.writeAll(fds[1], "line one\rline two\r"));
+    try testing.expectEqualStrings("line one\nline two\n", typedText(try readKeys(fds[0], &parser, 18, &buf), &text));
+    @import("metacodes-internal").platform.sync.sleepMs(60);
+    try testing.expect(pfs.writeAll(fds[1], "\r"));
+    try testing.expectEqual(Key.enter, (try readKeys(fds[0], &parser, 1, &buf))[0]);
+}
+
+test "feedRead: bytes already waiting count as one burst however slowly they are read" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var parser = KeyParser{};
+    var text: [32]u8 = undefined;
+    var n: usize = 0;
+    try testing.expect(pfs.writeAll(fds[1], "line one\rline two\r"));
+    for (0..18) |_| {
+        n += typedText(&.{try readEditorKey(fds[0], &parser)}, text[n..]).len;
+        @import("metacodes-internal").platform.sync.sleepMs(15);
+    }
+    try testing.expectEqualStrings("line one\nline two\n", text[0..n]);
+}
+
+test "feedRead: one line and its Enter written at once is sent, and a CR LF is one Enter" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var parser = KeyParser{};
+    var buf: [8]Key = undefined;
+    var text: [16]u8 = undefined;
+    try testing.expect(pfs.writeAll(fds[1], "hello\r"));
+    try testing.expectEqualStrings("hello\r", typedText(try readKeys(fds[0], &parser, 6, &buf), &text));
+    try testing.expect(pfs.writeAll(fds[1], "again\r\n"));
+    try testing.expectEqualStrings("again\r", typedText(try readKeys(fds[0], &parser, 6, &buf), &text));
+    @import("metacodes-internal").platform.sync.sleepMs(60);
+    try testing.expect(pfs.writeAll(fds[1], "\r"));
+    try testing.expectEqual(Key.enter, try readEditorKey(fds[0], &parser));
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(fds[0], 0));
+}
+
+test "feedRead: an IME commit, then Enter 150 ms later, submits" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var parser = KeyParser{};
+    var buf: [32]Key = undefined;
+    var text: [32]u8 = undefined;
+    try testing.expect(pfs.writeAll(fds[1], "你好世界"));
+    try testing.expectEqualStrings("你好世界", typedText(try readKeys(fds[0], &parser, 12, &buf), &text));
+    @import("metacodes-internal").platform.sync.sleepMs(150);
+    try testing.expect(pfs.writeAll(fds[1], "\r"));
+    try testing.expectEqual(Key.enter, (try readKeys(fds[0], &parser, 1, &buf))[0]);
+}
+
+test "feedRead: after a bracketed paste read the way the prompt reads it, the next Enter submits" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var parser = KeyParser{};
+    var buf: [4]Key = undefined;
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[200~p1\rp2\rp3\x1b[201~"));
+    try testing.expectEqual(Key.paste_begin, (try readKeys(fds[0], &parser, 1, &buf))[0]);
+    var pasted: [16]u8 = undefined;
+    var n: usize = 0;
+    while (true) {
+        var b: [1]u8 = undefined;
+        try testing.expectEqual(@as(isize, 1), platform_term.readInput(fds[0], &b));
+        const key = parser.feed(b[0]) orelse continue;
+        if (key == .paste_end) break;
+        pasted[n] = pastedByte(key).?;
+        n += 1;
+    }
+    try testing.expectEqualStrings("p1\np2\np3", pasted[0..n]);
+    @import("metacodes-internal").platform.sync.sleepMs(30);
+    try testing.expect(pfs.writeAll(fds[1], "\r"));
+    try testing.expectEqual(Key.enter, (try readKeys(fds[0], &parser, 1, &buf))[0]);
+}
+
+fn readUntilQuiet(fd: c_int, parser: *KeyParser, out: []Key) []Key {
+    var n: usize = 0;
+    while (n < out.len) {
+        if (parser.drain()) |key| {
+            out[n] = key;
+            n += 1;
+            continue;
+        }
+        if (platform_term.waitReadable(fd, 50) <= 0) break;
+        var b: [1]u8 = undefined;
+        if (platform_term.readInput(fd, &b) != 1) break; // no EINTR: waitReadable reported data
+        if (parser.feedEditorRead(fd, b[0])) |key| {
+            out[n] = key;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+test "feedRead: a paste mixing CR, LF and CR LF reads at the prompt as the timed model parses it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const pastes = [_]struct { bytes: []const u8, text: []const u8 }{
+        .{ .bytes = "one\rX\nthree", .text = "one\nX\nthree" },
+        .{ .bytes = "a\rb\nc\r\nd\re", .text = "a\nb\nc\nd\ne" },
+        .{ .bytes = "x\r\r\ny\rz\n", .text = "x\n\ny\nz\n" },
+    };
+    for (pastes) |paste| {
+        errdefer std.debug.print("paste {f}\n", .{std.ascii.hexEscape(paste.bytes, .upper)});
+        var model_buf: [32]Key = undefined;
+        const model = parseTimed(&.{.{ .bytes = paste.bytes, .after_ms = 1000 }}, &model_buf);
+        var text: [32]u8 = undefined;
+        try testing.expectEqualStrings(paste.text, typedText(model, &text));
+        var parser = KeyParser{};
+        try testing.expect(pfs.writeAll(fds[1], paste.bytes));
+        var buf: [32]Key = undefined;
+        try testing.expectEqualSlices(Key, model, readUntilQuiet(fds[0], &parser, &buf));
+    }
 }
 
 /// `stream` read the way platform/terminal.zig reads a console that sends

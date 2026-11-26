@@ -715,7 +715,7 @@ pub const TuiBackend = struct {
             }
             dead_reads = 0;
 
-            const key = parser.feedRead(fd, b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
+            const key = (if (self.region.escapeClosesOverlay()) parser.feedRead(fd, b[0]) else parser.feedEditorRead(fd, b[0])) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
             self.routeKey(snap, key, editor, &paste);
             // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
             while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &paste);

@@ -169,11 +169,28 @@ chars = "\u001b\r"
 
 Inside tmux, Shift+Enter reaches metacodes only when tmux forwards extended keys
 in CSI u form (see `extended-keys` and `extended-keys-format` in tmux(1)).
+metacodes cannot see that setting, so inside tmux the footer says
+`\ + ⏎ for newline` even when tmux forwards the keys.
+
+## Turning the keyboard protocol off
+
+Set `METACODES_NO_KEYBOARD_ENHANCEMENT` (to any value, even `0`, like the other
+`METACODES_NO_*` switches) and metacodes turns on neither the Kitty keyboard
+protocol (`ESC [ > 1 u`) nor xterm modifyOtherKeys (`ESC [ > 4 ; 2 m`), in any
+terminal, and does not ask a terminal it does not recognize about them at
+startup. Leaving, handing the terminal to `$EDITOR`, and being stopped and
+continued (`kill -STOP`, then `kill -CONT`) then send nothing for them either.
+Use it when keys come out garbled, or not at all, with the protocol on, as
+they can in some terminals or behind a multiplexer that rewrites them.
+Shift+Enter then submits in the terminals of the table's first two rows: end a
+line with `\` and press Enter, or bind Shift+Enter to `ESC CR` as above. The
+footer says `\ + ⏎ for newline`, `/doctor` shows the protocol as off and why,
+and `/terminal-setup` says the variable is set.
 
 ## The footer hint
 
 The footer says `shift + ⏎ for newline` when Shift+Enter inserts a newline: the
-terminal speaks the keyboard protocol; VS Code's `keybindings.json` holds the
+terminal speaks the keyboard protocol (outside tmux, see above); VS Code's `keybindings.json` holds the
 binding (whoever added it), and so does that of every profile with shortcuts of
 its own; or `/terminal-setup` mapped it in Apple Terminal, the Terminal running
 now is not the one that was running at setup (setup records it even when run

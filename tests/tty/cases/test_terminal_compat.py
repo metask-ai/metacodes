@@ -69,6 +69,19 @@ def test_sigstop_sigcont_reapplies_terminal_modes(bin_path):
     assert raw.count(b"\x1b[?2004h") >= 2, "SIGCONT should re-enable bracketed paste"
 
 
+def test_no_keyboard_enhancement_env_sends_no_protocol_sequence_through_stop_and_exit(bin_path):
+    _skip_if_conpty()
+    raw = run(
+        bin_path,
+        [READY, "signal:stopcont", "sleep:0.8", "key:ctrl_c", "key:ctrl_c", "strictsleep:1.0"],
+        env={"TERM_PROGRAM": "WarpTerminal", "TERM": "xterm-kitty", "METACODES_NO_KEYBOARD_ENHANCEMENT": "1"},
+    )
+    for sequence in (b"\x1b[<u", b"\x1b[>1u", b"\x1b[>4;2m", b"\x1b[>4m", b"\x1b[?u"):
+        assert sequence not in raw, f"METACODES_NO_KEYBOARD_ENHANCEMENT still sent {sequence!r}"
+    assert raw.count(b"\x1b[?2004h") >= 2, "SIGCONT should still re-enable bracketed paste"
+    assert b"\x1b[?2004l" in raw, "leaving should still turn bracketed paste off"
+
+
 def test_sigcont_restores_raw_input_after_shell_cooked_the_tty(bin_path):
     _skip_if_conpty()
     # While stopped, the tty goes back to canonical mode (no echo). Without the
@@ -193,7 +206,7 @@ def _multiline_footer(bin_path, term_program):
         events = [READY, "type:a\\", "raw:\\x0d", "type:b", "sleep:0.3"]
     else:
         events = [READY, "type:a", "key:shift_enter", "type:b", "sleep:0.3"]
-    raw = run(bin_path, events, env={"TERM_PROGRAM": term_program, "TERM": "xterm-256color"})
+    raw = run(bin_path, events, env={"TERM_PROGRAM": term_program, "TERM": "xterm-256color", "TMUX": None})
     sc = Screen(24, 80)
     sc.feed(raw)
     return "\n".join(sc.line_text(r) for r in range(sc.rows))

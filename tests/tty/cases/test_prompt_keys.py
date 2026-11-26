@@ -140,3 +140,11 @@ def test_ctrl_l_clears_the_screen_and_redraws_the_box_on_top(bin_path):
         ed2 = raw.find(b"\x1b[2J")
         if ed2 < 0 or not _in_one_sync_frame(raw, ed2, b"\x1b[2J"):
             a._fail("Ctrl+L should erase the box and clear the screen in one synchronized frame")
+
+
+def test_home_and_end_as_tmux_screen_and_rxvt_send_them_move_the_cursor(bin_path):
+    raw = run(bin_path, [READY, "type:abc", "raw:\\x1b[1~", "type:X", "raw:\\x1b[4~", "type:Y", "strictsleep:0.4"])
+    TTYAssert(raw).assert_input_echo("XabcY")
+
+    raw = run(bin_path, [READY, "type:abc", "raw:\\x1b[7~", "type:X", "raw:\\x1b[8~", "type:Y", "strictsleep:0.4"])
+    TTYAssert(raw).assert_input_echo("XabcY")

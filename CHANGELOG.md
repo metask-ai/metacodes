@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`METACODES_NO_KEYBOARD_ENHANCEMENT` keeps the TUI's keyboard protocol
+  off.** Set to any value, it stops the interactive TUI from turning on the
+  Kitty keyboard protocol and xterm modifyOtherKeys in any terminal, and from
+  asking a terminal it does not recognize about them at startup. Starting,
+  being stopped and continued, handing the terminal to `$EDITOR` and leaving
+  then send neither their on nor their off sequences. It is the way out for a
+  terminal or multiplexer that garbles keys with the protocol on; where the
+  protocol was what made Shift+Enter a newline, end the line with `\` and
+  press Enter, or bind Shift+Enter to `ESC CR`. `/doctor` shows whether the
+  protocol is on and why, and `/terminal-setup` names the variable when it is
+  set ([TERMINAL_SETUP.md](doc/TERMINAL_SETUP.md#turning-the-keyboard-protocol-off)).
+
 - **Background Bash jobs can get a time limit and a stuck-prompt notice**
   (preview feature `background_watchdog`, off by default). With
   `--preview=background_watchdog`, a `run_in_background` job stops when it
@@ -394,6 +406,50 @@ status, compatibility boundaries, and entry points are defined by
   `max_queued`.
 
 ### Fixed
+
+- **Inside tmux the multi-line hint says `\ + ⏎ for newline`.** It said
+  `shift + ⏎ for newline`, but under tmux's default configuration
+  Shift+Enter arrives as Enter and submits.
+
+- **A multi-line paste waits for Enter in terminals that do not mark
+  pastes.** Without bracketed paste markers (a terminal that does not support
+  them, the classic Windows console, a multiplexer that drops them) a paste
+  reaches the TUI as ordinary keys, and its first line break submitted the
+  first line. A line break now counts as part of a paste when more input
+  follows it within 10 ms, or when an earlier line break of the same burst
+  (bytes within 10 ms of each other) already did. Such line breaks go into
+  the prompt as newlines (a CR LF pair as one), so a multi-line paste waits
+  for Enter, with or without a line break at its end. One line written
+  together with its Enter, as a script or `tmux send-keys` writes it, is
+  still sent, and so is a one-line paste that ends in a line break. Only the
+  prompt's own text takes this: the permission and question dialogs, the
+  model picker and the menus over the prompt still read keys written
+  together one by one, Enter included. A typed Enter, an Enter after an
+  input method commits several characters at once, and a paste that carries
+  markers work as before.
+
+- **Ctrl+_, Shift+Backspace, Shift+Space, Alt+Enter and Ctrl+H, I, J, M
+  and [ work in terminals that report modified keys.** Under the kitty
+  keyboard protocol (Ghostty, kitty, Alacritty 0.16 and later, iTerm2 3.7.7
+  and later) and xterm modifyOtherKeys (tmux with `extended-keys`, WezTerm)
+  these keys arrive as sequences such as `ESC [ 127 ; 2 u` or
+  `ESC [ 27 ; 2 ; 32 ~`, and the key parser had no entry for them: Ctrl+_
+  (`ESC [ 45 ; 6 u`, `ESC [ 47 ; 5 u`) did not undo, Shift+Backspace and
+  Ctrl+H did not delete, Shift+Space was lost, Ctrl+J and Ctrl+M did not
+  submit, Ctrl+I did not complete, Ctrl+[ was not Esc, and Alt+Enter
+  submitted the draft instead of starting a new line. Each now does what its
+  legacy byte does in both encodings, with or without Caps Lock and Num Lock:
+  Enter with Alt starts a new line as `ESC CR` does, and a printable key with
+  only Shift is that character.
+
+- **Home and End work in tmux, GNU screen, the Linux console and rxvt.**
+  These send Home as `ESC [ 1 ~` and End as `ESC [ 4 ~` (rxvt `ESC [ 7 ~`
+  and `ESC [ 8 ~`), and the key parser knew Home and End only as
+  `ESC [ H` and `ESC [ F`, so in tmux both keys did nothing at the prompt
+  and in the `/model` list, whose footer offers them. The four forms are now
+  Home and End, also with only Caps Lock or Num Lock in the modifier; with
+  Shift, Alt or Ctrl they are still ignored, like the other cursor and
+  editing keys.
 
 - **`bench pull` also pulls verifier and sidecar images.** It took only the
   first `docker_image` of a task's `task.toml`, which in the FrontierHarness

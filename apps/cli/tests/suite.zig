@@ -60,6 +60,7 @@ comptime {
     _ = @import("component/vterm_test.zig");
     _ = @import("component/render_region_contract_test.zig");
     _ = @import("component/redraw_window_contract_test.zig");
+    _ = @import("component/keyboard_enhancement_env_test.zig");
     _ = @import("component/picker_frame_race_test.zig");
     _ = @import("component/md_stream_convergence_test.zig");
     _ = @import("component/ui_state_test.zig");

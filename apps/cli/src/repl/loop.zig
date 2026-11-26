@@ -2047,7 +2047,8 @@ fn readLineRaw(
             }
             if (n == 0) return error.Eof;
 
-            break :blk parser.feedRead(fd, b[0]) orelse continue;
+            const editor_takes_text = !region.escapeClosesOverlay() and (!vim_keys or vim_state.mode == .insert);
+            break :blk (if (editor_takes_text) parser.feedEditorRead(fd, b[0]) else parser.feedRead(fd, b[0])) orelse continue;
         };
 
         switch (copy_select.handle(allocator, region, key)) {
@@ -4051,6 +4052,7 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     } else {
         cmd_output.print("Config problems:  none\n", .{});
     }
+    cmd_output.print("Keyboard:         {s}\n", .{input.keyboardSummary()});
     cmd_output.print("Home:             {s}\n", .{@import("metacodes-internal").platform.paths.homeDir() orelse "unset"});
     if (util_fs.getCwd(allocator)) |cwd| {
         defer allocator.free(cwd);

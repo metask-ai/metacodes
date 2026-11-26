@@ -72,6 +72,21 @@ def test_at_menu_tab_inserts(bin_path):
         shutil.rmtree(wd, ignore_errors=True)
 
 
+def test_at_menu_ctrl_i_in_both_encodings_inserts_like_tab(bin_path):
+    for tab in ("raw:\\x1b[105;5u", "raw:\\x1b[27;5;105~"):
+        wd = _mkdir_with_files()
+        try:
+            sc, _ = _cap(bin_path, wd, ["type:@R", "sleep:0.3", tab, "sleep:0.3"])
+            box = ""
+            for r in range(sc.rows):
+                t = sc.line_text(r).strip()
+                if t.startswith("❯"):
+                    box = t
+            assert "@README.md" in box, f"{tab} should insert @README.md like Tab, got {box!r}"
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
 def test_at_menu_down_moves_highlight(bin_path):
     wd = _mkdir_with_files()
     try:
