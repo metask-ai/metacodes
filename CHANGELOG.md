@@ -450,6 +450,12 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **The TUI draws an MCP tool call.** A call to an MCP tool ran and its
+  result reached the model, but nothing of it appeared on screen. It now gets
+  the line a built-in tool gets, `⏺ mcp__<server>__<tool>(<arguments>)`, with
+  the text the server returned under it, folded after 10 lines; an error
+  shows its first line. The transcript view (Ctrl+O) and `--resume` show the
+  call as well.
 
 - **`bench pull` also pulls verifier and sidecar images.** It took only the
   first `docker_image` of a task's `task.toml`, which in the FrontierHarness
