@@ -418,6 +418,9 @@ class LayoutTest(unittest.TestCase):
         self.assertNotIn("tests", layout.products)
         self.assertNotIn("testing", layout.products)
         self.assertEqual(layout.affected(["base"]), layout.products)
+        self.assertEqual(layout.violations, {})
+        for package in layout.products:
+            self.assertIn(f"test:{package}", layout.test_steps)
         # A change confined to the cli package, sources or tests, runs test:cli.
         for path in ("apps/cli/src/repl/tui/widget/status_bar.zig", "apps/cli/tests/component/ui_render_test.zig"):
             with self.subTest(path=path):
@@ -427,6 +430,18 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, changes, layout)
                 self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
                 self.assertTrue(chosen.product and chosen.tty)
+        for path, expected in (
+            ("packages/agentcore/abi_v1.zig", ("agentcore", "cli")),
+            ("src/lib.zig", ("facade", "agentcore", "cli")),
+            ("packages/teamwork/src/root.zig", ("teamwork", "facade", "agentcore", "cli")),
+            ("packages/coding/src/core/agent_loop.zig", ("coding", "session", "teamwork", "facade", "agentcore", "cli")),
+        ):
+            with self.subTest(path=path):
+                scope, reason = ci_scope.classify([path], layout=layout)
+                self.assertEqual(scope, "packages", reason)
+                chosen = ci_scope.select(scope, [("M", path)], layout)
+                self.assertEqual(chosen.packages, expected)
+                self.assertEqual(chosen.package_tests, tuple(f"test:{pkg}" for pkg in expected))
         self.assertEqual(layout.owner("packages/kernel/src/conversation.zig"), "kernel")
         self.assertEqual(layout.owner("packages/coding/src/core/agent_loop.zig"), "coding")
         self.assertEqual(layout.owner("packages/coding/src/core/tools_extra.zig"), "coding")

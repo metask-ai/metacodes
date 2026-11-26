@@ -94,15 +94,18 @@ package by package as the migration empties the baseline, upper packages
 first, because a package's affected set includes everything above it. On
 the tree of 0b (#792) every product package but `agentcore` has entries, and
 `agentcore`'s set includes `cli`, so every product change is still `full`.
-Since migration step 1.3c `cli` is the first package narrowed: it has no
+Since migration step 1.3c `cli` was the first package narrowed: it has no
 entries, nothing depends on it, and `test:cli` runs its tests (the inline
 tests of `apps/cli/src`, the picker root, the component suite in
 `apps/cli/tests/` and the termios spike). A change confined to `apps/cli/`
 runs `test:cli` in place of `test:units`. Its tests live in the `tests`
 package (`apps/cli/tests/` is listed there, so they may use the harness),
 but a test inside a product package's directory counts as a change to that
-package. `agentcore` has no entries either, but no `test:agentcore` step
-yet, so its changes are still `full`.
+package. With `layer_baseline.zon` empty and `test:base`, `test:ai`,
+`test:kernel`, `test:guard`, `test:coding`, `test:session`, `test:teamwork`,
+`test:facade`, `test:agentcore` and `test:cli` declared in `build.zig`, every
+product package in `layers.zon` narrows to its affected closure under the
+`packages` scope.
 
 `build.zig`, `build.zig.zon`, `layers.zon`, `layer_baseline.zon`, the
 `testing` package (`tests/_harness/`, `tests/helpers/`), `.github/`,
