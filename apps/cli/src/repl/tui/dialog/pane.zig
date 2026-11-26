@@ -24,6 +24,7 @@ const ansi = @import("../ansi.zig");
 const term = @import("../term.zig");
 const reflow = @import("../reflow.zig");
 const input = @import("../../input.zig");
+const app_mod = @import("../../../app.zig");
 const Theme = @import("../theme.zig").Theme;
 
 pub const INDENT = "  ";
@@ -319,6 +320,10 @@ pub fn run(comptime D: type, dialog: *D, allocator: std.mem.Allocator, th: Theme
         const key: input.Key = key: {
             if (parser.drain()) |pending| break :key pending;
             const rc = platform_term.waitReadable(in_fd, 100);
+            if (app_mod.terminateRequested()) {
+                _ = dialog.key(.ctrl_c);
+                return;
+            }
             if (rc <= 0) {
                 if (parser.flushEsc()) |esc| break :key esc;
                 // A resize interrupts the wait (or shows on the next tick):

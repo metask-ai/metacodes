@@ -450,6 +450,13 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **A dialog left open no longer keeps a closed terminal waiting 45
+  seconds** (#763). With `/help`, `/skills` or a `/login` pane open, a closed
+  terminal (SIGHUP) or a `kill` (SIGTERM) went unnoticed until the 45-second
+  limit ended the process outright, without the resume hint. The pane now
+  closes as Ctrl+C closes it, a sign-in in progress included, and the REPL
+  leaves at once, as it does from an idle prompt.
+
 - **A long paste no longer sends another session's text** (#764). A paste
   of more than 3 lines or 1600 bytes is stored as `pastes/<N>.txt` in the
   state directory, and the box holds `[Pasted text #N +M lines]` until the
