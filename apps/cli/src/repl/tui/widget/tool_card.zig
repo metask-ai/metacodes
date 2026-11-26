@@ -71,8 +71,8 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     if (std.mem.eql(u8, tool_name, "Skill")) return .hidden;
     // 有专用 summary 渲染器的工具(renderResultBody 分发到 diff/搜索/Read/WebFetch 渲染器)。
     const summary_tools = [_][]const u8{
-        "Bash",     "BashOutput", "Edit",  "Write", "Read", "Grep", "Glob",
-        "WebFetch", "WebSearch",  "Agent",
+        "Bash",     "BashOutput", "Edit",  "Write",      "Read", "Grep", "Glob",
+        "WebFetch", "WebSearch",  "Agent", "ApplyPatch",
     };
     for (summary_tools) |t| {
         if (std.mem.eql(u8, tool_name, t)) return .summary;
@@ -1401,6 +1401,7 @@ fn jsonUnescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 /// WebFetch→域名;WebSearch→"query";其余→空(标题不带括号)。caller free。
 fn headerArg(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
     if (isMcpTool(tool_name)) return mcpArgSummary(alloc, args);
+    if (std.mem.eql(u8, tool_name, "ApplyPatch")) return patchFilesSummary(alloc, args);
     if (std.mem.eql(u8, tool_name, "Bash")) {
         if (extractField(args, "command")) |cmd| {
             const dec = try jsonUnescape(alloc, cmd);
@@ -1625,7 +1626,29 @@ fn isMcpTool(tool_name: []const u8) bool {
     return std.mem.startsWith(u8, tool_name, mcp_naming.PREFIX);
 }
 
-const MCP_ARG_SUMMARY_COLS: usize = 60;
+const ARG_SUMMARY_COLS: usize = 60;
+const PATCH_FILE_MARKERS = [_][]const u8{ "*** Add File: ", "*** Update File: ", "*** Delete File: " };
+
+fn patchFilesSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, args, .{}) catch return alloc.dupe(u8, "");
+    defer parsed.deinit();
+    if (parsed.value != .object) return alloc.dupe(u8, "");
+    const patch = parsed.value.object.get("patch") orelse return alloc.dupe(u8, "");
+    if (patch != .string) return alloc.dupe(u8, "");
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, patch.string, '\n');
+    while (lines.next()) |line| {
+        const path = for (PATCH_FILE_MARKERS) |marker| {
+            if (std.mem.startsWith(u8, line, marker)) break std.mem.trim(u8, line[marker.len..], " \t\r");
+        } else continue;
+        if (names.items.len > 0) try names.appendSlice(alloc, ", ");
+        try appendPrintable(alloc, &names, basename(path));
+    }
+    const shown = try layout.truncate(alloc, names.items, ARG_SUMMARY_COLS, "…");
+    defer if (shown.ptr != names.items.ptr) alloc.free(shown);
+    return alloc.dupe(u8, shown);
+}
 const REPLACEMENT_CHAR = "\u{FFFD}";
 
 fn mcpArgSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
@@ -1643,7 +1666,7 @@ fn mcpArgSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
         defer alloc.free(value);
         try summary.appendSlice(alloc, value);
     }
-    const shown = try layout.truncate(alloc, summary.items, MCP_ARG_SUMMARY_COLS, "…");
+    const shown = try layout.truncate(alloc, summary.items, ARG_SUMMARY_COLS, "…");
     defer if (shown.ptr != summary.items.ptr) alloc.free(shown);
     return alloc.dupe(u8, shown);
 }
@@ -2646,4 +2669,39 @@ test "an MCP error shows the server's first line of text, not its JSON" {
     const structured = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", "{\"error\":{\"code\":\"other\",\"detail\":\"server went away\"}}", .err, 0, .{});
     defer a.free(structured);
     try capture.expectContains(structured, "server went away");
+}
+
+test "ApplyPatch gets a start line naming the files it touches, and its result shows the counts and the diff" {
+    const a = testing.allocator;
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ApplyPatch"));
+    try testing.expect(showStartCard("ApplyPatch"));
+
+    const patch = "{\"patch\":\"*** Begin Patch\\n*** Add File: /tmp/w/hello.txt\\n+hi\\n*** Update File: src/app.py\\n@@\\n-a\\n+b\\n*** Delete File: old.txt\\n*** End Patch\"}";
+    const start = try renderStart(a, theme_mod.monochrome, "ApplyPatch", patch);
+    defer a.free(start);
+    try testing.expectEqualStrings("* ApplyPatch(hello.txt, app.py, old.txt)\n", start);
+
+    const result = "{\"success\":true,\"added\":1,\"modified\":1,\"deleted\":1,\"gitDiff\":\"--- /dev/null\\n+++ b/hello.txt\\n@@ -0,0 +1 @@\\n+hi\\n\"}";
+    const body = try renderResult(a, theme_mod.monochrome, "ApplyPatch", patch, result, .ok, 0, .{});
+    defer a.free(body);
+    try capture.expectContains(body, "Applied patch: 1 added, 1 modified, 1 deleted");
+    try capture.expectContains(body, "+hi");
+    try testing.expect(std.mem.indexOf(u8, body, "gitDiff") == null);
+}
+
+test "an ApplyPatch start line keeps file names on one line and out of the terminal's control" {
+    const a = testing.allocator;
+    const many = try renderStart(a, theme_mod.monochrome, "ApplyPatch", "{\"patch\":\"*** Begin Patch\\n" ++ "*** Add File: a_rather_long_file_name.txt\\n+x\\n" ** 6 ++ "*** End Patch\"}");
+    defer a.free(many);
+    try testing.expect(std.mem.indexOf(u8, many, "…)") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, many, "\n"));
+
+    const hostile = try renderStart(a, theme_mod.monochrome, "ApplyPatch", "{\"patch\":\"*** Add File: a\\u001b[2Jb.txt\\n+x\"}");
+    defer a.free(hostile);
+    try testing.expect(std.mem.indexOfScalar(u8, hostile, 0x1b) == null);
+    try capture.expectContains(hostile, "ApplyPatch(a" ++ REPLACEMENT_CHAR ++ "[2Jb.txt)");
+
+    const empty = try renderStart(a, theme_mod.monochrome, "ApplyPatch", "{}");
+    defer a.free(empty);
+    try testing.expectEqualStrings("* ApplyPatch\n", empty);
 }

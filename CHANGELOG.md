@@ -450,6 +450,10 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **The TUI draws an ApplyPatch call.** A patch changed files without a line
+  on screen. It now gets a start line naming the files it touches and, under
+  it, the added/modified/deleted counts and the diff.
+
 - **The TUI draws an MCP tool call.** A call to an MCP tool ran and its
   result reached the model, but nothing of it appeared on screen. It now gets
   the line a built-in tool gets, `⏺ mcp__<server>__<tool>(<arguments>)`, with
