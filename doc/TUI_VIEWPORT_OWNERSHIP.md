@@ -118,7 +118,8 @@ records a `reflow.Anchor` (rows above the cursor and their widths, measured
 from the frame's bytes), and the next erase climbs `anchor.climb()` rows. On
 a terminal that re-wraps when it narrows, the climb counts the rows those
 widths take at the new width; on one that clips (`term.reflowFromEnv`;
-Windows ConPTY, xterm, GNU screen) it counts them as drawn.
+Windows ConPTY, xterm, GNU screen, st, PuTTY, named by the environment or
+by the startup probe's XTVERSION and DA2 answers) it counts them as drawn.
 
 **6. The half-line continuation is a mortgage on the terminal's geometry.**
 `pending_col` is a column on a physical row. A resize re-wraps or clips the

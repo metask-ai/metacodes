@@ -331,7 +331,9 @@ pub fn resolveThemeVariant(allocator: std.mem.Allocator, no_theme: bool, state_r
 /// it first takes the terminal whether to turn on the Kitty keyboard protocol
 /// (Shift+Enter as a newline). A terminal `input.keyboardPolicy` cannot place
 /// from its environment is asked in the same round trip as its background
-/// (#327); `METACODES_NO_PROBE` skips both questions, leaving the protocol off.
+/// (#327), and one whose environment does not tell whether it re-wraps on a
+/// resize is asked its name (XTVERSION, DA2: `term.reflowFromEnv`);
+/// `METACODES_NO_PROBE` skips every question, leaving the protocol off.
 pub fn resolveInteractiveTerminal(allocator: std.mem.Allocator, no_theme: bool, state_root: []const u8) @import("repl/tui/theme.zig").Variant {
     return settleTerminal(allocator, no_theme, state_root, .theme_and_keyboard);
 }
@@ -347,15 +349,18 @@ fn settleTerminal(
     const persisted = if (no_theme or state_root.len == 0) null else @import("repl/tui/config.zig").loadTheme(allocator, state_root);
     const variant: @import("repl/tui/theme.zig").Variant = if (no_theme) .monochrome else persisted orelse .auto;
     if (std.c.getenv("METACODES_NO_PROBE") != null) return variant;
+    const term = @import("repl/tui/term.zig");
     const want: bg_probe.Want = .{
-        .background = variant == .auto and @import("repl/tui/term.zig").detectFromEnv(1) != .none,
+        .background = variant == .auto and term.detectFromEnv(1) != .none,
         .keyboard = questions == .theme_and_keyboard and input.keyboardPolicy() == .probe,
+        .identity = questions == .theme_and_keyboard and term.reflowNeedsProbe(),
     };
     if (!want.any()) return variant;
     // The interactive REPL takes the terminal next: a round its deadline cut
     // short keeps reading its answers until then (`bg_probe.handOver`).
     const answer = bg_probe.probe(want, questions == .theme_and_keyboard);
     if (want.keyboard) input.recordKeyboardProbe(answer.keyboard == .supported);
+    if (want.identity) term.recordProbeAnswers(answer.xtversion.text(), answer.da2.text());
     if (variant != .auto) return variant;
     const bg = answer.background orelse return variant;
     return if (bg_probe.isLight(bg)) .light else .dark;

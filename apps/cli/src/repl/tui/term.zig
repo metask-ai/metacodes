@@ -130,24 +130,48 @@ pub fn getSize(fd: c_int) ?TermSize {
 
 /// Whether the terminal re-wraps the lines it shows when the window narrows.
 /// Most POSIX terminals do (iTerm2, Terminal.app, kitty, Ghostty, WezTerm,
-/// Alacritty, VTE, xterm.js, tmux); xterm, GNU screen and the Linux console
-/// clip instead. tmux re-wraps whatever runs inside it, so its marker wins over
-/// the outer terminal's. See reflow.zig for what the answer changes.
+/// Alacritty, VTE, xterm.js, rxvt-unicode, tmux); xterm, GNU screen, st, PuTTY
+/// and the Linux console clip instead. tmux re-wraps whatever runs inside it,
+/// so its marker wins over the outer terminal's. A terminal nothing names
+/// counts as re-wrapping. See reflow.zig for what the answer changes.
 pub fn detectReflow(tmux: bool, screen: bool, xterm: bool, term: ?[]const u8) bool {
     if (tmux) return true;
     if (screen or xterm) return false;
-    if (term) |t| if (std.mem.eql(u8, t, "linux")) return false;
+    if (term) |t| if (termClips(t)) return false;
     return true;
 }
 
-/// detectReflow over the process environment: `TMUX`, GNU screen's `STY`,
-/// xterm's `XTERM_VERSION`, and `TERM`. Where the platform's console decides
-/// (Windows: conhost clips, platform.terminal.console_reflows), the
-/// environment is not consulted.
+fn termClips(term: []const u8) bool {
+    return std.mem.eql(u8, term, "linux") or std.mem.eql(u8, term, "st") or std.mem.startsWith(u8, term, "st-") or
+        std.mem.startsWith(u8, term, "stterm") or std.mem.startsWith(u8, term, "putty");
+}
+
+pub fn answersNameClippingTerminal(xtversion: []const u8, da2: []const u8) bool {
+    return std.mem.startsWith(u8, xtversion, "XTerm(") or std.mem.eql(u8, da2, "0;136;0");
+}
+
+var g_answers_name_clipping_terminal = false;
+
+pub fn recordProbeAnswers(xtversion: []const u8, da2: []const u8) void {
+    g_answers_name_clipping_terminal = answersNameClippingTerminal(xtversion, da2);
+}
+
+pub fn reflowNeedsProbe() bool {
+    if (platform_term.console_reflows != null) return false;
+    const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
+    if (envSet("TMUX") or envSet("STY") or envSet("XTERM_VERSION")) return false;
+    return if (term) |t| !termClips(t) else true;
+}
+
+/// detectReflow over the process environment (`TMUX`, GNU screen's `STY`,
+/// xterm's `XTERM_VERSION`, `TERM`) and the startup probe's XTVERSION and DA2
+/// answers, which name xterm and PuTTY where an SSH login dropped the rest.
+/// Where the platform's console decides (Windows: conhost clips,
+/// platform.terminal.console_reflows), neither is consulted.
 pub fn reflowFromEnv() bool {
     if (platform_term.console_reflows) |reflows| return reflows;
     const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
-    return detectReflow(envSet("TMUX"), envSet("STY"), envSet("XTERM_VERSION"), term);
+    return detectReflow(envSet("TMUX"), envSet("STY"), envSet("XTERM_VERSION") or g_answers_name_clipping_terminal, term);
 }
 
 fn envSet(name: [*:0]const u8) bool {
@@ -304,6 +328,21 @@ test "detectReflow: xterm, GNU screen and the Linux console clip; tmux re-wraps 
     // tmux running in xterm or in screen still re-wraps its own panes.
     try testing.expect(detectReflow(true, false, true, "tmux-256color"));
     try testing.expect(detectReflow(true, true, false, "screen-256color"));
+}
+
+test "detectReflow: st and PuTTY clip, rxvt-unicode and an unnamed terminal re-wrap" {
+    for ([_][]const u8{ "st", "st-256color", "stterm-256color", "putty", "putty-256color" }) |t| try testing.expect(!detectReflow(false, false, false, t));
+    for ([_][]const u8{ "rxvt-unicode-256color", "xterm-256color", "xterm-kitty", "xterm-ghostty", "wezterm", "stx" }) |t| try testing.expect(detectReflow(false, false, false, t));
+    try testing.expect(detectReflow(true, false, false, "st-256color"));
+}
+
+test "answersNameClippingTerminal: xterm's XTVERSION and PuTTY's DA2" {
+    try testing.expect(answersNameClippingTerminal("XTerm(390)", ""));
+    try testing.expect(answersNameClippingTerminal("", "0;136;0"));
+    try testing.expect(!answersNameClippingTerminal("tmux 3.5a", "84;0;0"));
+    try testing.expect(!answersNameClippingTerminal("iTerm2 3.5.10", "0;95;0"));
+    try testing.expect(!answersNameClippingTerminal("", "41;390;0"));
+    try testing.expect(!answersNameClippingTerminal("", ""));
 }
 
 test "reflowFromEnv: the platform's console answer wins over the environment" {

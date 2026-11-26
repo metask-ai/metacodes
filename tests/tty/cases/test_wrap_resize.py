@@ -40,7 +40,7 @@ def test_T12_resize_widens(bin_path):
     a.assert_box_at_bottom()
 
 
-def _narrow_idle_box(bin_path, env=None, reflow=True):
+def _narrow_idle_box(bin_path, env=None, reflow=True, probe_answer=None):
     """空闲输入框从 100 列分四步缩到 60 列(拖窗口边时一串 SIGWINCH),每步等重画。
 
     回放在每次 resize 的那个字节偏移改尺寸:reflow=True 按现代终端重排已显示的行,
@@ -52,11 +52,19 @@ def _narrow_idle_box(bin_path, env=None, reflow=True):
     from tty_driver import READY, case_tmpdir
     resizes = []
     events = [READY]
+    drain = {}
+    if probe_answer is not None:
+        events = ["waitbytes:\\x1b[c:10", "raw:" + probe_answer, READY]
+        drain = {"startup_drain": 0}
     for cols in (90, 80, 70, 60):
         events += [f"resize:24x{cols}", "strictsleep:0.5"]
     raw = run(bin_path, events, term_size=(24, 100), env=env, resizes=resizes,
-              cwd=case_tmpdir("cc-tty-narrow-"))
+              cwd=case_tmpdir("cc-tty-narrow-"), **drain)
     return TTYAssert(raw, resizes=resizes, reflow=reflow)
+
+
+_PROBED_TERMINAL = {"TERM": "xterm-256color", "TERM_PROGRAM": None, "TMUX": None, "STY": None, "ZELLIJ": None,
+                    "XTERM_VERSION": None, "METACODES_NO_PROBE": None}
 
 
 def _assert_nothing_above_the_box_moved(a):
@@ -80,6 +88,21 @@ def test_T44_narrowing_a_clipping_terminal_keeps_the_lines_above_the_box(bin_pat
     # xterm(XTERM_VERSION)变窄时只裁剪,横线仍是一行:按重排算行数会多爬一行,
     # 每次 resize 吃掉框上方一行对话。
     a = _narrow_idle_box(bin_path, env={"XTERM_VERSION": "XTerm(390)"}, reflow=False)
+    a.assert_single_box()
+    _assert_nothing_above_the_box_moved(a)
+    a.assert_cursor_on_content("")
+
+
+def test_T48_narrowing_xterm_named_only_by_its_xtversion_answer_keeps_the_lines_above_the_box(bin_path):
+    a = _narrow_idle_box(bin_path, env=_PROBED_TERMINAL, reflow=False,
+                         probe_answer="\\x1bP>|XTerm(390)\\x1b\\\\\\x1b[?64;1c")
+    a.assert_single_box()
+    _assert_nothing_above_the_box_moved(a)
+    a.assert_cursor_on_content("")
+
+
+def test_T49_narrowing_putty_named_only_by_its_da2_answer_keeps_the_lines_above_the_box(bin_path):
+    a = _narrow_idle_box(bin_path, env=_PROBED_TERMINAL, reflow=False, probe_answer="\\x1b[>0;136;0c\\x1b[?6c")
     a.assert_single_box()
     _assert_nothing_above_the_box_moved(a)
     a.assert_cursor_on_content("")

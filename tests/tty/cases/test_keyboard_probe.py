@@ -135,6 +135,22 @@ def test_probe_timeout_falls_back_and_late_answers_do_not_leak(bin_path):
         assert leak not in screen, f"迟到的应答漏进了屏幕({leak!r}):\n" + screen
 
 
+def test_late_identity_answers_do_not_reach_the_prompt(bin_path):
+    _posix_only()
+    raw = _run(bin_path, [
+        QUERY_SENT,
+        wait_for('Try "fix typecheck errors"'),
+        "type:z",
+        "raw:\\x1bP>|XTerm(390)\\x1b\\\\\\x1b[>41;390;0c\\x1b[?62;22c",
+        "type:w",
+        wait_for("\u276f zw"),
+    ], _unknown_terminal())
+    assert b"\x1b[>0q\x1b[>c" in raw, "认不出是否重排的终端应被问 XTVERSION 和 DA2"
+    _, screen = _screen(raw)
+    for leak in ("XTerm", ">|", "41;390", "62;22"):
+        assert leak not in screen, f"迟到的应答漏进了屏幕({leak!r}):\n" + screen
+
+
 def test_deny_listed_terminal_is_not_asked(bin_path):
     _posix_only()
     # #23350 的教训:Apple Terminal 不发协议,也不问;背景色那一轮照问(DA1 作哨兵)。
