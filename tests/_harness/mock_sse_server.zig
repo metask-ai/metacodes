@@ -27,7 +27,7 @@ pub const LogFile = @import("log_capture.zig").LogFile;
 ///
 /// Windows 的文件 API 同样接受正斜杠,所以在取根处归一一次,下游每个插值点都不必各自
 /// 转义。POSIX 上路径本就没有反斜杠,这个函数是**空操作**——它只改变 Windows 行为。
-/// 同一条纪律见 src/tools/test_tmp.zig 对 TEMP 的处理。
+/// 同一条纪律见 packages/base/src/tools/test_tmp.zig 对 TEMP 的处理。
 pub fn normalizeSlashes(s: []u8) []const u8 {
     for (s) |*c| {
         if (c.* == '\\') c.* = '/';

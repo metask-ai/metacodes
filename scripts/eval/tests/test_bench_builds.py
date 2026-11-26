@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import venv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -28,7 +30,7 @@ from scripts.eval.harbor.bench.profiles import bundle_choices
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES
 from scripts.eval.tests.posix_only import POSIX
 
-FAKE_DOCKER = """#!{python}
+FAKE_DOCKER = """\
 import json, os, pathlib, sys, time
 args = sys.argv[1:]
 with pathlib.Path(os.environ['FAKE_DOCKER_LOG']).open('a') as log:
@@ -58,7 +60,7 @@ for rel in {executables!r}:
 
 # `ssh <options> <host> <command>`: the command runs on this machine, in the
 # fake executor's home directory.
-FAKE_SSH = """#!{python}
+FAKE_SSH = """\
 import os, sys
 args = sys.argv[1:]
 i = 0
@@ -68,7 +70,7 @@ os.chdir(os.environ['FAKE_REMOTE_HOME'])
 os.execvp('sh', ['sh', '-c', ' '.join(args[i + 1:])])
 """
 
-FAKE_MACOS_TAR = """#!{python}
+FAKE_MACOS_TAR = """\
 import io, os, sys, tarfile
 args = sys.argv[1:]
 if args[:2] != ['-cf', '-'] or os.environ.get('COPYFILE_DISABLE') == '1':
@@ -96,7 +98,7 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as archive:
 """
 
 # The executor's node: `metacodes bench node ...` with its own state root.
-FAKE_NODE = """#!{python}
+FAKE_NODE = """\
 import sys
 sys.path.insert(0, {root!r})
 from scripts.eval.harbor import cli
@@ -106,6 +108,26 @@ from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.viewer import server
 sys.exit(cli.main(['--state-root', {state!r}] + sys.argv[2:]))
 """
+
+
+def write_python_tool(path: Path, source: str) -> None:
+    path.with_name(path.name + '.py').write_text(source)
+    path.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$0.py" "$@"\n')
+    path.chmod(0o755)
+
+
+@unittest.skipUnless(POSIX, 'fake tools use POSIX launchers')
+class PythonToolTest(unittest.TestCase):
+    def test_child_uses_the_selected_interpreter_and_preserves_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment = root / "test user's venv"
+            venv.EnvBuilder(symlinks=True).create(environment)
+            tool = root / 'fake tool'
+            with patch.object(sys, 'executable', str(environment / 'bin' / 'python')):
+                write_python_tool(tool, 'import json, sys\nprint(json.dumps([sys.prefix, *sys.argv[1:]]))')
+            output = subprocess.check_output([str(tool), 'two words', ''], text=True)
+            self.assertEqual(json.loads(output), [str(environment), 'two words', ''])
 
 
 @unittest.skipUnless(POSIX, 'process groups are POSIX')
@@ -137,9 +159,7 @@ class GitRefBuildTest(unittest.TestCase):
         self.bench.mkdir(parents=True)
         tools = self.root / 'bin'
         tools.mkdir()
-        docker = tools / 'docker'
-        docker.write_text(FAKE_DOCKER.format(python=sys.executable, executables=list(BUNDLE_EXECUTABLES)))
-        docker.chmod(0o755)
+        write_python_tool(tools / 'docker', FAKE_DOCKER.format(executables=list(BUNDLE_EXECUTABLES)))
         env = patch.dict(os.environ, {'PATH': str(tools) + os.pathsep + os.environ['PATH'],
                                       'FAKE_DOCKER_LOG': str(self.root / 'docker.log'),
                                       'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.com',
@@ -215,12 +235,9 @@ class GitRefBuildTest(unittest.TestCase):
         home = self.root / 'remote-home'
         node = home / '.metacodes-bench' / 'bin' / 'metacodes'
         node.parent.mkdir(parents=True)
-        node.write_text(FAKE_NODE.format(python=sys.executable, root=str(Path(__file__).resolve().parents[3]),
-                                         state=str(self.root / 'remote-state')))
-        node.chmod(0o755)
-        ssh = self.root / 'bin' / 'ssh'
-        ssh.write_text(FAKE_SSH.format(python=sys.executable))
-        ssh.chmod(0o755)
+        write_python_tool(node, FAKE_NODE.format(root=str(Path(__file__).resolve().parents[3]),
+                                                 state=str(self.root / 'remote-state')))
+        write_python_tool(self.root / 'bin' / 'ssh', FAKE_SSH)
         env = patch.dict(os.environ, {'FAKE_REMOTE_HOME': str(home)})
         env.start()
         self.addCleanup(env.stop)
@@ -264,9 +281,7 @@ class GitRefBuildTest(unittest.TestCase):
 
     def test_a_unit_comes_back_from_a_node_whose_tar_adds_macos_metadata(self):
         executor = self.remote_executor()
-        tar = self.root / 'bin' / 'tar'
-        tar.write_text(FAKE_MACOS_TAR.format(python=sys.executable))
-        tar.chmod(0o755)
+        write_python_tool(self.root / 'bin' / 'tar', FAKE_MACOS_TAR)
         commit = self.git('rev-parse', 'HEAD')
         unit, info = builds.build_on(executor, 'main', self.bench, str(self.repo))
         self.assertEqual((unit / 'bin' / 'metacodes').read_text(), commit)

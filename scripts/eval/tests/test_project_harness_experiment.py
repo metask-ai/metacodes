@@ -21,7 +21,7 @@ from scripts.eval.project_harness_experiment import (
 
 
 def _zig_formal_batch_schema() -> str:
-    zig = (Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig").read_text(
+    zig = (Path(__file__).resolve().parents[3] / "packages/guard/src/tools/observation.zig").read_text(
         encoding="utf-8"
     )
     for line in zig.splitlines():

@@ -1,0 +1,508 @@
+//! 统一的 MCP resources 工具:跨所有连接的 MCP server fan-out。
+//!
+//! Claude Code 官方有 ListMcpResourcesTool / ReadMcpResourceTool 两个统一工具
+//! (与 per-server `<server>__list_resources` 区别:用户不必记 namespace)。
+//!
+//! ListMcpResourcesTool(server?):
+//!   - 无 server:聚合所有 session 的 resources
+//!   - 有 server:只列那个 server 的
+//!   返回:[{server, uri, name, description, mimeType}, ...]
+//!
+//! ReadMcpResourceTool(uri, server?):
+//!   - uri 必填
+//!   - server 指定时只查那个;否则尝试所有,第一个匹配的胜
+//!   返回:被读的 resource 内容
+
+const std = @import("std");
+const common = @import("metacodes-guard").tools.common;
+const ToolContext = @import("context.zig").ToolContext;
+const ToolResultBody = @import("context.zig").ToolResultBody;
+const util_json = @import("metacodes-base").util.json;
+const McpSessionEntry = @import("../core/mcp_session.zig").McpSessionEntry;
+const artifact_store = @import("metacodes-guard").core.tool_result_artifact;
+const result_budget = @import("metacodes-kernel").result_budget;
+const result_spool = @import("result_spool.zig");
+
+const LAST_ERROR_DETAIL_MAX_BYTES: usize = 512;
+
+const NO_MCP_SESSIONS_DETAIL = "No MCP servers are connected in this session. Declare servers under \"mcpServers\" in <state root>/config.json (Claude Code's ~/.claude.json and Codex's ~/.codex/config.toml are read too; see /mcp) and restart; their tools then register as mcp__<server>__<tool> and are listed under \"# Deferred tools\".";
+
+fn extractDecodedField(a: std.mem.Allocator, args: []const u8, field: []const u8) !?[]u8 {
+    const raw = common.extractJsonArg(args, field) orelse return null;
+    return try util_json.unescapeString(raw, a);
+}
+
+/// 本 session 连接的 MCP session 列表。宿主没接 MCP(null)或一个 server 都没连(空)都是
+/// `NoMcpSessions`——空数组 `{"resources":[]}` 会让模型以为"server 在,只是没资源",
+/// 然后去猜工具名(实测:模型把 mecode/Claude Code 的 mcp_server.py 进程当成本 session 的)。
+fn connectedSessions(ctx: *const ToolContext) ![]McpSessionEntry {
+    const sessions = ctx.mcp_sessions orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, NO_MCP_SESSIONS_DETAIL, .{});
+        return error.NoMcpSessions;
+    };
+    if (sessions.len == 0) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, NO_MCP_SESSIONS_DETAIL, .{});
+        return error.NoMcpSessions;
+    }
+    return sessions.*;
+}
+
+/// `server` 过滤值必须是已连接的 server 名;否则报 McpServerNotFound 并列出已连接的名字。
+fn requireServer(ctx: *const ToolContext, sessions: []McpSessionEntry, filter: ?[]const u8) !void {
+    const wanted = filter orelse return;
+    for (sessions) |*entry| if (std.mem.eql(u8, wanted, entry.name)) return;
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(ctx.allocator);
+    for (sessions, 0..) |*entry, i| {
+        if (i > 0) try names.appendSlice(ctx.allocator, ", ");
+        try names.appendSlice(ctx.allocator, entry.name);
+    }
+    common.setErrorDetail(ctx.error_detail, ctx.allocator, "MCP server \"{s}\" is not connected in this session. Connected servers: {s}. Omit \"server\" to list resources across all of them.", .{ wanted, names.items });
+    return error.McpServerNotFound;
+}
+
+pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    if (ctx.artifact_root.len == 0)
+        return ToolResultBody.initInline(try listExecute(ctx, args));
+    const allocator = ctx.allocator;
+    const sessions = try connectedSessions(ctx);
+    const server_filter = try extractDecodedField(allocator, args, "server");
+    defer if (server_filter) |filter| allocator.free(filter);
+    try requireServer(ctx, sessions, server_filter);
+    var capture = try artifact_store.Capture.begin(
+        allocator,
+        ctx.artifact_root,
+        artifact_store.MAX_ARTIFACT_BYTES,
+    );
+    defer capture.deinit();
+    var output = result_spool.CaptureWriter.init(&capture);
+    try output.writer.writeAll("{\"resources\":[");
+    var first = true;
+    for (sessions) |*entry| {
+        if (server_filter) |filter| if (!std.mem.eql(u8, filter, entry.name)) continue;
+        var body = entry.client.listResourcesBodyAbortable(ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| {
+            @import("metacodes-base").util.log.warn("mcp", "list_resources failed for {s}: {s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        defer body.deinit(allocator);
+        switch (body) {
+            .@"inline" => |inline_result| {
+                const array = findArrayField(inline_result.bytes, "resources") orelse continue;
+                var iter = jsonArrayIter(array);
+                while (iter.next()) |object| {
+                    if (!first) try output.writer.writeByte(',');
+                    first = false;
+                    try output.writer.writeAll("{\"server\":");
+                    try util_json.writeJsonString(&output.writer, entry.name);
+                    if (object.len > 2) {
+                        try output.writer.writeByte(',');
+                        try output.writer.writeAll(object[1 .. object.len - 1]);
+                    }
+                    try output.writer.writeByte('}');
+                }
+            },
+            .artifact, .sealed => {
+                var rendered = try body.render(allocator);
+                defer rendered.deinit(allocator);
+                if (!first) try output.writer.writeByte(',');
+                first = false;
+                try output.writer.writeAll("{\"server\":");
+                try util_json.writeJsonString(&output.writer, entry.name);
+                try output.writer.writeAll(",\"resource_list_artifact\":");
+                try output.writer.writeAll(rendered.bytes);
+                try output.writer.writeByte('}');
+            },
+            .structured_error => continue,
+        }
+    }
+    try output.writer.writeAll("]}");
+    try output.check();
+    try capture.seal();
+    return result_spool.finishCaptureAsBody(
+        allocator,
+        ctx.artifact_root,
+        &capture,
+        .json,
+        true,
+        ctx.result_budget,
+    );
+}
+
+pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    var body: ToolResultBody = undefined;
+    try readExecuteBodyInto(&body, ctx, args);
+    return body;
+}
+
+/// `readExecuteBody` writing its result to `out`. In a function returning a
+/// ToolResultBody, each `return error.X` would copy a 3.7 KiB constant, one
+/// per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn readExecuteBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const u8) anyerror!void {
+    if (ctx.artifact_root.len == 0) {
+        out.* = .initInline(try readExecute(ctx, args));
+        return;
+    }
+    const allocator = ctx.allocator;
+    const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
+    const uri = (try extractDecodedField(allocator, args, "uri")) orelse return error.MissingUri;
+    defer allocator.free(uri);
+    if (uri.len == 0) return error.EmptyUri;
+    const server_hint = try extractDecodedField(allocator, args, "server");
+    defer if (server_hint) |hint| allocator.free(hint);
+
+    if (server_hint) |hint| {
+        for (sessions.*) |*entry| if (std.mem.eql(u8, hint, entry.name)) {
+            out.* = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| blk: {
+                var failed: std.Io.Writer.Allocating = .init(allocator);
+                errdefer failed.deinit();
+                try failed.writer.writeAll("{\"error\":\"read_failed\",\"server\":");
+                try util_json.writeJsonString(&failed.writer, hint);
+                try failed.writer.writeAll(",\"message\":");
+                try util_json.writeJsonString(&failed.writer, @errorName(err));
+                try failed.writer.writeByte('}');
+                break :blk ToolResultBody.initInline(try failed.toOwnedSlice());
+            };
+            return;
+        };
+        var missing: std.Io.Writer.Allocating = .init(allocator);
+        errdefer missing.deinit();
+        try missing.writer.writeAll("{\"error\":\"server_not_found\",\"server\":");
+        try util_json.writeJsonString(&missing.writer, hint);
+        try missing.writer.writeByte('}');
+        out.* = .initInline(try missing.toOwnedSlice());
+        return;
+    }
+
+    var last_error: ?[]const u8 = null;
+    var last_error_detail: ?[]u8 = null;
+    defer if (last_error_detail) |detail| allocator.free(detail);
+    for (sessions.*) |*entry| {
+        var body = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| {
+            if (last_error_detail) |detail| {
+                allocator.free(detail);
+                last_error_detail = null;
+            }
+            last_error = @errorName(err);
+            continue;
+        };
+        if (body == .structured_error) {
+            if (body.structured_error.category == .system_error) {
+                out.* = body;
+                return;
+            }
+            const detail = duplicateStructuredErrorDetail(
+                allocator,
+                body.structured_error.encoded,
+            ) catch |err| {
+                body.deinit(allocator);
+                return err;
+            };
+            body.deinit(allocator);
+            if (last_error_detail) |previous| allocator.free(previous);
+            last_error_detail = detail;
+            last_error = "remote_error";
+            continue;
+        }
+        out.* = body;
+        return;
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"error\":\"resource_not_found\",\"uri\":");
+    try util_json.writeJsonString(&output.writer, uri);
+    try output.writer.writeAll(",\"last_err\":");
+    try util_json.writeJsonString(&output.writer, last_error orelse "none");
+    if (last_error_detail) |detail| {
+        try output.writer.writeAll(",\"last_error_detail\":");
+        try util_json.writeJsonString(&output.writer, detail);
+    }
+    try output.writer.writeByte('}');
+    out.* = .initInline(try output.toOwnedSlice());
+}
+
+fn duplicateStructuredErrorDetail(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) error{OutOfMemory}!?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        encoded,
+        .{ .duplicate_field_behavior = .@"error" },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const payload = parsed.object.get("error") orelse return null;
+    if (payload != .object) return null;
+    const detail = payload.object.get("detail") orelse return null;
+    if (detail != .string) return null;
+    const bounded_len = result_budget.floorUtf8Boundary(
+        detail.string,
+        LAST_ERROR_DETAIL_MAX_BYTES,
+    );
+    const bounded = detail.string[0..bounded_len];
+    return try allocator.dupe(u8, bounded);
+}
+
+pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const a = ctx.allocator;
+    const sessions = try connectedSessions(ctx);
+    const server_filter = try extractDecodedField(a, args, "server");
+    defer if (server_filter) |filter| a.free(filter);
+    try requireServer(ctx, sessions, server_filter);
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.writeAll("{\"resources\":[");
+
+    var first = true;
+    for (sessions) |*entry| {
+        if (server_filter) |sf| {
+            if (!std.mem.eql(u8, sf, entry.name)) continue;
+        }
+        const list_json = entry.client.listResources() catch |err| {
+            @import("metacodes-base").util.log.warn("mcp", "list_resources failed for {s}: {s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        defer a.free(list_json);
+
+        // list_json 形如 {"resources":[{...},{...}]}
+        // 简单提取 resources 数组里的对象,加 server 字段后追加
+        const arr = findArrayField(list_json, "resources") orelse continue;
+        var iter = jsonArrayIter(arr);
+        while (iter.next()) |obj| {
+            if (!first) try out.writer.writeByte(',');
+            first = false;
+            // 把 server 字段注入对象前
+            try out.writer.writeAll("{\"server\":");
+            try util_json.writeJsonString(&out.writer, entry.name);
+            // 再把原对象内容(去掉外层 {} 的)拼接
+            if (obj.len > 2) {
+                try out.writer.writeAll(",");
+                try out.writer.writeAll(obj[1 .. obj.len - 1]);
+            }
+            try out.writer.writeByte('}');
+        }
+    }
+    try out.writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn readExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const a = ctx.allocator;
+    const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
+    const uri = (try extractDecodedField(a, args, "uri")) orelse return error.MissingUri;
+    defer a.free(uri);
+    if (uri.len == 0) return error.EmptyUri;
+    const server_hint = try extractDecodedField(a, args, "server");
+    defer if (server_hint) |hint| a.free(hint);
+
+    // 优先查 hint 的 server
+    if (server_hint) |sh| {
+        for (sessions.*) |*entry| {
+            if (std.mem.eql(u8, sh, entry.name)) {
+                return entry.client.readResource(uri) catch |err| {
+                    var out: std.Io.Writer.Allocating = .init(a);
+                    defer out.deinit();
+                    try out.writer.writeAll("{\"error\":\"read_failed\",\"server\":");
+                    try util_json.writeJsonString(&out.writer, sh);
+                    try out.writer.writeAll(",\"message\":");
+                    try util_json.writeJsonString(&out.writer, @errorName(err));
+                    try out.writer.writeByte('}');
+                    return out.toOwnedSlice();
+                };
+            }
+        }
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try out.writer.writeAll("{\"error\":\"server_not_found\",\"server\":");
+        try util_json.writeJsonString(&out.writer, sh);
+        try out.writer.writeByte('}');
+        return out.toOwnedSlice();
+    }
+
+    // 无 hint:依次尝试所有 server,第一个成功的
+    var last_err: ?[]const u8 = null;
+    for (sessions.*) |*entry| {
+        const res = entry.client.readResource(uri) catch |err| {
+            last_err = @errorName(err);
+            continue;
+        };
+        return res;
+    }
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.writeAll("{\"error\":\"resource_not_found\",\"uri\":");
+    try util_json.writeJsonString(&out.writer, uri);
+    try out.writer.writeAll(",\"last_err\":");
+    try util_json.writeJsonString(&out.writer, last_err orelse "none");
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+// ============================================================================
+// 小工具:JSON 数组+字段解析(简化,够用)
+// ============================================================================
+
+fn findArrayField(data: []const u8, field: []const u8) ?[]const u8 {
+    var pat_buf: [128]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{field}) catch return null;
+    const idx = std.mem.indexOf(u8, data, pat) orelse return null;
+    var p = idx + pat.len;
+    while (p < data.len and (data[p] == ' ' or data[p] == '\t')) : (p += 1) {}
+    if (p >= data.len or data[p] != '[') return null;
+    var depth: i32 = 0;
+    var in_str = false;
+    var esc = false;
+    var i = p;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (c == '\\') {
+            esc = true;
+            continue;
+        }
+        if (c == '"') {
+            in_str = !in_str;
+            continue;
+        }
+        if (in_str) continue;
+        if (c == '[') depth += 1;
+        if (c == ']') {
+            depth -= 1;
+            if (depth == 0) return data[p .. i + 1];
+        }
+    }
+    return null;
+}
+
+const ArrayIter = struct {
+    data: []const u8,
+    pos: usize,
+
+    pub fn next(self: *ArrayIter) ?[]const u8 {
+        while (self.pos < self.data.len and (self.data[self.pos] == ' ' or self.data[self.pos] == ',' or self.data[self.pos] == '[' or self.data[self.pos] == '\n' or self.data[self.pos] == '\t')) {
+            self.pos += 1;
+        }
+        if (self.pos >= self.data.len or self.data[self.pos] == ']') return null;
+        if (self.data[self.pos] != '{') return null;
+        const start = self.pos;
+        var depth: i32 = 0;
+        var in_str = false;
+        var esc = false;
+        while (self.pos < self.data.len) : (self.pos += 1) {
+            const c = self.data[self.pos];
+            if (esc) {
+                esc = false;
+                continue;
+            }
+            if (c == '\\') {
+                esc = true;
+                continue;
+            }
+            if (c == '"') {
+                in_str = !in_str;
+                continue;
+            }
+            if (in_str) continue;
+            if (c == '{') depth += 1;
+            if (c == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    self.pos += 1;
+                    return self.data[start..self.pos];
+                }
+            }
+        }
+        return null;
+    }
+};
+
+fn jsonArrayIter(arr: []const u8) ArrayIter {
+    return .{ .data = arr, .pos = 0 };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "findArrayField: nested" {
+    const data = "{\"resources\":[{\"uri\":\"file://a\"},{\"uri\":\"file://b\"}]}";
+    const arr = findArrayField(data, "resources").?;
+    try testing.expect(std.mem.indexOf(u8, arr, "file://a") != null);
+    try testing.expect(std.mem.indexOf(u8, arr, "file://b") != null);
+    try testing.expect(arr[0] == '[' and arr[arr.len - 1] == ']');
+}
+
+test "ArrayIter: iterates objects" {
+    const arr = "[{\"a\":1},{\"b\":2}]";
+    var it = jsonArrayIter(arr);
+    const o1 = it.next().?;
+    try testing.expect(std.mem.indexOf(u8, o1, "\"a\":1") != null);
+    const o2 = it.next().?;
+    try testing.expect(std.mem.indexOf(u8, o2, "\"b\":2") != null);
+    try testing.expect(it.next() == null);
+}
+
+test "list: missing mcp_sessions errors" {
+    const ctx = ToolContext.simple(testing.allocator);
+    try testing.expectError(error.NoMcpSessions, listExecute(&ctx, "{}"));
+}
+
+test "list: zero connected servers is NoMcpSessions with a config hint, not an empty resources array" {
+    const a = testing.allocator;
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    var empty: []McpSessionEntry = &.{};
+    const ctx = ToolContext{ .allocator = a, .mcp_sessions = &empty, .error_detail = &detail };
+    try testing.expectError(error.NoMcpSessions, listExecute(&ctx, "{}"));
+    try testing.expect(std.mem.indexOf(u8, detail.?, "mcpServers") != null);
+    a.free(detail.?);
+    detail = null;
+    // 带 server 过滤同样先报"没连"——不是 server_not_found,更不是空数组。
+    try testing.expectError(error.NoMcpSessions, listExecute(&ctx, "{\"server\":\"knowforge\"}"));
+    try testing.expect(detail != null);
+    // artifact 路径(有 artifact_root)同一行为。
+    a.free(detail.?);
+    detail = null;
+    const body_ctx = ToolContext{ .allocator = a, .mcp_sessions = &empty, .error_detail = &detail, .artifact_root = "/tmp" };
+    try testing.expectError(error.NoMcpSessions, listExecuteBody(&body_ctx, "{\"server\":\"knowforge\"}"));
+    try testing.expect(detail != null);
+}
+
+test "read: missing uri errors" {
+    var sessions: []@import("../core/mcp_session.zig").McpSessionEntry = &.{};
+    var ctx = ToolContext.simple(testing.allocator);
+    ctx.mcp_sessions = &sessions;
+    try testing.expectError(error.MissingUri, readExecute(&ctx, "{}"));
+}
+
+test "read_resource detail respects UTF-8 boundaries" {
+    const allocator = testing.allocator;
+    const detail = try allocator.alloc(u8, 514);
+    defer allocator.free(detail);
+    @memset(detail[0..511], 'a');
+    detail[511] = 0xe4;
+    detail[512] = 0xb8;
+    detail[513] = 0xad;
+
+    var encoded: std.Io.Writer.Allocating = .init(allocator);
+    defer encoded.deinit();
+    try encoded.writer.writeAll("{\"error\":{\"detail\":");
+    try util_json.writeJsonString(&encoded.writer, detail);
+    try encoded.writer.writeAll("}}");
+
+    const bounded = try duplicateStructuredErrorDetail(allocator, encoded.written());
+    try testing.expect(bounded != null);
+    defer allocator.free(bounded.?);
+    try testing.expectEqualStrings(detail[0..511], bounded.?);
+}

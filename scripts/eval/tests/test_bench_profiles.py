@@ -6,6 +6,7 @@ store and the page API are read back over HTTP. No provider or Docker calls.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -14,14 +15,15 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.eval.harbor import cli, profiling
+from scripts.eval.harbor import cli, profiling, suites
 from scripts.eval.harbor.store.backend import Store
 from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest
-from scripts.eval.harbor.bench import data, executors, profiles
+from scripts.eval.harbor.bench import builds, data, executors, profiles
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import ExecutorUnreachable, RunManager, atomic_json
 from scripts.eval.harbor.bench.setup import LoginManager
@@ -466,16 +468,22 @@ class ProfileTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '正整数'):
                 self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 0})
             self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 64})
-            record = self.manager.profiles.get(created['id'])
+            record = self.client.request('api/profile?id=' + created['id'])
             self.assertEqual([i['concurrency'] for i in record['items']], [64, 64])
+
+            with patch.object(self.manager, 'set_concurrency', side_effect=OSError('写入失败')):
+                failed = self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 5})
+            self.assertIn('写入失败', failed['warning'])
+            record = self.client.request('api/profile?id=' + created['id'])
+            self.assertEqual((record['concurrency'], [i['concurrency'] for i in record['items']]), (5, [64, 5]))
 
             changed = self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 2})
 
             self.assertEqual(changed, {'id': created['id'], 'concurrency': 2})
             limit_file = self.manager.records / (run + '.concurrency')
             self.assertEqual(limit_file.read_text(), '2')
-            record = self.manager.profiles.get(created['id'])
-            self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']], [(2, 2), (2, 2)])
+            record = self.client.request('api/profile?id=' + created['id'])
+            self.assertEqual([i['concurrency'] for i in record['items']], [2, 2])
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and not (self.manager.jobs_dir / run / 'harbor-env.json').exists():
                 time.sleep(.05)
@@ -502,8 +510,8 @@ class ProfileTest(unittest.TestCase):
         self.client.request('api/profiles/run', {**one, 'profile': created['id'], 'name': None})
         self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
         record = self.wait_profile(created['id'])
-        self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']],
-                         [(10, 10), (3, 3), (3, 3)])
+        self.assertEqual([i['concurrency'] for i in self.client.request('api/profile?id=' + created['id'])['items']],
+                         [10, 3, 3])
         # A profile saved before it had one keeps its latest dataset's.
         legacy = {k: v for k, v in record.items() if k != 'concurrency'}
         self.assertEqual(profiles.profile_concurrency(legacy), 3)
@@ -515,18 +523,68 @@ class ProfileTest(unittest.TestCase):
         self.client.request('api/profile/concurrency', {'id': created['id'], 'concurrency': 3})
         self.assertEqual(self.client.request('api/profiles/run', one)['id'], created['id'])
         record = self.wait_profile(created['id'])
-        self.assertEqual([(i['concurrency'], i['request']['concurrency']) for i in record['items']], [(10, 10), (3, 3)])
+        runs = {r['name']: r for r in self.manager.runs()}
+        self.assertEqual([runs[i['run']]['concurrency'] for i in record['items']], [10, 3])
+
+    def test_saving_concurrency_leaves_active_workbuddy_at_its_starting_value(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        profile = self.client.request('api/profiles/run', self.request())['id']
+        record = self.manager.profiles.get(profile)
+        name = 'bench-workbuddy'
+        record['items'][0].update(status='running', run=name, concurrency=10, **suites.label('workbuddy-code'))
+        self.manager.profiles.save(record)
+        receipt = {'name': name, 'runner': suites.WORKBUDDY, 'status': 'running', 'concurrency': 10}
+        path = self.manager.records / (name + '.json')
+        atomic_json(path, receipt)
+        try:
+            changed = self.client.request('api/profile/concurrency', {'id': profile, 'concurrency': 4})
+            self.assertEqual(changed['run'], name)
+            self.assertIn('WorkBuddy 保持并发 10', changed['warning'])
+            self.assertEqual(self.manager.profiles.get(profile)['concurrency'], 4)
+            self.assertFalse(path.with_suffix('.concurrency').exists())
+            view = self.client.request('api/profile?id=' + profile)
+            self.assertEqual([i['concurrency'] for i in view['items']], [10, 4])
+        finally:
+            atomic_json(path, {**receipt, 'status': 'finished'})
+        record = self.wait_profile(profile)
+        following = record['items'][1]
+        run = next(r for r in self.manager.runs() if r['name'] == following['run'])
+        self.assertEqual((following['status'], run['concurrency']), ('finished', 4))
+
+    def test_queued_dataset_uses_current_capped_value_despite_legacy_request(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        suite = replace(suites.get('terminal-bench-2.1'), max_concurrency=5)
+        with patch.dict(suites.BY_ID, {suite.id: suite}):
+            one = self.request(items=[{'suite': suite.id, 'tasks': ['fix-git']}])
+            profile = self.client.request('api/profiles/run', one)['id']
+            record = self.manager.profiles.get(profile)
+            item = record['items'][0]
+            self.assertNotIn('concurrency', item)
+            self.assertNotIn('concurrency', item['request'])
+            item['concurrency'] = item['request']['concurrency'] = 2
+            self.manager.profiles.save(record)
+            self.client.request('api/profile/concurrency', {'id': profile, 'concurrency': 8})
+            view = self.client.request('api/profile?id=' + profile)
+            self.assertEqual((view['concurrency'], view['items'][0]['concurrency']), (8, 5))
+            with patch.object(self.manager, 'launch', wraps=self.manager.launch) as launch:
+                self.manager.profiles.advance()
+            self.assertEqual(launch.call_args.args[0]['concurrency'], 5)
+            record = self.wait_profile(profile)
+            self.assertEqual(record['items'][0]['concurrency'], 5)
 
     def test_a_profile_saved_without_concurrency_keeps_it_when_a_cli_run_appends(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
         created = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
         legacy = {k: v for k, v in self.manager.profiles.get(created['id']).items() if k != 'concurrency'}
+        legacy['items'][-1]['concurrency'] = 7
         self.manager.profiles.save(legacy)
         run = self.client.request('api/runs', {'model': 'tokenjoy/test-model', 'tasks': ['fix-git'], 'attempts': 1,
                                                'concurrency': 1, 'features': created['features']})
         self.assertEqual((run['profile'], run['concurrency']), (created['id'], 1))
         record = self.wait_profile(created['id'])
-        self.assertEqual((profiles.profile_concurrency(record), record['items'][-1]['concurrency']), (profiles.DEFAULT_CONCURRENCY, 1))
+        self.assertEqual((profiles.profile_concurrency(record), record['items'][-1]['concurrency']), (7, 1))
 
     def test_deleting_a_profile_removes_its_runs_results_and_rows(self):
         one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
@@ -564,6 +622,23 @@ class ProfileTest(unittest.TestCase):
                          (kept['items'][0]['run'],))
         self.assertEqual(orphans, [])
         self.assertEqual(json.loads(ingest.decode(*spec))['name'], kept['items'][0]['run'])
+
+    def test_profile_deletion_protects_worker_rows_even_after_receipt_loss(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        profile = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
+        name = profile['items'][0]['run']
+        self.workbench.library.sync()
+        (self.manager.records / (name + '.json')).unlink()
+        with self.workbench.library.store.transaction() as tx:
+            tx.execute("INSERT INTO worker_jobs (job, log_tail, ingested_at) VALUES (?, '', ?)", (name, profile['created_at']))
+            tx.execute("DELETE FROM runs WHERE name = ?", (name,))
+        self.client.request('api/profile/delete', {'id': profile['id']})
+        self.assertTrue((self.manager.jobs_dir / name / 'result.json').is_file())
+        self.assertEqual(self.client.request('api/store')['counts']['trials'], 1)
+        self.assertEqual(self.client.request('api/jobs')['jobs'], [])
+        with contextlib.closing(workbench_module.open_local(self.workbench.library.store.config, self.manager.jobs_dir)) as reopened:
+            self.assertEqual(reopened.overview(), [])
+            self.assertIsNone(reopened.job(name))
 
     def test_deleting_a_job_removes_its_run_files_and_rows_and_keeps_its_profile(self):
         record = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])
@@ -813,7 +888,6 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(self.manager.runs(), [])
 
     def git_unit(self, commit, repo):
-        from scripts.eval.harbor.bench import builds
         unit = builds.unit_path(self.root, commit)
         shutil.copytree(self.root / 'bundle', unit)
         atomic_json(unit / 'manifest.json', {'target': {'os': 'linux'}, 'source': {'commit': commit, 'dirty': False}})
@@ -866,17 +940,35 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(spec['bundle'], frozen)
 
     def test_frozen_git_bundle_runs_after_the_original_is_archived(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
         unit = self.git_unit('d' * 40, 'https://example.com/fork.git')
         cfg = {k: v for k, v in json.loads(self.config.read_text()).items() if k != 'bundle'}
         atomic_json(self.config, {**cfg, 'source_repo': 'https://example.com/fork.git'})
         created = self.client.request('api/profiles/run', self.request(bundle=unit))
         archive = self.root / 'archive'
         archive.mkdir()
-        for path in (self.root / 'bundles').glob(unit + '*'):
-            path.rename(archive / path.name)
+        original = self.root / 'bundles' / unit
+        build_info = builds.build_info
+
+        def archive_after_read(path):
+            info = build_info(path)
+            if path == original and info:
+                original.rename(archive / unit)
+                record = original.with_suffix('.json')
+                record.rename(archive / record.name)
+            return info
+
+        with patch.object(builds, 'build_info', side_effect=archive_after_read):
+            self.manager.profiles.advance()
+        self.assertTrue((archive / unit).is_dir())
+        self.assertTrue((archive / (unit + '.json')).is_file())
         final = self.wait_profile(created['id'])
         self.assertEqual(final['status'], 'finished', final)
-        self.assertEqual([i['status'] for i in final['items']], ['finished', 'finished'])
+        self.assertEqual([i['status'] for i in final['items']], ['finished', 'finished'], final['items'])
+        for item in final['items']:
+            argv = json.loads((self.manager.jobs_dir / item['run'] / 'argv.json').read_text())
+            self.assertIn('bundle=' + created['metacodes']['bundle'], argv)
 
     def test_frozen_git_bundle_is_refused_after_a_repository_switch(self):
         self.manager.profiles.stop()
@@ -1002,6 +1094,43 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(left['submission'], right['submission'])
         self.assertNotIn(left['submission'], {group, ended['items'][2]['submission']})
         self.assertEqual([i['suite'] for i in replay['items'][-2:]], [i['suite'] for i in first['items']])
+
+    def test_delete_last_submission_preserves_legacy_profile_concurrency(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        created = self.client.request('api/profiles/run', self.request())
+        pid = created['id']
+        command = {'id': pid, 'submission': created['items'][0]['submission']}
+        self.client.request('api/profile/submission', {**command, 'action': 'cancel'})
+        record = self.manager.profiles.get(pid)
+        del record['concurrency']
+        record['items'][-1]['concurrency'] = 1
+        self.manager.profiles.save(record)
+        self.client.request('api/profile/submission', {**command, 'action': 'delete'})
+        reloaded = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(reloaded['items'], [])
+        self.assertEqual(reloaded['concurrency'], 1)
+        queued = self.client.request('api/profiles/run', self.request(profile=pid))
+        self.assertEqual([item['concurrency'] for item in queued['items']], [1, 1])
+
+    def test_delete_submission_preserves_other_item_handles(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        first = self.client.request('api/profiles/run', self.request())
+        pid = first['id']
+        command = {'id': pid, 'submission': first['items'][0]['submission']}
+        def action(name):
+            return self.client.request('api/profile/submission', {**command, 'action': name})
+        self.client.request('api/profiles/run', self.request(profile=pid))
+        with self.assertRaisesRegex(ValueError, '请先取消'):
+            action('delete')
+        action('cancel')
+        remaining = action('delete')['items']
+        self.assertEqual([item['index'] for item in remaining], [2, 3])
+        with self.assertRaisesRegex(ValueError, '评测集不存在'):
+            self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'cancel'})
+        self.client.request('api/profile/item', {'id': pid, 'index': 2, 'action': 'cancel'})
+        self.assertEqual([i['status'] for i in self.manager.profiles.get(pid)['items']], ['skipped', 'pending'])
 
     def test_old_queued_auto_retry_is_cancelled_and_its_original_replayed_once(self):
         self.manager.profiles.stop()

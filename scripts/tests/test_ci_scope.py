@@ -165,7 +165,7 @@ class ClassifyTest(unittest.TestCase):
 
     def test_markdown_outside_doc_and_the_top_level_is_an_input(self) -> None:
         # Prompt templates are @embedFile'd; agent and Skill fixtures are read by tests.
-        for path in ("src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
+        for path in ("packages/coding/src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
             with self.subTest(path=path):
                 self.assertEqual(ci_scope.classify([path])[0], "full")
 
@@ -427,9 +427,9 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, changes, layout)
                 self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
                 self.assertTrue(chosen.product and chosen.tty)
-        self.assertEqual(layout.owner("src/core/conversation.zig"), "kernel")
-        self.assertEqual(layout.owner("src/core/agent_loop.zig"), "coding")
-        self.assertEqual(layout.owner("src/core/tools_extra.zig"), "coding")
+        self.assertEqual(layout.owner("packages/kernel/src/conversation.zig"), "kernel")
+        self.assertEqual(layout.owner("packages/coding/src/core/agent_loop.zig"), "coding")
+        self.assertEqual(layout.owner("packages/coding/src/core/tools_extra.zig"), "coding")
         self.assertEqual(layout.owner("tests/helpers/x.zig"), "testing")
 
     def test_a_package_is_charged_for_each_baseline_entry_it_is_part_of(self) -> None:
@@ -545,6 +545,17 @@ class LayoutTest(unittest.TestCase):
         scope, reason = ci_scope.decide("pull_request", "HEAD^1", "HEAD", diff, labels=["bug", "migration"])
         self.assertEqual(scope, "full")
         self.assertIn("migration", reason)
+
+    def test_product_runtime_still_runs_for_a_tui_only_change(self) -> None:
+        layout = ci_scope.load_layout(ci_scope.tree_reader(ROOT, None))
+        paths = ["apps/cli/src/repl/tui/theme.zig", "apps/cli/tests/component/theme_test.zig", "README.md"]
+        for extra, target in (([], "test:product-runtime"), (["scripts/eval/cli.py"], "test:product"),
+                              (["tests/tty/slow_mock_server.py"], "test:product")):
+            changes = [("M", path) for path in paths + extra]
+            scope, _ = ci_scope.classify(paths + extra, layout=layout)
+            selection = ci_scope.select(scope, changes, layout)
+            self.assertEqual(selection.offline_eval, bool(extra))
+            self.assertIn(target, ci_scope.local_commands(scope, selection)[0])
 
     def test_local_commands_follow_the_selection(self) -> None:
         layout = fixture_layout()
@@ -678,6 +689,15 @@ class PackageScopeMainTest(unittest.TestCase):
         self.run_main("--event", "pull_request", "--base", "HEAD^1", "--fast-path", "true", "--record", str(record))
         self.assertTrue(json.loads(record.read_text(encoding="utf-8"))["fast_path"])
 
+    def test_core_changes_keep_offline_evaluation_without_a_provider_report(self) -> None:
+        (self.repo / "packages/kernel/src").mkdir(parents=True)
+        self.edit("packages/kernel/src/loop.zig")
+        self.commit("loop")
+        for event in ("pull_request", "merge_group"):
+            got = self.run_main("--event", event, "--base", "HEAD^1")
+            self.assertEqual(got["offline_eval"], "true")
+            self.assertNotIn("model_eval", got)
+
     def test_the_nightly_report_reads_what_each_pull_request_recorded(self) -> None:
         self.edit("src/mid/a.zig")
         self.commit("mid (#7)")
@@ -802,7 +822,7 @@ class WorkflowTest(unittest.TestCase):
     def test_full_evidence_requires_all_suites_and_excludes_scope_fast_paths(self) -> None:
         job = self.jobs["full-pr-evidence"]
         # macOS and Windows through their result jobs: a pool job or the hosted legs.
-        self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux", "gates-macos-result",
+        self.assertEqual(set(job["needs"]), {"release-fast-path", "scope", "gates-linux-result", "gates-macos-result",
                                             "gates-windows-result", "tty-linux", "tty-windows", "sdk-bindings"})
         self.assertIn("needs.scope.outputs.scope == 'full'", job["if"])
         self.assertIn("needs.release-fast-path.outputs.fast == 'false'", job["if"])
@@ -1062,7 +1082,11 @@ class WorkflowTest(unittest.TestCase):
                 self.assertTrue(steps[packages]["if"].endswith("&& env.UNITS != 'false' && env.PACKAGE_TESTS != ''"))
                 self.assertIn("PACKAGE_TESTS", steps[packages]["run"])
                 self.assertNotIn("test:units", steps[packages]["run"])
-                self.assertTrue(steps["Offline test suite (product)"]["if"].endswith("&& env.PRODUCT != 'false'"))
+                for name, condition, target in (("product", "!=", "test:product"),
+                                                ("product runtime", "==", "test:product-runtime")):
+                    step = steps[f"Offline test suite ({name})"]
+                    self.assertTrue(step["if"].endswith(f"&& env.PRODUCT != 'false' && env.OFFLINE_EVAL {condition} 'false'"))
+                    self.assertIn(f"zig build {target} ", step["run"])
                 # The lower packages' other unit runs skip with test:units.
                 self.assertTrue(steps["Native platform modules"]["if"].endswith("&& env.PACKAGE_TESTS == ''"))
         core = next(step for step in self.jobs["gates-linux"]["steps"] if step.get("name") == "ReleaseSafe core gate")
@@ -1094,7 +1118,7 @@ class WorkflowTest(unittest.TestCase):
         for name in ("Record the executed test IDs", "Upload the executed test IDs"):
             self.assertTrue(steps[name]["if"].endswith("&& env.COMPLETE != 'false'"), name)
         job = self.jobs["test-ids"]
-        kept = [step for step in job["steps"] if step.get("uses", "").startswith(("actions/download-artifact@", "actions/upload-artifact@"))
+        kept = [step for step in job["steps"] if step.get("with", {}).get("name") == "test-ids" or step.get("with", {}).get("pattern") == "test-ids-raw-*"
                 or step.get("name") == "Collect the executed test IDs"]
         self.assertEqual(len(kept), 3)
         for step in kept:
@@ -1242,6 +1266,23 @@ class AgentCoreWorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, [])
         self.assertIn("relevant=true", output)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_native_gate_follows_moved_core_and_isolated_roots(self) -> None:
+        for path in (
+            "packages/ai/src/core/auth.zig",
+            "packages/kernel/src/loop.zig",
+            "packages/guard/src/core/goal.zig",
+            "packages/coding/src/core/agent_loop.zig",
+            "packages/session/src/core/session_host.zig",
+            "packages/coding/src/lsp_test_root.zig",
+            "packages/base/src/platform/platform.zig",
+            "packages/base/src/root.zig",
+        ):
+            with self.subTest(path=path):
+                proc, _, output = self.run_step("pull_request", path)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("relevant=true", output)
 
     def test_native_steps_read_relevance(self) -> None:
         steps = self.workflow["jobs"]["native-windows-gate"]["steps"]

@@ -13,4 +13,4 @@ Describe the user-visible result and why this boundary is the right one.
 ## Evidence
 
 - [ ] 已执行 AGENTS.md 提交前清单(粘贴 `zig build gate:pr` 尾部 Build Summary)
-- [ ] 无付费评测 / 无密钥 / 无二进制
+- [ ] 无密钥 / 无二进制

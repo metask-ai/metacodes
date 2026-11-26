@@ -18,8 +18,7 @@ host as before. An `ssh` executor runs the Harbor command on the remote host:
 - the node's driver (remote.py) owns the credential relay next to
   the remote Docker daemon, reports heartbeats on stdout, cancels on request
   or when the channel closes;
-- the remote job directory is copied back incrementally into the local jobs
-  directory, so the viewer and other local readers see ordinary job files.
+- the node indexes its job and sends aggregates. Details are queried on demand.
 
 Python 3.9, stdlib only. Every subprocess is spawned with an argv list.
 """
@@ -40,10 +39,13 @@ import tarfile
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
+
+from scripts.eval.harbor.bench import task_files
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]{0,252}$")
@@ -193,17 +195,7 @@ def task_owned_settings(dataset: Path, mirrors: Dict[str, str]) -> List[str]:
                    **container_mirror_env(mirrors, "http://cache", DOWNLOAD_CACHE_KINDS)}) \
         + ([APT_PROXY_SETTING] if "apt" in mirrors else [])
     found = set()
-    for path in Path(dataset).rglob("*"):
-        name = path.name.lower()
-        if not (name == "task.toml" or name.startswith("dockerfile") or
-                (name.endswith((".yaml", ".yml")) and "compose" in name)):
-            continue
-        if not path.is_file() or path.is_symlink():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+    for _, text in task_files.sources(Path(dataset), dockerfile_suffix=False):
         found.update(setting for setting in wanted if setting in text)
     return sorted(found)
 
@@ -1225,10 +1217,12 @@ class JobSync:
                                   else current.get(member.name))
         return True
 
-    def complete(self) -> bool:
+    def complete(self, *, require_files=False) -> bool:
         """Whether the local copy holds every remote file at its current
         size, as of a fresh manifest (no pass left anything behind)."""
         current = self.manifest()
+        if require_files and not current:
+            raise ValueError("执行机器上没有可同步的历史作业文件")
         self.pending = sum(1 for name, stamp in current.items() if self.seen.get(name) != stamp)
         if self.pending:
             return False
@@ -1245,10 +1239,7 @@ class JobSync:
 class RemoteRun:
     """Supervise one Harbor run on an SSH executor from the local worker.
 
-    The job directory is copied back on a background thread (`start_sync`),
-    so the supervisor's heartbeat and cancel handling never wait for a
-    transfer; `final_sync` copies what is left after Harbor exits and says
-    whether the local copy was verified complete."""
+    The manager refreshes aggregates in parallel with the control channel."""
 
     HEARTBEAT_TIMEOUT = 90
     SYNC_INTERVAL = 10
@@ -1272,11 +1263,9 @@ class RemoteRun:
         self.judge_credential = None
         self.events: List[Dict] = []
         self.last_event = time.monotonic()
-        self.sync_state = None
+        self.summary = None
         self.sync_stop = threading.Event()
         self.sync_thread = None
-        # How long the final copy may take before the run reports its
-        # results as still on the executor (the environment can shorten it).
         self.final_timeout = float(os.environ.get("METACODES_BENCH_FINAL_SYNC_TIMEOUT") or self.FINAL_SYNC_TIMEOUT)
         # How long a lost channel is reattached before the run counts as
         # lost; the remote driver keeps Harbor running exactly as long.
@@ -1466,6 +1455,7 @@ class RemoteRun:
     def upload_run(self, remote_spec: Dict) -> str:
         """The run directory holds the remote spec, provider config and compose overlay only."""
         import tempfile
+        remote_spec = {**remote_spec, "worker_results": True}
         self.uploaded = remote_spec
         run_dir = self.executor.remote("runs", self.spec["name"])
         with tempfile.TemporaryDirectory(prefix="bench-remote-run-") as temporary:
@@ -1483,7 +1473,6 @@ class RemoteRun:
 
     def start(self, secret_env: Dict[str, str], remote_spec_path: str, credential: Optional[str] = None) -> None:
         self.spawn(secret_env, remote_spec_path, credential)
-        self.sync_state = self.job_sync()
 
     def retry_tunnel(self, secret_env: Dict[str, str], credential: Callable[[], Optional[str]]) -> bool:
         if len(self.tunnel_ports) >= TUNNEL_ATTEMPTS or not self.forward_was_refused():
@@ -1697,47 +1686,39 @@ class RemoteRun:
         return JobSync(self.executor, self.remote_job_dir, self.local_job_dir,
                        runner=self.runner, log=self.log, popen=self.popen, binary=self.node)
 
-    def sync(self) -> bool:
-        """One pass; False when it failed (logged, retried by the caller)."""
-        try:
-            self.sync_state.sync()
-            return True
-        except (ValueError, OSError, subprocess.TimeoutExpired, tarfile.TarError) as exc:
-            self.log("同步远程作业目录失败：" + str(exc))
-            return False
+    def fetch_summary(self, final=False, timeout=120):
+        from scripts.eval.harbor.bench.results import check_snapshot, request
+        summary = request(self.executor, self.spec["name"], "final" if final else "summary",
+                          binary=self.node, runner=self.runner, timeout=timeout)
+        if summary is not None:
+            check_snapshot(summary, self.spec["name"])
+            self.summary = summary
+        return summary is not None
 
     def start_sync(self) -> None:
-        """Copy the job back every SYNC_INTERVAL seconds on a thread; a pass
-        that left files behind is followed by the next one at once."""
         def loop():
             while not self.sync_stop.is_set():
-                ok = self.sync()
-                if self.sync_stop.wait(0 if ok and self.sync_state.pending else self.SYNC_INTERVAL):
-                    return
-
-        self.sync_thread = threading.Thread(target=loop, name="bench-remote-sync", daemon=True)
+                try:
+                    self.fetch_summary()
+                except ValueError as exc:
+                    self.log(str(exc))
+                self.sync_stop.wait(self.SYNC_INTERVAL)
+        self.sync_thread = threading.Thread(target=loop, name="bench-worker-summary", daemon=True)
         self.sync_thread.start()
 
-    def final_sync(self, stop: Optional[threading.Event] = None, timeout: Optional[float] = None) -> bool:
-        """After Harbor exited: finish the running pass, then copy until a
-        fresh manifest shows the local copy complete. False when that could
-        not be verified within `timeout` or `stop` was set."""
+    def final_sync(self, stop=None, timeout=None) -> bool:
         self.sync_stop.set()
         if self.sync_thread is not None:
             self.sync_thread.join()
-        deadline = time.monotonic() + (self.final_timeout if timeout is None else timeout)
         stop = stop or threading.Event()
-        while time.monotonic() < deadline and not stop.is_set():
-            pause = self.SYNC_INTERVAL
+        deadline = time.monotonic() + (self.final_timeout if timeout is None else timeout)
+        while not stop.is_set() and time.monotonic() < deadline:
             try:
-                if self.sync_state.complete():
-                    return True
-                # Files left: copy at once; a pass that copied nothing (a
-                # file the remote side cannot read yet) waits a little.
-                pause = 0 if self.sync_state.sync() else 1
-            except (ValueError, OSError, subprocess.TimeoutExpired, tarfile.TarError) as exc:
-                self.log("同步远程作业目录失败：" + str(exc))
-            stop.wait(min(pause, max(0.0, deadline - time.monotonic())))
+                available = self.fetch_summary(final=True, timeout=max(1, deadline - time.monotonic()))
+                return available or self.exit_code() != 0
+            except ValueError as exc:
+                self.log(str(exc))
+            stop.wait(min(1, max(0, deadline - time.monotonic())))
         return False
 
     def results_note(self) -> Dict:
@@ -1749,18 +1730,31 @@ class RemoteRun:
 RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]*$")
 
 
-def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = None) -> Dict:
-    """`metacodes bench sync --run NAME`: copy an SSH run's job directory
-    back after its worker could not, and clear the receipt's note. A run
-    whose Harbor exited 0 becomes `finished` once its copy is complete."""
+def sync_run(jobs_dir: Path, name: str, log=print, timeout: Optional[float] = None, *, store_config=None) -> Dict:
+    """Retry a worker summary or finish an existing historical mirror."""
     from scripts.eval.harbor.store.ingest import root_lock
     if not isinstance(name, str) or not RUN_NAME.fullmatch(name):
         raise ValueError("运行名称无效")
     with root_lock(Path(jobs_dir)):
-        return _sync_run(Path(jobs_dir), name, log, timeout)
+        return _sync_run(Path(jobs_dir), name, log, timeout, store_config)
 
 
-def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
+def _has_archived_mirror(local, store_config, spec):
+    from scripts.eval.harbor.store import config
+    from scripts.eval.harbor.store.backend import Store
+    if store_config is None:
+        if not spec.get("store"):
+            return False
+        store_config = config.parse(spec["store"], local.parent)
+    if isinstance(store_config, config.SqliteConfig) and not store_config.path.is_file():
+        return False
+    with closing(Store(store_config)) as store, store.read() as tx:
+        return tx.one("SELECT 1 FROM jobs WHERE name = ? AND source_dir = ? "
+                      "AND NOT EXISTS (SELECT 1 FROM worker_jobs WHERE job = jobs.name)",
+                      (local.name, str(local.resolve()))) is not None
+
+
+def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float], store_config) -> Dict:
     from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json
     records = Path(jobs_dir) / ".bench-runs"
     record_path, spec_path = records / (name + ".json"), records / (name + ".spec")
@@ -1775,22 +1769,37 @@ def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
     if record.get("status") in ACTIVE and fresh:
         raise ValueError(name + " 仍在运行；它结束时会自己同步结果")
     remote = RemoteRun(spec, log=log)
-    # Results left by a workbench from before nodes: say how to install one.
-    facts = probe(remote.executor)
-    problem = "；".join(reach_reasons(remote.executor, facts))
-    if problem:
-        raise ValueError(problem)
-    job = remote.job_sync()
-    deadline = time.monotonic() + (RemoteRun.FINAL_SYNC_TIMEOUT if timeout is None else timeout)
-    complete = False
-    while time.monotonic() < deadline:
-        if job.complete():
-            complete = True
-            break
-        if not job.sync():
-            time.sleep(1)
-    if not complete:
-        raise ValueError(f"仍有 {job.pending} 个文件未同步完整，请稍后重试")
+    local = jobs_dir / name
+    response = {"name": name, "executor": remote.executor.name}
+    timeout = RemoteRun.FINAL_SYNC_TIMEOUT if timeout is None else timeout
+    legacy_files = not (record.get("result_owner") or spec.get("result_owner")) and local.is_dir()
+    archived = not (spec.get("result_owner") or legacy_files) and _has_archived_mirror(local, store_config, spec)
+    if archived and not local.exists() and not record.get("remote_results"):
+        if "result_owner" in record or "worker_summary" in record:
+            record.pop("result_owner", None)
+            record.pop("worker_summary", None)
+            atomic_json(record_path, record)
+        return {**response, "status": record.get("status"), "archived": True}
+    if archived or legacy_files:
+        if local.is_symlink():
+            raise ValueError("历史镜像目录无效")
+        mirror = JobSync(remote.executor, remote.remote_job_dir, local, log=log)
+        deadline = time.monotonic() + timeout
+        while not mirror.complete(require_files=True):
+            if time.monotonic() >= deadline:
+                raise ValueError(f"仍有 {mirror.pending} 个历史镜像文件未同步完整，请稍后重试")
+            if not mirror.sync():
+                time.sleep(1)
+        response.update(local_dir=str(local), files=mirror.files)
+        record.pop("result_owner", None)
+        record.pop("worker_summary", None)
+    else:
+        problem = "；".join(reach_reasons(remote.executor, probe(remote.executor)))
+        if problem:
+            raise ValueError(problem)
+        if not remote.fetch_summary(final=True, timeout=timeout):
+            raise ValueError("worker 尚无作业汇总")
+        record.update(result_owner=remote.executor.name, worker_summary=remote.summary)
     note = record.pop("remote_results", None)
     if isinstance(note, dict):
         rest = [part for part in str(record.get("error") or "").split("；") if part and part not in
@@ -1798,6 +1807,5 @@ def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float]) -> Dict:
         record["error"] = "；".join(rest) or None
         if record.get("status") == "failed" and record.get("exit_code") == 0 and not rest:
             record["status"] = "finished"
-        atomic_json(record_path, record)
-    return {"name": name, "files": job.files, "status": record.get("status"),
-            "local_dir": str(remote.local_job_dir)}
+    atomic_json(record_path, record)
+    return {**response, "status": record.get("status")}

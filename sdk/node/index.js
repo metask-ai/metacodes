@@ -14,7 +14,7 @@ const BUILTIN_TOOLS = [
 ];
 const DEFAULT_TOOLS = ['Read'];
 const SHELL_TOOLS = ['Bash', 'BashOutput', 'KillShell'];
-// The CLI agent loop's own default (src/core/agent_loop.zig Options.max_turns).
+// The CLI agent loop's own default (packages/coding/src/core/agent_loop.zig Options.max_turns).
 const DEFAULT_MAX_TURNS = 400;
 const MAX_TURNS = 1000;
 // Revision 28: RunOptionsV1.stream_retry_budget runs from 0 to this.

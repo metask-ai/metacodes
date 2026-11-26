@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.eval.harbor.bench import data
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
+from scripts.eval.harbor.bench.results import WorkerUnavailable
 from scripts.eval.harbor.bench.workbench import Workbench
 from scripts.eval.harbor.store.backend import json_text
 
@@ -198,6 +199,8 @@ def make_handler(workbench: Workbench, public_url=None):
                 return
             try:
                 self.route(url.path, query)
+            except WorkerUnavailable as exc:
+                self.send_json({"error": str(exc)}, 503)
             except BrokenPipeError:
                 pass
             except Exception:  # never leak paths or tracebacks to the page
@@ -247,7 +250,7 @@ def make_handler(workbench: Workbench, public_url=None):
             elif path == "/api/leaderboard":
                 self.send_found(workbench.leaderboard(query.get("suite")), "no published board for this suite")
             elif path == "/api/run":
-                self.send_found(workbench.run(query.get("name")), "no such run")
+                self.send_found(workbench.run(query.get("name"), worker_log=query.get("log") == "1"), "no such run")
             elif path == "/api/jobs":
                 self.send_json({**workbench.jobs(query.get("profile") or "all"), "can_run": self.authorized()})
             elif path == "/api/job":

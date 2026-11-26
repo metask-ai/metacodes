@@ -93,7 +93,16 @@ context，权限会改变动作空间，sandbox 会改变失败模式，trace �
 
 ## 使用
 
-所有命令从 `metacodes/` 运行，仅依赖 Python 标准库。
+以下评测命令从仓库根目录运行。
+
+### 迁移 PR 的必测项
+
+`zig build test:affected` 和 PR 的 **Change scope** 使用同一份差异选择离线测试。
+改核心循环会运行 `test:eval` 的确定性回归和本地模拟模型测试。只改终端界面组件
+（`apps/cli/src/repl/tui/`）或 CLI 包内测试时，仍测产品运行和终端交互。完整的
+`zig build test`、带 `migration` 标签的 PR 和 main 的夜间检查都运行全套离线评测。
+
+按需进行真模型对照时，先取得本次调用授权，并约定模型、题集、次数和预算。
 
 ### 1. 校验任务定义
 

@@ -2,7 +2,7 @@
 
 > 状态:阶段 0(共享类型、配置、运行目录、预算账本)、内置 reviewer(评审结果契约、证据核验、
 > open-issues 台账,§6)与 seat 驱动(metacodes 子 agent、Claude Code 子进程、写入隔离,§7)已落地于
-> `src/teamwork/`;runtime 编排、独立完成审计与合回已接入,见 §10。用户入口与 MCP Manager 的
+> `packages/teamwork/src/`;runtime 编排、独立完成审计与合回已接入,见 §10。用户入口与 MCP Manager 的
 > 使用方式以 [API.md](API.md) 与 [TEAMWORK_MCP.md](TEAMWORK_MCP.md) 为准。
 > 来源:umbrella issue #514 及子 issue #515–#525。工作方式借鉴 Google Antigravity 的
 > `/teamwork` 预览功能(先批准再开跑、写的人不验、完成必须审计、状态全部落盘);本文与代码中的
@@ -41,7 +41,7 @@ artifact CAS)。
 
 ## 2. worker 契约
 
-`src/teamwork/types.zig` 中的 `SeatDriver` 是所有 harness 的统一接口:
+`packages/teamwork/src/types.zig` 中的 `SeatDriver` 是所有 harness 的统一接口:
 
 ```zig
 pub const SeatPaths = struct { packet: []const u8, handoff: []const u8, workspace: []const u8 };
@@ -83,7 +83,7 @@ pub const SeatOutcome = union(enum) { finished: Handoff, failed: SeatError, budg
 
 ## 3. 配置
 
-`src/teamwork/config.zig`,三步都是纯函数:
+`packages/teamwork/src/config.zig`,三步都是纯函数:
 
 1. `parse(arena, text, diag) ParseError!Layer` / `parseValue(arena, std.json.Value, diag)`:
    把一个来源的 `teamwork` 对象解析成 `Layer`(每个字段都可缺省)。
@@ -158,7 +158,7 @@ Manager(§10.2)。Manager 为默认 `metacodes` 时即内置确定性 SWE loop,�
 metacodes seat 根本没有放 `command` 的位置;`BudgetEnforcement.wallclock_only` 自带
 `WallclockLimit`。
 
-**CLI 接线**:`src/teamwork/command.zig` 从 `<state root>/config.json` 读出
+**CLI 接线**:`packages/teamwork/src/command.zig` 从 `<state root>/config.json` 读出
 `teamwork` 成员交给 `config.parseValue`,仓库根目录 `.metacodes/teamwork.json`
 交给 `config.parse`,再叠加 CLI Layer,经 `merge` / `validate` 后才启动 App。
 入口是 `metacodes teamwork run --request-file <file> --approve --budget-usd <cap>`;
@@ -170,7 +170,7 @@ CLI 使用请求文件,`--approve` 直接批准请求文件,不执行 interviewe
 SWE loop(不接受 model/effort);`seats.manager` 为 `claude_code` 时由 runtime 启动外部 Manager
 (§10.2)。`teamwork mcp` 拒绝外部 `seats.manager`(`UnsupportedManager`):那里 MCP 客户端就是 Manager。
 
-**请求参数段与面试(#518)**:`src/teamwork/interview.zig`。请求开头可以有若干方括号参数段:
+**请求参数段与面试(#518)**:`packages/teamwork/src/interview.zig`。请求开头可以有若干方括号参数段:
 `[skip-interview]` 与 `[seats=<role>:<harness>[:<model>],...]`。`parseSegments` 去掉参数段,
 其余文本即待批准文本;没有前导 `[` 时原样使用。`seats` 是只对本次运行生效的配置层,位于
 项目配置之上、CLI 覆盖之下。未知、重复、未闭合或格式错误的参数段直接报错,不当作请求文本。
@@ -196,7 +196,7 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
 
 ## 4. 运行目录
 
-`src/teamwork/run_dir.zig`,根在**工作区之外**:
+`packages/teamwork/src/run_dir.zig`,根在**工作区之外**:
 
 ```
 <state_root>/teamwork/<run_id>/
@@ -231,7 +231,7 @@ pending receipt 只展示不结算。`teamwork mcp` 复用批准门禁,由
   `recorded`(含 `has_handoff`),读不出的(建目录后、首次写 status 前崩溃,或记录被破坏、
   记录里的 seat_id 与目录不符)给出 `damaged`,由 runtime 决定重新登记还是放弃;临时文件和
   非法名字忽略。结果按 seat id 排序。
-- 所有带路径的文件操作都经 `src/platform/fs.zig` 与 `src/platform/dir.zig`。
+- 所有带路径的文件操作都经 `packages/base/src/platform/fs.zig` 与 `packages/base/src/platform/dir.zig`。
 
 **缓存契约**:run id、时间戳和运行目录的绝对路径都不进入 metacodes 发给 provider 的字节。
 packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径(`seat_relative_original_request`
@@ -242,7 +242,7 @@ packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径
 
 ## 5. 预算账本
 
-`src/teamwork/ledger.zig`,`budget.jsonl` 每行一条:
+`packages/teamwork/src/ledger.zig`,`budget.jsonl` 每行一条:
 
 ```json
 {"seat_id":"implementer-1","harness":"claude_code","usd":0.42,"wallclock_ms":61000,"source":"harness_reported"}
@@ -258,7 +258,7 @@ packet 引用同一运行里的其他文件时,用相对于 seat 目录的路径
 - `Ledger.load` 从磁盘重新求和。最后一行没有换行符说明追加时崩溃:丢弃并把文件截断到最后一个
   完整行,保证下一次追加从新行开始;**完整行**解析失败则不是崩溃产物,返回 `CorruptLedger`
   (预算数据宁可停也不猜)。
-- `remainingUsd()` 是 metacodes seat 子 agent 的 `cost_budget_usd`(`src/core/subagent.zig`),也是
+- `remainingUsd()` 是 metacodes seat 子 agent 的 `cost_budget_usd`(`packages/coding/src/core/subagent.zig`),也是
   Claude Code seat 的 `--max-budget-usd`(§7)。
 - 账本只有 runtime 写,不是线程安全的,由 runtime 串行化。
 
@@ -277,7 +277,7 @@ seat 留下余量,否则 `BudgetExhausted`。
 
 ## 6. 内置 reviewer 与 open-issues 台账(#517)
 
-`src/teamwork/reviewer.zig` 与 `src/teamwork/issues.zig`。reviewer seat 可以是任何 harness;
+`packages/teamwork/src/reviewer.zig` 与 `packages/teamwork/src/issues.zig`。reviewer seat 可以是任何 harness;
 评审是否成立由 runtime 按机制判定,不看 seat 自己怎么说。
 
 **内置、不可被遮蔽**:宪章 `reviewer.charter` 是编译期常量(原创文本),`charterSha256()` 供运行
@@ -362,7 +362,7 @@ packet:原始请求的相对路径、钉住的检查命令、未解决问题、`
 
 ## 7. seat 驱动(#515、#519、#520、#521)
 
-`src/teamwork/drivers/`。`factory.zig` 是唯一按 harness 分派的地方:
+`packages/teamwork/src/drivers/`。`factory.zig` 是唯一按 harness 分派的地方:
 
 ```zig
 pub const Deps = struct { metacodes: metacodes.Deps, claude_code: claude_code.Options };

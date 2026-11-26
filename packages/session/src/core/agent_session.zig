@@ -1,0 +1,6411 @@
+//! UI-neutral Runtime and stateful AgentCore Session owners.
+//!
+//! `AgentRuntime` owns the immutable built-in tool catalog and outlives all
+//! Sessions. `AgentSession` owns provider, credentials, workspace, tool
+//! selection, conversation, permission memory, jobs and Run lifecycle state.
+
+const std = @import("std");
+const sync = @import("platform").sync;
+const types = @import("metacodes-ai").types;
+const provider_factory = @import("metacodes-ai").api.provider_factory;
+const model_error = @import("metacodes-ai").api.model_error;
+const credential_cell = @import("metacodes-ai").api.credential_cell;
+const image_capability = @import("metacodes-ai").api.image_capability;
+const provider_mod = @import("metacodes-ai").api.provider;
+const conversation_mod = @import("metacodes-kernel").conversation;
+const Conversation = conversation_mod.Conversation;
+const message_mod = @import("metacodes-kernel").message;
+const permission = @import("metacodes-guard").permission_root;
+const permission_settings = @import("metacodes-guard").permission.settings;
+const compact_kernel = @import("metacodes-coding").core.compact_kernel;
+const abort_mod = @import("metacodes-base").util.abort;
+const AbortSignal = abort_mod.AbortSignal;
+const ui_backend = @import("metacodes-coding").core.protocol.ui_backend;
+const ui_request = @import("metacodes-guard").core.protocol.ui_request;
+const CoreEvent = ui_backend.CoreEvent;
+const UiEvent = ui_backend.UiEvent;
+const SessionId = ui_backend.SessionId;
+const agent_loop = @import("metacodes-coding").core.agent_loop;
+const secure = @import("metacodes-base").util.secure;
+const tool_catalog = @import("metacodes-coding").core.tool_catalog;
+const plugin_contract = @import("metacodes-coding").plugin.contract;
+const plugin_runtime = @import("metacodes-coding").plugin.runtime;
+const plugin_support = @import("metacodes-coding").plugin.support;
+const first_party_plugins = @import("metacodes-coding").plugin.first_party;
+const workspace_mod = @import("metacodes-guard").core.workspace_policy;
+const ReadState = @import("metacodes-coding").core.read_state.ReadState;
+const JobRegistry = @import("metacodes-coding").core.job_registry.JobRegistry;
+const SessionRules = @import("metacodes-guard").permission.session_rules.SessionRules;
+const ToolExecutionPolicy = @import("metacodes-coding").tools_root.ToolExecutionPolicy;
+const ToolDispatcher = @import("metacodes-coding").tools_root.ToolDispatcher;
+const ToolDefinition = @import("metacodes-ai").json.ToolDefinition;
+const tool_observation_journal = @import("metacodes-guard").core.tool_observation_journal;
+const project_rule_activation = @import("metacodes-coding").core.project_rule_activation;
+const log = @import("metacodes-base").util.log;
+const util_fs = @import("metacodes-base").util.fs;
+const prompt_sections = @import("metacodes-guard").core.prompt_sections;
+const goal_mod = @import("metacodes-guard").core.goal;
+const swarm_context = @import("metacodes-coding").swarm.context;
+const swarm_team = @import("metacodes-coding").swarm.team;
+const swarm_mailbox = @import("metacodes-coding").swarm.mailbox;
+const system_prompt_mod = @import("metacodes-coding").core.system_prompt;
+const run_input = @import("metacodes-coding").core.run_input;
+const cron_registry = @import("metacodes-coding").core.cron_registry;
+const CronRegistry = cron_registry.CronRegistry;
+
+/// Why a Host could not read or change a Session's cron jobs.
+pub const CronAccessError = error{ OutOfMemory, SessionBusy, InvalidSessionState };
+
+pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS;
+/// Built-ins whose complete execution dependencies are owned by AgentSession.
+/// Process-level tools (Task, Cron, KG, MCP, worktree, notifications, etc.) are
+/// deliberately rejected at Runtime creation instead of being advertised with
+/// null Host state. Membership here is a name-level claim only: built-ins that
+/// declare an external executable dependency are verified
+/// at catalog admission and fail Runtime creation with
+/// `error.ToolDependencyUnavailable` when the executable cannot be resolved.
+/// WebSearch is a Session-owned network capability backed by the configured
+/// internal web service/provider. It is an ordinary function tool, not a
+/// provider-specific server-tool descriptor; AgentSession owns its
+/// implementation and the Host does not register an executor callback.
+pub const SESSION_BUILTIN_TOOLS = DEFAULT_BUILTIN_TOOLS ++ first_party_plugins.PREVIEW_TOOLS ++ [_][]const u8{"AskUserQuestion"};
+
+/// Issue #277: the team tools, admissible only when the Runtime enables teams
+/// (`RuntimeConfig.enable_teams`). Unlike Task they are Session-owned — their
+/// whole dependency is the Session's `SwarmContext` — so they do not violate
+/// the process-level-tool exclusion. `SpawnTeammate` records a host spawn
+/// request; the Host, not the runtime, creates the teammate Session.
+pub const TEAM_BUILTIN_TOOLS = [_][]const u8{ "TeamCreate", "TeamDelete", "SendMessage", "SpawnTeammate" };
+
+/// Issue #445: the cron tools, admissible only when the Runtime enables cron
+/// (`RuntimeConfig.enable_cron`). Their whole dependency is the Session's own
+/// `CronRegistry`, which lives as long as the Session and is never persisted
+/// (as the CLI's `App` keeps it). The tools only schedule: a prompt fires when
+/// the Session's Host takes it with `takeDueCronPrompts` while the Session is
+/// idle, as `SessionHost` does, so the C ABI does not offer them.
+pub const CRON_BUILTIN_TOOLS = [_][]const u8{ "CronCreate", "CronDelete", "CronList", "ScheduleWakeup" };
+
+pub fn isCronBuiltin(name: []const u8) bool {
+    return containsToolName(&CRON_BUILTIN_TOOLS, name);
+}
+
+pub fn isTeamBuiltin(name: []const u8) bool {
+    for (TEAM_BUILTIN_TOOLS) |supported| {
+        if (std.mem.eql(u8, supported, name)) return true;
+    }
+    return false;
+}
+
+pub fn isSessionBuiltin(name: []const u8) bool {
+    if (isTeamBuiltin(name)) return true;
+    for (SESSION_BUILTIN_TOOLS) |supported| {
+        if (std.mem.eql(u8, supported, name)) return true;
+    }
+    return false;
+}
+
+fn containsToolName(names: []const []const u8, needle: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, needle)) return true;
+    }
+    return false;
+}
+
+/// Issue #277: the host-scheduled `SwarmContext` for `config.team`. A lead
+/// starts with no team on disk (its `TeamCreate` / `team->create` makes it);
+/// a member joins the roster of an existing team and ensures its own inbox.
+/// `out_self_name` receives the member's Session-owned name buffer (the lead
+/// keeps the static "team-lead").
+fn buildSwarmContext(
+    allocator: std.mem.Allocator,
+    team: TeamConfig,
+    own_session_id: SessionId,
+    state_root: []const u8,
+    out_self_name: *?[]u8,
+) !swarm_context.SwarmContext {
+    if (state_root.len == 0) return error.TeamStateRootRequired;
+    switch (team.role) {
+        .lead => return .{
+            .allocator = allocator,
+            .scheduler = .host,
+            .is_lead = true,
+            .session = own_session_id,
+            .state_root = state_root,
+        },
+        .member => {
+            if (team.member_name.len == 0 or team.team_name.len == 0) return error.InvalidTeamConfig;
+            const lead_session = SessionId.fromSlice(team.lead_session_id) orelse return error.InvalidTeamConfig;
+            const lease = SessionId.fromSlice(team.member_lease) orelse return error.InvalidTeamConfig;
+            var name_buf: [64]u8 = undefined;
+            const name_s = swarm_team.sanitizeAgentName(team.member_name, &name_buf);
+            if (name_s.len == 0 or std.mem.eql(u8, name_s, swarm_team.TEAM_LEAD_NAME)) return error.InvalidTeamConfig;
+
+            const self_name = try allocator.dupe(u8, name_s);
+            errdefer allocator.free(self_name);
+            const team_name = try allocator.dupe(u8, team.team_name);
+            errdefer allocator.free(team_name);
+
+            var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cfg = swarm_team.configPath(state_root, team_name, &cfg_buf);
+            const JoinCtx = struct {
+                name: []const u8,
+                team: []const u8,
+                session: []const u8,
+                lease: []const u8,
+                fn mutate(c: @This(), tf: *swarm_team.TeamFile) anyerror!void {
+                    // A member rejoining under the same identity is idempotent.
+                    if (tf.findMember(c.name)) |existing| {
+                        const es = existing.session_id orelse return error.InvalidTeamConfig;
+                        const el = existing.lease_id orelse return error.InvalidTeamConfig;
+                        if (std.mem.eql(u8, es, c.session) and std.mem.eql(u8, el, c.lease)) return;
+                        return error.InvalidTeamConfig; // a different worker holds this name
+                    }
+                    var agent_id_buf: [96]u8 = undefined;
+                    const agent_id = swarm_team.formatAgentId(c.name, c.team, &agent_id_buf) orelse return error.InvalidTeamConfig;
+                    try tf.addMember(.{
+                        .agent_id = agent_id,
+                        .name = c.name,
+                        .session_id = c.session,
+                        .lease_id = c.lease,
+                        .backend_type = "process",
+                    });
+                }
+            };
+            try swarm_team.updateTeam(allocator, cfg, JoinCtx{
+                .name = name_s,
+                .team = team_name,
+                .session = lead_session.asSlice(),
+                .lease = lease.asSlice(),
+            }, JoinCtx.mutate);
+
+            var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+            try swarm_mailbox.ensureInbox(swarm_team.inboxPath(state_root, team_name, name_s, &inbox_buf));
+
+            out_self_name.* = self_name;
+            return .{
+                .allocator = allocator,
+                .scheduler = .host,
+                .is_lead = false,
+                .session = lead_session,
+                .lease = lease,
+                .self_name = self_name,
+                .state_root = state_root,
+                .team_sanitized = team_name,
+            };
+        },
+    }
+}
+
+test "WebSearch and WebFetch are AgentSession-owned builtins" {
+    try std.testing.expect(isSessionBuiltin("WebSearch"));
+    try std.testing.expect(isSessionBuiltin("WebFetch"));
+}
+
+test "default AgentRuntime preserves the coding tool surface through first-party plugin provenance" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{});
+    defer runtime.destroy() catch unreachable;
+    try std.testing.expectEqual(DEFAULT_BUILTIN_TOOLS.len, runtime.catalog.entries.len);
+    for (DEFAULT_BUILTIN_TOOLS, runtime.catalog.entries) |expected, entry|
+        try std.testing.expectEqualStrings(expected, entry.definition.name);
+    const inventory = try runtime.describePlugins(std.testing.allocator);
+    defer std.testing.allocator.free(inventory);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.core.coding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":8") != null);
+}
+
+test "standalone navigation and retired search tools are outside the embedded tool catalog" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{});
+    defer runtime.destroy() catch unreachable;
+    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
+        try std.testing.expect(runtime.catalog.find(name) == null);
+        try std.testing.expectError(error.UnsupportedBuiltinTool, AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{name} }));
+    }
+}
+
+test "minimal and none core profiles retain the mandatory artifact recovery kernel" {
+    const minimal = try AgentRuntime.create(std.testing.allocator, .{ .core_profile = .minimal });
+    defer minimal.destroy() catch unreachable;
+    try std.testing.expect(minimal.catalog.find("Read") != null);
+    try std.testing.expect(minimal.catalog.find("Grep") == null);
+    try std.testing.expect(minimal.catalog.find("Write") == null);
+    try std.testing.expect(minimal.catalog.find("WebFetch") == null);
+
+    const none = try AgentRuntime.create(std.testing.allocator, .{ .core_profile = .none });
+    defer none.destroy() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), none.catalog.entries.len);
+    try std.testing.expect(none.catalog.find("ReadArtifact") != null);
+}
+
+pub const RuntimeConfig = struct {
+    /// Explicit Host opt-in per preview feature. Profiles remain stable when none is selected.
+    preview: @import("metacodes-ai").preview.Features = .none,
+    /// Null selects the first-party `core_profile`. A non-null slice is the
+    /// source-compatible explicit/legacy override used by older embedding
+    /// adapters and tests; first-party packs are then omitted, while any
+    /// explicitly supplied static builtin bundle is still composed.
+    builtin_tools: ?[]const []const u8 = null,
+    core_profile: first_party_plugins.Profile = .coding,
+    host_sync_tools: []const tool_catalog.HostSyncTool = &.{},
+    host_stream_tools: []const tool_catalog.HostStreamTool = &.{},
+    static_plugins: []const plugin_runtime.StaticPlugin = &.{},
+    process_plugins: []const plugin_runtime.PackageSource = &.{},
+    /// Issue #277: admit the team tools (`TEAM_BUILTIN_TOOLS`) into the
+    /// catalog so team Sessions can select them. Off by default — teams are
+    /// opt-in, as `--agent-teams` is in the CLI.
+    enable_teams: bool = false,
+    /// Issue #445: admit the cron tools (`CRON_BUILTIN_TOOLS`) into the
+    /// catalog so Sessions can select them. Off by default: a Session's
+    /// cron prompts fire only through a Host that takes them
+    /// (`AgentSession.takeDueCronPrompts`), which `SessionHost` does.
+    enable_cron: bool = false,
+};
+
+pub const HostSyncTool = tool_catalog.HostSyncTool;
+pub const HostToolResult = tool_catalog.HostToolResult;
+pub const HostToolOutcome = tool_catalog.HostToolOutcome;
+pub const HostStreamTool = tool_catalog.HostStreamTool;
+pub const HostStreamOutcome = tool_catalog.HostStreamOutcome;
+pub const HostResultSink = tool_catalog.HostResultSink;
+pub const HostResultSinkError = tool_catalog.HostResultSinkError;
+pub const HostStreamExecuteError = tool_catalog.HostStreamExecuteError;
+pub const HostStreamMediaType = @import("metacodes-coding").core.tool_result.MediaType;
+pub const RunIdentity = tool_catalog.RunIdentity;
+pub const HostRunIdentity = tool_catalog.HostRunIdentity;
+pub const StaticPlugin = plugin_runtime.StaticPlugin;
+pub const CoreProfile = first_party_plugins.Profile;
+pub const ProcessPlugin = plugin_runtime.PackageSource;
+pub const AdvisoryPolicy = ToolExecutionPolicy;
+pub const UiRequester = ui_request.UiRequester;
+
+pub const AgentSessionUiRequester = struct {
+    ctx: *anyopaque,
+    requestFn: *const fn (
+        ctx: *anyopaque,
+        identity: RunIdentity,
+        allocator: std.mem.Allocator,
+        req: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!ui_request.RequestOutcome,
+
+    fn request(self: AgentSessionUiRequester, identity: RunIdentity, response_allocator: std.mem.Allocator, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
+        return self.requestFn(self.ctx, identity, response_allocator, req, out);
+    }
+};
+
+pub const RuntimeError = error{
+    RuntimeBusy,
+    RuntimeUnavailable,
+};
+
+const RuntimeState = enum { active, draining, destroying };
+
+const SessionIdSource = struct {
+    ctx: ?*anyopaque = null,
+    nextFn: *const fn (ctx: ?*anyopaque) SessionId = systemNext,
+
+    fn next(self: SessionIdSource) SessionId {
+        return self.nextFn(self.ctx);
+    }
+
+    fn systemNext(_: ?*anyopaque) SessionId {
+        return @import("metacodes-kernel").session_id.gen();
+    }
+};
+
+/// Private construction seams make collision and rollback paths deterministic
+/// without exposing test controls through the public Runtime/Session config.
+const SessionCreateHooks = struct {
+    session_id_source: SessionIdSource = .{},
+    restored: ?RestoredSessionState = null,
+    ctx: ?*anyopaque = null,
+    after_id_registered_fn: ?*const fn (ctx: ?*anyopaque) anyerror!void = null,
+
+    fn afterIdRegistered(self: SessionCreateHooks) !void {
+        if (self.after_id_registered_fn) |hook| try hook(self.ctx);
+    }
+};
+
+pub const AgentRuntime = struct {
+    allocator: std.mem.Allocator,
+    preview: @import("metacodes-ai").preview.Features,
+    plugin_snapshot: *plugin_runtime.Snapshot,
+    catalog: tool_catalog.Catalog,
+    mutex: sync.Mutex = .{},
+    live_sessions: usize = 0,
+    state: RuntimeState = .active,
+    /// 并存 Session 的 session_id 唯一性由本 registry 主动保证(collision detection),
+    /// 不是"生成两个 ID 然后断言不同"。key 为 [24]u8 **值语义**(SessionId.bytes 定长
+    /// 拷贝)——禁止借用 slice key(本仓吃过 HashMap slice key 悬挂的亏)。
+    session_ids: std.AutoHashMapUnmanaged([24]u8, void) = .empty,
+
+    /// collision 重试上限:生成器故障(恒返同值)时报不可达级错误而非无限循环。
+    const MAX_SESSION_ID_RETRIES: usize = 8;
+
+    pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*AgentRuntime {
+        return createWithGeneration(allocator, config, @enumFromInt(1));
+    }
+
+    fn createWithGeneration(
+        allocator: std.mem.Allocator,
+        config: RuntimeConfig,
+        generation: plugin_contract.GenerationId,
+    ) !*AgentRuntime {
+        if (config.builtin_tools) |explicit| {
+            for (explicit) |name| {
+                if (isTeamBuiltin(name)) return error.UnsupportedBuiltinTool; // team tools come from enable_teams, not the explicit list
+                if (isCronBuiltin(name)) return error.UnsupportedBuiltinTool; // cron tools come from enable_cron
+                if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
+            }
+        }
+        var static_plugins: std.ArrayList(plugin_runtime.StaticPlugin) = .empty;
+        defer static_plugins.deinit(allocator);
+        try static_plugins.appendSlice(allocator, first_party_plugins.kernelPlugins());
+        if (config.builtin_tools == null)
+            try static_plugins.appendSlice(allocator, first_party_plugins.plugins(config.core_profile));
+        try static_plugins.appendSlice(allocator, config.static_plugins);
+
+        const self = try allocator.create(AgentRuntime);
+        errdefer allocator.destroy(self);
+        const plugin_snapshot = try plugin_runtime.Snapshot.create(allocator, .{
+            .generation = generation,
+            .supported_capabilities = plugin_support.acceptedCapabilities(.agent_core_static),
+            .compatibility_host_tools = config.host_sync_tools,
+            .compatibility_host_stream_tools = config.host_stream_tools,
+            .static_plugins = static_plugins.items,
+            .process_packages = config.process_plugins,
+        });
+        errdefer plugin_snapshot.destroy();
+
+        var builtin_tools: std.ArrayList([]const u8) = .empty;
+        defer builtin_tools.deinit(allocator);
+        if (config.builtin_tools) |explicit| {
+            for (explicit) |name| {
+                if (!first_party_plugins.isKernelTool(name)) try builtin_tools.append(allocator, name);
+            }
+        }
+        try builtin_tools.appendSlice(allocator, plugin_snapshot.builtin_tools);
+        for (first_party_plugins.PREVIEW_TOOLS) |name| {
+            const builtin = @import("metacodes-coding").tools_root.getTool(name) orelse return error.UnsupportedBuiltinTool;
+            if (builtin.previewAllowed(config.preview) and !containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
+        }
+        if (config.enable_teams) {
+            for (TEAM_BUILTIN_TOOLS) |name| {
+                if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
+            }
+        }
+        if (config.enable_cron) {
+            for (CRON_BUILTIN_TOOLS) |name| {
+                if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
+            }
+        }
+        for (builtin_tools.items) |name| {
+            if (@import("metacodes-coding").tools_root.getTool(name)) |builtin| {
+                if (!builtin.previewAllowed(config.preview)) return error.PreviewFeatureDisabled;
+            }
+            if (config.enable_cron and isCronBuiltin(name)) continue;
+            if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
+        }
+        const catalog = try tool_catalog.Catalog.initWithExecutors(
+            allocator,
+            builtin_tools.items,
+            plugin_snapshot.host_tools,
+            plugin_snapshot.host_stream_tools,
+            plugin_snapshot.process_tools,
+        );
+        self.* = .{ .allocator = allocator, .preview = config.preview, .plugin_snapshot = plugin_snapshot, .catalog = catalog };
+        return self;
+    }
+
+    pub fn destroy(self: *AgentRuntime) RuntimeError!void {
+        self.mutex.lock();
+        if (self.state != .active) {
+            self.mutex.unlock();
+            return error.RuntimeUnavailable;
+        }
+        if (self.live_sessions != 0) {
+            self.mutex.unlock();
+            return error.RuntimeBusy;
+        }
+        self.state = .destroying;
+        // 生命周期合同:live_sessions==0 时 registry 必须为空(创建失败已回滚、
+        // destroy 已注销)。非空即内部记账错误——Debug 下必炸。
+        std.debug.assert(self.session_ids.count() == 0);
+        self.mutex.unlock();
+
+        self.destroyOwned();
+    }
+
+    fn destroyOwned(self: *AgentRuntime) void {
+        const allocator = self.allocator;
+        std.debug.assert(self.state == .destroying);
+        std.debug.assert(self.live_sessions == 0);
+        std.debug.assert(self.session_ids.count() == 0);
+        self.session_ids.deinit(allocator);
+        self.catalog.deinit();
+        self.plugin_snapshot.destroy();
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    /// Stop admitting new Sessions. A zero-session Runtime is destroyed now;
+    /// otherwise the final Session release performs the destruction. This is
+    /// the immutable-generation drain boundary used by `RuntimeHost`.
+    fn retire(self: *AgentRuntime) void {
+        self.mutex.lock();
+        std.debug.assert(self.state == .active);
+        self.state = .draining;
+        const reap = self.live_sessions == 0;
+        if (reap) self.state = .destroying;
+        self.mutex.unlock();
+        if (reap) self.destroyOwned();
+    }
+
+    /// 原子注册:锁下 getOrPut,已存在 → false(调用方换新 ID 重试)。
+    fn registerSessionId(self: *AgentRuntime, sid: SessionId) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const gop = try self.session_ids.getOrPut(self.allocator, sid.bytes);
+        return !gop.found_existing;
+    }
+
+    fn unregisterSessionId(self: *AgentRuntime, sid: SessionId) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.session_ids.remove(sid.bytes));
+    }
+
+    pub fn createSession(self: *AgentRuntime, config: SessionConfig) !*AgentSession {
+        return AgentSession.create(self, config);
+    }
+
+    /// Stable immutable inventory for in-process embedding Hosts. The returned
+    /// JSON is caller-owned and contains no callback pointers or kernel state.
+    pub fn describePlugins(self: *const AgentRuntime, allocator: std.mem.Allocator) ![]u8 {
+        return self.plugin_snapshot.describe(allocator);
+    }
+
+    /// Narrow Core seam for an already validated AgentCore checkpoint. The
+    /// exact logical ID is registered atomically; no Handle is published on
+    /// collision or reconstruction failure.
+    pub fn createRestoredSession(
+        self: *AgentRuntime,
+        config: SessionConfig,
+        restored: RestoredSessionState,
+    ) !*AgentSession {
+        return AgentSession.createRestored(self, config, restored);
+    }
+
+    fn retainSession(self: *AgentRuntime) RuntimeError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.state != .active) return error.RuntimeUnavailable;
+        self.live_sessions += 1;
+    }
+
+    fn releaseSession(self: *AgentRuntime) void {
+        self.mutex.lock();
+        std.debug.assert(self.live_sessions > 0);
+        self.live_sessions -= 1;
+        const reap = self.live_sessions == 0 and self.state == .draining;
+        if (reap) self.state = .destroying;
+        self.mutex.unlock();
+        if (reap) self.destroyOwned();
+    }
+};
+
+const RuntimeHostState = enum {
+    active,
+    replacing,
+    destroying,
+};
+
+/// Stack-borrowed conjunction used only for one synchronous Run. Plugin policy
+/// and facade policy are both upper bounds: neither can authorize what the
+/// other, native permission, Lean, or workspace policy denies.
+const ExecutionPolicyIntersection = struct {
+    plugin: ToolExecutionPolicy,
+    facade: ToolExecutionPolicy,
+
+    fn policy(self: *const ExecutionPolicyIntersection) ToolExecutionPolicy {
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsTool,
+            .allowsInvocationFn = allowsInvocation,
+        };
+    }
+
+    fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const ExecutionPolicyIntersection = @ptrCast(@alignCast(raw));
+        return self.plugin.allowsTool(name) and self.facade.allowsTool(name);
+    }
+
+    fn allowsInvocation(raw: *const anyopaque, name: []const u8, arguments_json: []const u8) bool {
+        const self: *const ExecutionPolicyIntersection = @ptrCast(@alignCast(raw));
+        return self.plugin.allowsInvocation(name, arguments_json) and
+            self.facade.allowsInvocation(name, arguments_json);
+    }
+};
+
+/// Atomic owner for immutable AgentRuntime generations.
+///
+/// Replacement never edits an active Runtime. It stages a complete successor,
+/// swaps the admission pointer, then retires the predecessor. Sessions retain
+/// their original Runtime and trigger its cleanup after the final release.
+pub const RuntimeHost = struct {
+    allocator: std.mem.Allocator,
+    mutex: sync.Mutex = .{},
+    active: *AgentRuntime,
+    next_generation: ?u64 = 2,
+    state: RuntimeHostState = .active,
+
+    pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*RuntimeHost {
+        const runtime = try AgentRuntime.createWithGeneration(allocator, config, @enumFromInt(1));
+        errdefer runtime.destroy() catch unreachable;
+        const self = try allocator.create(RuntimeHost);
+        self.* = .{ .allocator = allocator, .active = runtime };
+        return self;
+    }
+
+    /// Stage and atomically publish the next generation. A staging failure
+    /// restores `.active` and leaves the existing admission pointer unchanged.
+    /// Reentrant/concurrent replacement is a typed error rather than a lock.
+    pub fn replace(self: *RuntimeHost, config: RuntimeConfig) !plugin_contract.GenerationId {
+        self.mutex.lock();
+        const generation_value = switch (self.state) {
+            .active => self.next_generation orelse {
+                self.mutex.unlock();
+                return error.GenerationExhausted;
+            },
+            .replacing => {
+                self.mutex.unlock();
+                return error.RuntimeHostBusy;
+            },
+            .destroying => {
+                self.mutex.unlock();
+                return error.RuntimeUnavailable;
+            },
+        };
+        self.state = .replacing;
+        self.mutex.unlock();
+
+        var restore_active = true;
+        defer if (restore_active) {
+            self.mutex.lock();
+            std.debug.assert(self.state == .replacing);
+            self.state = .active;
+            self.mutex.unlock();
+        };
+
+        const staged_generation: plugin_contract.GenerationId = @enumFromInt(generation_value);
+        const replacement = try AgentRuntime.createWithGeneration(self.allocator, config, staged_generation);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .replacing);
+        const previous = self.active;
+        self.active = replacement;
+        self.next_generation = std.math.add(u64, generation_value, 1) catch null;
+        self.mutex.unlock();
+
+        // Keep replacement serialized while immediate predecessor cleanup runs:
+        // trusted cleanup may reenter this Host, but cannot start a nested swap
+        // or destroy the owner halfway through this call. Session admission may
+        // already use the newly published pointer while state is `.replacing`.
+        previous.retire();
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .replacing);
+        self.state = .active;
+        self.mutex.unlock();
+        restore_active = false;
+        return staged_generation;
+    }
+
+    /// Session admission is serialized only across the pointer swap. Provider
+    /// and Session construction complete while holding the Host lock so the
+    /// chosen Runtime cannot enter draining before it records the Session.
+    pub fn createSession(self: *RuntimeHost, config: SessionConfig) !*AgentSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.createSession(config),
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    pub fn createRestoredSession(
+        self: *RuntimeHost,
+        config: SessionConfig,
+        restored: RestoredSessionState,
+    ) !*AgentSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.createRestoredSession(config, restored),
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    pub fn describePlugins(self: *RuntimeHost, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.describePlugins(allocator),
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    pub fn generation(self: *RuntimeHost) !plugin_contract.GenerationId {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.state) {
+            .active, .replacing => self.active.plugin_snapshot.generation,
+            .destroying => error.RuntimeUnavailable,
+        };
+    }
+
+    /// Stop admission and retire the current generation. Existing Sessions
+    /// remain valid and self-reap their Runtime after their final destroy.
+    pub fn destroy(self: *RuntimeHost) error{RuntimeHostBusy}!void {
+        self.mutex.lock();
+        if (self.state == .replacing) {
+            self.mutex.unlock();
+            return error.RuntimeHostBusy;
+        }
+        std.debug.assert(self.state == .active);
+        self.state = .destroying;
+        const runtime = self.active;
+        self.mutex.unlock();
+
+        const allocator = self.allocator;
+        runtime.retire();
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+};
+
+pub const WorkspaceConfig = workspace_mod.Config;
+pub const ShellPolicy = workspace_mod.ShellPolicy;
+
+/// Artifact-store authority is fixed when the Session is created. A tagged
+/// policy avoids the old ambiguous empty-string state and makes restored
+/// AgentCore Sessions derive the same path from their logical Session ID.
+pub const ArtifactStoreConfig = union(enum) {
+    disabled,
+    exact_root: []const u8,
+    session_under_workspace_home,
+
+    pub fn enabled(self: ArtifactStoreConfig) bool {
+        return self != .disabled;
+    }
+
+    fn resolve(
+        self: ArtifactStoreConfig,
+        allocator: std.mem.Allocator,
+        workspace: workspace_mod.WorkspacePolicy,
+        session_id: SessionId,
+    ) ![]u8 {
+        return switch (self) {
+            .disabled => allocator.dupe(u8, ""),
+            .exact_root => |root| if (root.len == 0)
+                error.InvalidArtifactStoreConfig
+            else
+                allocator.dupe(u8, root),
+            // `<state_root>/agentcore/sessions/<id>`; the default state root is
+            // `<home>/.metacodes` (WorkspacePolicy), the historical location.
+            .session_under_workspace_home => blk: {
+                if (workspace.state_root.len == 0) return error.InvalidArtifactStoreConfig;
+                break :blk std.fmt.allocPrint(
+                    allocator,
+                    "{s}/agentcore/sessions/{s}",
+                    .{ workspace.state_root, session_id.asSlice() },
+                );
+            },
+        };
+    }
+};
+
+/// Optional active-Run durability for the embedded Session. Ephemeral is the
+/// zero-I/O/default profile. Durable locations contain the existing unified
+/// tool/provider journal; no SQLite or second evidence store enters the core.
+pub const RunJournalConfig = union(enum) {
+    ephemeral,
+    exact_root: []const u8,
+    session_under_workspace_home,
+
+    pub fn enabled(self: RunJournalConfig) bool {
+        return self != .ephemeral;
+    }
+
+    fn resolve(
+        self: RunJournalConfig,
+        allocator: std.mem.Allocator,
+        workspace: workspace_mod.WorkspacePolicy,
+        session_id: SessionId,
+    ) ![]u8 {
+        return switch (self) {
+            .ephemeral => allocator.dupe(u8, ""),
+            .exact_root => |root| if (root.len == 0)
+                error.InvalidRunJournalConfig
+            else
+                allocator.dupe(u8, root),
+            // `<state_root>/agentcore/sessions/<id>`; the default state root is
+            // `<home>/.metacodes` (WorkspacePolicy), the historical location.
+            .session_under_workspace_home => blk: {
+                if (workspace.state_root.len == 0) return error.InvalidRunJournalConfig;
+                break :blk std.fmt.allocPrint(
+                    allocator,
+                    "{s}/agentcore/sessions/{s}",
+                    .{ workspace.state_root, session_id.asSlice() },
+                );
+            },
+        };
+    }
+};
+
+/// What a Run whose process died, without its terminal record, gets when the
+/// next Run opens the durable journal (`tool_observation_journal`).
+pub const AbandonedRunPolicy = tool_observation_journal.AbandonedRunPolicy;
+
+/// Whether a Session's Runs are gated by the project's active rule bundle.
+pub const ProjectRules = enum {
+    /// No bundle is consulted (the default, and every Session before #445).
+    ignored,
+    /// As the bundled daemon gates a Run (`project_rule_activation.RunControl`):
+    /// when `<dirname(run journal root)>/project-rules` has an active bundle
+    /// for the workspace root, it is re-attested before the provider request
+    /// and decides each tool call through the project kernel; a missing or
+    /// invalid kernel configuration, a bundle that fails attestation, or a
+    /// running background job or active team fails the Run before any
+    /// provider request. Such a refusal fails only that Run, as the daemon
+    /// reports it failed and takes the next message: its input never enters
+    /// the Conversation and the Session stays usable. A refused resumption
+    /// (`AdmittedRun.resumeWithResults`) leaves its suspended turn waiting
+    /// for its results, so a later Run can still continue it. After the Run
+    /// the bundle is re-attested and the Run's operational observation
+    /// published.
+    enforced,
+};
+
+/// The per-Run control a durable Session's Runs open (#445), the
+/// `RunControl` the bundled daemon opens for each Run. Only a durable
+/// `run_journal` has one: anything but the default on an ephemeral Session
+/// is refused at creation (`error.RunControlRequiresRunJournal`).
+pub const RunControlConfig = struct {
+    /// The daemon records an abandoned Run (`record_abandoned`); a library
+    /// Session stays closed by default (`UnfinishedRun`).
+    abandoned_run: AbandonedRunPolicy = .fail_closed,
+    project_rules: ProjectRules = .ignored,
+
+    fn isDefault(self: RunControlConfig) bool {
+        return self.abandoned_run == .fail_closed and self.project_rules == .ignored;
+    }
+};
+
+pub const SessionConfig = struct {
+    provider_kind: types.ProviderKind,
+    /// OpenAI wire protocol. Public adapters validate provider/protocol
+    /// pairing before this typed configuration reaches the Session.
+    openai_protocol: types.OpenAIProtocol = .chat_completions,
+    /// issue #16: provider-declared authentication for the resolved route.
+    /// Null keeps the historical `authorization: Bearer` bytes, so an embedder
+    /// that names no provider is byte-identical.
+    auth_scheme: ?@import("metacodes-ai").provider.credential.AuthScheme = null,
+    /// The vendor dialect the resolved route declares, for `model`; empty
+    /// infers it from the model name, which is what a Session did before routes
+    /// could say.
+    dialect: @import("metacodes-ai").provider.vendor.Declaration = .{},
+    api_key: []const u8,
+    model: []const u8,
+    base_url: ?[]const u8 = null,
+    /// What the Host knows about its models' image input (issue #273),
+    /// borrowed for the call and copied into the Session. A declaration
+    /// outranks the family table and holds for the Session's model, every
+    /// `setModel` target, and tool-scoped providers. Two entries naming the
+    /// same model (ignoring case) fail creation with `error.DuplicateModel`.
+    model_capabilities: []const image_capability.Declaration = &.{},
+    permission_mode: types.PermissionMode = .default,
+    permission_rules: ?permission_settings.RuleSetInput = null,
+    workspace: WorkspaceConfig,
+    /// Session-stable recoverable Tool Result storage. AgentCore uses
+    /// `session_under_workspace_home`; CLI callers that already own a
+    /// transcript directory use `exact_root` at the lower agent-loop seam.
+    artifact_store: ArtifactStoreConfig = .disabled,
+    /// Active-Run intent/result durability. This is independent of checkpoint
+    /// export: checkpoints preserve committed model state; the Run journal
+    /// preserves effects that may be in flight across a process crash.
+    run_journal: RunJournalConfig = .ephemeral,
+    /// What each Run opens on the durable `run_journal` (#445): the
+    /// abandoned-Run policy and the project rule gate.
+    run_control: RunControlConfig = .{},
+    /// Explicit Host authority ceiling. The kernel adds only ReadArtifact when
+    /// `artifact_store` is enabled; no other global built-in fallback exists.
+    allowed_tools: []const []const u8,
+    /// Optional synchronous Host UI bridge. The Host-owned callback context
+    /// must outlive this Session.
+    ui_requester: ?UiRequester = null,
+    run_ui_requester: ?AgentSessionUiRequester = null,
+    /// Host tool 身份锚点(type-erased,注册方 adapter 才可解释;core 只透传不解引用)。
+    /// 合法状态:未选任何 Host tool → 允许 null;选了 Host tool 而 null → create 拒绝
+    /// (admission 校验,不留"理论上不可能"的运行期空态)。owner 为创建方,须活到
+    /// destroy 成功。
+    host_identity_ctx: ?*anyopaque = null,
+    /// Session prompt profile (#184): Host edits of the kernel prompt sections.
+    /// Borrowed for `create`, which refuses an invalid profile
+    /// (`system_prompt.validateProfile` names the broken rule) and keeps a copy
+    /// until `setPromptProfile`. Empty renders the kernel prompt byte for byte.
+    prompt_profile: prompt_sections.Profile = .{},
+    /// Reasoning effort for this Session's provider, kept across `setModel`
+    /// and changed at idle by `setReasoningEffort`. Null leaves the provider
+    /// default. A provider without an effort control refuses a non-null value
+    /// at create with `error.AgentEffortUnsupportedProvider`.
+    reasoning_effort: ?types.ReasoningEffort = null,
+    /// Issue #277: this Session's place in a host-scheduled team. Null is no
+    /// team. When set, the Runtime must have `enable_teams`, the team tools
+    /// are available, and the Session runs with a `host`-scheduled
+    /// `SwarmContext` rooted under the workspace state root.
+    team: ?TeamConfig = null,
+};
+
+/// Issue #277: a Session's team role. The lead creates the team and delegates
+/// (`SpawnTeammate` records a request the Host fulfils); a member joins the
+/// roster on create and talks through `SendMessage`.
+pub const TeamConfig = struct {
+    role: enum { lead, member },
+    /// The already-sanitized team name (the lead's `TeamCreate` also sets
+    /// this on disk; a member names the team it joins).
+    team_name: []const u8,
+    /// Member role only: this member's name and the lead's session id (24-hex)
+    /// it joins under, plus a fresh per-spawn lease (24-hex). A member with a
+    /// missing or malformed identity fails `create`.
+    member_name: []const u8 = "",
+    lead_session_id: []const u8 = "",
+    member_lease: []const u8 = "",
+};
+
+pub const Config = SessionConfig;
+
+pub const EventSink = struct {
+    ctx: *anyopaque,
+    /// The callback is synchronous. Returning false is fatal for this Session.
+    emit: *const fn (ctx: *anyopaque, session_id: SessionId, run_id: u64, event: CoreEvent) bool,
+};
+
+/// Borrowed, immutable tool surface for one admitted Run. Facades may add
+/// run-scoped tools without mutating the Session catalog or the shared agent
+/// loop. The owner must keep both fields alive until the synchronous Run and
+/// every tool worker have quiesced.
+pub const RunToolSurface = struct {
+    definitions: []const ToolDefinition,
+    dispatcher: ToolDispatcher,
+};
+
+const State = enum {
+    idle,
+    running,
+    abort_requested,
+    compacting,
+    compact_finishing,
+    mutating,
+    checkpointing,
+    poisoned,
+    destroying,
+};
+
+/// Reasons an external host may use to stop a synchronous Run. Internal
+/// failures use private AbortSignal reasons and cannot be forged by callers.
+pub const AbortReason = enum {
+    user_interrupt,
+    timeout,
+
+    fn internal(self: AbortReason) abort_mod.Reason {
+        return switch (self) {
+            .user_interrupt => .user_interrupt,
+            .timeout => .timeout,
+        };
+    }
+};
+
+pub const LifecycleError = error{
+    SessionBusy,
+    StaleRun,
+    AbortTooLate,
+    InvalidSessionState,
+    CallbackFailed,
+};
+
+/// `submitInput` outcomes besides the queue's own (`run_input.SubmitError`).
+/// `InputTooLate`: the Run named is the most recent one and it has ended, or is
+/// ending (abort requested, a callback failed) — no later boundary will adopt
+/// anything. `StaleRun`: no such Run is active or most recent.
+/// `InvalidSessionState`: the Session is poisoned or being destroyed, or its
+/// active Run never adopts input (a forked Skill Run).
+pub const SubmitInputError = error{
+    StaleRun,
+    InputTooLate,
+    InvalidSessionState,
+} || run_input.SubmitError;
+
+/// What `AgentSession.setRoute` moves a Session onto (issue #16, #445): the
+/// provider fields of `SessionConfig`, as one value, so a route is never
+/// half-applied. Borrowed for the call, which copies it.
+pub const Route = struct {
+    provider_kind: types.ProviderKind,
+    openai_protocol: types.OpenAIProtocol = .chat_completions,
+    /// Null keeps the historical `authorization: Bearer` bytes.
+    auth_scheme: ?AuthScheme = null,
+    /// Declared for `model`.
+    dialect: @import("metacodes-ai").provider.vendor.Declaration = .{},
+    /// The route's credential. Never journaled or logged.
+    api_key: []const u8,
+    /// The model id the route's requests carry.
+    model: []const u8,
+    base_url: ?[]const u8 = null,
+};
+
+const AuthScheme = @import("metacodes-ai").provider.credential.AuthScheme;
+
+/// An owned copy of `scheme` and the bytes it names (`freeAuthScheme`).
+fn dupeAuthScheme(allocator: std.mem.Allocator, scheme: ?AuthScheme) error{OutOfMemory}!?AuthScheme {
+    const value = scheme orelse return null;
+    return switch (value) {
+        .bearer => .bearer,
+        .api_key_header => |name| .{ .api_key_header = try allocator.dupe(u8, name) },
+        .signed_adapter => |name| .{ .signed_adapter = try allocator.dupe(u8, name) },
+        .custom_header => |custom| blk: {
+            const name = try allocator.dupe(u8, custom.name);
+            errdefer allocator.free(name);
+            break :blk .{ .custom_header = .{ .name = name, .value_prefix = try allocator.dupe(u8, custom.value_prefix) } };
+        },
+    };
+}
+
+fn freeAuthScheme(allocator: std.mem.Allocator, scheme: ?AuthScheme) void {
+    switch (scheme orelse return) {
+        .bearer => {},
+        .api_key_header, .signed_adapter => |name| allocator.free(name),
+        .custom_header => |custom| {
+            allocator.free(custom.name);
+            allocator.free(custom.value_prefix);
+        },
+    }
+}
+
+pub const ModelMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    InvalidModel,
+    OutOfMemory,
+};
+
+/// `setRoute` refusals (issue #16, #445). Each leaves the Session on the
+/// route it had: provider, endpoint, credential, model and effort.
+pub const RouteMutationError = ModelMutationError || credential_cell.ValidationError || error{
+    /// The Session has a reasoning effort and the route's provider takes
+    /// none. Clearing it first (`setReasoningEffort(null)`) is the Host's
+    /// explicit choice; it is never dropped silently.
+    AgentEffortUnsupportedProvider,
+};
+
+/// `updateCredential` refusals (issue #336). `InvalidSessionState`: the
+/// Session is poisoned or being destroyed. The rest are the candidate's own
+/// (`credential_cell.ReplacementError`). Every refusal leaves the credential
+/// as it was. There is no `SessionBusy`: an update is admitted in every other
+/// state.
+pub const CredentialUpdateError = error{InvalidSessionState} || credential_cell.ReplacementError;
+
+pub const PermissionRuleMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    OutOfMemory,
+    ResourceLimit,
+    InvalidRule,
+    /// The Session decides with another Session's rules
+    /// (`AgentSession.inheritPermissions`, #445), so its own would never be
+    /// read. Nothing changes.
+    PermissionsInherited,
+};
+
+pub const PermissionModeMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    /// The Session's settings disable the mode (`disableBypassPermissionsMode`,
+    /// `disableAutoMode`; PermissionContext.modeAllowed). A Session's settings
+    /// today are only the Host-imported allow/ask/deny layer, which cannot
+    /// disable a mode, so the Host owns which modes it offers; the check is
+    /// here so a Session that does carry such settings refuses the mode.
+    PermissionModeDisabled,
+};
+
+pub const AdditionalDirectoriesMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    InvalidAdditionalDirectory,
+    OutOfMemory,
+    /// The Session decides with another Session's directories
+    /// (`AgentSession.inheritPermissions`, #445), so a permission decision
+    /// would never read its own. Nothing changes.
+    PermissionsInherited,
+};
+
+/// `AgentSession.inheritPermissions` refusals; each leaves both Sessions as
+/// they were.
+pub const InheritPermissionsError = error{
+    /// This Session is not idle.
+    SessionBusy,
+    /// This Session or the lender is poisoned or being destroyed.
+    InvalidSessionState,
+    /// This Session already decides with another Session's permissions.
+    PermissionsInherited,
+    /// A Session cannot lend to itself.
+    InvalidPermissionLender,
+};
+
+pub const ReasoningEffortMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    AgentEffortUnsupportedProvider,
+};
+
+pub const PromptProfileMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    InvalidPromptProfile,
+    OutOfMemory,
+};
+
+pub const CompactError = error{
+    InvalidOperationId,
+    StaleCompact,
+    SessionBusy,
+    InvalidSessionState,
+    OutOfMemory,
+    ConcurrentMutation,
+};
+
+pub const CheckpointError = error{
+    SessionBusy,
+    InvalidSessionState,
+};
+
+/// Canonical state already reconstructed and validated by the AgentCore
+/// checkpoint layer. Conversation remains caller-owned and is deep-cloned into
+/// the Runtime allocator before the new Session can escape.
+pub const RestoredSessionState = struct {
+    session_id: SessionId,
+    last_run_id: u64,
+    last_compact_id: u64,
+    conversation: *Conversation,
+    /// Issue #277: the checkpoint's goal, deep-cloned like the Conversation.
+    goal: ?*const goal_mod.Goal = null,
+};
+
+/// Borrowed committed state protected by the Session's checkpointing activity.
+/// This value is linear: callers must not copy it and must call deinit exactly
+/// once on every success path, including Host sink failure.
+pub const CheckpointLease = struct {
+    session: ?*AgentSession,
+    session_id: SessionId,
+    last_run_id: u64,
+    last_compact_id: u64,
+    model: []const u8,
+    conversation: *const Conversation,
+
+    pub fn deinit(self: *CheckpointLease) void {
+        const session = self.session orelse return;
+        self.session = null;
+        session.finishCheckpoint();
+    }
+};
+
+pub const AbortCompactError = error{
+    InvalidOperationId,
+    StaleCompact,
+    AbortTooLate,
+    InvalidSessionState,
+};
+
+pub const CompactCommitGuard = struct {
+    ctx: *anyopaque,
+    allowFn: *const fn (
+        ctx: *anyopaque,
+        replacement: *const Conversation,
+    ) bool,
+
+    fn allows(
+        self: CompactCommitGuard,
+        replacement: *const Conversation,
+    ) bool {
+        return self.allowFn(self.ctx, replacement);
+    }
+};
+
+pub const CompactOptions = struct {
+    keep_recent: usize = 10,
+    /// Optional facade-owned, non-allocating commit predicate evaluated at
+    /// the existing Conversation replacement linearization point. Default
+    /// callers retain the canonical degraded-compaction behavior.
+    commit_guard: ?CompactCommitGuard = null,
+};
+
+/// Synchronous isolated execution hook used by a facade that needs a fresh
+/// child Conversation while retaining this Session's admitted Run lifecycle.
+///
+/// `out_final_text` is owned by AgentSession and starts empty. The executor
+/// appends only the final assistant text that is safe to commit to the parent
+/// Conversation. It must return only after every event producer is quiescent.
+pub const IsolatedRunExecutor = struct {
+    ctx: *anyopaque,
+    executeFn: *const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        identity: RunIdentity,
+        backend: *const ui_backend.UiBackend,
+        abort: *const AbortSignal,
+        evidence: RunExecutionEvidence,
+        out_final_text: *std.ArrayList(u8),
+    ) anyerror!agent_loop.RunResult,
+
+    fn execute(
+        self: IsolatedRunExecutor,
+        allocator: std.mem.Allocator,
+        identity: RunIdentity,
+        backend: *const ui_backend.UiBackend,
+        abort: *const AbortSignal,
+        evidence: RunExecutionEvidence,
+        out_final_text: *std.ArrayList(u8),
+    ) anyerror!agent_loop.RunResult {
+        return self.executeFn(
+            self.ctx,
+            allocator,
+            identity,
+            backend,
+            abort,
+            evidence,
+            out_final_text,
+        );
+    }
+};
+
+/// Borrowed execution evidence for one admitted Run. Both seams point at the
+/// same unified journal when durability is enabled; ephemeral Sessions carry
+/// the canonical all-null value and pay no journal I/O.
+pub const RunExecutionEvidence = struct {
+    tool_observer: ?@import("metacodes-coding").tools.context.ToolObservationSink = null,
+    execution_boundary: ?@import("metacodes-guard").core.execution_effect.Boundary = null,
+    /// The system prompt the Session rendered, recorded and announced for an
+    /// isolated Run (#184): the subagent prompt under the Session's profile.
+    /// The executor sends exactly these bytes.
+    system_prompt: ?[]const u8 = null,
+};
+
+/// What an admitted Run puts into the Conversation. `runLoop` appends it
+/// only once the Run's control let the Run go on, so a Run the project
+/// rules refuse leaves the Conversation as it was (#445).
+const RunInput = union(enum) {
+    /// User text records, in order. Borrowed.
+    prompts: []const []const u8,
+    /// User text records whose first leads with its own text part
+    /// (`AdmittedRun.lead_text`, #534). Borrowed.
+    led_prompts: LedPrompts,
+    /// One built user record, owned by the Run: the Conversation takes it,
+    /// or `runLoop` frees it when the Run ends before.
+    record: message_mod.Message,
+    /// Results for the suspended turn's tool calls
+    /// (`agent_loop.resumeRunWithResults`, #446). Borrowed.
+    resumption: []const agent_loop.SuspendInfo.CompletedResult,
+};
+
+/// `RunInput.led_prompts`: `lead` and `prompts[0]` are the two text parts of
+/// the first user record; the rest are text records, in order.
+const LedPrompts = struct {
+    lead: []const u8,
+    prompts: []const []const u8,
+};
+
+/// A durable Run's control once its journal opened (#445).
+const RunControlOpening = union(enum) {
+    /// The Run goes on; the caller finishes and frees it.
+    open: *project_rule_activation.RunControl,
+    /// The project rules refused the Run before any provider request or
+    /// tool action: an active bundle that cannot be attested (or a kernel
+    /// configuration that cannot be used), or a detached worker running.
+    /// The Run is closed in the journal under this error's name.
+    refused: anyerror,
+};
+
+/// Exactly-once capability returned after Run admission but before any
+/// Conversation mutation. AgentCore uses this narrow seam to materialize a
+/// typed Skill without duplicating the Session lifecycle state machine.
+pub const AdmittedRun = struct {
+    session: *AgentSession,
+    identity_value: RunIdentity,
+    completed: bool = false,
+    /// Same-turn re-issues this Run's loop may make after an accepted stream
+    /// failed without an answer and after it showed output
+    /// (`agent_loop.Options.retractable_stream_retries`, #452). The embedding
+    /// layer sets it before the Run starts; 0 keeps the loop's default.
+    stream_retry_budget: u8 = 0,
+    /// Text leading the Run's first user record as its own text part, the
+    /// Host's rendered context for this Run (#534): that record holds
+    /// `[lead_text, first prompt]` where it would hold the first prompt
+    /// alone, for `runUserMessages*` and `runIsolated`'s root records. The
+    /// embedding layer sets it before the Run starts; borrowed until the Run
+    /// returns. Null leaves every record a plain text record.
+    lead_text: ?[]const u8 = null,
+
+    pub fn identity(self: *const AdmittedRun) RunIdentity {
+        std.debug.assert(!self.completed);
+        return self.identity_value;
+    }
+
+    pub fn abortSignal(self: *const AdmittedRun) *const AbortSignal {
+        std.debug.assert(!self.completed);
+        return &self.session.abort_signal;
+    }
+
+    /// Complete an admitted Run without appending to Conversation or entering
+    /// the provider/tool loop. The Run ID remains consumed by admission.
+    pub fn finishWithoutConversation(
+        self: *AdmittedRun,
+    ) LifecycleError!AdmittedCompletion {
+        if (self.completed) return error.InvalidSessionState;
+        const completion = try self.session.finishAdmittedRun(self.identity_value);
+        self.completed = true;
+        return completion;
+    }
+
+    /// Append the already-prepared root prompt and reuse the ordinary Run
+    /// pipeline. Any failure after this call begins has normal admitted-Run
+    /// poison semantics, except the project rules refusing the Run
+    /// (`RunControlConfig.project_rules`, #445): that error returns with the
+    /// Run finished, the prompt not appended and the Session idle.
+    pub fn runText(
+        self: *AdmittedRun,
+        prompt: []const u8,
+        max_turns: u32,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithPolicy(&.{prompt}, max_turns, null);
+    }
+
+    /// Continue an admitted Run with a caller-defined sequence of user
+    /// records and an immutable execution upper bound. Appends and provider
+    /// execution retain the ordinary poison semantics; a project-rules
+    /// refusal fails only the Run, as for `runText`.
+    pub fn runUserMessagesWithPolicy(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithToolSurface(
+            prompts,
+            max_turns,
+            execution_policy,
+            null,
+        );
+    }
+
+    /// Continue an admitted Run with a caller-owned tool overlay. This is the
+    /// only shared-core seam needed by AgentCore's bound Skill catalog; it
+    /// changes neither provider behavior nor the agent-loop tool protocol.
+    pub fn runUserMessagesWithToolSurface(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithToolSurfaceImpl(
+            prompts,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            null,
+        );
+    }
+
+    /// Borrow a facade-owned Provider for this admitted synchronous Run. This
+    /// narrow override exists so embedding layers can enforce per-operation
+    /// admission without mutating the Session-owned Provider or duplicating
+    /// the shared agent loop. The caller keeps the Provider context alive until
+    /// the Run and all of its workers have quiesced.
+    pub fn runUserMessagesWithToolSurfaceUsingProvider(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithToolSurfaceImpl(
+            prompts,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            provider_override,
+        );
+    }
+
+    fn runUserMessagesWithToolSurfaceImpl(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: ?provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        if (prompts.len == 0) {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        }
+        try self.session.claimAdmittedRun(self.identity_value);
+        self.completed = true;
+        return self.session.runLoop(
+            self.identity_value,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            provider_override,
+            self.stream_retry_budget,
+            if (self.lead_text) |lead|
+                .{ .led_prompts = .{ .lead = lead, .prompts = prompts } }
+            else
+                .{ .prompts = prompts },
+        );
+    }
+
+    /// Continue an admitted Run with one multimodal user record built from
+    /// ordered text/image parts. Part bytes are borrowed and copied while the
+    /// record is built, which happens **before** the Run is claimed: a build
+    /// failure returns its error with the Run finished cleanly, no provider
+    /// request sent, and the session left usable for the next Run. Provider
+    /// execution retains the ordinary poison semantics; a non-vision model
+    /// still fails the provider serializer with `error.ImageInputUnsupported`
+    /// before any network I/O.
+    pub fn runUserParts(
+        self: *AdmittedRun,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserPartsWithToolSurfaceImpl(parts, max_turns, null, null, null);
+    }
+
+    /// Multimodal companion of `runUserMessagesWithToolSurfaceUsingProvider`:
+    /// the same facade-owned Provider override and tool overlay, with one
+    /// ordered text/image user record instead of text prompts.
+    pub fn runUserPartsWithToolSurfaceUsingProvider(
+        self: *AdmittedRun,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserPartsWithToolSurfaceImpl(
+            parts,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            provider_override,
+        );
+    }
+
+    fn runUserPartsWithToolSurfaceImpl(
+        self: *AdmittedRun,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: ?provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        if (parts.len == 0) {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        }
+        // 构造记录先于认领 Run:构造失败(输入不合法、OOM)是这次输入的问题,
+        // 该走与上面 parts.len==0 同一条干净退出(Run 正常收尾、不发请求、
+        // 会话可继续下一个 Run),而不是把会话毒掉。
+        const record = message_mod.userMessageFromParts(
+            self.session.conversation.allocator,
+            parts,
+        ) catch |err| {
+            _ = try self.finishWithoutConversation();
+            return err;
+        };
+        self.session.claimAdmittedRun(self.identity_value) catch |err| {
+            record.deinit(self.session.conversation.allocator);
+            return err;
+        };
+        self.completed = true;
+        // 此后失败才是普通的 admitted-Run poison 语义;record 归 runLoop
+        // (追加进 Conversation,或在追加前失败时由它释放)。
+        return self.session.runLoop(
+            self.identity_value,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            provider_override,
+            self.stream_retry_budget,
+            .{ .record = record },
+        );
+    }
+
+    /// Resume a Run that ended `suspended` (`RunResult.suspend_info`, #446):
+    /// `results` answer the tool calls of the Conversation's last assistant
+    /// turn, the suspended one's first, followed by the `completed_results`
+    /// of its siblings, and enter the Conversation as one user message
+    /// (`agent_loop.resumeRunWithResults`); the loop then goes on as any Run
+    /// does. Borrowed for the call.
+    ///
+    /// Everything that was per-Run in the suspended Run is the caller's to
+    /// give again: `max_turns`, and `stream_retry_budget` on this admission.
+    /// The Conversation, permissions and configuration are the Session's own
+    /// and carry over by themselves.
+    ///
+    /// Refused before anything changes, the admitted Run finished cleanly:
+    /// `error.NothingToResume` when the Conversation does not end in an
+    /// assistant turn with tool calls, `error.ResumeMismatch` when a result
+    /// names a call that turn did not make or names one twice. The project
+    /// rules refusing the Run (`RunControlConfig.project_rules`, #445) also
+    /// return with the Run finished, the results not recorded and the
+    /// Session idle: the suspended turn still waits for them, and another
+    /// admitted Run can resume it.
+    pub fn resumeWithResults(
+        self: *AdmittedRun,
+        results: []const agent_loop.SuspendInfo.CompletedResult,
+        max_turns: u32,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        checkResumable(&self.session.conversation, results) catch |err| {
+            _ = try self.finishWithoutConversation();
+            return err;
+        };
+        try self.session.claimAdmittedRun(self.identity_value);
+        self.completed = true;
+        return self.session.runLoop(
+            self.identity_value,
+            max_turns,
+            null,
+            null,
+            null,
+            self.stream_retry_budget,
+            .{ .resumption = results },
+        );
+    }
+
+    /// Run a synchronous child executor under this already-admitted Run. The
+    /// parent Conversation receives the supplied root records and, only after
+    /// successful quiescence, the executor's non-empty final assistant text.
+    /// Errors poison through the same lifecycle as the ordinary agent loop.
+    pub fn runIsolated(
+        self: *AdmittedRun,
+        root_records: []const []const u8,
+        executor: IsolatedRunExecutor,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        if (root_records.len == 0) {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        }
+        // The executor runs its own loop, out of the project rule gate's
+        // reach: refused before anything changes, the Session still usable.
+        if (self.session.run_control.project_rules == .enforced) {
+            _ = try self.finishWithoutConversation();
+            return error.ProjectRulesUnsupportedForIsolatedRun;
+        }
+        try self.session.claimAdmittedRun(self.identity_value);
+        self.completed = true;
+        // The executor runs on its own Conversation, discarded when it returns:
+        // no boundary of this Run can adopt Host input, so stop accepting it.
+        self.session.refuseRunInputs();
+        self.session.appendUserTexts(self.lead_text, root_records) catch |err| {
+            _ = self.session.poisonRun();
+            return err;
+        };
+
+        var final_text = std.ArrayList(u8).empty;
+        defer final_text.deinit(self.session.allocator);
+        var backend = ui_backend.UiBackend{
+            .ctx = @ptrCast(self.session),
+            .emit = AgentSession.backendEmit,
+            .poll = AgentSession.backendPoll,
+        };
+        var rendered_prompt = self.session.renderSubagentPrompt(self.session.allocator) catch |err| {
+            _ = self.session.poisonRun();
+            return err;
+        };
+        defer rendered_prompt.deinit(self.session.allocator);
+        var run_journal: ?tool_observation_journal.Journal = if (self.session.run_journal_root.len == 0)
+            null
+        else
+            tool_observation_journal.Journal.initWithOptions(
+                self.session.run_journal_root,
+                self.identity_value.session_id,
+                .{ .prompt = rendered_prompt.manifest, .abandoned_run = self.session.run_control.abandoned_run },
+            ) catch |err| {
+                _ = self.session.poisonRun();
+                return err;
+            };
+        defer if (run_journal) |*journal| journal.deinit();
+        self.session.announcePromptManifest(rendered_prompt.manifest) catch |err| {
+            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
+            _ = self.session.poisonRun();
+            return err;
+        };
+        const evidence = RunExecutionEvidence{
+            .tool_observer = if (run_journal) |*journal| journal.sink() else null,
+            .execution_boundary = if (run_journal) |*journal| journal.executionBoundary() else null,
+            .system_prompt = rendered_prompt.text,
+        };
+        var native_result = executor.execute(
+            self.session.allocator,
+            self.identity_value,
+            &backend,
+            &self.session.abort_signal,
+            evidence,
+            &final_text,
+        ) catch |err| {
+            if (run_journal) |*journal| journal.finishRun(@errorName(err)) catch {};
+            const callback_failed = self.session.poisonRun();
+            if (callback_failed) return error.CallbackFailed;
+            return err;
+        };
+
+        // The executor contract guarantees event-producer quiescence here, so
+        // callback_failed cannot change between this observation and terminal.
+        if (!self.session.callbackFailed() and final_text.items.len != 0) {
+            self.session.conversation.appendText(.assistant, final_text.items) catch |err| {
+                if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+                _ = self.session.poisonRun();
+                return err;
+            };
+        }
+
+        if (run_journal) |*journal| journal.finishRun(@tagName(native_result.stop_reason)) catch {
+            if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+            _ = self.session.poisonRun();
+            return error.RunJournalFailed;
+        };
+
+        const completion = self.session.finishRunLifecycle();
+        if (completion.callback_failed) {
+            if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+            return error.CallbackFailed;
+        }
+        if (completion.abort_requested) native_result.stop_reason = .aborted;
+        return native_result;
+    }
+};
+
+pub const AdmittedCompletion = struct {
+    aborted: bool,
+};
+
+pub const AgentSession = struct {
+    allocator: std.mem.Allocator,
+    runtime: *AgentRuntime,
+    session_id: SessionId,
+    /// The provider credential (issue #336), owned. Every provider this
+    /// Session builds — its own, a `setModel` replacement, a tool's per-call
+    /// provider — reads it at each request, so `updateCredential` reaches them
+    /// all. Destroyed after the last of them.
+    credential: *credential_cell.Cell,
+    model: []u8,
+    base_url: ?[]u8,
+    openai_protocol: types.OpenAIProtocol,
+    /// Carried so a tool-scoped provider authenticates the way the session's
+    /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
+    /// the right key and the wrong header. Owned (`dupeAuthScheme`), so a
+    /// route `setRoute` took outlives the Host's copy.
+    auth_scheme: ?AuthScheme = null,
+    /// Carried with `auth_scheme`: a tool-scoped provider writes the route's
+    /// dialect. Declared for `model`; a model switch keeps only the route's part.
+    dialect: @import("metacodes-ai").provider.vendor.Declaration = .{},
+    /// Owned copy of `SessionConfig.model_capabilities`, handed to every
+    /// provider this Session builds.
+    model_capabilities: image_capability.Declarations = .{},
+    provider: provider_factory.OwnedProvider,
+    /// The effort last applied to `provider`; reapplied to a replacement
+    /// provider by `setModel`.
+    reasoning_effort: ?types.ReasoningEffort = null,
+    conversation: Conversation,
+    workspace: workspace_mod.WorkspacePolicy,
+    artifact_root: []u8,
+    run_journal_root: []u8,
+    /// `SessionConfig.run_control`; meaningful only with a durable journal.
+    run_control: RunControlConfig,
+    tool_result_metrics: @import("metacodes-coding").core.tool_result_metrics.Metrics = .{},
+    tools: tool_catalog.Selection,
+    read_state: ReadState,
+    jobs: ?JobRegistry,
+    /// Issue #445: the Session's scheduled prompts, present when it selected
+    /// a cron tool. The cron tools change it during a Run and
+    /// `takeDueCronPrompts` while idle; never persisted.
+    cron: ?CronRegistry = null,
+    session_rules: SessionRules,
+    imported_permission_rules: ?permission_settings.MergedSettings,
+    permission_ctx: permission.PermissionContext,
+    host_ui_requester: ?UiRequester,
+    host_run_ui_requester: ?AgentSessionUiRequester,
+    /// Host tool 身份锚点(SessionConfig.host_identity_ctx,core 只透传)。
+    host_identity_ctx: ?*anyopaque = null,
+    /// The validated prompt profile every Run renders from (#184). Replaced
+    /// only by `setPromptProfile` while idle.
+    prompt_profile: prompt_sections.OwnedProfile = .{},
+    /// Manifest of the system prompt the latest Run sent; a Run whose prompt
+    /// differs delivers its manifest as a `prompt_manifest` event.
+    last_prompt_manifest: ?prompt_sections.OwnedManifest = null,
+    /// Issue #277: the Session's goal, changed only while idle (`setGoal`,
+    /// `updateGoal`, `clearGoal`) or by its own Runs through `goal_meter`.
+    goal_state: goal_mod.State,
+    /// Charges `goal_state` for each Run; points into this Session.
+    goal_meter: goal_mod.Meter = undefined,
+    /// What the Run that just returned failed on, when it stopped on the model
+    /// (issue #408). Written by that Run on its own thread and read by whoever
+    /// made the run call, before the next one.
+    last_model_error: ?model_error.Detail = null,
+    /// Issue #277: this Session's team membership, when `SessionConfig.team`
+    /// was set. Host-scheduled: the lead's `SpawnTeammate` records requests
+    /// the embedding Host fulfils; the runtime never starts a teammate. Null
+    /// for a Session with no team. The Run passes `&swarm.?` as the agent
+    /// loop's swarm context so the team tools execute.
+    swarm: ?swarm_context.SwarmContext = null,
+    /// Member role only: the Session-owned copy of this member's name that
+    /// `swarm.self_name` borrows (the lead's `self_name` is the static
+    /// "team-lead"). Freed at deinit.
+    swarm_self_name: ?[]u8 = null,
+    abort_signal: AbortSignal,
+    compact_abort_signal: AbortSignal,
+    active_sink: ?EventSink = null,
+    /// Run-scoped candidate-response boundary (issue #34).
+    ///
+    /// Installed by the embedding facade around one Run, alongside whatever
+    /// Provider override that facade supplies, and cleared when the Run
+    /// finishes. Null is the ordinary path: the loop assembles and commits
+    /// exactly as before, unobserved.
+    response_observer: ?@import("metacodes-coding").core.response_candidate.Observer = null,
+    /// Run-scoped durable-state compaction control (issue #430). Installed by
+    /// the embedding facade around one Run together with its budgeted
+    /// Provider, like `response_observer`; null leaves compaction to the
+    /// loop's own token-window policy.
+    compaction_control: ?@import("metacodes-coding").core.compaction_control.Control = null,
+    /// Host input submitted to the active Run (#270). Opened at admission,
+    /// closed on every path that ends the Run; between Runs it keeps the
+    /// counts of the last one (`runInputReconciliation`).
+    run_inputs: run_input.Queue,
+    /// Durable-state admission the next Run's input window starts with.
+    /// Installed by the embedding facade around one Run, like
+    /// `response_observer`; null admits input without a budget.
+    run_input_admission: ?run_input.Admission = null,
+
+    mutex: sync.Mutex = .{},
+    callback_mutex: sync.Mutex = .{},
+    state: State = .idle,
+    active_run_id: u64 = 0,
+    /// Shared exactly-once gate for copyable `AdmittedRun` values. False means
+    /// no Conversation mutation has begun; the first continuation claims it.
+    active_run_started: bool = false,
+    /// Highest admitted Run ID. Zero is the no-Run sentinel; admission only
+    /// replaces it with a strictly greater value, preventing ABA reuse.
+    last_run_id: u64 = 0,
+    active_compact_id: u64 = 0,
+    active_compact_provider: ?provider_mod.Provider = null,
+    /// Number of matching abort calls that borrowed a provider under `mutex`
+    /// and have not yet returned from `Provider.cancel`. A terminal Run or
+    /// compact may publish `.idle` first; all later activity admission remains
+    /// BUSY until these borrows drain, so model replacement/destroy cannot free
+    /// a provider still used by a cross-thread abort.
+    in_flight_provider_cancels: usize = 0,
+    /// Broadcast under `mutex` when `in_flight_provider_cancels` reaches zero
+    /// (`awaitProviderCancelsDrained`).
+    provider_cancels_drained: sync.Condition = .{},
+    /// Issue #445: this Session's imported rules and additional directories
+    /// as other Sessions' permission decisions read them
+    /// (`inheritPermissions`). Republished by `updatePermissionRules` and
+    /// `setAdditionalDirectories`; permission/lent.zig states the locking
+    /// rule.
+    lent_permissions: permission.LentPermissions = .{},
+    /// Sessions that decide with this one's permissions
+    /// (`inheritPermissions`) and are not destroyed yet; under `mutex`.
+    /// `destroy` waits for zero, so a lender outlives every borrower.
+    permission_heirs: usize = 0,
+    /// Broadcast under `mutex` when `permission_heirs` reaches zero.
+    permission_heirs_gone: sync.Condition = .{},
+    /// The Session whose permissions this one decides with
+    /// (`inheritPermissions`): set once while idle, given back only at the
+    /// end of `destroy`.
+    permission_lender: ?*AgentSession = null,
+    last_admitted_compact_id: u64 = 0,
+    last_terminal_compact_id: u64 = 0,
+    callback_failed: bool = false,
+
+    fn limitSingleAddressWorkers(provider: *const provider_factory.OwnedProvider, base_url: ?[]const u8) void {
+        const uri = std.Uri.parse(base_url orelse return) catch return;
+        var buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = uri.getHost(&buffer) catch return;
+        _ = @import("platform").net.parseIpLiteral(host.bytes, 0) catch return;
+        provider.io.setAsyncLimit(provider.io.async_limit.min(.limited(2)));
+    }
+
+    fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
+        const self: *AgentSession = @ptrCast(@alignCast(raw));
+        return provider_factory.makeProviderWithOptions(
+            std.heap.c_allocator,
+            self.provider.kind(),
+            .{ .replaceable = self.credential },
+            self.model,
+            self.base_url,
+            self.openai_protocol,
+            self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = self.auth_scheme, .dialect = self.dialect, .limits = null, .capability_declarations = self.model_capabilities },
+        );
+    }
+
+    fn toolProviderFactory(self: *AgentSession) provider_factory.Factory {
+        return .{ .ctx = @ptrCast(self), .makeFn = &makeToolProvider };
+    }
+
+    /// Allocate directly at the final address. This avoids the invalid
+    /// init-by-value + bind(self) pattern where a later move leaves backend ctx
+    /// pointing at stale storage.
+    pub fn create(runtime: *AgentRuntime, config: SessionConfig) !*AgentSession {
+        return createWithHooks(runtime, config, .{});
+    }
+
+    pub fn createRestored(
+        runtime: *AgentRuntime,
+        config: SessionConfig,
+        restored: RestoredSessionState,
+    ) !*AgentSession {
+        if (std.mem.eql(
+            u8,
+            restored.session_id.asSlice(),
+            SessionId.single.asSlice(),
+        ) or restored.conversation.compact_boundary >
+            restored.conversation.messages.items.len)
+            return error.InvalidRestoredState;
+        return createWithHooks(runtime, config, .{ .restored = restored });
+    }
+
+    fn createWithHooks(runtime: *AgentRuntime, config: SessionConfig, hooks: SessionCreateHooks) !*AgentSession {
+        if (system_prompt_mod.validateProfile(config.prompt_profile) != null) return error.InvalidPromptProfile;
+        // A policy without the journal it governs would be a silent no-op.
+        if (!config.run_journal.enabled() and !config.run_control.isDefault()) return error.RunControlRequiresRunJournal;
+        try runtime.retainSession();
+        errdefer runtime.releaseSession();
+        const allocator = runtime.allocator;
+        const self = try allocator.create(AgentSession);
+        errdefer allocator.destroy(self);
+
+        var workspace = try workspace_mod.WorkspacePolicy.init(allocator, config.workspace);
+        errdefer workspace.deinit();
+        var selected_names: std.ArrayList([]const u8) = .empty;
+        defer selected_names.deinit(allocator);
+        try selected_names.appendSlice(allocator, config.allowed_tools);
+        if (config.artifact_store.enabled() and !containsToolName(selected_names.items, "ReadArtifact"))
+            try selected_names.append(allocator, "ReadArtifact");
+        var selected_tools = try tool_catalog.Selection.init(allocator, &runtime.catalog, selected_names.items);
+        errdefer selected_tools.deinit();
+        for (selected_tools.entries) |entry| {
+            if (!workspace.allowsTool(entry.definition.name)) return error.ShellToolDisabled;
+            // 选了 Host tool 却没有身份锚点 → admission 拒绝,消灭运行期空态。
+            if ((entry.executor == .host_sync or entry.executor == .host_stream) and
+                config.host_identity_ctx == null)
+                return error.HostIdentityRequired;
+            if (entry.executor == .host_stream and !config.artifact_store.enabled())
+                return error.ArtifactStoreRequired;
+        }
+        var jobs: ?JobRegistry = null;
+        if (selected_tools.contains("Bash") or selected_tools.contains("BashOutput") or selected_tools.contains("KillShell")) {
+            jobs = try JobRegistry.init(allocator);
+        }
+        errdefer if (jobs) |*registry| registry.deinit();
+        var cron: ?CronRegistry = null;
+        for (CRON_BUILTIN_TOOLS) |name| {
+            if (cron == null and selected_tools.contains(name)) cron = CronRegistry.init(allocator);
+        }
+        errdefer if (cron) |*registry| registry.deinit();
+        var imported_permission_rules: ?permission_settings.MergedSettings =
+            if (config.permission_rules) |rules|
+                if (rules.isEmpty())
+                    null
+                else
+                    try permission_settings.buildRuleSet(allocator, rules, .{})
+            else
+                null;
+        errdefer if (imported_permission_rules) |*rules| rules.deinit();
+
+        const credential = try credential_cell.Cell.create(allocator, config.api_key);
+        errdefer credential.destroy();
+        const model = try allocator.dupe(u8, config.model);
+        errdefer allocator.free(model);
+        const base_url = if (config.base_url) |url| try allocator.dupe(u8, url) else null;
+        errdefer if (base_url) |url| allocator.free(url);
+        const auth_scheme = try dupeAuthScheme(allocator, config.auth_scheme);
+        errdefer freeAuthScheme(allocator, auth_scheme);
+        var prompt_profile = try prompt_sections.OwnedProfile.clone(allocator, config.prompt_profile);
+        errdefer prompt_profile.deinit();
+        var model_capabilities = try image_capability.Declarations.init(allocator, config.model_capabilities);
+        errdefer model_capabilities.deinit();
+
+        var conversation = if (hooks.restored) |restored|
+            try restored.conversation.cloneInto(allocator)
+        else
+            Conversation.init(allocator);
+        errdefer conversation.deinit();
+        var goal_state = goal_mod.State.init(allocator);
+        errdefer goal_state.deinit();
+        if (hooks.restored) |restored| if (restored.goal) |g| {
+            goal_state.current = try g.clone(allocator);
+        };
+
+        var owned_provider = try provider_factory.makeProviderWithOptions(
+            allocator,
+            config.provider_kind,
+            .{ .replaceable = credential },
+            model,
+            base_url,
+            config.openai_protocol,
+            runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = auth_scheme, .dialect = config.dialect, .limits = null, .capability_declarations = model_capabilities },
+        );
+        errdefer owned_provider.deinit();
+        limitSingleAddressWorkers(&owned_provider, base_url);
+        if (config.reasoning_effort) |effort| try owned_provider.provider().setReasoningEffort(effort);
+
+        // collision detection:锁下原子注册,冲突则重新生成;重试超限 = 生成器故障,
+        // 报不可达级错误而非无限循环。创建失败由 errdefer 回滚注册。
+        const session_id = if (hooks.restored) |restored| restored_id: {
+            if (!(try runtime.registerSessionId(restored.session_id)))
+                return error.SessionAlreadyOpen;
+            break :restored_id restored.session_id;
+        } else blk: {
+            var attempts: usize = 0;
+            while (attempts < AgentRuntime.MAX_SESSION_ID_RETRIES) : (attempts += 1) {
+                const candidate = hooks.session_id_source.next();
+                if (try runtime.registerSessionId(candidate)) break :blk candidate;
+            }
+            return error.SessionIdGeneratorBroken;
+        };
+        errdefer runtime.unregisterSessionId(session_id);
+        try hooks.afterIdRegistered();
+        const artifact_root = try config.artifact_store.resolve(allocator, workspace, session_id);
+        errdefer allocator.free(artifact_root);
+        const run_journal_root = try config.run_journal.resolve(allocator, workspace, session_id);
+        errdefer allocator.free(run_journal_root);
+        if (config.run_journal.enabled()) try util_fs.mkdirParents(run_journal_root);
+        var permission_ctx = permission.createContext(config.permission_mode, allocator);
+        permission_ctx.session = session_id;
+
+        // Issue #277: this Session's host-scheduled team membership. Built from
+        // slices and ids, not `self` pointers, so it is assembled before the
+        // literal like `goal_state`. The member also joins the on-disk roster.
+        var swarm_self_name: ?[]u8 = null;
+        errdefer if (swarm_self_name) |n| allocator.free(n);
+        var swarm_ctx: ?swarm_context.SwarmContext = if (config.team) |team|
+            try buildSwarmContext(allocator, team, session_id, workspace.state_root, &swarm_self_name)
+        else
+            null;
+        errdefer if (swarm_ctx) |*s| s.deinit();
+        if (swarm_ctx) |*s| s.preview = runtime.preview;
+
+        self.* = .{
+            .allocator = allocator,
+            .runtime = runtime,
+            .session_id = session_id,
+            .credential = credential,
+            .model = model,
+            .base_url = base_url,
+            .openai_protocol = config.openai_protocol,
+            .auth_scheme = auth_scheme,
+            .dialect = config.dialect,
+            .model_capabilities = model_capabilities,
+            .provider = owned_provider,
+            .reasoning_effort = config.reasoning_effort,
+            .conversation = conversation,
+            .workspace = workspace,
+            .artifact_root = artifact_root,
+            .run_journal_root = run_journal_root,
+            .run_control = config.run_control,
+            .tools = selected_tools,
+            .read_state = ReadState.init(allocator),
+            .jobs = jobs,
+            .cron = cron,
+            .session_rules = .{},
+            .imported_permission_rules = imported_permission_rules,
+            .permission_ctx = permission_ctx,
+            .host_ui_requester = config.ui_requester,
+            .host_run_ui_requester = config.run_ui_requester,
+            .host_identity_ctx = config.host_identity_ctx,
+            .prompt_profile = prompt_profile,
+            .goal_state = goal_state,
+            .swarm = swarm_ctx,
+            .swarm_self_name = swarm_self_name,
+            .abort_signal = AbortSignal.init(),
+            .compact_abort_signal = AbortSignal.init(),
+            .run_inputs = run_input.Queue.init(allocator, .{}),
+            .last_run_id = if (hooks.restored) |restored|
+                restored.last_run_id
+            else
+                0,
+            .last_admitted_compact_id = if (hooks.restored) |restored|
+                restored.last_compact_id
+            else
+                0,
+            .last_terminal_compact_id = if (hooks.restored) |restored|
+                restored.last_compact_id
+            else
+                0,
+        };
+        self.goal_meter = goal_mod.Meter.init(&self.goal_state);
+        self.permission_ctx.session_rules = &self.session_rules;
+        self.permission_ctx.settings = if (self.imported_permission_rules) |*rules|
+            rules
+        else
+            null;
+        self.permission_ctx.ui_requester = if (config.ui_requester != null or config.run_ui_requester != null)
+            .{ .ctx = self, .requestFn = requestHostUi }
+        else
+            null;
+        // A UI-neutral library must never fall back to process stdin. Until a
+        // Host requester is attached, `.ask` decisions fail closed.
+        self.permission_ctx.no_interactive_prompt = true;
+        self.permission_ctx.match_ctx = .{
+            .cwd = self.workspace.root,
+            .project_root = self.workspace.root,
+            .home = self.workspace.home,
+            .additional_dirs = self.workspace.additional_dirs,
+        };
+        // The same settings the Bash tool wraps with (`.sandbox` in run
+        // options): autoAllowBashIfSandboxed allows only a call they really
+        // confine, and a sandboxed shell ignores `dangerouslyDisableSandbox`.
+        self.permission_ctx.sandbox = self.workspace.sandbox();
+        self.lent_permissions.publish(self.permission_ctx.settings, self.workspace.additional_dirs);
+        return self;
+    }
+
+    /// Destroy requires unique ownership of `self` and is valid only after the
+    /// synchronous activity and every matching abort and `submitInput` call
+    /// have returned. As
+    /// with allocator.destroy, using the pointer again after success is invalid.
+    pub fn destroy(self: *AgentSession) LifecycleError!void {
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle, .poisoned => self.state = .destroying,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        // #445: a Session others decide with outlives them. `.destroying`
+        // admits no new borrower; the ones there leave at the end of their
+        // own destroy.
+        while (self.permission_heirs > 0) self.permission_heirs_gone.wait(&self.mutex);
+        self.mutex.unlock();
+
+        const allocator = self.allocator;
+        const runtime = self.runtime;
+        const sid = self.session_id;
+        const lender = self.permission_lender;
+        self.provider.deinit();
+        self.conversation.deinit();
+        self.run_inputs.deinit();
+        if (self.jobs) |*registry| registry.deinit();
+        if (self.cron) |*registry| registry.deinit();
+        if (self.imported_permission_rules) |*rules| rules.deinit();
+        self.read_state.deinit();
+        self.tools.deinit();
+        self.workspace.deinit();
+        self.prompt_profile.deinit();
+        self.goal_state.deinit();
+        if (self.swarm) |*s| s.deinit();
+        if (self.swarm_self_name) |n| allocator.free(n);
+        self.model_capabilities.deinit();
+        if (self.last_prompt_manifest) |*manifest| manifest.deinit();
+        allocator.free(self.artifact_root);
+        allocator.free(self.run_journal_root);
+        if (self.base_url) |url| allocator.free(url);
+        freeAuthScheme(allocator, self.auth_scheme);
+        allocator.free(self.model);
+        // After every provider that read it: `provider` above, and each tool
+        // provider, which lives within a Run.
+        self.credential.destroy();
+        self.* = undefined;
+        allocator.destroy(self);
+        // Last: nothing of this Session reads the lender's state any more
+        // (its Runs, jobs and scoped permission copies are gone).
+        if (lender) |lead| lead.releasePermissionHeir();
+        // destroy 成功必须注销(先于 releaseSession:live==0 时 registry 必须已空)。
+        runtime.unregisterSessionId(sid);
+        runtime.releaseSession();
+    }
+
+    /// Return the core state machine's poison decision. Poisoned is terminal
+    /// for a live Session, so callers may safely mirror a true result.
+    pub fn isPoisoned(self: *AgentSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.state == .poisoned;
+    }
+
+    /// Immutable plugin generation pinned when this Session was admitted.
+    pub fn pluginGeneration(self: *const AgentSession) plugin_contract.GenerationId {
+        return self.runtime.plugin_snapshot.generation;
+    }
+
+    /// Admit an immutable committed-state view without copying the long
+    /// Conversation. The dedicated lifecycle state prevents every mutation
+    /// until the caller releases the returned lease.
+    pub fn snapshotCommitted(self: *AgentSession) CheckpointError!CheckpointLease {
+        return self.snapshotCommittedWithJobs(false);
+    }
+
+    /// Run-budget finalization only needs a coherent durable-state read.
+    /// Runtime jobs are intentionally excluded from the checkpoint payload and
+    /// do not participate in this internal measurement boundary.
+    pub fn snapshotCommittedForRunMeasurement(self: *AgentSession) CheckpointError!CheckpointLease {
+        return self.snapshotCommittedWithJobs(true);
+    }
+
+    fn snapshotCommittedWithJobs(
+        self: *AgentSession,
+        allow_runtime_jobs: bool,
+    ) CheckpointError!CheckpointLease {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.in_flight_provider_cancels != 0)
+            return error.SessionBusy;
+        switch (self.state) {
+            .idle => {},
+            .running,
+            .abort_requested,
+            .compacting,
+            .compact_finishing,
+            .mutating,
+            .checkpointing,
+            => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        if (!allow_runtime_jobs) {
+            if (self.jobs) |*registry| {
+                if (registry.activeCount() != 0) return error.SessionBusy;
+            }
+        }
+        self.state = .checkpointing;
+        return .{
+            .session = self,
+            .session_id = self.session_id,
+            .last_run_id = self.last_run_id,
+            .last_compact_id = self.last_terminal_compact_id,
+            .model = self.model,
+            .conversation = &self.conversation,
+        };
+    }
+
+    fn finishCheckpoint(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .checkpointing);
+        self.state = .idle;
+    }
+
+    /// Atomically replace the Session's effective model/provider pair.
+    ///
+    /// Provider construction happens after the mutation gate is acquired but
+    /// before publication. A construction failure restores `.idle` and leaves
+    /// every existing Session-owned object untouched.
+    pub fn setModel(self: *AgentSession, requested_model: []const u8) ModelMutationError!void {
+        if (requested_model.len == 0 or
+            !std.unicode.utf8ValidateSlice(requested_model))
+            return error.InvalidModel;
+
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        if (std.mem.eql(u8, self.model, requested_model)) {
+            self.mutex.unlock();
+            return;
+        }
+        self.state = .mutating;
+        const provider_kind = self.provider.kind();
+        self.mutex.unlock();
+
+        const replacement_model = self.allocator.dupe(u8, requested_model) catch {
+            self.cancelMutation();
+            return error.OutOfMemory;
+        };
+        errdefer self.allocator.free(replacement_model);
+        // Same options as creation: the route's auth scheme and the Host's
+        // capability declarations belong to the Session, not to one model.
+        // A model entry's dialect declaration does: the new model keeps only
+        // the route's.
+        const replacement_dialect = self.dialect.rebind(self.model, replacement_model);
+        var replacement_provider = provider_factory.makeProviderWithOptions(
+            self.allocator,
+            provider_kind,
+            .{ .replaceable = self.credential },
+            replacement_model,
+            self.base_url,
+            self.openai_protocol,
+            self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = self.auth_scheme, .dialect = replacement_dialect, .limits = null, .capability_declarations = self.model_capabilities },
+        ) catch |err| {
+            self.cancelMutation();
+            return err;
+        };
+        errdefer replacement_provider.deinit();
+        limitSingleAddressWorkers(&replacement_provider, self.base_url);
+        // A fresh client starts at the provider default; carry the Session's
+        // effort over. The replacement has the same provider kind, whose
+        // client accepted this effort when it was set, so it has the setter.
+        if (self.reasoning_effort) |effort|
+            replacement_provider.provider().setReasoningEffort(effort) catch unreachable;
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous_model = self.model;
+        const previous_provider = self.provider;
+        self.model = replacement_model;
+        self.dialect = replacement_dialect;
+        self.provider = replacement_provider;
+        self.mutex.unlock();
+
+        // Concrete clients borrow their model bytes, so destroy the previous
+        // provider before releasing its backing model slice. Keep the mutation
+        // gate held until cleanup finishes so a direct Core destroy cannot
+        // reclaim `self` while this call still reads its allocator.
+        previous_provider.deinit();
+        self.allocator.free(previous_model);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// Atomically replace the Host-imported canonical permission rule layer.
+    /// Session-local allow/deny memory is a distinct field and is preserved.
+    pub fn updatePermissionRules(
+        self: *AgentSession,
+        input: permission_settings.RuleSetInput,
+    ) PermissionRuleMutationError!void {
+        self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        const replacement: ?permission_settings.MergedSettings =
+            if (input.isEmpty())
+                null
+            else
+                permission_settings.buildRuleSet(
+                    self.allocator,
+                    input,
+                    .{},
+                ) catch |err| {
+                    self.cancelMutation();
+                    return err;
+                };
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous = self.imported_permission_rules;
+        self.imported_permission_rules = replacement;
+        self.permission_ctx.settings = if (self.imported_permission_rules) |*rules|
+            rules
+        else
+            null;
+        // Borrowers' next decision reads the new layer, and none reads
+        // `previous` once `publish` returns, so it is freed below.
+        self.lent_permissions.publish(self.permission_ctx.settings, self.workspace.additional_dirs);
+        self.mutex.unlock();
+
+        if (previous) |rules_value| {
+            var rules = rules_value;
+            rules.deinit();
+        }
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// Replace the Session's permission mode at the idle mutation boundary.
+    /// The next permission decision uses it. Imported rules and Session-local
+    /// allow/deny memory are separate layers and are left as they are. A mode
+    /// the Session's settings disable is refused with
+    /// `error.PermissionModeDisabled` and the mode stays as it was.
+    pub fn setPermissionMode(
+        self: *AgentSession,
+        mode: types.PermissionMode,
+    ) PermissionModeMutationError!void {
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        // Settings are stable while this mutation holds the Session (a rule
+        // update is another mutation).
+        if (!self.permission_ctx.modeAllowed(mode)) {
+            self.cancelMutation();
+            return error.PermissionModeDisabled;
+        }
+
+        // The mode sink, when one is attached, runs outside the Session lock.
+        self.permission_ctx.setMode(mode);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// Replace the Session's additional working directories at the idle
+    /// mutation boundary. Every directory is validated and resolved before
+    /// the Session changes; on error the previous set stays in force. The
+    /// next permission decision and Run use the new set.
+    pub fn setAdditionalDirectories(
+        self: *AgentSession,
+        dirs: []const []const u8,
+    ) AdditionalDirectoriesMutationError!void {
+        self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        // `.mutating` keeps destroy and every other activity out until the
+        // old set is freed, so nothing below races a teardown of `self`.
+        const replacement = workspace_mod.resolveAdditionalDirs(self.allocator, self.workspace.root, dirs) catch |err| {
+            self.cancelMutation();
+            return err;
+        };
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous = self.workspace.additional_dirs;
+        self.workspace.additional_dirs = replacement;
+        self.permission_ctx.match_ctx.additional_dirs = replacement;
+        // As for the rules: borrowers read the new set from their next
+        // decision on, and none reads `previous` once `publish` returns.
+        self.lent_permissions.publish(self.permission_ctx.settings, replacement);
+        self.mutex.unlock();
+        workspace_mod.freeDirs(self.allocator, previous);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// Issue #445: from now on this Session decides every tool call with
+    /// `lead`'s imported permission rules and additional working directories
+    /// as they are at that call, and both Sessions remember "allow
+    /// always"/"deny" answers in `lead`'s Session memory and read it: a rule
+    /// or directory the lead gains later applies to this Session's next tool
+    /// call, as the bundled daemon's in-process teammates borrow their lead's
+    /// permission context. This Session's own rules, directories and memory
+    /// are no longer read, so `updatePermissionRules` and
+    /// `setAdditionalDirectories` on it refuse with
+    /// `error.PermissionsInherited`. Its permission mode, workspace root,
+    /// tools and sandbox stay its own. A lead that itself inherits lends what
+    /// it inherits.
+    ///
+    /// Locking and lifetime (permission/lent.zig): each decision holds the
+    /// lender's `lent_permissions.mutex`; the lender republishes under it and
+    /// frees what it replaced afterwards. The lender outlives this Session:
+    /// its `destroy` waits until every Session that inherits from it is
+    /// destroyed, so destroy borrowers first. Only while this Session is
+    /// idle; once.
+    pub fn inheritPermissions(self: *AgentSession, lead: *AgentSession) InheritPermissionsError!void {
+        const lender = lead.permission_lender orelse lead;
+        if (lender == self) return error.InvalidPermissionLender;
+        self.mutex.lock();
+        if (self.permission_lender != null) {
+            self.mutex.unlock();
+            return error.PermissionsInherited;
+        }
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        // Never under this Session's lock: no path takes the two the other
+        // way round, but none needs to take them together either.
+        lender.mutex.lock();
+        const admitted = lender.state != .destroying and lender.state != .poisoned;
+        if (admitted) lender.permission_heirs += 1;
+        lender.mutex.unlock();
+        if (!admitted) {
+            self.cancelMutation();
+            return error.InvalidSessionState;
+        }
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.permission_lender = lender;
+        self.permission_ctx.inherited = &lender.lent_permissions;
+        self.permission_ctx.session_rules = &lender.session_rules;
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// The end of a borrower's `destroy`.
+    fn releasePermissionHeir(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.permission_heirs > 0);
+        self.permission_heirs -= 1;
+        if (self.permission_heirs == 0) self.permission_heirs_gone.broadcast();
+    }
+
+    /// Issue #445: the prompts of the cron jobs due now, in the order the
+    /// jobs were created, owned by `allocator` (free each and the slice). A
+    /// recurring job is rescheduled and a one-shot job removed
+    /// (`CronRegistry.collectDue`). Empty for a Session without cron tools.
+    /// At most `limit` prompts (#493): a job due past it stays due, untouched,
+    /// for a later call. Only while idle: a Run's cron tools change the same
+    /// registry.
+    pub fn takeDueCronPrompts(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+        limit: usize,
+    ) CronAccessError![]const []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.requireIdleForCron();
+        const registry = if (self.cron) |*registry| registry else return &.{};
+        return registry.collectDue(allocator, limit);
+    }
+
+    /// Issue #445: how many cron jobs the Session has scheduled; 0 without
+    /// cron tools. Read it between Runs, when no cron tool runs.
+    pub fn cronJobCount(self: *const AgentSession) usize {
+        return if (self.cron) |*registry| registry.count() else 0;
+    }
+
+    /// Issue #493: how many cron jobs are due now; 0 without cron tools.
+    /// Read it between Runs, as `cronJobCount`.
+    pub fn cronDueCount(self: *const AgentSession) usize {
+        return if (self.cron) |*registry| registry.dueCount() else 0;
+    }
+
+    /// Issue #493: the Session's cron jobs as a Host sees them (id, next
+    /// fire, schedule), in the order they were created, owned by `allocator`
+    /// (`cron_registry.freeViews`). Empty without cron tools. Only while
+    /// idle, as `takeDueCronPrompts`.
+    pub fn cronJobs(self: *AgentSession, allocator: std.mem.Allocator) CronAccessError![]cron_registry.JobView {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.requireIdleForCron();
+        const registry = if (self.cron) |*registry| registry else return allocator.alloc(cron_registry.JobView, 0);
+        return registry.list(allocator);
+    }
+
+    /// Issue #493: removes cron job `id` without a Run, so it never fires
+    /// again; whether the Session had it. Only while idle.
+    pub fn cancelCronJob(self: *AgentSession, id: cron_registry.JobId) CronAccessError!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.requireIdleForCron();
+        const registry = if (self.cron) |*registry| registry else return false;
+        return registry.remove(id);
+    }
+
+    /// Issue #493: removes every cron job without a Run; how many there
+    /// were. Only while idle.
+    pub fn cancelAllCronJobs(self: *AgentSession) CronAccessError!usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.requireIdleForCron();
+        const registry = if (self.cron) |*registry| registry else return 0;
+        return registry.clear();
+    }
+
+    /// Caller holds `mutex`.
+    fn requireIdleForCron(self: *const AgentSession) error{ SessionBusy, InvalidSessionState }!void {
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+    }
+
+    /// Replace the Session's reasoning effort at the idle mutation boundary;
+    /// null returns the provider to its default. The next provider request
+    /// carries it, and `setModel` keeps it.
+    pub fn setReasoningEffort(
+        self: *AgentSession,
+        effort: ?types.ReasoningEffort,
+    ) ReasoningEffortMutationError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.in_flight_provider_cancels != 0) return error.SessionBusy;
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        // Idle under the lock: the setter only stores a field on a provider
+        // no Run is reading.
+        if (effort == null and self.reasoning_effort == null) return;
+        try self.provider.provider().setReasoningEffort(effort);
+        self.reasoning_effort = effort;
+    }
+
+    /// The Host rule set as it was imported, rule for rule and in order.
+    /// The returned lists are owned by `allocator`; the rule strings borrow
+    /// the Session and stay valid until the next rule update.
+    pub fn importedPermissionRuleInput(
+        self: *const AgentSession,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}!permission_settings.RuleSetInput {
+        const rules = if (self.imported_permission_rules) |*value| value else return .{};
+        std.debug.assert(rules.layers.len == 1);
+        const layer = rules.layers[0];
+        const allow = try rawRules(allocator, layer.allow);
+        errdefer allocator.free(allow);
+        const ask = try rawRules(allocator, layer.ask);
+        errdefer allocator.free(ask);
+        const deny = try rawRules(allocator, layer.deny);
+        return .{ .allow = allow, .ask = ask, .deny = deny };
+    }
+
+    fn rawRules(
+        allocator: std.mem.Allocator,
+        rules: []const permission_settings.Rule,
+    ) error{OutOfMemory}![]const []const u8 {
+        const raw = try allocator.alloc([]const u8, rules.len);
+        for (rules, raw) |rule, *value| value.* = rule.raw;
+        return raw;
+    }
+
+    /// Replace the prompt profile while idle (#184). The next Run renders its
+    /// system prompt from the new profile: exactly one prompt-cache boundary,
+    /// announced by that Run's `prompt_manifest` event. An equal profile
+    /// changes nothing. An invalid one is refused before the Session is
+    /// touched; `system_prompt.validateProfile` names the broken rule.
+    pub fn setPromptProfile(
+        self: *AgentSession,
+        profile: prompt_sections.Profile,
+    ) PromptProfileMutationError!void {
+        if (system_prompt_mod.validateProfile(profile) != null) return error.InvalidPromptProfile;
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+        defer {
+            self.mutex.lock();
+            std.debug.assert(self.state == .mutating);
+            self.state = .idle;
+            self.mutex.unlock();
+        }
+
+        if (self.prompt_profile.profile().eql(profile)) return;
+        const replacement = try prompt_sections.OwnedProfile.clone(self.allocator, profile);
+        var previous = self.prompt_profile;
+        self.prompt_profile = replacement;
+        previous.deinit();
+    }
+
+    /// The prompt profile Runs render from. Valid while the caller keeps the
+    /// Session from mutating: during its own Run, compact or checkpoint lease.
+    pub fn promptProfile(self: *const AgentSession) prompt_sections.Profile {
+        return self.prompt_profile.profile();
+    }
+
+    pub const GoalMutationError = goal_mod.State.UpdateError || error{ SessionBusy, InvalidSessionState };
+
+    /// The Session's goal (issue #277), or null. Valid while the caller keeps
+    /// the Session from mutating, as for `promptProfile`.
+    pub fn currentGoal(self: *const AgentSession) ?*const goal_mod.Goal {
+        return if (self.goal_state.current) |*g| g else null;
+    }
+
+    /// Replaces any goal with a new active one (new id, usage from zero).
+    /// Idle-only, like `setPromptProfile`; a refusal changes nothing.
+    pub fn setGoal(self: *AgentSession, objective: []const u8, token_budget: ?u64) GoalMutationError!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        self.goal_state.setNew(objective, token_budget) catch |err| return switch (err) {
+            error.EmptyObjective, error.ObjectiveTooLong, error.InvalidObjective, error.InvalidBudget, error.OutOfMemory => |e| e,
+        };
+    }
+
+    /// Applies `changes` to the goal together or not at all. Idle-only.
+    pub fn updateGoal(self: *AgentSession, changes: goal_mod.State.Update) GoalMutationError!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        try self.goal_state.update(changes);
+    }
+
+    /// Removes the goal; without one, changes nothing. Idle-only.
+    pub fn clearGoal(self: *AgentSession) error{ SessionBusy, InvalidSessionState }!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        self.goal_state.clearInMemory();
+    }
+
+    fn beginGoalMutation(self: *AgentSession) error{ SessionBusy, InvalidSessionState }!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.in_flight_provider_cancels != 0) return error.SessionBusy;
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+    }
+
+    fn endGoalMutation(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+    }
+
+    pub const RewindMutationError = conversation_mod.RewindError || error{ SessionBusy, InvalidSessionState };
+
+    /// Edit-and-rerun (issue #432): drop the user message at `position` and
+    /// everything after it, so the input of the next Run takes its place
+    /// after exactly the context that preceded it. Idle-only; a refused
+    /// position (`conversation.RewindError`) changes nothing.
+    ///
+    /// Only the Conversation changes: files written and other effects of the
+    /// dropped turns stay as they are. What the model read in them no longer
+    /// counts for the must-read-first check (as after `/clear`), since the
+    /// rerun's context no longer shows it. A checkpoint or transcript taken
+    /// afterwards holds the rewound history; the dropped one is discarded.
+    pub fn rewindToUserMessage(self: *AgentSession, position: conversation_mod.MessagePosition) RewindMutationError!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        try self.conversation.rewindTo(position);
+        self.read_state.clearAll();
+    }
+
+    /// Manifest of the system prompt the latest Run sent, or null before the
+    /// first Run. Same validity as `promptProfile`.
+    pub fn lastPromptManifest(self: *const AgentSession) ?prompt_sections.Manifest {
+        return if (self.last_prompt_manifest) |*owned| owned.manifest else null;
+    }
+
+    /// Render this Session's subagent system prompt: `metacodes:subagent` and
+    /// the environment, with the Session's prompt profile inherited.
+    pub fn renderSubagentPrompt(self: *const AgentSession, allocator: std.mem.Allocator) !prompt_sections.Rendered {
+        return system_prompt_mod.renderSubagentPromptWithPreview(allocator, self.model, self.workspace.root, self.promptProfile(), self.runtime.preview);
+    }
+
+    /// Record the manifest of the prompt this Run sends and, when it differs
+    /// from the latest Run's, deliver it to the Host before the first provider
+    /// request.
+    fn announcePromptManifest(self: *AgentSession, manifest: prompt_sections.Manifest) !void {
+        if (self.last_prompt_manifest) |*last| {
+            if (std.mem.eql(u8, &last.manifest.fingerprint(), &manifest.fingerprint())) return;
+        }
+        var owned = try prompt_sections.OwnedManifest.clone(self.allocator, manifest);
+        errdefer owned.deinit();
+        backendEmit(@ptrCast(self), self.session_id, .{ .prompt_manifest = manifest });
+        if (self.last_prompt_manifest) |*last| last.deinit();
+        self.last_prompt_manifest = owned;
+    }
+
+    pub fn compact(
+        self: *AgentSession,
+        operation_id: u64,
+        options: CompactOptions,
+    ) CompactError!compact_kernel.Report {
+        // The production provider snapshot is intentionally selected by
+        // compactUsingProvider under the same mutex that admits `.compacting`.
+        // Tests may pass an explicit provider through that private seam.
+        return self.compactUsingProvider(
+            operation_id,
+            options,
+            null,
+        );
+    }
+
+    /// Borrow a facade-owned Provider for one synchronous compact operation.
+    /// This keeps the canonical compact preview/commit state machine in Core
+    /// while allowing embedding layers to enforce request/result budgets. The
+    /// caller owns the Provider context and keeps it alive through quiescence.
+    pub fn compactUsingBorrowedProvider(
+        self: *AgentSession,
+        operation_id: u64,
+        options: CompactOptions,
+        provider_override: provider_mod.Provider,
+    ) CompactError!compact_kernel.Report {
+        return self.compactUsingProvider(
+            operation_id,
+            options,
+            provider_override,
+        );
+    }
+
+    fn compactUsingProvider(
+        self: *AgentSession,
+        operation_id: u64,
+        options: CompactOptions,
+        provider_override: ?provider_mod.Provider,
+    ) CompactError!compact_kernel.Report {
+        if (operation_id == 0) return error.InvalidOperationId;
+        self.mutex.lock();
+        // A provider cancel borrow is a lifetime gate, not another operation-ID
+        // state. Do not classify or admit a new compact until that borrow drains;
+        // BUSY therefore intentionally takes precedence over stale-ID reporting.
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        if (operation_id <= self.last_admitted_compact_id) {
+            self.mutex.unlock();
+            return error.StaleCompact;
+        }
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        const provider = provider_override orelse self.provider.provider();
+        self.state = .compacting;
+        self.active_compact_id = operation_id;
+        self.active_compact_provider = provider;
+        self.last_admitted_compact_id = operation_id;
+        self.compact_abort_signal = AbortSignal.init();
+        self.mutex.unlock();
+        defer self.finishCompact(operation_id);
+
+        var commit_context = CompactCommitContext{
+            .session = self,
+            .guard = options.commit_guard,
+        };
+
+        return compact_kernel.run(
+            self.allocator,
+            &self.conversation,
+            provider,
+            &self.compact_abort_signal,
+            .{
+                .keep_recent = options.keep_recent,
+                .committer = .{
+                    .ctx = &commit_context,
+                    .commit_fn = commitCompact,
+                },
+            },
+        );
+    }
+
+    fn commitCompact(
+        raw: *anyopaque,
+        live: *Conversation,
+        suffix: *const Conversation.SuffixSnapshot,
+        replacement: *Conversation,
+        signal: *const AbortSignal,
+    ) compact_kernel.CommitResult {
+        const context: *CompactCommitContext = @ptrCast(@alignCast(raw));
+        const self = context.session;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .compacting);
+        if (signal.isAborted()) return .aborted;
+        if (context.guard) |guard| {
+            if (!guard.allows(replacement)) return .refused;
+        }
+        if (!live.replaceWithOwnedIfSuffixUnchanged(suffix, replacement))
+            return .concurrent_mutation;
+        self.last_terminal_compact_id = self.active_compact_id;
+        self.active_compact_id = 0;
+        self.active_compact_provider = null;
+        self.state = .compact_finishing;
+        return .committed;
+    }
+
+    const CompactCommitContext = struct {
+        session: *AgentSession,
+        guard: ?CompactCommitGuard,
+    };
+
+    pub fn abortCompact(
+        self: *AgentSession,
+        operation_id: u64,
+    ) AbortCompactError!void {
+        if (operation_id == 0) return error.InvalidOperationId;
+        self.mutex.lock();
+        switch (self.state) {
+            .compacting => {
+                if (operation_id < self.active_compact_id) {
+                    self.mutex.unlock();
+                    return error.StaleCompact;
+                }
+                if (operation_id > self.active_compact_id) {
+                    self.mutex.unlock();
+                    return error.InvalidOperationId;
+                }
+                self.compact_abort_signal.abort(.user_interrupt);
+                const provider = self.active_compact_provider.?;
+                std.debug.assert(self.in_flight_provider_cancels < std.math.maxInt(usize));
+                self.in_flight_provider_cancels += 1;
+                self.mutex.unlock();
+                defer self.finishProviderCancel();
+                provider.cancel(&self.compact_abort_signal);
+            },
+            .compact_finishing => {
+                const terminal = self.last_terminal_compact_id;
+                self.mutex.unlock();
+                if (operation_id == terminal) return error.AbortTooLate;
+                if (operation_id < terminal) return error.StaleCompact;
+                return error.InvalidOperationId;
+            },
+            .idle => {
+                const terminal = self.last_terminal_compact_id;
+                self.mutex.unlock();
+                if (terminal != 0 and operation_id == terminal)
+                    return error.AbortTooLate;
+                if (terminal != 0 and operation_id < terminal)
+                    return error.StaleCompact;
+                return error.InvalidOperationId;
+            },
+            .running, .abort_requested, .mutating, .checkpointing, .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+    }
+
+    fn finishCompact(self: *AgentSession, operation_id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (self.state) {
+            .compacting => {
+                std.debug.assert(self.active_compact_id == operation_id);
+                self.active_compact_id = 0;
+                self.active_compact_provider = null;
+                self.last_terminal_compact_id = operation_id;
+            },
+            .compact_finishing => {
+                std.debug.assert(self.active_compact_id == 0);
+                std.debug.assert(self.last_terminal_compact_id == operation_id);
+            },
+            else => unreachable,
+        }
+        self.state = .idle;
+    }
+
+    fn finishProviderCancel(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.in_flight_provider_cancels > 0);
+        self.in_flight_provider_cancels -= 1;
+        if (self.in_flight_provider_cancels == 0) self.provider_cancels_drained.broadcast();
+    }
+
+    /// Block until every abort that borrowed a provider has returned from
+    /// `Provider.cancel`. A Run or compact can return (aborted) while the
+    /// cross-thread abort that stopped it is still inside `cancel`. A caller
+    /// that lent the provider (`compactUsingBorrowedProvider`) must keep it
+    /// alive until then, and terminal bookkeeping must wait too: the session
+    /// still answers BUSY to every admission and snapshot meanwhile. The wait is
+    /// bounded by `Provider.cancel`, which never waits on the activity it
+    /// cancels.
+    pub fn awaitProviderCancelsDrained(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.in_flight_provider_cancels != 0) self.provider_cancels_drained.wait(&self.mutex);
+    }
+
+    /// Move the Session onto another route (issue #16, #445), as the bundled
+    /// CLI binds a committed `/model` selection: provider kind, wire
+    /// protocol, authentication, dialect, endpoint, credential and model
+    /// change together at the idle mutation boundary, so no request is ever
+    /// sent on a mix of the old route and the new. Every request after this
+    /// returns (the Session's own, a tool's, a compaction's) goes to the new
+    /// endpoint with the new credential. The conversation, the Host's model
+    /// capability declarations and the reasoning effort carry over; an
+    /// effort the new provider cannot take is refused
+    /// (`AgentEffortUnsupportedProvider`). Every refusal, out of memory
+    /// included, leaves the previous route in force. The previous credential
+    /// is erased.
+    pub fn setRoute(self: *AgentSession, route: Route) RouteMutationError!void {
+        if (route.model.len == 0 or
+            !std.unicode.utf8ValidateSlice(route.model))
+            return error.InvalidModel;
+        try credential_cell.validate(route.api_key);
+
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        const effort = self.reasoning_effort;
+        self.mutex.unlock();
+        errdefer self.cancelMutation();
+
+        const model = try self.allocator.dupe(u8, route.model);
+        errdefer self.allocator.free(model);
+        const base_url = if (route.base_url) |url| try self.allocator.dupe(u8, url) else null;
+        errdefer if (base_url) |url| self.allocator.free(url);
+        const auth_scheme = try dupeAuthScheme(self.allocator, route.auth_scheme);
+        errdefer freeAuthScheme(self.allocator, auth_scheme);
+        var credential = try self.credential.prepare(route.api_key);
+        errdefer credential.discard();
+        // Reads the cell at each request, so it authenticates with the new
+        // credential once it is published below, and is not used before.
+        var provider = try provider_factory.makeProviderWithOptions(
+            self.allocator,
+            route.provider_kind,
+            .{ .replaceable = self.credential },
+            model,
+            base_url,
+            route.openai_protocol,
+            self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = auth_scheme, .dialect = route.dialect, .limits = null, .capability_declarations = self.model_capabilities },
+        );
+        errdefer provider.deinit();
+        limitSingleAddressWorkers(&provider, base_url);
+        if (effort) |value| provider.provider().setReasoningEffort(value) catch
+            return error.AgentEffortUnsupportedProvider;
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous_provider = self.provider;
+        const previous_model = self.model;
+        const previous_base_url = self.base_url;
+        const previous_auth_scheme = self.auth_scheme;
+        self.provider = provider;
+        self.model = model;
+        self.base_url = base_url;
+        self.openai_protocol = route.openai_protocol;
+        self.auth_scheme = auth_scheme;
+        self.dialect = route.dialect;
+        // Lock order: `mutex`, then the credential's own.
+        _ = credential.publish();
+        self.mutex.unlock();
+
+        // Concrete clients borrow their model, endpoint and scheme bytes: the
+        // previous provider goes first. The mutation gate stays held until
+        // cleanup finishes, as in `setModel`.
+        previous_provider.deinit();
+        self.allocator.free(previous_model);
+        if (previous_base_url) |url| self.allocator.free(url);
+        freeAuthScheme(self.allocator, previous_auth_scheme);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    fn cancelMutation(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+    }
+
+    fn callbackFailed(self: *AgentSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.callback_failed;
+    }
+
+    /// Run one text turn while preserving Conversation across successful Runs.
+    pub fn runText(self: *AgentSession, run_id: u64, prompt: []const u8, max_turns: u32, sink: EventSink) anyerror!agent_loop.RunResult {
+        var admitted = try self.admitRun(run_id, sink);
+        return admitted.runText(prompt, max_turns);
+    }
+
+    /// Run one multimodal user turn (ordered text/image parts) while
+    /// preserving Conversation across successful Runs. Part bytes are borrowed
+    /// and copied during append; a non-vision model fails the provider
+    /// serializer with `error.ImageInputUnsupported` before any network I/O.
+    pub fn runUserParts(
+        self: *AgentSession,
+        run_id: u64,
+        parts: []const message_mod.UserContentPart,
+        max_turns: u32,
+        sink: EventSink,
+    ) anyerror!agent_loop.RunResult {
+        var admitted = try self.admitRun(run_id, sink);
+        return admitted.runUserParts(parts, max_turns);
+    }
+
+    /// Install the candidate-response boundary for the Runs that follow, or
+    /// clear it with null. Paired with the facade-owned Provider override: the
+    /// override decides what a response costs, the observer decides whether an
+    /// assembled one may become Conversation state, and installing one without
+    /// the other would leave a policy that can measure but not refuse.
+    pub fn setResponseObserver(
+        self: *AgentSession,
+        observer: ?@import("metacodes-coding").core.response_candidate.Observer,
+    ) void {
+        self.response_observer = observer;
+    }
+
+    /// Install the durable-state compaction control for the Runs that follow,
+    /// or clear it with null (issue #430). Paired with the facade-owned
+    /// Provider override exactly like `setResponseObserver`.
+    pub fn setCompactionControl(
+        self: *AgentSession,
+        control: ?@import("metacodes-coding").core.compaction_control.Control,
+    ) void {
+        self.compaction_control = control;
+    }
+
+    /// Install the durable-state admission for the input window of the Runs
+    /// admitted while it is set, or clear it with null. The facade installs
+    /// its budget controller here before admission and clears it after the
+    /// Run returns; the window itself drops the admission when it closes, so
+    /// no reservation outlives the Run that made it.
+    pub fn setRunInputAdmission(self: *AgentSession, admission: ?run_input.Admission) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.run_input_admission = admission;
+    }
+
+    /// Undo `setRunInputAdmission` after the Run that used it has returned,
+    /// and make sure that Run's input window is closed. Every lifecycle path
+    /// that ends a Run already closes it; doing it here as well guarantees no
+    /// reservation can outlive the facade's budget controller.
+    pub fn finishRunInputAdmission(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.run_input_admission = null;
+        _ = self.run_inputs.close();
+    }
+
+    /// Replace the provider credential in place (issue #336). A request reads
+    /// the credential when it is sent (once it holds its connection slot), so
+    /// every request sent after this returns uses the new credential: later
+    /// turns, retries of a request already under way, a compaction summary, a
+    /// Skill Run, every provider this Session built earlier, tool providers
+    /// included, and a request still waiting for a connection slot. A request
+    /// already sent keeps the old credential and is not touched; nothing is
+    /// cancelled or replayed. Provider, authentication scheme, base URL and
+    /// model are unchanged.
+    ///
+    /// Safe from any thread and from inside the active Run's callbacks: it
+    /// never waits for a Run, compaction, checkpoint or mutation, and it never
+    /// takes `callback_mutex`. Updates are linearized at the swap under the
+    /// credential's own lock; the returned generation orders them (the
+    /// creation credential is generation 1). Lock order is `mutex` then the
+    /// credential lock, whose holders only copy bytes through an allocator,
+    /// so the swap is atomic with respect to poisoning and cannot deadlock.
+    ///
+    /// The candidate is validated and copied before any lock is taken. A
+    /// refusal, out of memory included, changes nothing. A poisoned Session
+    /// refuses before looking at the candidate. The previous bytes are erased
+    /// and freed before this returns. The caller must let it return before
+    /// destroying the Session.
+    pub fn updateCredential(self: *AgentSession, candidate: []const u8) CredentialUpdateError!u64 {
+        try self.checkCredentialUpdateState();
+        var replacement = try self.credential.prepare(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (self.state) {
+            .poisoned, .destroying => {
+                replacement.discard();
+                return error.InvalidSessionState;
+            },
+            .idle, .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {},
+        }
+        return replacement.publish();
+    }
+
+    /// The state `updateCredential` checks before it looks at the candidate:
+    /// `InvalidSessionState` once the Session is poisoned or being destroyed.
+    /// A facade that validates the candidate itself calls this first, so the
+    /// state outranks the candidate there too.
+    pub fn checkCredentialUpdateState(self: *AgentSession) error{InvalidSessionState}!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (self.state) {
+            .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {},
+        }
+    }
+
+    /// Hand the active Run more user text (#270). Safe from any thread while
+    /// that Run is active, including from inside its event and UI callbacks;
+    /// it never waits for the Run. Returns the input's 1-based acceptance
+    /// sequence. Acceptance only queues it: the agent loop appends it to the
+    /// Conversation at the next turn boundary that leads to another provider
+    /// request, and a Run that ends first leaves it unadopted — see
+    /// `runInputReconciliation`. It never answers a pending permission or
+    /// question request and never stops the Run (that is `abort`).
+    pub fn submitInput(self: *AgentSession, run_id: u64, input_id: u64, text: []const u8) SubmitInputError!u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.active_run_id != 0 and self.active_run_id != run_id) return error.StaleRun;
+        switch (self.state) {
+            .running => {
+                // `active_run_id == run_id` here, and it is never zero while running.
+                // A failed callback already aborted the Run; nothing is adopted after it.
+                if (self.callback_failed) return error.InputTooLate;
+                return self.run_inputs.submit(input_id, text) catch |err| switch (err) {
+                    error.InputClosed => error.InputTooLate,
+                    error.InputNotAccepted => error.InvalidSessionState,
+                    else => |e| e,
+                };
+            },
+            // The loop-top abort check precedes the input boundary.
+            .abort_requested => return error.InputTooLate,
+            // No Run is active. The answer is about the Run named, not about what
+            // the Session is doing now: the facade measures durable usage right
+            // before admission and right after a Run (`checkpointing`), and a
+            // submission racing either edge must read as not-yet-admitted or as
+            // too late — never as a third outcome.
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                const too_late = run_id != 0 and self.last_run_id == run_id;
+                return if (too_late) error.InputTooLate else error.StaleRun;
+            },
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+    }
+
+    /// The most recently admitted Run ID (0 before the first). A facade that
+    /// holds the Session's call gate reads it before and after a Run call to
+    /// learn whether that call admitted its Run.
+    pub fn lastAdmittedRunId(self: *AgentSession) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.last_run_id;
+    }
+
+    /// The final input counts of `run_id` (#270) once that Run has ended:
+    /// inputs with a sequence at most `adopted` are in the Conversation, the
+    /// rest never will be. Null while the Run is active, or when `run_id` is
+    /// not the most recent Run (no input could be accepted for it, or its
+    /// record was replaced by a later admission).
+    pub fn runInputReconciliation(self: *AgentSession, run_id: u64) ?run_input.Reconciliation {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.run_inputs.reconciliation(run_id);
+    }
+
+    pub fn admitRun(
+        self: *AgentSession,
+        run_id: u64,
+        sink: EventSink,
+    ) LifecycleError!AdmittedRun {
+        return .{
+            .session = self,
+            .identity_value = try self.beginRun(run_id, sink),
+        };
+    }
+
+    fn runLoop(
+        self: *AgentSession,
+        identity: RunIdentity,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: ?provider_mod.Provider,
+        stream_retry_budget: u8,
+        input: RunInput,
+    ) anyerror!agent_loop.RunResult {
+        // A built record is the Run's until the Conversation takes it.
+        var pending_record: ?message_mod.Message = switch (input) {
+            .record => |record| record,
+            .prompts, .led_prompts, .resumption => null,
+        };
+        defer if (pending_record) |record| record.deinit(self.conversation.allocator);
+        var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
+        const tool_definitions = if (tool_surface) |surface|
+            surface.definitions
+        else
+            self.tools.definitions;
+        const tool_dispatcher = if (tool_surface) |surface|
+            surface.dispatcher
+        else
+            self.tools.dispatcher();
+        const plugin_policy = self.runtime.plugin_snapshot.executionPolicy();
+        var policy_intersection: ExecutionPolicyIntersection = undefined;
+        const effective_execution_policy: ?ToolExecutionPolicy = if (plugin_policy) |plugin| blk: {
+            if (execution_policy) |facade| {
+                policy_intersection = .{ .plugin = plugin, .facade = facade };
+                break :blk policy_intersection.policy();
+            }
+            break :blk plugin;
+        } else execution_policy;
+
+        // 缺陷 A 修复:主 Agent 注入环境段 + 工具段 system_prompt。
+        // 环境段 cwd 用 workspace.root(非进程 cwd——Session 隔离);工具段按 enabled_tool_names 裁剪。
+        // skills/agents/kg/memory 为 CLI 专属,Session 不渲染。#184:按 Session 的提示词档案编辑
+        // 内核段;渲染失败即 poison——不能退回无 system prompt 的请求(锁定段随之丢失)。
+        const sp_names = self.allocator.alloc([]const u8, tool_definitions.len) catch |err| {
+            _ = self.poisonRun();
+            return err;
+        };
+        defer self.allocator.free(sp_names);
+        for (tool_definitions, 0..) |d, i| sp_names[i] = d.name;
+        var rendered_prompt = system_prompt_mod.renderSessionPrompt(self.allocator, .{
+            .preview = self.runtime.preview,
+            .model = self.model,
+            .cwd = self.workspace.root,
+            .enabled_tool_names = sp_names,
+            .tool_defs = tool_definitions,
+            .profile = self.promptProfile(),
+        }) catch |err| {
+            _ = self.poisonRun();
+            return err;
+        };
+        defer rendered_prompt.deinit(self.allocator);
+        const system_prompt: ?[]const u8 = rendered_prompt.text;
+
+        // #445: the bundled daemon's per-Run control. It opens the durable
+        // journal and, under `project_rules = .enforced`, loads and
+        // re-attests the active project rule bundle. A journal that cannot
+        // open poisons the Session; the project rules refusing the Run fail
+        // only the Run, as the daemon reports such a Run failed and takes the
+        // next message: nothing of it entered the Conversation yet.
+        const run_control: ?*project_rule_activation.RunControl = if (self.run_journal_root.len == 0)
+            null
+        else switch (self.openRunControl(identity, rendered_prompt.manifest) catch |err| {
+            _ = self.poisonRun();
+            return err;
+        }) {
+            .open => |control| control,
+            .refused => |err| {
+                // A resumption's results stay out of the Conversation too:
+                // its suspended turn still waits for them, so a later Run
+                // can still give them (`SessionHost` keeps the suspension).
+                const completion = self.finishRunLifecycle();
+                if (completion.callback_failed) return error.CallbackFailed;
+                return err;
+            },
+        };
+        defer if (run_control) |control| control.deinit();
+        // The Run's input enters the Conversation once the Run may go on.
+        self.appendRunInput(input) catch |err| {
+            if (run_control) |control| control.finishRun(@errorName(err)) catch {};
+            _ = self.poisonRun();
+            return err;
+        };
+        pending_record = null;
+        self.announcePromptManifest(rendered_prompt.manifest) catch |err| {
+            if (run_control) |control| control.finishRun(@errorName(err)) catch {};
+            _ = self.poisonRun();
+            return err;
+        };
+
+        const run_options: agent_loop.Options = .{
+            .preview = self.runtime.preview,
+            .max_turns = max_turns,
+            .retractable_stream_retries = stream_retry_budget,
+            .model_error_out = &self.last_model_error,
+            .session = identity.session_id,
+            .session_id = identity.session_id.asSlice(),
+            .abort = &self.abort_signal,
+            .read_state = &self.read_state,
+            .jobs = if (self.jobs) |*registry| registry else null,
+            .cron_registry = if (self.cron) |*registry| registry else null,
+            .provider_factory = self.toolProviderFactory(),
+            .tool_defs = tool_definitions,
+            .tool_dispatcher = tool_dispatcher,
+            .execution_policy = effective_execution_policy,
+            .tool_observer = if (run_control) |control| control.observer() else null,
+            .execution_boundary = if (run_control) |control| control.executionBoundary() else null,
+            .project_rule_gate = if (run_control) |control| control.formalGate() else null,
+            .agent_ident = identity.session_id,
+            // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
+            .host_run = if (self.host_identity_ctx) |hctx| .{
+                .identity = identity,
+                .host_session_ctx = hctx,
+            } else null,
+            .ui_requester = self.permission_ctx.ui_requester,
+            .response_observer = self.response_observer,
+            .compaction_control = self.compaction_control,
+            .run_inputs = &self.run_inputs,
+            .emit_tool_cards = true,
+            .project_dir = self.workspace.root,
+            .cwd_abs = self.workspace.root,
+            .additional_dirs = self.workspace.additional_dirs,
+            .resolve_relative_paths = true,
+            .home_dir = self.workspace.home,
+            .state_root = self.workspace.state_root,
+            .artifact_root = self.artifact_root,
+            .tool_result_metrics = &self.tool_result_metrics,
+            .sandbox = self.workspace.sandbox(),
+            .parent_model = self.model,
+            .colorize = false,
+            .system_prompt = system_prompt,
+            .goal_meter = &self.goal_meter,
+            // Issue #277: the team tools execute against this; the SWARM
+            // addendum rides the system prompt while a team is active.
+            .swarm = if (self.swarm) |*s| s else null,
+        };
+        const run_provider = provider_override orelse self.provider.provider();
+        var native_result = (switch (input) {
+            .resumption => |results| agent_loop.resumeRunWithResults(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, results, run_options, &backend, self.allocator),
+            .prompts, .led_prompts, .record => agent_loop.run(&self.conversation, run_provider, tool_definitions, &self.permission_ctx, run_options, &backend, self.allocator),
+        }) catch |err| {
+            if (run_control) |control| control.finishRun(@errorName(err)) catch {};
+            if (err == error.HostToolFatal) {
+                self.mutex.lock();
+                self.callback_failed = true;
+                self.mutex.unlock();
+            }
+            const callback_failed = self.poisonRun();
+            if (callback_failed) return error.CallbackFailed;
+            return err;
+        };
+
+        if (run_control) |control| control.finishRun(@tagName(native_result.stop_reason)) catch {
+            if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+            _ = self.poisonRun();
+            return error.RunJournalFailed;
+        };
+
+        const completion = self.finishRunLifecycle();
+        if (completion.callback_failed) {
+            if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+            return error.CallbackFailed;
+        }
+        if (completion.abort_requested) native_result.stop_reason = .aborted;
+        return native_result;
+    }
+
+    /// The Run's `RunControl` on the durable journal (#445), as
+    /// `daemon/app_driver.zig` opens one per Run: the bundle of the
+    /// workspace root when `project_rules` is enforced, then the
+    /// detached-worker check the daemon makes (a Bash job of this Session
+    /// still running, or a team). An error is a journal that cannot open;
+    /// the project rules refusing the Run after it opened is `.refused`,
+    /// the Run closed in the journal under the refusal's name.
+    fn openRunControl(
+        self: *AgentSession,
+        identity: RunIdentity,
+        prompt: prompt_sections.Manifest,
+    ) !RunControlOpening {
+        var report: tool_observation_journal.OpenReport = .{};
+        const control = try project_rule_activation.RunControl.initWithOptions(
+            self.allocator,
+            self.run_journal_root,
+            identity.session_id,
+            .{
+                .project_root = null,
+                .abandoned_run = self.run_control.abandoned_run,
+                .prompt = prompt,
+                .report = &report,
+            },
+        );
+        if (report.unfinished) |abandoned| {
+            var text: [512]u8 = undefined;
+            log.warn("agent_session", "{s}", .{tool_observation_journal.describeAbandoned(&text, &abandoned)});
+        }
+        switch (self.run_control.project_rules) {
+            .ignored => {},
+            .enforced => control.loadProjectGate(self.workspace.root, &self.abort_signal) catch |err| {
+                control.deinit();
+                return .{ .refused = err };
+            },
+        }
+        control.requireDetachedIdle(
+            if (self.jobs) |*registry| registry.runningCountForOwner(self.session_id) else 0,
+            if (self.swarm) |*swarm| swarm.hasTeam() else false,
+        ) catch |err| {
+            control.finishRun(@errorName(err)) catch {};
+            control.deinit();
+            return .{ .refused = err };
+        };
+        return .{ .open = control };
+    }
+
+    /// The Run's input, appended to the Conversation (#445). A record is
+    /// the Conversation's only once this returns; a resumption's results
+    /// enter it through `agent_loop.resumeRunWithResults`.
+    fn appendRunInput(self: *AgentSession, input: RunInput) !void {
+        switch (input) {
+            .prompts => |prompts| try self.appendUserTexts(null, prompts),
+            .led_prompts => |led| try self.appendUserTexts(led.lead, led.prompts),
+            .record => |record| try self.conversation.append(record),
+            .resumption => {},
+        }
+    }
+
+    /// User text records, in order; a non-null `lead` is the first record's
+    /// leading text part (`AdmittedRun.lead_text`, #534).
+    fn appendUserTexts(self: *AgentSession, lead: ?[]const u8, prompts: []const []const u8) !void {
+        for (prompts, 0..) |prompt, index| {
+            if (index == 0) if (lead) |text| {
+                const record = try message_mod.userMessageFromParts(self.conversation.allocator, &.{
+                    .{ .text = text },
+                    .{ .text = prompt },
+                });
+                self.conversation.append(record) catch |err| {
+                    record.deinit(self.conversation.allocator);
+                    return err;
+                };
+                continue;
+            };
+            try self.conversation.appendText(.user, prompt);
+        }
+    }
+
+    const RunCompletion = struct {
+        abort_requested: bool,
+        callback_failed: bool,
+    };
+
+    fn finishRunLifecycle(self: *AgentSession) RunCompletion {
+        self.callback_mutex.lock();
+        self.mutex.lock();
+        const completion = RunCompletion{
+            .abort_requested = self.state == .abort_requested,
+            .callback_failed = self.callback_failed,
+        };
+        if (completion.callback_failed) {
+            self.state = .poisoned;
+        } else {
+            self.state = .idle;
+        }
+        self.active_run_id = 0;
+        self.active_run_started = false;
+        self.active_sink = null;
+        _ = self.run_inputs.close();
+        self.mutex.unlock();
+        self.callback_mutex.unlock();
+        return completion;
+    }
+
+    pub fn abort(self: *AgentSession, run_id: u64, reason: AbortReason) LifecycleError!void {
+        return self.abortUsingProvider(run_id, reason, null);
+    }
+
+    fn abortUsingProvider(
+        self: *AgentSession,
+        run_id: u64,
+        reason: AbortReason,
+        provider_override: ?provider_mod.Provider,
+    ) LifecycleError!void {
+        self.mutex.lock();
+        if (self.active_run_id != 0 and self.active_run_id != run_id) {
+            self.mutex.unlock();
+            return error.StaleRun;
+        }
+        switch (self.state) {
+            .running => {
+                self.state = .abort_requested;
+                // Store the abort flag under the same lock that linearizes the
+                // state transition. The signal itself is atomic and nonblocking.
+                self.abort_signal.abort(reason.internal());
+                const provider = provider_override orelse self.provider.provider();
+                std.debug.assert(self.in_flight_provider_cancels < std.math.maxInt(usize));
+                self.in_flight_provider_cancels += 1;
+                self.mutex.unlock();
+                defer self.finishProviderCancel();
+                provider.cancel(&self.abort_signal);
+            },
+            .abort_requested => self.mutex.unlock(),
+            .idle => {
+                const too_late = run_id != 0 and self.last_run_id == run_id;
+                self.mutex.unlock();
+                return if (too_late) error.AbortTooLate else error.StaleRun;
+            },
+            .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+    }
+
+    /// Admission linearization point for the public nonzero, strictly
+    /// increasing, Session-scoped Run ID contract.
+    fn beginRun(self: *AgentSession, run_id: u64, sink: EventSink) LifecycleError!RunIdentity {
+        self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        if (run_id == 0 or run_id <= self.last_run_id) {
+            self.mutex.unlock();
+            return error.StaleRun;
+        }
+        self.abort_signal = AbortSignal.init();
+        self.state = .running;
+        self.active_run_id = run_id;
+        self.active_run_started = false;
+        self.last_run_id = run_id;
+        self.callback_failed = false;
+        self.active_sink = sink;
+        self.run_inputs.open(run_id, self.run_input_admission);
+        const identity = RunIdentity{ .session_id = self.session_id, .run_id = run_id };
+        self.mutex.unlock();
+        return identity;
+    }
+
+    fn refuseRunInputs(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.run_inputs.refuse();
+    }
+
+    fn claimAdmittedRun(
+        self: *AgentSession,
+        identity: RunIdentity,
+    ) LifecycleError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!std.mem.eql(u8, identity.session_id.asSlice(), self.session_id.asSlice()) or
+            identity.run_id == 0 or
+            identity.run_id != self.active_run_id or
+            self.active_run_started)
+            return error.InvalidSessionState;
+        switch (self.state) {
+            .running, .abort_requested => {},
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        self.active_run_started = true;
+    }
+
+    fn finishAdmittedRun(
+        self: *AgentSession,
+        identity: RunIdentity,
+    ) LifecycleError!AdmittedCompletion {
+        self.callback_mutex.lock();
+        defer self.callback_mutex.unlock();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!std.mem.eql(u8, identity.session_id.asSlice(), self.session_id.asSlice()) or
+            identity.run_id == 0 or
+            identity.run_id != self.active_run_id or
+            self.active_run_started)
+            return error.InvalidSessionState;
+        switch (self.state) {
+            .running, .abort_requested => {},
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        const aborted = self.state == .abort_requested;
+        if (self.callback_failed) {
+            self.state = .poisoned;
+        } else {
+            self.state = .idle;
+        }
+        self.active_run_id = 0;
+        self.active_run_started = false;
+        self.active_sink = null;
+        _ = self.run_inputs.close();
+        if (self.callback_failed) return error.CallbackFailed;
+        return .{ .aborted = aborted };
+    }
+
+    /// Poison a failed Run and return whether delivery failure was the cause.
+    fn poisonRun(self: *AgentSession) bool {
+        // Quiesce event delivery before clearing active_sink. The lock order is
+        // always callback_mutex -> mutex, matching backendEmit/runLoop.
+        self.callback_mutex.lock();
+        defer self.callback_mutex.unlock();
+        self.mutex.lock();
+        const failed = self.callback_failed;
+        self.state = .poisoned;
+        self.active_run_id = 0;
+        self.active_run_started = false;
+        self.active_sink = null;
+        _ = self.run_inputs.close();
+        self.mutex.unlock();
+        return failed;
+    }
+
+    fn backendEmit(ctx: *anyopaque, _: SessionId, event: CoreEvent) void {
+        const self: *AgentSession = @ptrCast(@alignCast(ctx));
+
+        // Serialize admission and delivery. This makes "first callback failure"
+        // exact even when future tool threads emit concurrently, without holding
+        // the lifecycle mutex across consumer code (abort reentrancy stays safe).
+        self.callback_mutex.lock();
+        defer self.callback_mutex.unlock();
+
+        self.mutex.lock();
+        const already_failed = self.callback_failed;
+        const run_id = self.active_run_id;
+        const sink = self.active_sink;
+        self.mutex.unlock();
+        if (already_failed or run_id == 0 or sink == null) return;
+
+        if (!sink.?.emit(sink.?.ctx, self.session_id, run_id, event)) {
+            self.noteCallbackFailure();
+        }
+    }
+
+    /// Deliver a facade-owned lifecycle edge through the same callback mutex
+    /// as ordinary CoreEvent delivery. Synchronous Host UI requests use this
+    /// path so RunState ordering remains serialized with concurrent tool
+    /// progress events.
+    pub fn emitLifecycleEvent(self: *AgentSession, event: CoreEvent) void {
+        backendEmit(@ptrCast(self), self.session_id, event);
+    }
+
+    /// Record a callback-channel failure from a facade-side observation that
+    /// is not itself delivered through the Core EventSink.
+    pub fn noteCallbackFailure(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.callback_failed) {
+            self.callback_failed = true;
+            self.abort_signal.abort(.host_failure);
+        }
+    }
+
+    fn requestHostUi(
+        raw: *anyopaque,
+        session_id: SessionId,
+        response_allocator: std.mem.Allocator,
+        req: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!ui_request.RequestOutcome {
+        const self: *AgentSession = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        const identity = switch (self.state) {
+            .running, .abort_requested => if (std.mem.eql(u8, session_id.asSlice(), self.session_id.asSlice()) and self.active_run_id != 0)
+                RunIdentity{ .session_id = self.session_id, .run_id = self.active_run_id }
+            else
+                null,
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => null,
+        };
+        if (identity == null and (self.state == .running or self.state == .abort_requested)) {
+            if (!self.callback_failed) {
+                self.callback_failed = true;
+                self.abort_signal.abort(.host_failure);
+            }
+        }
+        self.mutex.unlock();
+        const admitted = identity orelse return error.HostUiFailed;
+
+        const result = if (self.host_run_ui_requester) |requester|
+            requester.request(admitted, response_allocator, req, out)
+        else if (self.host_ui_requester) |requester|
+            requester.request(session_id, response_allocator, req, out)
+        else
+            return .unavailable;
+        return result catch |err| {
+            // A user cancelling AskQuestion is a model-visible tool outcome,
+            // not a broken Host transport. AgentCore is the only current
+            // producer; every other callback error retains poison semantics.
+            if (err == error.UiCancelled and req.* == .ask_question) return err;
+            // Likewise a permission prompt nobody answered (a Host timeout,
+            // an interrupt or close, an unreadable answer): the gate denies
+            // the call and tells the model why (#463).
+            if (req.* == .permission and ui_request.isUnanswered(err)) return err;
+            // A Host UI transport/decoding error is infrastructure failure,
+            // not a model-visible tool error. Abort the current Run and let
+            // finishRunLifecycle poison the Session consistently with event
+            // callback failure.
+            self.mutex.lock();
+            if (!self.callback_failed) {
+                self.callback_failed = true;
+                self.abort_signal.abort(.host_failure);
+            }
+            self.mutex.unlock();
+            return err;
+        };
+    }
+
+    /// A Session takes input for its active Run through `submitInput` and
+    /// the typed `run_inputs` queue (#270), which carries an id, an adoption
+    /// event and reconciliation counts. The untyped in-process
+    /// `UiEvent.queue_message` seam (#115) is therefore never fed here.
+    fn backendPoll(_: *anyopaque, _: SessionId) ?UiEvent {
+        return null;
+    }
+};
+
+/// `AdmittedRun.resumeWithResults`'s precondition: the Conversation ends in
+/// the suspended assistant turn, and every result answers one of its tool
+/// calls, at most once. A call left without a result is not refused here:
+/// the kernel's suspension does not carry results for calls it denied, and
+/// the request builder stands in for them (message_repair).
+fn checkResumable(
+    conversation: *const Conversation,
+    results: []const agent_loop.SuspendInfo.CompletedResult,
+) error{ NothingToResume, ResumeMismatch }!void {
+    const messages = conversation.messages.items;
+    if (messages.len == 0 or results.len == 0) return error.NothingToResume;
+    const last = messages[messages.len - 1];
+    if (last.role != .assistant) return error.NothingToResume;
+    var calls: usize = 0;
+    for (last.blocks) |block| {
+        if (block == .tool_use) calls += 1;
+    }
+    if (calls == 0) return error.NothingToResume;
+    for (results, 0..) |result, index| {
+        var made = false;
+        for (last.blocks) |block| switch (block) {
+            .tool_use => |call| made = made or std.mem.eql(u8, call.id, result.tool_use_id),
+            else => {},
+        };
+        if (!made) return error.ResumeMismatch;
+        for (results[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier.tool_use_id, result.tool_use_id)) return error.ResumeMismatch;
+        }
+    }
+}
+
+pub fn secureClear(bytes: []u8) void {
+    secure.zero(bytes);
+}
+
+fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
+    secure.free(allocator, bytes);
+}
+
+const EraseObservingAllocator = struct {
+    backing: std.mem.Allocator,
+    target_len: usize,
+    fail_index: ?usize = null,
+    fail_after_target: bool = false,
+    failed_after_target: bool = false,
+    allocations: usize = 0,
+    target_ptr: ?[*]u8 = null,
+    /// Allocations whose length matched `target_len`. The observer can only
+    /// key on length, so a test must assert this is exactly one: a second hit
+    /// means some other allocation (a path, a catalog entry) shares the key's
+    /// length and the zeroing verdict would be about the wrong block (#70).
+    target_hits: usize = 0,
+    target_freed: bool = false,
+    target_was_zero: bool = false,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.fail_after_target and self.target_ptr != null and !self.failed_after_target) {
+            self.failed_after_target = true;
+            self.allocations += 1;
+            return null;
+        }
+        if (self.fail_index == self.allocations) {
+            self.allocations += 1;
+            return null;
+        }
+        self.allocations += 1;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        if (len == self.target_len) {
+            self.target_hits += 1;
+            if (self.target_ptr == null) self.target_ptr = ptr;
+        }
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.target_ptr) |target| {
+            if (memory.ptr == target) {
+                self.target_freed = true;
+                self.target_was_zero = std.mem.allEqual(u8, memory, 0);
+            }
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
+const SinkProbe = struct {
+    accept: bool = true,
+    calls: usize = 0,
+    session_id: ?SessionId = null,
+    run_id: u64 = 0,
+
+    fn emit(ctx: *anyopaque, session_id: SessionId, run_id: u64, _: CoreEvent) bool {
+        const self: *SinkProbe = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.session_id = session_id;
+        self.run_id = run_id;
+        return self.accept;
+    }
+
+    fn sink(self: *SinkProbe) EventSink {
+        return .{ .ctx = self, .emit = emit };
+    }
+};
+
+fn createTestRuntime(allocator: std.mem.Allocator) !*AgentRuntime {
+    return AgentRuntime.create(allocator, .{ .builtin_tools = &.{"Read"} });
+}
+
+fn testCwd() ![]u8 {
+    return @import("metacodes-base").util.fs.getCwd(std.testing.allocator);
+}
+
+fn createTestSession(runtime: *AgentRuntime, mode: types.PermissionMode, root: []const u8) !*AgentSession {
+    return runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .permission_mode = mode,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
+    });
+}
+
+test "a session's named endpoint can connect to IPv4 while IPv6 is still pending" {
+    const Io = std.Io;
+    const net = Io.net;
+    const a = std.testing.allocator;
+    if ((std.Thread.getCpuCount() catch 0) < 4) return error.SkipZigTest;
+    const runtime = try createTestRuntime(a);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer a.free(cwd);
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = "https://provider.example/v1/messages",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer session.destroy() catch unreachable;
+
+    const Routes = struct {
+        var first_started: Io.Event = .unset;
+        var second_connected: Io.Event = .unset;
+        var first_finished: Io.Event = .unset;
+        const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(3) } };
+
+        fn waitForFirst(io: Io) !void {
+            first_started.waitTimeout(io, timeout) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.Unexpected,
+            };
+        }
+
+        fn resolve(ctx: ?*anyopaque, _: net.HostName, results: *Io.Queue(net.HostName.LookupResult), options: net.HostName.LookupOptions) net.HostName.LookupError!void {
+            const pool: *Io.Threaded = @ptrCast(@alignCast(ctx.?));
+            const io = pool.io();
+            defer results.close(io);
+            results.putAll(io, &.{
+                .{ .address = .{ .ip6 = .loopback(options.port) } },
+                .{ .address = .{ .ip4 = .loopback(options.port) } },
+            }) catch |err| switch (err) {
+                error.Closed => unreachable,
+                error.Canceled => return error.Canceled,
+            };
+            try waitForFirst(io);
+        }
+
+        fn connect(ctx: ?*anyopaque, address: *const net.IpAddress, options: net.IpAddress.ConnectOptions) net.IpAddress.ConnectError!net.Socket {
+            const pool: *Io.Threaded = @ptrCast(@alignCast(ctx.?));
+            const io = pool.io();
+            if (address.* == .ip6) {
+                first_started.set(io);
+                defer first_finished.set(io);
+                const deadline = timeout.toDeadline(io).deadline;
+                while (!second_connected.isSet() and Io.Clock.Timestamp.now(io, .awake).compare(.lt, deadline)) {
+                    try Io.sleep(io, .fromMilliseconds(2), .awake);
+                }
+                return error.ConnectionRefused;
+            }
+            try waitForFirst(io);
+            const socket = try io.vtable.netConnectIp(ctx, address, options);
+            if (first_finished.isSet()) {
+                socket.close(io);
+                return error.ConnectionRefused;
+            }
+            second_connected.set(io);
+            return socket;
+        }
+    };
+    Routes.first_started = .unset;
+    Routes.second_connected = .unset;
+    Routes.first_finished = .unset;
+    var io = session.provider.io.io();
+    var table = io.vtable.*;
+    table.netLookup = Routes.resolve;
+    table.netConnectIp = Routes.connect;
+    io.vtable = &table;
+    const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try loopback.listen(io, .{});
+    defer server.deinit(io);
+    const host: net.HostName = .{ .bytes = "provider.example" };
+    const stream = try host.connect(io, server.socket.address.getPort(), .{ .mode = .stream });
+    defer stream.close(io);
+    try std.testing.expect(Routes.second_connected.isSet());
+}
+
+test "secureClear uses optimizer-resistant zeroing" {
+    var key = [_]u8{ 1, 2, 3, 4 };
+    secureClear(&key);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &key);
+}
+
+test "AgentSession zeroes the copied API key before normal free" {
+    // 1009 bytes: a length no path, catalog entry or buffer allocation shares (#70).
+    const key = "normal-destroy-key-" ++ ("k" ** 990);
+    var observer = EraseObservingAllocator{ .backing = std.testing.allocator, .target_len = key.len };
+    const runtime = try AgentRuntime.create(observer.allocator(), .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = key,
+        .model = "m",
+        .base_url = null,
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    try self.destroy();
+    // Exactly one allocation had the key's length: the verdict below is about the copy.
+    try std.testing.expectEqual(@as(usize, 1), observer.target_hits);
+    try std.testing.expect(observer.target_freed);
+    try std.testing.expect(observer.target_was_zero);
+}
+
+test "AgentSession zeroes the copied API key when later construction fails" {
+    const key = "failed-create-key-" ++ ("k" ** 991); // 1009 bytes, see above (#70)
+    // Fail the first allocation after the sensitive copy, independent of how
+    // many Workspace/catalog allocations Session construction adds before it.
+    var observer = EraseObservingAllocator{
+        .backing = std.testing.allocator,
+        .target_len = key.len,
+        .fail_after_target = true,
+    };
+    const runtime = try AgentRuntime.create(observer.allocator(), .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectError(error.OutOfMemory, runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = key,
+        .model = "m",
+        .base_url = null,
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    }));
+    // Exactly one allocation had the key's length: the verdict below is about the copy.
+    try std.testing.expectEqual(@as(usize, 1), observer.target_hits);
+    try std.testing.expect(observer.target_freed);
+    try std.testing.expect(observer.target_was_zero);
+}
+
+/// Watches every free for the bytes of `secrets` (issue #336): a block freed
+/// while it still holds one is a leak; a block of a secret's length freed as
+/// zeros is that secret's erased copy.
+const SecretFreeObserver = struct {
+    backing: std.mem.Allocator,
+    secrets: []const []const u8,
+    leaked: usize = 0,
+    erased: [4]usize = .{0} ** 4,
+
+    fn allocator(self: *SecretFreeObserver) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        for (self.secrets, 0..) |secret, index| {
+            if (std.mem.indexOf(u8, memory, secret) != null) self.leaked += 1;
+            if (memory.len == secret.len and std.mem.allEqual(u8, memory, 0)) self.erased[index] += 1;
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "AgentSession erases each replaced credential when it is replaced and the last one at destroy" {
+    // 1009, 1013 and 1019 bytes: lengths no path, catalog entry or buffer shares (#70).
+    const first = "erase-first-" ++ ("k" ** 997);
+    const second = "erase-second-" ++ ("k" ** 1000);
+    const third = "erase-third-" ++ ("k" ** 1007);
+    var observer = SecretFreeObserver{ .backing = std.testing.allocator, .secrets = &.{ first, second, third } };
+    const runtime = try AgentRuntime.create(observer.allocator(), .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = first,
+        .model = "m",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+
+    try std.testing.expectEqual(@as(u64, 2), try self.updateCredential(second));
+    try std.testing.expectEqual([4]usize{ 1, 0, 0, 0 }, observer.erased);
+    // A refusal keeps `second` and erases nothing.
+    try std.testing.expectError(error.InvalidCredentialByte, self.updateCredential("erase third"));
+    try std.testing.expectEqual(@as(u64, 3), try self.updateCredential(third));
+    try std.testing.expectEqual([4]usize{ 1, 1, 0, 0 }, observer.erased);
+    try std.testing.expect(self.credential.matches(third));
+
+    try self.destroy();
+    try std.testing.expectEqual([4]usize{ 1, 1, 1, 0 }, observer.erased);
+    try std.testing.expectEqual(@as(usize, 0), observer.leaked);
+}
+
+test "AgentSession refuses a credential update once poisoned or destroying, before reading it" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try std.testing.expectEqual(@as(u64, 2), try self.updateCredential("replacement-key"));
+    for ([_]State{ .poisoned, .destroying }) |terminal| {
+        self.mutex.lock();
+        self.state = terminal;
+        self.mutex.unlock();
+        try std.testing.expectError(error.InvalidSessionState, self.updateCredential("later-key"));
+        try std.testing.expectError(error.InvalidSessionState, self.updateCredential(""));
+        try std.testing.expect(self.credential.matches("replacement-key"));
+    }
+    // Every other state admits the update: it waits for no Run, compaction,
+    // checkpoint export or mutation.
+    for ([_]State{ .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing, .idle }) |state| {
+        self.mutex.lock();
+        self.state = state;
+        self.mutex.unlock();
+        _ = try self.updateCredential("busy-state-key");
+    }
+    try std.testing.expectEqual(@as(u64, 9), self.credential.currentGeneration());
+}
+
+test "AgentSession initializes per-session permission state" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .dont_ask, cwd);
+    defer self.destroy() catch unreachable;
+    try std.testing.expectEqual(types.PermissionMode.dont_ask, self.permission_ctx.modeValue());
+    try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), self.permission_ctx.session.asSlice());
+}
+
+test "AgentSession model mutation is idle-only and preserves Session state" {
+    const ApiErrorExecutor = struct {
+        fn run(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: RunIdentity,
+            _: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            _: RunExecutionEvidence,
+            _: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            return .{ .stop_reason = .api_error, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "preserve me");
+    self.session_rules.rememberAllow("Read");
+    self.session_rules.rememberDeny("Bash");
+
+    var probe = SinkProbe{};
+    _ = try self.beginRun(17, probe.sink());
+    _ = self.finishRunLifecycle();
+
+    const session_id = self.session_id;
+    const messages_ptr = self.conversation.messages.items.ptr;
+    const tools_ptr = self.tools.entries.ptr;
+    const workspace_root_ptr = self.workspace.root.ptr;
+    const previous_provider_ctx = self.provider.provider().ctx;
+    try self.setModel("replacement-model");
+
+    try std.testing.expectEqualStrings("replacement-model", self.model);
+    try std.testing.expectEqualStrings("replacement-model", self.provider.provider().model());
+    try std.testing.expect(self.provider.provider().ctx != previous_provider_ctx);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqualSlices(u8, session_id.asSlice(), self.session_id.asSlice());
+    try std.testing.expectEqual(@as(u64, 17), self.last_run_id);
+    try std.testing.expectEqual(@as(usize, 1), self.conversation.messages.items.len);
+    try std.testing.expect(self.conversation.messages.items.ptr == messages_ptr);
+    try std.testing.expect(self.tools.entries.ptr == tools_ptr);
+    try std.testing.expect(self.workspace.root.ptr == workspace_root_ptr);
+    try std.testing.expect(self.session_rules.isAllowed("Read"));
+    try std.testing.expect(self.session_rules.isDenied("Bash"));
+    try std.testing.expect(!self.isPoisoned());
+
+    const model_ptr = self.model.ptr;
+    const provider_ctx = self.provider.provider().ctx;
+    try self.setModel("replacement-model");
+    try std.testing.expect(self.model.ptr == model_ptr);
+    try std.testing.expect(self.provider.provider().ctx == provider_ctx);
+
+    _ = try self.beginRun(18, probe.sink());
+    try std.testing.expectError(error.SessionBusy, self.setModel("busy-model"));
+    try std.testing.expectEqualStrings("replacement-model", self.model);
+    _ = self.finishRunLifecycle();
+
+    // Model existence is intentionally provider-validated by the next Run.
+    // Its ordinary API-error outcome remains non-poisoning and the Host can
+    // switch the same Session back to another model.
+    try self.setModel("missing-model-is-locally-valid");
+    var executor: u8 = 0;
+    var admitted = try self.admitRun(19, probe.sink());
+    const result = try admitted.runIsolated(
+        &.{"provider validates the model"},
+        .{ .ctx = &executor, .executeFn = ApiErrorExecutor.run },
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expect(!self.isPoisoned());
+    try self.setModel("recovered-model");
+    try std.testing.expectEqualStrings("recovered-model", self.model);
+}
+
+test "AgentSession model mutation rejects invalid input and poisoned state" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer {
+        self.state = .idle;
+        self.destroy() catch unreachable;
+    }
+
+    try std.testing.expectError(error.InvalidModel, self.setModel(""));
+    try std.testing.expectError(error.InvalidModel, self.setModel(&.{0xff}));
+    try std.testing.expectEqualStrings("test-model", self.model);
+
+    self.state = .poisoned;
+    try std.testing.expectError(error.InvalidSessionState, self.setModel("other-model"));
+    try std.testing.expectEqualStrings("test-model", self.model);
+}
+
+test "AgentSession model mutation rolls back allocation failures" {
+    var observer = EraseObservingAllocator{
+        .backing = std.testing.allocator,
+        .target_len = std.math.maxInt(usize),
+    };
+    const runtime = try createTestRuntime(observer.allocator());
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "stable");
+
+    const original_model_ptr = self.model.ptr;
+    const original_provider_ctx = self.provider.provider().ctx;
+    const original_message_ptr = self.conversation.messages.items.ptr;
+
+    // The copied model is the first allocation after admission.
+    observer.fail_index = observer.allocations;
+    try std.testing.expectError(error.OutOfMemory, self.setModel("copy-fails"));
+    observer.fail_index = null;
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expect(self.model.ptr == original_model_ptr);
+    try std.testing.expect(self.provider.provider().ctx == original_provider_ctx);
+    try std.testing.expect(self.conversation.messages.items.ptr == original_message_ptr);
+    try std.testing.expectEqualStrings("test-model", self.model);
+
+    // The next allocation constructs the replacement provider after the model
+    // copy, proving that partial replacement state is also discarded.
+    observer.fail_index = observer.allocations + 1;
+    try std.testing.expectError(error.OutOfMemory, self.setModel("provider-fails"));
+    observer.fail_index = null;
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expect(self.model.ptr == original_model_ptr);
+    try std.testing.expect(self.provider.provider().ctx == original_provider_ctx);
+    try std.testing.expect(self.conversation.messages.items.ptr == original_message_ptr);
+    try std.testing.expectEqualStrings("test-model", self.model);
+    try std.testing.expect(!self.isPoisoned());
+}
+
+test "AgentSession route mutation moves provider, endpoint, scheme, credential and model together; a refusal changes none of them (#16)" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.setReasoningEffort(.high);
+
+    try std.testing.expectError(error.InvalidModel, self.setRoute(.{ .provider_kind = .openai, .api_key = "route-key", .model = "" }));
+    try std.testing.expectError(error.InvalidCredentialByte, self.setRoute(.{ .provider_kind = .openai, .api_key = "bad key", .model = "gpt-route" }));
+    // Gemini takes no effort: the Session's is never dropped to fit.
+    try std.testing.expectError(error.AgentEffortUnsupportedProvider, self.setRoute(.{ .provider_kind = .gemini, .api_key = "route-key", .model = "gemini-route" }));
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(types.ProviderKind.anthropic, self.provider.kind());
+    try std.testing.expectEqualStrings("test-model", self.model);
+    try std.testing.expect(self.base_url == null);
+    try std.testing.expect(self.auth_scheme == null);
+    try std.testing.expect(self.credential.matches("test-key"));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .high), self.reasoning_effort);
+
+    // The caller's bytes are copied: overwritten after the call, the route
+    // stays as bound.
+    var header = "x-route-key".*;
+    var url = "http://127.0.0.1:9/v1".*;
+    try self.setRoute(.{
+        .provider_kind = .openai,
+        .openai_protocol = .responses,
+        .auth_scheme = .{ .api_key_header = &header },
+        .api_key = "route-key",
+        .model = "gpt-route",
+        .base_url = &url,
+    });
+    @memset(&header, 'x');
+    @memset(&url, 'x');
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(types.ProviderKind.openai, self.provider.kind());
+    try std.testing.expectEqual(types.OpenAIProtocol.responses, self.openai_protocol);
+    try std.testing.expectEqualStrings("gpt-route", self.model);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9/v1", self.base_url.?);
+    try std.testing.expectEqualStrings("x-route-key", self.auth_scheme.?.api_key_header);
+    try std.testing.expect(self.credential.matches("route-key"));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, .high), self.reasoning_effort);
+
+    self.state = .poisoned;
+    try std.testing.expectError(error.InvalidSessionState, self.setRoute(.{ .provider_kind = .anthropic, .api_key = "k", .model = "m" }));
+    self.state = .idle;
+    try std.testing.expectEqualStrings("gpt-route", self.model);
+}
+
+test "AgentSession owns initial imported permission rules" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var borrowed_rule = [_]u8{ 'W', 'r', 'i', 't', 'e' };
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+        .permission_rules = .{ .allow = &.{&borrowed_rule} },
+    });
+    defer self.destroy() catch unreachable;
+    borrowed_rule[0] = 'X';
+
+    try std.testing.expectEqual(
+        permission.PermissionResult.allow,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Write",
+            "{\"file_path\":\"ordinary.txt\"}",
+        ),
+    );
+}
+
+test "AgentSession permission rule update is idle-only atomic and preserves memory" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    self.session_rules.rememberAllow("Bash");
+    self.session_rules.rememberDeny("Write");
+
+    try self.updatePermissionRules(.{
+        .allow = &.{"Write"},
+        .ask = &.{"Edit"},
+        .deny = &.{"Bash"},
+    });
+    try std.testing.expectEqual(
+        permission.PermissionResult.deny,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Bash",
+            "{\"command\":\"echo ok\"}",
+        ),
+    );
+    try std.testing.expectEqual(
+        permission.PermissionResult.deny,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Write",
+            "{\"file_path\":\"ordinary.txt\"}",
+        ),
+    );
+    try std.testing.expectEqual(
+        permission.PermissionResult.ask,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Edit",
+            "{\"file_path\":\"ordinary.txt\"}",
+        ),
+    );
+    const previous_settings = self.permission_ctx.settings;
+    try std.testing.expectError(
+        error.InvalidRule,
+        self.updatePermissionRules(.{ .allow = &.{"Bash("} }),
+    );
+    try std.testing.expect(self.permission_ctx.settings == previous_settings);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expect(!self.isPoisoned());
+
+    var probe = SinkProbe{};
+    _ = try self.beginRun(31, probe.sink());
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.updatePermissionRules(.{}),
+    );
+    try std.testing.expect(self.permission_ctx.settings == previous_settings);
+    _ = self.finishRunLifecycle();
+
+    try self.updatePermissionRules(.{ .ask = &.{"Bash"} });
+    try std.testing.expectEqual(
+        permission.PermissionResult.allow,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Bash",
+            "{\"command\":\"echo ok\"}",
+        ),
+    );
+    try self.updatePermissionRules(.{});
+    try std.testing.expect(self.permission_ctx.settings == null);
+    try std.testing.expect(self.session_rules.isAllowed("Bash"));
+    try std.testing.expect(self.session_rules.isDenied("Write"));
+}
+
+test "AgentSession permission mode update is idle-only and keeps the imported rules" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.updatePermissionRules(.{ .allow = &.{ "Read", "Glob" }, .deny = &.{"Bash(rm *)"} });
+    const write_args = "{\"file_path\":\"ordinary.txt\",\"content\":\"x\"}";
+    try std.testing.expectEqual(
+        permission.PermissionResult.ask,
+        permission.checkPermission(&self.permission_ctx, "Write", write_args),
+    );
+
+    try self.setPermissionMode(.accept_edits);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, self.permission_ctx.modeValue());
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(
+        permission.PermissionResult.allow,
+        permission.checkPermission(&self.permission_ctx, "Write", write_args),
+    );
+    try std.testing.expectEqual(
+        permission.PermissionResult.deny,
+        permission.checkPermission(&self.permission_ctx, "Bash", "{\"command\":\"rm -rf x\"}"),
+    );
+
+    const input = try self.importedPermissionRuleInput(std.testing.allocator);
+    defer {
+        std.testing.allocator.free(input.allow);
+        std.testing.allocator.free(input.ask);
+        std.testing.allocator.free(input.deny);
+    }
+    try std.testing.expectEqual(@as(usize, 2), input.allow.len);
+    try std.testing.expectEqualStrings("Read", input.allow[0]);
+    try std.testing.expectEqualStrings("Glob", input.allow[1]);
+    try std.testing.expectEqual(@as(usize, 0), input.ask.len);
+    try std.testing.expectEqualStrings("Bash(rm *)", input.deny[0]);
+
+    var probe = SinkProbe{};
+    _ = try self.beginRun(41, probe.sink());
+    try std.testing.expectError(error.SessionBusy, self.setPermissionMode(.default));
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, self.permission_ctx.modeValue());
+    _ = self.finishRunLifecycle();
+
+    try self.updatePermissionRules(.{});
+    const empty = try self.importedPermissionRuleInput(std.testing.allocator);
+    try std.testing.expect(empty.isEmpty());
+}
+
+test "AgentSession permission mode update refuses a mode the Session's settings disable" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+
+    // A Session's settings are the Host-imported rule layer, which has no mode
+    // switches. Put on one that has them, as a settings-bearing Session would.
+    const no_rules: []const permission_settings.Rule = &.{};
+    const layers = [_]permission_settings.Layer{.{
+        .source = .host,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+        .disable_auto_mode = true,
+    }};
+    const disabling = permission_settings.MergedSettings{ .layers = &layers, .allocator = std.testing.allocator };
+    const imported = self.permission_ctx.settings;
+    self.permission_ctx.settings = &disabling;
+    defer self.permission_ctx.settings = imported;
+
+    for ([_]types.PermissionMode{ .bypass_permissions, .bypass, .auto }) |mode| {
+        try std.testing.expectError(error.PermissionModeDisabled, self.setPermissionMode(mode));
+        try std.testing.expectEqual(types.PermissionMode.default, self.permission_ctx.modeValue());
+        try std.testing.expectEqual(State.idle, self.state);
+    }
+    // The refusal leaves the Session mutable: an allowed mode still applies.
+    try self.setPermissionMode(.accept_edits);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, self.permission_ctx.modeValue());
+
+    // Twin: without the switches the same mode applies.
+    self.permission_ctx.settings = imported;
+    try self.setPermissionMode(.bypass_permissions);
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, self.permission_ctx.modeValue());
+    try std.testing.expectEqual(State.idle, self.state);
+}
+
+const CompactTestProvider = struct {
+    block: bool = false,
+    block_cancel: bool = false,
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancel_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stream_stage: u8 = 0,
+
+    fn provider(self: *@This()) provider_mod.Provider {
+        return .{
+            .ctx = self,
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .cancelFn = cancel,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+
+    fn cast(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn model(_: *anyopaque) []const u8 {
+        return "compact-test";
+    }
+    fn sendStream(
+        raw: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const @import("metacodes-ai").json.ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?@import("metacodes-ai").json.ToolChoice,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = cast(raw);
+        if (!self.block) return error.ProviderFailed;
+        self.stream_stage = 0;
+        return .{
+            .ctx = raw,
+            .nextFn = next,
+            .deinitFn = deinitStream,
+            .stopReasonFn = stopReason,
+            .requestIdFn = requestId,
+        };
+    }
+    fn sendStreamRetry(
+        raw: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const @import("metacodes-ai").json.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?@import("metacodes-ai").json.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStream(raw, messages, system, tools, abort, model_override, tool_choice, user_query);
+    }
+    fn next(raw: *anyopaque) anyerror!?@import("metacodes-ai").api.stream.StreamEvent {
+        const self = cast(raw);
+        if (self.stream_stage == 0) {
+            self.stream_stage = 1;
+            return .{ .usage = .{ .input_tokens = 5, .output_tokens = 2 } };
+        }
+        self.started.store(true, .release);
+        while (!self.cancelled.load(.acquire)) std.Thread.yield() catch {};
+        return error.Aborted;
+    }
+    fn deinitStream(_: *anyopaque) void {}
+    fn stopReason(_: *anyopaque) @import("metacodes-ai").api.stream.StopReason {
+        return .unknown;
+    }
+    fn requestId(_: *anyopaque) @import("metacodes-base").util.log.RequestId {
+        return .{ .bytes = [_]u8{'c'} ** 12 };
+    }
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const @import("metacodes-ai").json.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.Unused;
+    }
+    fn cancel(raw: *anyopaque, _: *const AbortSignal) void {
+        const self = cast(raw);
+        self.cancelled.store(true, .release);
+        self.cancel_started.store(true, .release);
+        while (self.block_cancel and !self.release_cancel.load(.acquire))
+            std.Thread.yield() catch {};
+    }
+    fn maxTokens(_: *anyopaque) u32 {
+        return 32_000;
+    }
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+};
+
+const RunOverrideTestProvider = struct {
+    allocator: std.mem.Allocator,
+    calls: u32 = 0,
+    stage: u8 = 0,
+    /// Digest of the system prompt of the latest request.
+    last_system_sha256: ?[32]u8 = null,
+
+    fn provider(self: *@This()) provider_mod.Provider {
+        return .{
+            .ctx = self,
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+
+    fn cast(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn model(_: *anyopaque) []const u8 {
+        return "run-override-test";
+    }
+
+    fn sendStream(
+        raw: *anyopaque,
+        _: []const types.ApiMessage,
+        system: ?[]const u8,
+        _: ?[]const @import("metacodes-ai").json.ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?@import("metacodes-ai").json.ToolChoice,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = cast(raw);
+        self.calls += 1;
+        self.stage = 0;
+        self.last_system_sha256 = if (system) |text| prompt_sections.sha256(text) else null;
+        return .{
+            .ctx = raw,
+            .nextFn = next,
+            .deinitFn = deinitStream,
+            .stopReasonFn = stopReason,
+            .requestIdFn = requestId,
+        };
+    }
+
+    fn sendStreamRetry(
+        raw: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const @import("metacodes-ai").json.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?@import("metacodes-ai").json.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStream(
+            raw,
+            messages,
+            system,
+            tools,
+            abort,
+            model_override,
+            tool_choice,
+            user_query,
+        );
+    }
+
+    fn next(raw: *anyopaque) anyerror!?@import("metacodes-ai").api.stream.StreamEvent {
+        const self = cast(raw);
+        if (self.stage == 0) {
+            self.stage = 1;
+            return .{ .text = try self.allocator.dupe(u8, "override reply") };
+        }
+        if (self.stage == 1) {
+            self.stage = 2;
+            return .done;
+        }
+        return null;
+    }
+
+    fn deinitStream(_: *anyopaque) void {}
+
+    fn stopReason(_: *anyopaque) @import("metacodes-ai").api.stream.StopReason {
+        return .end_turn;
+    }
+
+    fn requestId(_: *anyopaque) @import("metacodes-base").util.log.RequestId {
+        return .{ .bytes = [_]u8{'r'} ** 12 };
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const @import("metacodes-ai").json.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.Unused;
+    }
+
+    fn maxTokens(_: *anyopaque) u32 {
+        return 1024;
+    }
+
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+};
+
+test "AdmittedRun uses a borrowed Provider override without mutating Session ownership" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var sink = SinkProbe{};
+    var override = RunOverrideTestProvider{
+        .allocator = std.testing.allocator,
+    };
+    var admitted = try self.admitRun(1, sink.sink());
+    const result = try admitted.runUserMessagesWithToolSurfaceUsingProvider(
+        &.{"hello"},
+        1,
+        null,
+        null,
+        override.provider(),
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), override.calls);
+    try std.testing.expectEqualStrings("test-model", self.provider.provider().model());
+    const last = self.conversation.messages.items[
+        self.conversation.messages.items.len - 1
+    ];
+    try std.testing.expectEqualStrings("override reply", last.blocks[0].text);
+}
+
+test "AgentSession durable profile wires provider effects into unified run journal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
+        .run_journal = .{ .exact_root = root },
+    });
+    defer self.destroy() catch unreachable;
+    var sink = SinkProbe{};
+    var override = RunOverrideTestProvider{ .allocator = std.testing.allocator };
+    var admitted = try self.admitRun(1, sink.sink());
+    const result = try admitted.runUserMessagesWithToolSurfaceUsingProvider(
+        &.{"hello durable core"},
+        1,
+        null,
+        null,
+        override.provider(),
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    const summary = try tool_observation_journal.validate(root, self.session_id);
+    try std.testing.expect(summary.complete);
+    // run_started + provider intent + provider result + run_finished.
+    try std.testing.expectEqual(@as(u64, 4), summary.records);
+}
+
+/// Counts `prompt_manifest` events and keeps the latest one's prompt digest.
+const ManifestProbe = struct {
+    manifests: usize = 0,
+    last_sha256: ?[32]u8 = null,
+    last_entries: usize = 0,
+
+    fn emit(ctx: *anyopaque, _: SessionId, _: u64, event: CoreEvent) bool {
+        const self: *ManifestProbe = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .prompt_manifest => |manifest| {
+                self.manifests += 1;
+                self.last_sha256 = manifest.sha256;
+                self.last_entries = manifest.entries.len;
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    fn sink(self: *ManifestProbe) EventSink {
+        return .{ .ctx = self, .emit = emit };
+    }
+};
+
+fn expectSessionPrompt(
+    self: *AgentSession,
+    profile: prompt_sections.Profile,
+    provider: *const RunOverrideTestProvider,
+) !prompt_sections.Rendered {
+    const names = try std.testing.allocator.alloc([]const u8, self.tools.definitions.len);
+    defer std.testing.allocator.free(names);
+    for (self.tools.definitions, names) |definition, *name| name.* = definition.name;
+    var expected = try system_prompt_mod.renderSessionPrompt(std.testing.allocator, .{
+        .model = self.model,
+        .cwd = self.workspace.root,
+        .enabled_tool_names = names,
+        .tool_defs = self.tools.definitions,
+        .profile = profile,
+    });
+    errdefer expected.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(expected.text), &provider.last_system_sha256.?);
+    return expected;
+}
+
+test "AgentSession renders, records and announces its prompt profile" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    // Borrowed by create only: the Session keeps its own copy.
+    var identity_text = "You are Shopkeeper, a browser agent.".*;
+    const profile_sections = [_]prompt_sections.ProfileSection{
+        .{ .op = .replace, .id = "metacodes:identity", .text = &identity_text },
+        .{ .op = .add, .id = "host:rules", .order = 500, .text = "Read the page before acting on it." },
+    };
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
+        .run_journal = .{ .exact_root = root },
+        .prompt_profile = .{ .sections = &profile_sections },
+    });
+    defer self.destroy() catch unreachable;
+    @memset(&identity_text, 'x');
+    var identity_copy = "You are Shopkeeper, a browser agent.".*;
+    const profile: prompt_sections.Profile = .{ .sections = &.{
+        .{ .op = .replace, .id = "metacodes:identity", .text = &identity_copy },
+        profile_sections[1],
+    } };
+    try std.testing.expect(self.promptProfile().eql(profile));
+    try std.testing.expectEqual(@as(?prompt_sections.Manifest, null), self.lastPromptManifest());
+
+    var sink = ManifestProbe{};
+    var provider = RunOverrideTestProvider{ .allocator = std.testing.allocator };
+    var run_id: u64 = 0;
+    const runOnce = struct {
+        fn f(session: *AgentSession, id: *u64, probe: *ManifestProbe, p: *RunOverrideTestProvider) !void {
+            id.* += 1;
+            var admitted = try session.admitRun(id.*, probe.sink());
+            const result = try admitted.runUserMessagesWithToolSurfaceUsingProvider(&.{"hello"}, 1, null, null, p.provider());
+            try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+        }
+    }.f;
+
+    // The first Run announces its prompt; an unchanged second Run does not.
+    try runOnce(self, &run_id, &sink, &provider);
+    var with_profile = try expectSessionPrompt(self, profile, &provider);
+    defer with_profile.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, with_profile.text, "You are Shopkeeper, a browser agent.\n\n"));
+    try std.testing.expectEqual(@as(usize, 1), sink.manifests);
+    try std.testing.expectEqualSlices(u8, &with_profile.manifest.sha256, &sink.last_sha256.?);
+    try std.testing.expectEqual(with_profile.manifest.entries.len, sink.last_entries);
+    try std.testing.expectEqualSlices(u8, &with_profile.manifest.fingerprint(), &self.lastPromptManifest().?.fingerprint());
+    try runOnce(self, &run_id, &sink, &provider);
+    try std.testing.expectEqual(@as(usize, 1), sink.manifests);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(with_profile.text), &provider.last_system_sha256.?);
+
+    // Setting an equal profile is no boundary; a different one is exactly one.
+    try self.setPromptProfile(profile);
+    try runOnce(self, &run_id, &sink, &provider);
+    try std.testing.expectEqual(@as(usize, 1), sink.manifests);
+    try self.setPromptProfile(.{});
+    try runOnce(self, &run_id, &sink, &provider);
+    var kernel = try expectSessionPrompt(self, .{}, &provider);
+    defer kernel.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), sink.manifests);
+    try std.testing.expectEqualSlices(u8, &kernel.manifest.sha256, &sink.last_sha256.?);
+    try runOnce(self, &run_id, &sink, &provider);
+    try std.testing.expectEqual(@as(usize, 2), sink.manifests);
+
+    // Every Run's run_started records the manifest of the prompt it sent.
+    const summary = try tool_observation_journal.validate(root, self.session_id);
+    try std.testing.expect(summary.complete);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, tool_observation_journal.FILE_NAME, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    for ([_]struct { [32]u8, usize }{
+        .{ with_profile.manifest.sha256, 3 },
+        .{ kernel.manifest.sha256, 2 },
+    }) |case| {
+        const needle = try std.mem.concat(std.testing.allocator, u8, &.{
+            "\"prompt\":{\"sha256\":\"",
+            &std.fmt.bytesToHex(case[0], .lower),
+        });
+        defer std.testing.allocator.free(needle);
+        try std.testing.expectEqual(case[1], std.mem.count(u8, bytes, needle));
+    }
+}
+
+test "AgentSession refuses an invalid prompt profile at create and at set" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectError(error.InvalidPromptProfile, runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+        .prompt_profile = .{ .sections = &.{.{ .op = .replace, .id = "metacodes:system", .text = "x" }} },
+    }));
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    const kept: prompt_sections.Profile = .{ .sections = &.{.{ .op = .remove, .id = "metacodes:tone" }} };
+    try self.setPromptProfile(kept);
+    for ([_]prompt_sections.ProfileSection{
+        .{ .op = .remove, .id = "metacodes:safety-policy" },
+        .{ .op = .add, .id = "host:a", .text = "{{cwd}}", .interpolate = true },
+        .{ .op = .remove, .id = "metacodes:identity" },
+    }) |section| {
+        try std.testing.expectError(error.InvalidPromptProfile, self.setPromptProfile(.{ .sections = &.{section} }));
+        try std.testing.expect(self.promptProfile().eql(kept));
+    }
+    try std.testing.expectError(error.InvalidPromptProfile, self.setPromptProfile(.{ .sections = &.{
+        .{ .op = .add, .id = "host:a", .text = "a" },
+        .{ .op = .add, .id = "host:a", .text = "b" },
+    } }));
+    try std.testing.expect(!self.isPoisoned());
+}
+
+test "AgentSession durable profile crosses isolated executor boundary" {
+    const execution_effect = @import("metacodes-guard").core.execution_effect;
+    const Executor = struct {
+        saw_observer: bool = false,
+        saw_boundary: bool = false,
+        system_prompt_sha256: ?[32]u8 = null,
+
+        fn run(
+            raw: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            _: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            evidence: RunExecutionEvidence,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.saw_observer = evidence.tool_observer != null;
+            if (evidence.system_prompt) |prompt| self.system_prompt_sha256 = prompt_sections.sha256(prompt);
+            const boundary = evidence.execution_boundary orelse
+                return error.MissingExecutionBoundary;
+            self.saw_boundary = true;
+            const request_sha256 = execution_effect.sha256Hex(&.{"isolated-request"});
+            const attempt_id = execution_effect.providerAttemptId(
+                identity.session_id.bytes,
+                request_sha256,
+                1,
+                0,
+                1,
+            );
+            if (!boundary.emit(.{ .before = .{ .provider_request = .{
+                .attempt_id = attempt_id,
+                .actor_id = identity.session_id.bytes,
+                .request_sha256 = request_sha256,
+                .logical_turn = 1,
+                .context_generation = 0,
+                .physical_attempt = 1,
+                .max_attempts = 1,
+            } } })) return error.ExecutionBoundaryRejected;
+            if (!boundary.emit(.{ .after = .{ .provider_request = .{
+                .attempt_id = attempt_id,
+                .outcome = .succeeded,
+                .metering = .{ .known = .{
+                    .input_tokens = 1,
+                    .output_tokens = 1,
+                    .cache_read_input_tokens = 0,
+                    .cache_creation_input_tokens = 0,
+                } },
+            } } })) return error.ExecutionBoundaryRejected;
+            try out_final_text.appendSlice(allocator, "isolated final");
+            return .{ .stop_reason = .end_turn, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
+        .run_journal = .{ .exact_root = root },
+    });
+    defer self.destroy() catch unreachable;
+    var sink = SinkProbe{};
+    var executor = Executor{};
+    var admitted = try self.admitRun(1, sink.sink());
+    const result = try admitted.runIsolated(
+        &.{"isolated durable core"},
+        .{ .ctx = &executor, .executeFn = Executor.run },
+    );
+    try std.testing.expect(result.stop_reason == .end_turn);
+    try std.testing.expect(executor.saw_observer);
+    try std.testing.expect(executor.saw_boundary);
+    const summary = try tool_observation_journal.validate(root, self.session_id);
+    try std.testing.expect(summary.complete);
+    try std.testing.expectEqual(@as(u64, 4), summary.records);
+    // The executor receives the subagent prompt the Session recorded.
+    const subagent_prompt = try system_prompt_mod.buildSubagentSystemPrompt(std.testing.allocator, "test-model", root);
+    defer std.testing.allocator.free(subagent_prompt);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(subagent_prompt), &executor.system_prompt_sha256.?);
+    try std.testing.expectEqualSlices(u8, &prompt_sections.sha256(subagent_prompt), &self.lastPromptManifest().?.sha256);
+}
+
+test "AgentSession compact admission consumes only admitted operation ids" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+
+    var fake = CompactTestProvider{};
+    try std.testing.expectError(
+        error.InvalidOperationId,
+        self.compactUsingBorrowedProvider(0, .{ .keep_recent = 1 }, fake.provider()),
+    );
+    const first = try self.compactUsingBorrowedProvider(
+        1,
+        .{ .keep_recent = 1 },
+        fake.provider(),
+    );
+    try std.testing.expectEqual(compact_kernel.Outcome.degraded, first.outcome);
+    try std.testing.expect(first.dropped > 0);
+    try std.testing.expectEqual(@as(u64, 1), self.last_admitted_compact_id);
+    try std.testing.expectEqual(@as(u64, 1), self.last_terminal_compact_id);
+    try std.testing.expectEqual(@as(u64, 0), self.last_run_id);
+    try std.testing.expectEqualStrings("test-model", self.provider.provider().model());
+    try std.testing.expectError(
+        error.StaleCompact,
+        self.compactUsingProvider(1, .{}, fake.provider()),
+    );
+    try std.testing.expectError(error.AbortTooLate, self.abortCompact(1));
+    try std.testing.expectError(error.InvalidOperationId, self.abortCompact(2));
+
+    var sink_probe = SinkProbe{};
+    _ = try self.beginRun(7, sink_probe.sink());
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(2, .{}, fake.provider()),
+    );
+    _ = self.finishRunLifecycle();
+    const second = try self.compactUsingProvider(2, .{}, fake.provider());
+    try std.testing.expectEqual(compact_kernel.Outcome.no_change, second.outcome);
+    try std.testing.expectError(error.StaleCompact, self.abortCompact(1));
+    try std.testing.expectError(error.AbortTooLate, self.abortCompact(2));
+}
+
+test "AgentSession borrowed compact commit guard preserves Conversation on rejection" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+
+    const Guard = struct {
+        fn reject(_: *anyopaque, _: *const Conversation) bool {
+            return false;
+        }
+    };
+    var guard_anchor: u8 = 0;
+    var fake = CompactTestProvider{};
+    const before_len = self.conversation.len();
+    const report = try self.compactUsingBorrowedProvider(
+        1,
+        .{
+            .keep_recent = 1,
+            .commit_guard = .{
+                .ctx = &guard_anchor,
+                .allowFn = Guard.reject,
+            },
+        },
+        fake.provider(),
+    );
+    // A guard rejection is a refusal, reported apart from a cancellation.
+    try std.testing.expectEqual(compact_kernel.Outcome.refused, report.outcome);
+    try std.testing.expectEqual(before_len, self.conversation.len());
+    try std.testing.expectEqualStrings(
+        "old user context",
+        self.conversation.messages.items[0].blocks[0].text,
+    );
+    try std.testing.expectEqual(@as(u64, 1), self.last_admitted_compact_id);
+    try std.testing.expectEqual(@as(u64, 1), self.last_terminal_compact_id);
+}
+
+test "AgentSession compact abort is bounded terminal and leaves Conversation unchanged" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+    const boundary_before = self.conversation.compact_boundary;
+    var fake = CompactTestProvider{ .block = true };
+    const Worker = struct {
+        session: *AgentSession,
+        provider: provider_mod.Provider,
+        report: ?compact_kernel.Report = null,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.report = ctx.session.compactUsingProvider(
+                3,
+                .{ .keep_recent = 1 },
+                ctx.provider,
+            ) catch |err| {
+                ctx.failure = err;
+                return;
+            };
+        }
+    };
+    var worker = Worker{ .session = self, .provider = fake.provider() };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!fake.started.load(.acquire)) std.Thread.yield() catch {};
+
+    try std.testing.expectError(error.InvalidOperationId, self.abortCompact(0));
+    try std.testing.expectError(error.StaleCompact, self.abortCompact(2));
+    try std.testing.expectError(error.InvalidOperationId, self.abortCompact(4));
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(4, .{}, fake.provider()),
+    );
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+    try self.abortCompact(3);
+    thread.join();
+
+    try std.testing.expect(worker.failure == null);
+    try std.testing.expectEqual(compact_kernel.Outcome.aborted, worker.report.?.outcome);
+    try std.testing.expectEqual(@as(u64, 5), worker.report.?.usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), worker.report.?.usage.output_tokens);
+    try std.testing.expectEqual(boundary_before, self.conversation.compact_boundary);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(@as(u64, 3), self.last_terminal_compact_id);
+    try std.testing.expectError(error.AbortTooLate, self.abortCompact(3));
+}
+
+test "AgentSession keeps every activity busy until compact provider cancel returns" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+
+    var fake = CompactTestProvider{ .block = true, .block_cancel = true };
+    const CompactWorker = struct {
+        session: *AgentSession,
+        provider: provider_mod.Provider,
+        report: ?compact_kernel.Report = null,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.report = ctx.session.compactUsingProvider(
+                3,
+                .{ .keep_recent = 1 },
+                ctx.provider,
+            ) catch |err| {
+                ctx.failure = err;
+                return;
+            };
+        }
+    };
+    const AbortWorker = struct {
+        session: *AgentSession,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.session.abortCompact(3) catch |err| {
+                ctx.failure = err;
+            };
+        }
+    };
+    var compact_worker = CompactWorker{ .session = self, .provider = fake.provider() };
+    var abort_worker = AbortWorker{ .session = self };
+    const compact_thread = try std.Thread.spawn(.{}, CompactWorker.run, .{&compact_worker});
+    while (!fake.started.load(.acquire)) std.Thread.yield() catch {};
+    const abort_thread = try std.Thread.spawn(.{}, AbortWorker.run, .{&abort_worker});
+    while (!fake.cancel_started.load(.acquire)) std.Thread.yield() catch {};
+    compact_thread.join();
+
+    try std.testing.expect(compact_worker.failure == null);
+    try std.testing.expectEqual(compact_kernel.Outcome.aborted, compact_worker.report.?.outcome);
+    try std.testing.expectError(error.SessionBusy, self.setModel("model-while-cancel-borrowed"));
+    try std.testing.expectError(error.SessionBusy, self.updatePermissionRules(.{}));
+    var sink_probe = SinkProbe{};
+    try std.testing.expectError(error.SessionBusy, self.beginRun(1, sink_probe.sink()));
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(4, .{}, fake.provider()),
+    );
+    try std.testing.expectEqual(@as(u64, 3), self.last_admitted_compact_id);
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+    // The terminal measurement an embedding layer takes after compact returns
+    // is refused too, so it has to wait for the borrow (AgentCore once
+    // poisoned its facade when it measured inside this window).
+    try std.testing.expectError(error.SessionBusy, self.snapshotCommittedForRunMeasurement());
+    const Waiter = struct {
+        session: *AgentSession,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(ctx: *@This()) void {
+            ctx.session.awaitProviderCancelsDrained();
+            ctx.done.store(true, .release);
+        }
+    };
+    var waiter = Waiter{ .session = self };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    sync.sleepMs(20);
+    try std.testing.expect(!waiter.done.load(.acquire));
+
+    fake.release_cancel.store(true, .release);
+    abort_thread.join();
+    waiter_thread.join();
+    try std.testing.expect(waiter.done.load(.acquire));
+    try std.testing.expect(abort_worker.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), self.in_flight_provider_cancels);
+    var lease = try self.snapshotCommittedForRunMeasurement();
+    lease.deinit();
+    self.awaitProviderCancelsDrained(); // nothing borrowed: returns at once
+    try self.setModel("model-after-cancel-returned");
+}
+
+test "AgentSession keeps every activity busy until Run provider cancel returns" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var sink_probe = SinkProbe{};
+    _ = try self.beginRun(1, sink_probe.sink());
+
+    var fake = CompactTestProvider{ .block_cancel = true };
+    const AbortWorker = struct {
+        session: *AgentSession,
+        provider: provider_mod.Provider,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.session.abortUsingProvider(
+                1,
+                .user_interrupt,
+                ctx.provider,
+            ) catch |err| {
+                ctx.failure = err;
+            };
+        }
+    };
+    var abort_worker = AbortWorker{ .session = self, .provider = fake.provider() };
+    const abort_thread = try std.Thread.spawn(.{}, AbortWorker.run, .{&abort_worker});
+    while (!fake.cancel_started.load(.acquire)) std.Thread.yield() catch {};
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.abort_requested);
+
+    try std.testing.expectError(error.SessionBusy, self.setModel("model-while-cancel-borrowed"));
+    try std.testing.expectError(error.SessionBusy, self.updatePermissionRules(.{}));
+    try std.testing.expectError(error.SessionBusy, self.beginRun(2, sink_probe.sink()));
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(1, .{}, fake.provider()),
+    );
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+
+    fake.release_cancel.store(true, .release);
+    abort_thread.join();
+    try std.testing.expect(abort_worker.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), self.in_flight_provider_cancels);
+    _ = try self.beginRun(2, sink_probe.sink());
+    _ = self.finishRunLifecycle();
+}
+
+test "AgentSession enforces one active Run and monotonic nonzero run ids" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    var probe = SinkProbe{};
+    try std.testing.expect(!self.isPoisoned());
+
+    try std.testing.expectError(error.StaleRun, self.beginRun(0, probe.sink()));
+    const first_identity = try self.beginRun(1, probe.sink());
+    try std.testing.expectEqual(@as(u64, 1), first_identity.run_id);
+    try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), first_identity.session_id.asSlice());
+    try std.testing.expectEqual(State.running, self.state);
+    try std.testing.expectError(error.SessionBusy, self.beginRun(2, probe.sink()));
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+
+    const first = self.finishRunLifecycle();
+    try std.testing.expect(!first.abort_requested);
+    try std.testing.expect(!first.callback_failed);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectError(error.StaleRun, self.beginRun(1, probe.sink()));
+
+    _ = try self.beginRun(2, probe.sink());
+    _ = self.finishRunLifecycle();
+    _ = try self.beginRun(20, probe.sink());
+    _ = self.finishRunLifecycle();
+    const max_run_id = std.math.maxInt(u64);
+    _ = try self.beginRun(max_run_id, probe.sink());
+    _ = self.finishRunLifecycle();
+    try std.testing.expectError(error.StaleRun, self.beginRun(1, probe.sink()));
+    try std.testing.expectError(error.StaleRun, self.beginRun(max_run_id, probe.sink()));
+    try std.testing.expect(!self.isPoisoned());
+    try self.destroy();
+}
+
+test "AdmittedRun consumes run id without mutating Conversation" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{};
+    const initial_messages = self.conversation.messages.items.len;
+
+    var first = try self.admitRun(1, probe.sink());
+    var copied = first;
+    try std.testing.expectEqual(@as(u64, 1), first.identity().run_id);
+    try std.testing.expect(!first.abortSignal().isAborted());
+    const first_completion = try first.finishWithoutConversation();
+    try std.testing.expect(!first_completion.aborted);
+    try std.testing.expectEqual(initial_messages, self.conversation.messages.items.len);
+    try std.testing.expectError(error.InvalidSessionState, first.finishWithoutConversation());
+    try std.testing.expectError(error.InvalidSessionState, copied.finishWithoutConversation());
+    try std.testing.expectError(error.StaleRun, self.admitRun(1, probe.sink()));
+
+    var second = try self.admitRun(2, probe.sink());
+    try self.abort(2, .timeout);
+    const second_completion = try second.finishWithoutConversation();
+    try std.testing.expect(second_completion.aborted);
+    try std.testing.expectEqual(initial_messages, self.conversation.messages.items.len);
+
+    var third = try self.admitRun(3, probe.sink());
+    _ = try third.finishWithoutConversation();
+
+    var fourth = try self.admitRun(4, probe.sink());
+    try std.testing.expectError(
+        error.InvalidSessionState,
+        fourth.runUserMessagesWithPolicy(&.{}, 1, null),
+    );
+    try std.testing.expectEqual(initial_messages, self.conversation.messages.items.len);
+    try std.testing.expectError(error.StaleRun, self.admitRun(4, probe.sink()));
+}
+
+test "AdmittedRun isolated executor shares identity and commits only final assistant text" {
+    const Executor = struct {
+        seen_run_id: u64 = 0,
+        seen_session: ?SessionId = null,
+
+        fn run(
+            raw: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            backend: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            _: RunExecutionEvidence,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen_run_id = identity.run_id;
+            self.seen_session = identity.session_id;
+            backend.emitEvent(identity.session_id, .{ .text_chunk = "provisional" });
+            backend.emitEvent(identity.session_id, .stream_done);
+            try out_final_text.appendSlice(allocator, "final");
+            return .{ .stop_reason = .end_turn, .turns = 2, .tool_calls = 1 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{};
+    var executor = Executor{};
+    var admitted = try self.admitRun(7, probe.sink());
+    const result = try admitted.runIsolated(
+        &.{"invocation"},
+        .{ .ctx = &executor, .executeFn = Executor.run },
+    );
+
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 2), result.turns);
+    try std.testing.expectEqual(@as(u64, 7), executor.seen_run_id);
+    try std.testing.expectEqualSlices(
+        u8,
+        self.session_id.asSlice(),
+        executor.seen_session.?.asSlice(),
+    );
+    // The Session's prompt_manifest for the isolated Run, then the executor's two.
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqual(@as(u64, 7), probe.run_id);
+    try std.testing.expectEqual(@as(usize, 2), self.conversation.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "invocation",
+        self.conversation.messages.items[0].blocks[0].text,
+    );
+    try std.testing.expectEqualStrings(
+        "final",
+        self.conversation.messages.items[1].blocks[0].text,
+    );
+    try std.testing.expectEqual(State.idle, self.state);
+}
+
+test "AdmittedRun isolated callback failure poisons and does not commit final text" {
+    const Executor = struct {
+        fn run(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            backend: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            _: RunExecutionEvidence,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            backend.emitEvent(identity.session_id, .{ .text_chunk = "rejected" });
+            try out_final_text.appendSlice(allocator, "must-not-commit");
+            return .{ .stop_reason = .aborted, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{ .accept = false };
+    var executor: u8 = 0;
+    var admitted = try self.admitRun(9, probe.sink());
+    try std.testing.expectError(
+        error.CallbackFailed,
+        admitted.runIsolated(
+            &.{"invocation"},
+            .{ .ctx = &executor, .executeFn = Executor.run },
+        ),
+    );
+
+    try std.testing.expect(self.isPoisoned());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), self.conversation.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "invocation",
+        self.conversation.messages.items[0].blocks[0].text,
+    );
+}
+
+test "AdmittedRun isolated executor shares outer abort and closes cleanly" {
+    const Executor = struct {
+        session: *AgentSession,
+
+        fn run(
+            raw: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            _: *const ui_backend.UiBackend,
+            abort: *const AbortSignal,
+            _: RunExecutionEvidence,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.session.abort(identity.run_id, .timeout);
+            try std.testing.expect(abort.isAborted());
+            try out_final_text.appendSlice(allocator, "closed-before-abort");
+            return .{ .stop_reason = .end_turn, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{};
+    var executor = Executor{ .session = self };
+    var admitted = try self.admitRun(11, probe.sink());
+    const result = try admitted.runIsolated(
+        &.{"invocation"},
+        .{ .ctx = &executor, .executeFn = Executor.run },
+    );
+
+    try std.testing.expectEqual(agent_loop.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(@as(usize, 2), self.conversation.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "closed-before-abort",
+        self.conversation.messages.items[1].blocks[0].text,
+    );
+}
+
+test "AgentSession abort is run-scoped, idempotent and reports late requests" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    var probe = SinkProbe{};
+
+    try std.testing.expectError(error.StaleRun, self.abort(0, .user_interrupt));
+    _ = try self.beginRun(3, probe.sink());
+    try std.testing.expectError(error.StaleRun, self.abort(4, .user_interrupt));
+    try self.abort(3, .timeout);
+    try std.testing.expectEqual(State.abort_requested, self.state);
+    try std.testing.expect(self.abort_signal.isAborted());
+    try std.testing.expectEqual(abort_mod.Reason.timeout, self.abort_signal.reason());
+
+    // A repeated abort is harmless and preserves the first reason.
+    try self.abort(3, .user_interrupt);
+    try std.testing.expectEqual(abort_mod.Reason.timeout, self.abort_signal.reason());
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.abort_requested);
+    try std.testing.expect(!completion.callback_failed);
+    try std.testing.expectError(error.AbortTooLate, self.abort(3, .user_interrupt));
+    try self.destroy();
+}
+
+test "AgentSession callback failure aborts delivery and poisons the Session" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    var probe = SinkProbe{ .accept = false };
+    _ = try self.beginRun(7, probe.sink());
+
+    AgentSession.backendEmit(self, self.session_id, .stream_begin);
+    AgentSession.backendEmit(self, self.session_id, .stream_done);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(u64, 7), probe.run_id);
+    try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), probe.session_id.?.asSlice());
+    try std.testing.expect(self.abort_signal.isAborted());
+    try std.testing.expectEqual(abort_mod.Reason.host_failure, self.abort_signal.reason());
+
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.callback_failed);
+    try std.testing.expectEqual(State.poisoned, self.state);
+    try std.testing.expect(self.isPoisoned());
+    try std.testing.expectError(error.InvalidSessionState, self.beginRun(8, probe.sink()));
+    try self.destroy();
+}
+
+test "unexpected pre-run allocation failure poisons the Session" {
+    const allocator = std.testing.allocator;
+    const runtime = try createTestRuntime(allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = "http://127.0.0.1:1/v1/messages",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    });
+    defer self.destroy() catch unreachable;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    self.conversation.allocator = failing.allocator();
+    var sink_state: u8 = 0;
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: SessionId, _: u64, _: CoreEvent) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.OutOfMemory, self.runText(1, "must fail before provider I/O", 1, .{
+        .ctx = &sink_state,
+        .emit = Sink.emit,
+    }));
+    try std.testing.expectEqual(State.poisoned, self.state);
+    try std.testing.expectError(error.InvalidSessionState, self.beginRun(2, .{
+        .ctx = &sink_state,
+        .emit = Sink.emit,
+    }));
+    try std.testing.expectError(error.InvalidSessionState, self.abort(1, .user_interrupt));
+}
+
+test "AgentRuntime refuses destruction while Sessions are live" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const first = try createTestSession(runtime, .default, cwd);
+    const second = try createTestSession(runtime, .default, cwd);
+    try std.testing.expectError(error.RuntimeBusy, runtime.destroy());
+    try first.destroy();
+    try std.testing.expectError(error.RuntimeBusy, runtime.destroy());
+    try second.destroy();
+    try runtime.destroy();
+}
+
+test "AgentSession checkpoint lease gates lifecycle and releases to idle" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+
+    try self.conversation.appendText(.user, "committed before checkpoint");
+    var sink_probe = SinkProbe{};
+    var first = try self.admitRun(7, sink_probe.sink());
+    _ = try first.finishWithoutConversation();
+
+    var lease = try self.snapshotCommitted();
+    try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), lease.session_id.asSlice());
+    try std.testing.expectEqual(@as(u64, 7), lease.last_run_id);
+    try std.testing.expectEqualStrings("test-model", lease.model);
+    try std.testing.expectEqual(@as(usize, 1), lease.conversation.messages.items.len);
+    try std.testing.expectError(error.SessionBusy, self.admitRun(8, sink_probe.sink()));
+    try std.testing.expectError(error.SessionBusy, self.compact(1, .{}));
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+
+    lease.deinit();
+    var second = try self.admitRun(8, sink_probe.sink());
+    _ = try second.finishWithoutConversation();
+}
+
+test "restored AgentSession preserves logical identity and operation continuity" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "restored-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = cwd, .home = cwd },
+        .artifact_store = .session_under_workspace_home,
+        .allowed_tools = &.{"Read"},
+    };
+
+    var source = Conversation.init(std.testing.allocator);
+    defer source.deinit();
+    try source.appendText(.user, "before compact");
+    try source.appendText(.assistant, "after compact");
+    try source.restoreCompactState(1, "restored summary");
+
+    try std.testing.expectError(error.InvalidRestoredState, runtime.createRestoredSession(config, .{
+        .session_id = SessionId.single,
+        .last_run_id = 11,
+        .last_compact_id = 4,
+        .conversation = &source,
+    }));
+
+    const logical_id = SessionId.fromSlice("0000000000000000000000aa").?;
+    const restored = try runtime.createRestoredSession(config, .{
+        .session_id = logical_id,
+        .last_run_id = 11,
+        .last_compact_id = 4,
+        .conversation = &source,
+    });
+    // A failed check below must still release the Session before the deferred
+    // runtime.destroy, which otherwise reports RuntimeBusy and panics.
+    var restored_live = true;
+    defer if (restored_live) restored.destroy() catch {};
+    // The default state root is `<home>/.metacodes`, joined with the platform
+    // separator (`\` on Windows); the artifact store appends
+    // `/agentcore/sessions/<id>` to it.
+    const state_root = try std.fs.path.join(std.testing.allocator, &.{ cwd, ".metacodes" });
+    defer std.testing.allocator.free(state_root);
+    try std.testing.expectEqualStrings(state_root, restored.workspace.state_root);
+    const expected_artifact_root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/agentcore/sessions/{s}",
+        .{ state_root, logical_id.asSlice() },
+    );
+    defer std.testing.allocator.free(expected_artifact_root);
+    try std.testing.expectEqualStrings(expected_artifact_root, restored.artifact_root);
+    try std.testing.expect(restored.tools.contains("ReadArtifact"));
+    try source.appendText(.user, "source mutates independently");
+    try std.testing.expectEqual(@as(usize, 2), restored.conversation.messages.items.len);
+
+    try std.testing.expectError(error.SessionAlreadyOpen, runtime.createRestoredSession(config, .{
+        .session_id = logical_id,
+        .last_run_id = 11,
+        .last_compact_id = 4,
+        .conversation = &source,
+    }));
+    var sink_probe = SinkProbe{};
+    try std.testing.expectError(error.StaleRun, restored.admitRun(11, sink_probe.sink()));
+
+    {
+        // Released on every path: a held lease keeps the Session busy.
+        var lease = try restored.snapshotCommitted();
+        defer lease.deinit();
+        try std.testing.expectEqualSlices(u8, logical_id.asSlice(), lease.session_id.asSlice());
+        try std.testing.expectEqual(@as(u64, 11), lease.last_run_id);
+        try std.testing.expectEqual(@as(u64, 4), lease.last_compact_id);
+        try std.testing.expectEqual(@as(usize, 1), lease.conversation.compact_boundary);
+        try std.testing.expectEqualStrings("restored summary", lease.conversation.compact_summary.?);
+    }
+
+    var admitted = try restored.admitRun(12, sink_probe.sink());
+    _ = try admitted.finishWithoutConversation();
+    try restored.destroy();
+    restored_live = false;
+
+    const reopened = try runtime.createRestoredSession(config, .{
+        .session_id = logical_id,
+        .last_run_id = 12,
+        .last_compact_id = 4,
+        .conversation = &source,
+    });
+    var reopened_live = true;
+    defer if (reopened_live) reopened.destroy() catch {};
+    try std.testing.expectEqualStrings(expected_artifact_root, reopened.artifact_root);
+    try std.testing.expect(reopened.tools.contains("ReadArtifact"));
+    try reopened.destroy();
+    reopened_live = false;
+}
+
+test "AgentRuntime rejects process-only built-ins that AgentSession cannot wire" {
+    try std.testing.expectError(error.UnsupportedBuiltinTool, AgentRuntime.create(std.testing.allocator, .{
+        .builtin_tools = &.{"TaskCreate"},
+    }));
+}
+
+test "Host UI requester failure aborts and poisons the active Run" {
+    const FailingUi = struct {
+        fn request(
+            _: *anyopaque,
+            _: SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            return error.HostUiFailed;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"AskUserQuestion"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var ui_state: u8 = 0;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"AskUserQuestion"},
+        .ui_requester = .{ .ctx = &ui_state, .requestFn = FailingUi.request },
+    });
+    defer self.destroy() catch unreachable;
+    var sink_probe = SinkProbe{};
+    _ = try self.beginRun(11, sink_probe.sink());
+
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    try std.testing.expectError(error.HostUiFailed, self.permission_ctx.ui_requester.?.request(
+        self.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expect(self.abort_signal.isAborted());
+    try std.testing.expectEqual(abort_mod.Reason.host_failure, self.abort_signal.reason());
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.callback_failed);
+    try std.testing.expectEqual(State.poisoned, self.state);
+}
+
+test "a permission prompt nobody answered reaches the gate without poisoning the Run (#463)" {
+    const Unanswered = struct {
+        var next: anyerror = error.UiRequestTimedOut;
+        fn request(
+            _: *anyopaque,
+            _: SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            return next;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var ui_state: u8 = 0;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+        .ui_requester = .{ .ctx = &ui_state, .requestFn = Unanswered.request },
+    });
+    defer self.destroy() catch unreachable;
+    var sink_probe = SinkProbe{};
+    _ = try self.beginRun(12, sink_probe.sink());
+
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    inline for (.{ error.UiRequestTimedOut, error.UiRequestCancelled, error.UiAnswerUnreadable }) |cause| {
+        Unanswered.next = cause;
+        try std.testing.expectError(cause, self.permission_ctx.ui_requester.?.request(
+            self.session_id,
+            std.testing.allocator,
+            &req,
+            &response,
+        ));
+    }
+    try std.testing.expect(!self.abort_signal.isAborted());
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(!completion.callback_failed);
+    try std.testing.expectEqual(State.idle, self.state);
+}
+
+test "run-aware Host UI adapter snapshots identity and allows callback abort" {
+    const Probe = struct {
+        session: ?*AgentSession = null,
+        calls: usize = 0,
+        seen: ?RunIdentity = null,
+
+        fn request(
+            raw: *anyopaque,
+            identity: RunIdentity,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.seen = identity;
+            try self.session.?.abort(identity.run_id, .user_interrupt);
+            return .unavailable;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"AskUserQuestion"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var probe = Probe{};
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"AskUserQuestion"},
+        .run_ui_requester = .{ .ctx = &probe, .requestFn = Probe.request },
+    });
+    defer self.destroy() catch unreachable;
+    probe.session = self;
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+
+    // Idle state is defensive failure and never enters Host code.
+    try std.testing.expectError(error.HostUiFailed, self.permission_ctx.ui_requester.?.request(
+        self.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+
+    var sink_probe = SinkProbe{};
+    const admitted = try self.beginRun(41, sink_probe.sink());
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.unavailable,
+        try self.permission_ctx.ui_requester.?.request(self.session_id, std.testing.allocator, &req, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(u64, 41), probe.seen.?.run_id);
+    try std.testing.expectEqualSlices(u8, admitted.session_id.asSlice(), probe.seen.?.session_id.asSlice());
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.abort_requested);
+    try std.testing.expect(!completion.callback_failed);
+    try std.testing.expectEqual(State.idle, self.state);
+}
+
+test "run-aware Host UI adapter rejects cross-Session identity and poisons only the target" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn request(
+            raw: *anyopaque,
+            _: RunIdentity,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .unavailable;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"AskUserQuestion"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var probe_a = Probe{};
+    var probe_b = Probe{};
+    const common = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"AskUserQuestion"},
+    };
+    var config_a = common;
+    config_a.run_ui_requester = .{ .ctx = &probe_a, .requestFn = Probe.request };
+    const session_a = try runtime.createSession(config_a);
+    defer session_a.destroy() catch unreachable;
+    var config_b = common;
+    config_b.run_ui_requester = .{ .ctx = &probe_b, .requestFn = Probe.request };
+    const session_b = try runtime.createSession(config_b);
+    defer session_b.destroy() catch unreachable;
+
+    var sink_a = SinkProbe{};
+    _ = try session_a.beginRun(51, sink_a.sink());
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    try std.testing.expectError(error.HostUiFailed, session_a.permission_ctx.ui_requester.?.request(
+        session_b.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), probe_a.calls);
+    try std.testing.expect(session_a.abort_signal.isAborted());
+    try std.testing.expectEqual(abort_mod.Reason.host_failure, session_a.abort_signal.reason());
+    const completion = session_a.finishRunLifecycle();
+    try std.testing.expect(completion.callback_failed);
+    try std.testing.expectEqual(State.poisoned, session_a.state);
+    try std.testing.expectEqual(State.idle, session_b.state);
+    try std.testing.expectEqual(@as(usize, 0), probe_b.calls);
+
+    // Poisoned state remains a defensive short circuit with no callback.
+    try std.testing.expectError(error.HostUiFailed, session_a.permission_ctx.ui_requester.?.request(
+        session_a.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), probe_a.calls);
+
+    var sink_b = SinkProbe{};
+    _ = try session_b.beginRun(1, sink_b.sink());
+    _ = session_b.finishRunLifecycle();
+    try std.testing.expectEqual(State.idle, session_b.state);
+}
+
+test "Workspace shell policy is an authority ceiling for Session tools" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Bash" } });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectError(error.ShellToolDisabled, runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd, .shell = .disabled },
+        .allowed_tools = &.{ "Read", "Bash" },
+    }));
+
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd, .shell = .disabled },
+        .allowed_tools = &.{"Read"},
+    });
+    defer session.destroy() catch unreachable;
+    try std.testing.expect(session.tools.contains("Read"));
+    try std.testing.expect(!session.tools.contains("Bash"));
+}
+
+test "Sessions sharing one Runtime keep independent tool selections" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Edit" } });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const read_session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "read-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    });
+    defer read_session.destroy() catch unreachable;
+    const edit_session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "grep-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Edit"},
+    });
+    defer edit_session.destroy() catch unreachable;
+
+    try std.testing.expect(read_session.tools.contains("Read"));
+    try std.testing.expect(!read_session.tools.contains("Edit"));
+    try std.testing.expect(edit_session.tools.contains("Edit"));
+    try std.testing.expect(!edit_session.tools.contains("Read"));
+    try std.testing.expect(!std.mem.eql(u8, read_session.session_id.asSlice(), edit_session.session_id.asSlice()));
+}
+
+// —— T1 矩阵测试:session_id registry 生命周期(31/36)与 host identity 校验 ——
+
+test "Runtime session registry:原子注册、destroy 注销、Runtime destroy 时为空" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable; // destroy 内 assert registry 为空
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+
+    const a = try createTestSession(runtime, .default, cwd);
+    const b = try createTestSession(runtime, .default, cwd);
+    // 并存 Session 的 id 互异且均已注册(值语义 key)。
+    try std.testing.expect(!std.mem.eql(u8, &a.session_id.bytes, &b.session_id.bytes));
+    try std.testing.expectEqual(@as(usize, 2), runtime.session_ids.count());
+    // 原子注册:已存在的 id 二次注册 → false(collision detection 的判定分支)。
+    try std.testing.expect(!(try runtime.registerSessionId(a.session_id)));
+    try std.testing.expectEqual(@as(usize, 2), runtime.session_ids.count());
+
+    const a_id = a.session_id;
+    try a.destroy();
+    // destroy 成功必须注销。
+    try std.testing.expectEqual(@as(usize, 1), runtime.session_ids.count());
+    try std.testing.expect(!runtime.session_ids.contains(a_id.bytes));
+    try b.destroy();
+    try std.testing.expectEqual(@as(usize, 0), runtime.session_ids.count());
+}
+
+test "Runtime session registry retries an injected collision and registers the next value" {
+    const SequenceSource = struct {
+        ids: []const SessionId,
+        calls: usize = 0,
+
+        fn next(raw: ?*anyopaque) SessionId {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const index = @min(self.calls, self.ids.len - 1);
+            self.calls += 1;
+            return self.ids[index];
+        }
+    };
+
+    const ids = [_]SessionId{
+        SessionId.fromSlice("000000000000000000000001").?,
+        SessionId.fromSlice("000000000000000000000001").?,
+        SessionId.fromSlice("000000000000000000000002").?,
+    };
+    var source = SequenceSource{ .ids = &ids };
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    };
+    const hooks = SessionCreateHooks{ .session_id_source = .{
+        .ctx = &source,
+        .nextFn = SequenceSource.next,
+    } };
+
+    const first = try AgentSession.createWithHooks(runtime, config, hooks);
+    var first_live = true;
+    defer if (first_live) first.destroy() catch {};
+    const second = try AgentSession.createWithHooks(runtime, config, hooks);
+    var second_live = true;
+    defer if (second_live) second.destroy() catch {};
+
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    try std.testing.expectEqualStrings(ids[0].asSlice(), first.session_id.asSlice());
+    try std.testing.expectEqualStrings(ids[2].asSlice(), second.session_id.asSlice());
+    try std.testing.expectEqual(@as(usize, 2), runtime.session_ids.count());
+
+    try first.destroy();
+    first_live = false;
+    try second.destroy();
+    second_live = false;
+}
+
+test "Runtime session registry bounds repeated collisions without leaking registration or liveness" {
+    const ConstantSource = struct {
+        id: SessionId,
+        calls: usize = 0,
+
+        fn next(raw: ?*anyopaque) SessionId {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return self.id;
+        }
+    };
+
+    var source = ConstantSource{ .id = SessionId.fromSlice("000000000000000000000003").? };
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    };
+    const hooks = SessionCreateHooks{ .session_id_source = .{
+        .ctx = &source,
+        .nextFn = ConstantSource.next,
+    } };
+    const first = try AgentSession.createWithHooks(runtime, config, hooks);
+    defer first.destroy() catch unreachable;
+
+    try std.testing.expectError(error.SessionIdGeneratorBroken, AgentSession.createWithHooks(runtime, config, hooks));
+    try std.testing.expectEqual(@as(usize, 1 + AgentRuntime.MAX_SESSION_ID_RETRIES), source.calls);
+    try std.testing.expectEqual(@as(usize, 1), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 1), runtime.live_sessions);
+}
+
+test "Session creation failure after ID registration rolls the registry and live count back" {
+    const FailingHook = struct {
+        fn run(_: ?*anyopaque) anyerror!void {
+            return error.InjectedCreationFailure;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    };
+
+    try std.testing.expectError(error.InjectedCreationFailure, AgentSession.createWithHooks(runtime, config, .{
+        .after_id_registered_fn = FailingHook.run,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 0), runtime.live_sessions);
+
+    const recovered = try runtime.createSession(config);
+    defer recovered.destroy() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 1), runtime.live_sessions);
+}
+
+test "选择 Host tool 而无 host_identity_ctx → 创建拒绝且 registry 无残留" {
+    var probe_ctx: u8 = 0;
+    const HostFn = struct {
+        fn execute(_: *anyopaque, _: HostRunIdentity, _: []const u8) error{OutOfMemory}!HostToolOutcome {
+            return .{ .failed = null };
+        }
+    };
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{
+        .builtin_tools = &.{"Read"},
+        .host_sync_tools = &.{.{
+            .definition = .{
+                .name = "HostX",
+                .description = "probe",
+                .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
+            },
+            .ctx = &probe_ctx,
+            .execute = HostFn.execute,
+        }},
+    });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+
+    // 选 Host tool + null ctx → admission 拒绝;registry 与 live_sessions 双双无残留。
+    try std.testing.expectError(error.HostIdentityRequired, runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "k",
+        .model = "m",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"HostX"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 0), runtime.live_sessions);
+
+    // 带 ctx → 创建成功,runLoop 将以 admission 固定身份贯穿(此处验证接线存在)。
+    const ok = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "k",
+        .model = "m",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"HostX"},
+        .host_identity_ctx = &probe_ctx,
+    });
+    try std.testing.expectEqual(@as(?*anyopaque, &probe_ctx), ok.host_identity_ctx);
+    try ok.destroy();
+}
+
+test "resumeWithResults' precondition: the results answer the last assistant turn's calls, each at most once" {
+    const a = std.testing.allocator;
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    const Result = agent_loop.SuspendInfo.CompletedResult;
+    const question = Result{ .tool_use_id = "tu_q", .content = "{\"answers\":[\"Ship\"]}", .is_error = false };
+    try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{question}));
+    try conversation.appendText(.user, "ask me");
+    try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{question}));
+
+    const blocks = try a.alloc(message_mod.Block, 2);
+    blocks[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "tu_q"), .name = try a.dupe(u8, "AskUserQuestion"), .input = try a.dupe(u8, "{}") } };
+    blocks[1] = .{ .tool_use = .{ .id = try a.dupe(u8, "tu_r"), .name = try a.dupe(u8, "Read"), .input = try a.dupe(u8, "{}") } };
+    try conversation.append(.{ .role = .assistant, .blocks = blocks });
+    try checkResumable(&conversation, &.{question});
+    try checkResumable(&conversation, &.{ question, .{ .tool_use_id = "tu_r", .content = "x", .is_error = false } });
+    try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{ question, question }));
+    try std.testing.expectError(error.ResumeMismatch, checkResumable(&conversation, &.{.{ .tool_use_id = "tu_other", .content = "{}", .is_error = false }}));
+    try std.testing.expectError(error.NothingToResume, checkResumable(&conversation, &.{}));
+}
+
+test "AgentSession.inheritPermissions: the lead's rules, directories and memory as they are at each decision; the lead outlives the member" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.createDirPath(std.testing.io, "extra");
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(std.testing.io, &base_buffer);
+    for (base_buffer[0..base_len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    const base = base_buffer[0..base_len];
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, "{s}/root", .{base});
+    var extra_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const extra = try std.fmt.bufPrint(&extra_buffer, "{s}/extra", .{base});
+    var args_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const write_args = try std.fmt.bufPrint(&args_buffer, "{{\"file_path\":\"{s}/x.txt\",\"content\":\"x\"}}", .{extra});
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const lead = try createTestSession(runtime, .bypass_permissions, root);
+    var lead_destroyed = false;
+    defer if (!lead_destroyed) lead.destroy() catch unreachable;
+    const member = try createTestSession(runtime, .accept_edits, root);
+    var member_destroyed = false;
+    defer if (!member_destroyed) member.destroy() catch unreachable;
+
+    try std.testing.expectError(error.InvalidPermissionLender, lead.inheritPermissions(lead));
+    try member.inheritPermissions(lead);
+    try std.testing.expectError(error.PermissionsInherited, member.inheritPermissions(lead));
+    // The member keeps its own mode.
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, member.permission_ctx.modeValue());
+
+    // A Write outside the working directories asks; once the lead gains the
+    // directory, the member's next decision allows it, a scoped copy too.
+    try std.testing.expectEqual(permission.PermissionResult.ask, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    try lead.setAdditionalDirectories(&.{extra});
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    const scoped = member.permission_ctx.scopedDerive(null);
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&scoped, "Write", write_args));
+
+    // A rule the lead gains decides the member's next call; replacing it
+    // again frees the layer the member read.
+    try lead.updatePermissionRules(.{ .deny = &.{"Write"} });
+    try std.testing.expectEqual(permission.PermissionResult.deny, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+    try lead.updatePermissionRules(.{});
+    try std.testing.expectEqual(permission.PermissionResult.allow, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+
+    // Session memory is the lead's: its "deny" applies to the member.
+    lead.session_rules.rememberDeny("Write");
+    try std.testing.expectEqual(permission.PermissionResult.deny, permission.checkPermission(&member.permission_ctx, "Write", write_args));
+
+    // The member's own rules and directories would never be read: refused.
+    try std.testing.expectError(error.PermissionsInherited, member.updatePermissionRules(.{ .allow = &.{"Write"} }));
+    try std.testing.expectError(error.PermissionsInherited, member.setAdditionalDirectories(&.{}));
+    try std.testing.expectEqual(State.idle, member.state);
+
+    // The lead's destroy waits for the member's.
+    const Destroyer = struct {
+        fn run(session: *AgentSession, done: *std.atomic.Value(bool)) void {
+            session.destroy() catch unreachable;
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Destroyer.run, .{ lead, &done });
+    lead_destroyed = true;
+    std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake) catch {};
+    try std.testing.expect(!done.load(.acquire));
+    try member.destroy();
+    member_destroyed = true;
+    thread.join();
+    try std.testing.expect(done.load(.acquire));
+}
+
+test "AgentSession.inheritPermissions: the lead replaces its rules and directories while a member decides, and no decision reads a freed set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const lead = try createTestSession(runtime, .bypass_permissions, root);
+    defer lead.destroy() catch unreachable;
+    const member = try createTestSession(runtime, .bypass_permissions, root);
+    defer member.destroy() catch unreachable;
+    try member.inheritPermissions(lead);
+
+    const Writer = struct {
+        fn run(session: *AgentSession, dir: []const u8, stop: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                if (i % 2 == 0) {
+                    session.updatePermissionRules(.{ .deny = &.{"Bash"} }) catch unreachable;
+                    session.setAdditionalDirectories(&.{dir}) catch unreachable;
+                } else {
+                    session.updatePermissionRules(.{}) catch unreachable;
+                    session.setAdditionalDirectories(&.{}) catch unreachable;
+                }
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ lead, root, &stop });
+    var denied: usize = 0;
+    var allowed: usize = 0;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        switch (permission.checkPermission(&member.permission_ctx, "Bash", "{\"command\":\"make\"}")) {
+            .deny => denied += 1,
+            .allow => allowed += 1,
+            else => return error.UnexpectedDecision,
+        }
+    }
+    stop.store(true, .release);
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 2000), denied + allowed);
+}

@@ -293,7 +293,7 @@
     "scripts/eval/memory_agent_runtime_pilot.py": "4c52eeb01dce1d0e8adccbbc844cb6c6b120441db0c2d0b7aeb72eeff6caa97b",
     "scripts/eval/project_harness_experiment.py": "1e03325559eba1b3e1f0151c4a25c15105cdb5256a22619a1fd853790042d4e2",
     "scripts/eval/project_harness_rule_impact_prospective.py": "d5397e2bb23d4a730ef12ebfba4cd315da69d86d17decad534cf81299872e06b",
-    "scripts/eval/run_project_rule_evolution_mac_pilot.py": "121412ae70d27cd610794828ab38bacc6c9971ffd78b5f58e2561a513793450b",
+    "scripts/eval/run_project_rule_evolution_mac_pilot.py": "60b2eef996a57919fac8377a2d84e9e1b466d10073eed2e7a0c2b0b19b725a1c",
     "scripts/eval/tinykg_lean_factorial.py": "158df042d42919c3972368096d0de0fa985df46148618249dc8f267224c2bbd2",
     "scripts/eval/tinykg_lean_factorial_block.py": "ed5b6546c8f98f5bbc69c1b715b4ebe4b7a611d3eb4a9ae60abc8f424e0d6043",
     "scripts/eval/tinykg_lean_factorial_executor.py": "847b4cb42c91863a44bce7746a7fdda46e35efa703c70a7c5496cf6390ee3acb",

@@ -5,7 +5,7 @@
 //! that gap).
 //!
 //! The two halves are written against the same contract but never met until
-//! here: `src/kg/kgd/` synthesizes the envelope and `src/kg/transport.zig`
+//! here: `packages/coding/src/kg/kgd/` synthesizes the envelope and `packages/coding/src/kg/transport.zig`
 //! validates it field by field. This drives a real `tinykgd`, over a real
 //! socket, with the real client, so a contract drift on either side fails here
 //! rather than in a degraded session.

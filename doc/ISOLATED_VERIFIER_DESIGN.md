@@ -5,7 +5,7 @@ host check, 2026-11-16 (design 2026-10-17); §12 lists what is implemented,
 where it departs from this design, and what is still open. This is the
 second of three borrowings from RSIAgent (AetherLabsAI/RSIAgent, arXiv
 2609.15364). The first, the learning turn, is `doc/LEARNING_TURN_DESIGN.md`
-and `src/core/learning_turn.zig`. When this design was written it lived in
+and `packages/coding/src/core/learning_turn.zig`. When this design was written it lived in
 [metask-ai/metacodes#292](https://github.com/metask-ai/metacodes/pull/292);
 it has since reached `main`, but the verifier is not wired into it yet
 (§12.3).
@@ -22,11 +22,11 @@ them, the section says so.
 Today a run has one verdict source: a check command that the host pins at
 startup and runs itself. There are two places it runs:
 
-- **In-run**, [`check_gate.zig`](../src/core/check_gate.zig) runs the pinned
+- **In-run**, [`check_gate.zig`](../packages/coding/src/core/check_gate.zig) runs the pinned
   command when the model stops after a delivery-capable action. It classifies
   the result as `passed`, `failed`, `tainted` or `unavailable`. In enforce
   mode a clean failure continues the conversation.
-- **At the end of a headless run**, [`host_check.zig`](../src/core/host_check.zig)
+- **At the end of a headless run**, [`host_check.zig`](../packages/coding/src/core/host_check.zig)
   runs `METACODES_HOST_CHECK` once. It files a `task-outcome-v1` row with
   provenance `host_run` or `host_run_tainted` (`verdict.composeOutcomesJson`).
 
@@ -349,7 +349,7 @@ round does not exist.
 
 ## 4. Provenance rank
 
-[`verdict.zig`](../src/core/verdict.zig) orders provenance as `self_claim` <
+[`verdict.zig`](../packages/coding/src/core/verdict.zig) orders provenance as `self_claim` <
 `host_run_tainted` < `host_run` < `external_oracle` < `user`. The best-attempt
 selector compares rows lexicographically by (reward, rank, recency). This is
 proven in
@@ -763,15 +763,15 @@ claim.
 
 | Step | Files | Evidence that closes it |
 |---|---|---|
-| 1. Snapshot: temp-index tree id, `base`/`candidate` commits, alternates-backed repository, always-delete finalize, T′ recheck | `src/agents/isolation.zig` (a `Snapshot` beside `Worktree`) | Tests: the actor's index, `HEAD`, refs and stash are byte-identical before and after; untracked files are in, ignored files out; T′ ≠ T after a write; a `git stash` in the snapshot leaves the actor's stash untouched |
-| 2. Verifier core: charter constant and hash, packet render, token parse, evidence cross-check, result mapping, bounds `State` | `src/core/isolated_verifier.zig` | Unit tests per row of the §3.2 table and every §3.3 reason |
-| 3. Last-message and tool-input access for a spawned child | `src/core/subagent.zig` | A test where an earlier assistant message carries `VERDICT: PASS` and the last does not: the result is `no_token` |
-| 4. Wiring at the check-gate boundary: verifier after `passed`, FAIL continuation, leads round with the read-only gate, output-segment handling (§6.3) | `src/core/agent_loop.zig`, `src/core/check_gate.zig` | Component tests with a mock provider for each §3.4 row; observe arm byte-identical to the gate without the verifier |
-| 5. `Grounding.contested` and the verifier evidence sentence | `src/core/learning_turn.zig` (after #292) | Tests mirroring a `contested_learns_failed` theorem |
-| 6. End-of-run qualifier: `"verifier"` field and tree id on the `host_run` row; effective rank in the selector | `src/core/host_check.zig`, `src/core/verdict.zig`, history readers | Tests: an old-format row reads as before; a contested row loses only at equal reward |
+| 1. Snapshot: temp-index tree id, `base`/`candidate` commits, alternates-backed repository, always-delete finalize, T′ recheck | `packages/coding/src/agents/isolation.zig` (a `Snapshot` beside `Worktree`) | Tests: the actor's index, `HEAD`, refs and stash are byte-identical before and after; untracked files are in, ignored files out; T′ ≠ T after a write; a `git stash` in the snapshot leaves the actor's stash untouched |
+| 2. Verifier core: charter constant and hash, packet render, token parse, evidence cross-check, result mapping, bounds `State` | `packages/coding/src/core/isolated_verifier.zig` | Unit tests per row of the §3.2 table and every §3.3 reason |
+| 3. Last-message and tool-input access for a spawned child | `packages/coding/src/core/subagent.zig` | A test where an earlier assistant message carries `VERDICT: PASS` and the last does not: the result is `no_token` |
+| 4. Wiring at the check-gate boundary: verifier after `passed`, FAIL continuation, leads round with the read-only gate, output-segment handling (§6.3) | `packages/coding/src/core/agent_loop.zig`, `packages/coding/src/core/check_gate.zig` | Component tests with a mock provider for each §3.4 row; observe arm byte-identical to the gate without the verifier |
+| 5. `Grounding.contested` and the verifier evidence sentence | `packages/coding/src/core/learning_turn.zig` (after #292) | Tests mirroring a `contested_learns_failed` theorem |
+| 6. End-of-run qualifier: `"verifier"` field and tree id on the `host_run` row; effective rank in the selector | `packages/coding/src/core/host_check.zig`, `packages/coding/src/core/verdict.zig`, history readers | Tests: an old-format row reads as before; a contested row loses only at equal reward |
 | 7. Lean: `Qualifier`, `effectiveRank` and §4's theorems; an `IsolatedVerifier.lean` with `infra_never_verdict`, `pass_never_promotes`, `spawns_bounded` and `leads_bounded` | `control-plane/lean/MetaCodesControl/` | `zig build test` with the kernel |
 | 8. Flags `--verifier`, `--verifier-observe` and `--verifier-model`, with `METACODES_VERIFIER` for the adapter. Requires an armed check gate, else a parse error | `apps/cli/src/main.zig` | CLI tests as for `--check-gate` without `--host-check` |
-| 9. Record, `trace.py` validation, replay driver, experiment file | `src/tools/observation.zig`, `scripts/eval/`, `evals/experiments/isolated-verifier-v1.md` | Fixtures; the §9 protocol |
+| 9. Record, `trace.py` validation, replay driver, experiment file | `packages/guard/src/tools/observation.zig`, `scripts/eval/`, `evals/experiments/isolated-verifier-v1.md` | Fixtures; the §9 protocol |
 
 Steps 1–3 can be done and tested without a provider. Step 9's replay driver
 is all §9 needs: it uses steps 1–3 directly and does not depend on steps 4–8.
@@ -800,13 +800,13 @@ is all §9 needs: it uses steps 1–3 directly and does not depend on steps 4–
 
 | Step | Where | Evidence |
 |---|---|---|
-| 1. Snapshot | `isolation.Snapshot` in [`agents/isolation.zig`](../src/agents/isolation.zig): a temporary index seeded from the run-start `HEAD`, `git add -A`, `write-tree` → **T**, `base`/`candidate` written by `commit-tree` with a fixed identity and date, a separate repository whose objects resolve through `objects/info/alternates`, `workspaceUnchanged` (T′ = T), an always-delete `finalize` | Unit test: untracked in, ignored out, two host commits and no actor history, the actor's status, refs, stash and `HEAD` byte-identical, a `git stash` in the snapshot never reaches the actor, T′ ≠ T after a write, the directory removed |
-| 2. Verifier core | [`core/isolated_verifier.zig`](../src/core/isolated_verifier.zig): `CHARTER` and `charterSha256Hex`, `renderPacket`, `parseToken`, `parseEvidence`, `crossCheck`, `judge`, `compose`, the §5.2 constants, `Gate` | Unit tests per row of the §3.2 table, the §3.1 token rules, the demote-only composition |
+| 1. Snapshot | `isolation.Snapshot` in [`agents/isolation.zig`](../packages/coding/src/agents/isolation.zig): a temporary index seeded from the run-start `HEAD`, `git add -A`, `write-tree` → **T**, `base`/`candidate` written by `commit-tree` with a fixed identity and date, a separate repository whose objects resolve through `objects/info/alternates`, `workspaceUnchanged` (T′ = T), an always-delete `finalize` | Unit test: untracked in, ignored out, two host commits and no actor history, the actor's status, refs, stash and `HEAD` byte-identical, a `git stash` in the snapshot never reaches the actor, T′ ≠ T after a write, the directory removed |
+| 2. Verifier core | [`core/isolated_verifier.zig`](../packages/coding/src/core/isolated_verifier.zig): `CHARTER` and `charterSha256Hex`, `renderPacket`, `parseToken`, `parseEvidence`, `crossCheck`, `judge`, `compose`, the §5.2 constants, `Gate` | Unit tests per row of the §3.2 table, the §3.1 token rules, the demote-only composition |
 | 3. Last message and tool inputs | `subagent.ChildTranscript` / `SpawnOptions.transcript_out` | Unit test: an earlier `VERDICT: PASS` is not the last message |
 | 4. Check-gate wiring | `agent_loop.zig` (`Options.isolated_verifier`, `verifierSpawn`, `verifierConclude`, `verifierAfterLeads`), `check_gate.State.noteVerifierFail` and `Source` | Component tests in [`apps/cli/tests/component/isolated_verifier_test.zig`](../apps/cli/tests/component/isolated_verifier_test.zig): FAIL → continuation → fixed → PASS; FAIL in observe mode changes nothing; PASS leaves the verdict; an ambiguous token is `unavailable`; the leads round refuses a write and feeds a fresh verifier; a project agent named `verifier` cannot shadow the charter |
 | 6. End-of-run qualifier | `verdict.VerifierQualifier`, `verdict.effectiveRank`, `ComposeOptions.verifier`; `host_check.runAndIngestVerified`; the ` verifier=<q>` token in `self_evolution` rows; `scoped_recall.rowProvenanceRank` | Unit tests for the three §4 properties; a component test: a standalone FAIL composes a `host_run` row with `"verifier":"fail"` that loses to an uncontested row of equal reward |
 | 8. Flags | `--verifier`, `--verifier-observe`, `--verifier-model <model or tier>`, and `METACODES_VERIFIER=enforce\|observe` in print mode (`main.resolveVerifier`) | A verifier with no pinned check, `--verifier-model` alone, or a verifier beside `--learning-turn` is a parse error |
-| 9. Record | `isolated_verifier` observation (`metacodes-isolated-verifier-v1`) in [`tools/observation.zig`](../src/tools/observation.zig); `scripts/eval/workbuddy/trace.py` validates it | `WorkBuddyIsolatedVerifierRecordTest` |
+| 9. Record | `isolated_verifier` observation (`metacodes-isolated-verifier-v1`) in [`tools/observation.zig`](../packages/guard/src/tools/observation.zig); `scripts/eval/workbuddy/trace.py` validates it | `WorkBuddyIsolatedVerifierRecordTest` |
 
 The standalone entry point is `isolated_verifier.verify(gpa, Deps, VerifyRequest) → VerifyResult`.
 It holds no check-gate state, so a teamwork runtime can call it after an

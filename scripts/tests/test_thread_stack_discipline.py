@@ -5,7 +5,7 @@ to ``NtCreateThreadEx`` as the stack *commit*, so every such thread charges
 16 MiB of private commit for its whole life; an idle AgentCore Session kept
 three of them. Production code therefore spawns through
 ``platform.thread.spawn(stack, ...)``, which makes the choice explicit (see
-src/platform/thread.zig). Test blocks may use ``std.Thread.spawn`` directly:
+packages/base/src/platform/thread.zig). Test blocks may use ``std.Thread.spawn`` directly:
 their threads never reach a Host.
 """
 from __future__ import annotations
@@ -19,7 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 # The wrapper itself.
-ALLOWED = {Path("src/platform/thread.zig")}
+WRAPPER = Path("packages/base/src/platform/thread.zig")
+ALLOWED = {WRAPPER}
 # Also catches `const Thread = std.Thread;` followed by `Thread.spawn(`.
 DIRECT_SPAWN = re.compile(r"\bThread\s*\.\s*spawn\s*\(")
 TEST_OPEN = re.compile(r"^(\s*)test\b.*\{\s*$")
@@ -78,13 +79,14 @@ class ThreadStackDisciplineTest(unittest.TestCase):
             violations(ROOT),
             [],
             "spawn production threads with @import(\"platform\").thread.spawn(stack, ...) "
-            "and pick the stack class (see src/platform/thread.zig)",
+            "and pick the stack class (see packages/base/src/platform/thread.zig)",
         )
 
     def test_scanner_skips_tests_comments_and_the_wrapper(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "src" / "platform").mkdir(parents=True)
+            (root / "src").mkdir()
+            (root / WRAPPER).parent.mkdir(parents=True)
             (root / "src" / "direct.zig").write_text(
                 "fn start() !void {\n"
                 "    _ = try std.Thread.spawn(.{}, run, .{});\n"
@@ -126,7 +128,7 @@ class ThreadStackDisciplineTest(unittest.TestCase):
                 "}\n",
                 encoding="utf-8",
             )
-            (root / "src" / "platform" / "thread.zig").write_text(
+            (root / WRAPPER).write_text(
                 "pub fn spawn() void {\n    _ = std.Thread.spawn(.{}, f, .{});\n}\n",
                 encoding="utf-8",
             )

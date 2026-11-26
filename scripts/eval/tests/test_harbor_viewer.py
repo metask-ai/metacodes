@@ -17,8 +17,8 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.eval.harbor.bench import data
-from scripts.eval.harbor.bench.workbench import Workbench
+from scripts.eval.harbor.bench import data, results
+from scripts.eval.harbor.bench.workbench import Workbench, model_comparison
 from scripts.eval.harbor.viewer import server
 
 
@@ -159,6 +159,37 @@ class LibraryTest(unittest.TestCase):
         self.assertEqual(view["agent"], "MetacodesAgent")
         self.assertTrue(view["running"])
 
+    def test_remote_ttft_summaries_have_bounded_buckets_and_pool_the_exact_mean(self):
+        row = data.job_view(self.library.job_dir("glm-pilot"))["rows"][0]
+        samples = [100 + i / 13 for i in range(10000)]
+        remote_row = {**row, "ttft_samples_ms": samples}
+        remote = results.aggregate([remote_row])
+        self.assertEqual(results.task_summaries([remote_row])[row["task"]], remote)
+        self.assertNotIn("ttft_samples_ms", remote)
+        self.assertLessEqual(len(remote["ttft_histogram"]), len(data.TTFT_BUCKETS_MS))
+        self.assertEqual(sum(n for _, n in remote["ttft_histogram"]), len(samples))
+        local = data.summarize([{**row, "ttft_samples_ms": [3.1, 90000]}])
+        merged = data.merge_summaries([remote, local])
+        pooled = samples + local["ttft_samples_ms"]
+        self.assertAlmostEqual(merged["ttft_ms"], sum(pooled) / len(pooled))
+        self.assertEqual(merged["ttft_count"], len(pooled))
+        self.assertEqual(merged["ttft_histogram"], data.ttft_distribution(pooled)["ttft_histogram"])
+        for q, field in ((.5, "ttft_p50_ms"), (.95, "ttft_p95_ms")):
+            exact = data.percentile(pooled, q)
+            self.assertGreaterEqual(merged[field], exact)
+            self.assertLess(merged[field], exact * 1.1)
+
+    def test_model_comparison_combines_worker_and_local_results_across_suites(self):
+        row = next(r for r in data.job_view(self.library.job_dir("glm-pilot"))["rows"] if r["status"] == "pass")
+        remote = results.aggregate([row])
+        latest = {("suite-a", "m1", row["task"]): ({}, "remote", remote),
+                  ("suite-b", "m1", row["task"]): ({}, "local", [row]),
+                  ("suite-a", "m2", row["task"]): ({}, "other", [row])}
+        models, common = model_comparison(latest)
+        self.assertEqual(common, 1)
+        self.assertEqual([model["summary"]["tasks_solved"] for model in models], [2, 1])
+        self.assertEqual([model["common_summary"]["first_tasks"] for model in models], [1, 1])
+
     def test_row_fields(self):
         rows = {row["task"]: row for row in data.job_view(self.library.job_dir("glm-pilot"))["rows"]}
         row = rows["kv-store"]
@@ -178,6 +209,16 @@ class LibraryTest(unittest.TestCase):
         self.assertTrue(observation["is_error"])
         self.assertLess(len(observation["content"]), 4200)
         self.assertIn("more chars", observation["content"])
+
+    def test_skill_counts_use_invocation_names_before_display_clipping(self):
+        job = self.root / "glm-pilot"
+        calls = [{"function_name": "Skill", "arguments": args} for args in (
+            {"values": ["x" * 4000], "name": "review"}, {"name": "review"}, {"name": "audit"}, {})]
+        calls.append({"function_name": "Read", "arguments": {"name": "review"}})
+        trial = _trial(job, "skills__abc", steps=[{"tool_calls": calls}])
+        self.assertEqual(data.trial_detail(trial)["skills"], [("review", 2), (None, 1), ("audit", 1)])
+        self.assertEqual(data.trial_detail(job / "kv-store__aaa")["skills"], [])
+        self.assertIsNone(data.trial_detail(job / "running__eee")["skills"])
 
     def test_names_outside_the_jobs_cannot_be_addressed(self):
         for job, trial in (("..", "x"), ("glm-pilot", ".."), ("glm-pilot", "../qwen-pilot"),

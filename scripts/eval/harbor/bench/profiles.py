@@ -256,6 +256,12 @@ class ProfileManager:
         return self.dir / (profile + ".json")
 
     def save(self, record: Dict[str, Any]) -> None:
+        next_index = record.get("next_item_index", 0)
+        for item in record["items"]:
+            if "index" not in item:
+                item["index"] = next_index
+            next_index = max(next_index, item["index"] + 1)
+        record["next_item_index"] = next_index
         atomic_json(self.path(record["id"]), record)
 
     def records(self) -> List[Dict[str, Any]]:
@@ -300,7 +306,6 @@ class ProfileManager:
             raise ValueError(f"每次需要 1–{MAX_ITEMS} 个评测集")
         name = checked_name(request.get("name"))
         target = self.target(request)
-        concurrency = target["concurrency"]
         seen, planned = set(), []
         for item in items:
             if not isinstance(item, dict) or set(item) - {"suite", "tasks"}:
@@ -311,13 +316,12 @@ class ProfileManager:
             seen.add(suite.id)
             for model in models:
                 run_request = {"suite": suite.id, "model": model, "tasks": item.get("tasks"),
-                               "attempts": request.get("attempts", 1),
-                               "concurrency": suites.capped_concurrency(suite, concurrency)}
+                               "attempts": request.get("attempts", 1)}
                 if request.get("max_tokens") is not None:
                     run_request["max_tokens"] = request["max_tokens"]
                 label = suite.name if len(models) == 1 else f"{suite.name} · {model}"
                 planned.append(self.planned(target, run_request, request.get("executor"), label))
-        return self.append(target, name, planned, at_profile_concurrency=True)
+        return self.append(target, name, planned)
 
     def launch_now(self, request: Any) -> Dict[str, Any]:
         """One dataset started at once, on the profile of the configured
@@ -338,7 +342,7 @@ class ProfileManager:
             if owner:
                 raise ValueError("评测配置 " + owner + " 的队列正在运行，请等它结束或先停止")
             record = self._append(target, None, [planned])
-            self._step(record)
+            self._step(record, immediate_concurrency=request.get("concurrency", 1))
             item = record["items"][-1]
             if item["status"] == "pending":  # `bench run` does not wait for an executor
                 item.update(status="failed", error=item.pop("waiting")["reason"], finished_at=now())
@@ -357,8 +361,7 @@ class ProfileManager:
             record = self.get(request["profile"])
             if record is None:
                 raise ValueError("评测配置不存在")
-            return {"id": record["id"], "metacodes": record["metacodes"], "features": record.get("features") or [],
-                    "concurrency": profile_concurrency(record)}
+            return {"id": record["id"], "metacodes": record["metacodes"], "features": record.get("features") or []}
         features = chosen_features(request.get("features"))
         cfg = settings(self.runs.config_path)
         choices = bundle_choices(cfg, self.runs.config_path)
@@ -368,7 +371,7 @@ class ProfileManager:
         if choice is None:
             raise ValueError("请选择工作台列出的 metacodes 版本" if wanted else
                              self.runs.run_bundle(cfg, None, None)[1] or "请先配置 metacodes 发行包（bench setup）")
-        return {"id": None, "choice": choice, "features": features, "concurrency": DEFAULT_CONCURRENCY}
+        return {"id": None, "choice": choice, "features": features}
 
     def planned(self, target, run_request, executor, suite_name) -> Dict[str, Any]:
         """A dataset checked by a dry run on the profile's bundle, ready to
@@ -385,21 +388,22 @@ class ProfileManager:
         except ValueError as exc:
             raise ValueError(f"{suite_name}：{exc}") from None
         run_request.update(suite=checked["suite"], tasks=checked["tasks"], executor=checked["executor"],
-                           attempts=checked["attempts"], concurrency=checked["concurrency"])
+                           attempts=checked["attempts"])
+        run_request.pop("concurrency", None)
         run_request.pop("features")
         return {"suite": checked["suite"], **suites.label(checked["suite"]), "tasks": checked["tasks"],
                 "model": run_request["model"], "attempts": checked["attempts"],
-                "concurrency": checked["concurrency"], "executor": checked["executor"], "features": features,
+                "executor": checked["executor"], "features": features,
                 "request": run_request, "route": checked["route"], "status": "pending", "run": None,
                 "error": None, "queued_at": None, "started_at": None, "finished_at": None}
 
-    def append(self, target, name, planned, at_profile_concurrency=False) -> Dict[str, Any]:
+    def append(self, target, name, planned) -> Dict[str, Any]:
         with self.lock:
-            record = self._append(target, name, planned, at_profile_concurrency)
+            record = self._append(target, name, planned)
         self.wake()
         return record
 
-    def _append(self, target, name, planned, at_profile_concurrency=False, submission=None) -> Dict[str, Any]:
+    def _append(self, target, name, planned, submission=None) -> Dict[str, Any]:
         if target["id"] is None:
             metacodes = freeze(target["choice"], self.runs.config_path)
             git = builds.provenance(target["choice"]["path"])
@@ -419,12 +423,10 @@ class ProfileManager:
             record["name"] = name
         if record["status"] not in PROFILE_ACTIVE:
             record.update(status="queued", cancel_requested=False, finished_at=None)
-        concurrency = pin_concurrency(record)
+        record["concurrency"] = profile_concurrency(record)
         queued = now()
         submission = submission or uuid.uuid4().hex
         for item in planned:
-            if at_profile_concurrency:
-                item = at_concurrency(item, concurrency)
             record["items"].append({**item, "queued_at": queued, "submission": submission})
         self.save(record)
         return record
@@ -440,8 +442,6 @@ class ProfileManager:
         return {"id": record["id"], "name": name}
 
     def set_concurrency(self, profile: Any, concurrency: Any) -> Dict[str, Any]:
-        """The profile's concurrency: every dataset queued on it from now on
-        runs at it, and so do its waiting and running ones."""
         if type(concurrency) is not int or concurrency < 1:
             raise ValueError("concurrency 必须是正整数")
         with self.lock:
@@ -449,18 +449,25 @@ class ProfileManager:
             if record is None:
                 raise ValueError("评测配置不存在")
             record["concurrency"] = concurrency
-            active = {r["name"] for r in self.runs.runs() if r.get("status") in ACTIVE}
-            for item in record["items"]:
-                if item["status"] not in ("pending", "running"):
-                    continue
-                applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
-                if item["status"] == "running" and item.get("run") in active:
-                    self.runs.set_concurrency(item["run"], applied)
-                item["concurrency"] = applied
-                if isinstance(item.get("request"), dict):
-                    item["request"]["concurrency"] = applied
             self.save(record)
-        return {"id": record["id"], "concurrency": concurrency}
+            result = {"id": record["id"], "concurrency": concurrency}
+            item = next((i for i in record["items"] if i["status"] == "running"), None)
+            if item is None:
+                return result
+            try:
+                run = next((r for r in self.runs.runs() if r["name"] == item.get("run") and r["status"] in ACTIVE), None)
+                if run is None:
+                    return result
+                if run.get("runner") == suites.WORKBUDDY:
+                    return {**result, "run": run["name"],
+                            "warning": f"Profile 并发数已保存。正在运行的 WorkBuddy 保持并发 {run['concurrency']}。"}
+                applied = dataset_concurrency(item["suite"], concurrency)
+                self.runs.set_concurrency(run["name"], applied)
+            except (ValueError, OSError) as exc:
+                return {**result, "run": item.get("run"), "warning": f"Profile 并发数已保存，当前运行调整失败：{exc}"}
+            item["concurrency"] = applied
+            self.save(record)
+            return result
 
     def set_auto_rerun(self, profile: Any, enabled: Any) -> Dict[str, Any]:
         if type(enabled) is not bool:
@@ -494,9 +501,11 @@ class ProfileManager:
         record = self.get(profile)
         if record is None:
             raise ValueError("评测配置不存在")
-        if type(index) is not int or not 0 <= index < len(record["items"]):
-            raise ValueError("评测集不存在")
-        return record, record["items"][index]
+        if type(index) is int:
+            for item in record["items"]:
+                if item["index"] == index:
+                    return record, item
+        raise ValueError("评测集不存在")
 
     def submission_action(self, profile, submission, action):
         with self.lock:
@@ -514,16 +523,23 @@ class ProfileManager:
                     elif item["status"] == "running":
                         item["cancel_requested"] = True
                 self.save(record)
+            elif action == "delete":
+                if any(item["status"] not in ITEM_DONE for item in items):
+                    raise ValueError("请先取消作业，等所有评测结束后再删除")
+                record["concurrency"] = profile_concurrency(record)
+                record.setdefault("next_item_index", len(record["items"]))
+                record["items"] = [item for item in record["items"] if item["submission"] != submission]
+                self.save(record)
             elif action == "run":
                 if any(item["status"] not in ITEM_DONE for item in items):
                     raise ValueError("作业还在等待或运行")
                 originals = [item for item in items if not item.get("retry")]
                 if any(not isinstance(item.get("request"), dict) for item in originals):
                     raise ValueError("旧记录缺少启动参数，请从 Profile 创建作业")
-                planned = [rerun(item, item["tasks"], 0, profile_concurrency(record)) for item in originals]
+                planned = [rerun(item, item["tasks"], 0) for item in originals]
                 record = self._append({"id": profile}, None, planned)
             else:
-                raise ValueError("作业操作只能是 cancel 或 run")
+                raise ValueError("作业操作只能是 cancel、run 或 delete")
         self.wake()
         return public(record)
 
@@ -559,13 +575,17 @@ class ProfileManager:
                 raise ValueError("这个评测集是早期版本排的，请在评测配置上重新运行")
             if not tasks:
                 raise ValueError("这个评测集没有要运行的题")
-            again = rerun(item, tasks, 0, profile_concurrency(record))
+            again = rerun(item, tasks, 0)
             record = self._append({"id": record["id"]}, None, [{**again, "retry": True}],
                                   submission=item["submission"])
         self.wake()
         return public(record)
 
     def invalid_tasks(self, run: str) -> List[str]:
+        receipt = data.read_json(self.runs.records / (run + ".json")) or {}
+        if receipt.get("result_owner"):
+            groups = (receipt.get("worker_summary") or {}).get("tasks") or {}
+            return sorted(task for task, summary in groups.items() if summary["counts"]["invalid"])
         job_dir = self.runs.jobs_dir / run
         if not job_dir.is_dir():
             return []
@@ -586,7 +606,7 @@ class ProfileManager:
             item["auto_rerun_error"] = f"读取结果失败，没有自动重跑无效的题：{exc}"
             return
         if tasks:
-            again = rerun(item, tasks, next_round, pin_concurrency(record))
+            again = rerun(item, tasks, next_round)
             record["items"].append({**again, "queued_at": now(), "retry": True,
                                     "submission": item["submission"]})
 
@@ -604,7 +624,7 @@ class ProfileManager:
             if record["status"] in PROFILE_ACTIVE:
                 return  # this profile holds the executor until its queue ends
 
-    def _step(self, record: Dict[str, Any]) -> None:
+    def _step(self, record: Dict[str, Any], immediate_concurrency: Optional[int] = None) -> None:
         items = record["items"]
         runs = {r["name"]: r for r in self.runs.runs()}
         current = next((i for i in items if i["status"] == "running"), None)
@@ -641,7 +661,10 @@ class ProfileManager:
         try:
             if frozen_digest(Path(record["metacodes"]["bundle"])) != record["metacodes"]["digest"]:
                 raise ValueError("冻结的 metacodes 发行包已被修改，这个评测配置不再运行")
-            request = dict(pending["request"])
+            record["concurrency"] = profile_concurrency(record)
+            concurrency = immediate_concurrency if immediate_concurrency is not None else dataset_concurrency(
+                pending["suite"], record["concurrency"])
+            request = {**pending["request"], "concurrency": concurrency}
             features = pending.get("features")
             if features is None:
                 features = run_features(record.get("features") or [], request.get("suite", suites.DEFAULT_SUITE))
@@ -650,7 +673,7 @@ class ProfileManager:
             launched = self.runs.launch(request, frozen=record["metacodes"], profile=record["id"],
                                         pinned=pending.get("route"))
             pending.pop("waiting", None)
-            pending.update(status="running", run=launched["name"], started_at=now())
+            pending.update(status="running", run=launched["name"], started_at=now(), concurrency=concurrency)
             record["status"] = "running"
             record["started_at"] = record.get("started_at") or now()
         except ExecutorUnreachable as exc:
@@ -725,14 +748,12 @@ class ProfileManager:
             pass
 
 
-def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int, concurrency: int) -> Dict[str, Any]:
-    """An ended dataset queued again with `tasks` at the profile's
-    `concurrency`; `auto_round` counts the automatic reruns of invalid tasks
-    it descends from (0: asked for)."""
+def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int) -> Dict[str, Any]:
     again = {key: value for key, value in item.items()
-             if key not in ("waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry")}
-    again = at_concurrency({**again, "request": {**item["request"], "tasks": list(tasks)}}, concurrency)
-    again.update(tasks=list(tasks), status="pending", run=None, error=None, started_at=None, finished_at=None)
+             if key not in ("index", "waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry", "concurrency")}
+    request = {key: value for key, value in item["request"].items() if key != "concurrency"}
+    again.update(request={**request, "tasks": list(tasks)}, tasks=list(tasks), status="pending",
+                 run=None, error=None, started_at=None, finished_at=None)
     if auto_round:
         again["auto_rerun"] = auto_round
     return again
@@ -746,6 +767,7 @@ def queued_since(record: Dict[str, Any]) -> str:
 def restore_submissions(record):
     items = record.get("items") or []
     for index, item in enumerate(items):
+        item.setdefault("index", index)
         if item.get("submission"):
             continue
         item["submission"] = "legacy-" + str(item.get("queued_at") or index)
@@ -781,17 +803,8 @@ def runs_of(record: Dict[str, Any], receipts: List[Dict[str, Any]]) -> List[str]
     return sorted(n for n in names if isinstance(n, str) and data.NAME.fullmatch(n))
 
 
-def at_concurrency(item: Dict[str, Any], concurrency: int) -> Dict[str, Any]:
-    try:
-        applied = suites.capped_concurrency(suites.resolved(suites.get(item["suite"])), concurrency)
-    except ValueError:  # a suite no longer listed: its launch reports that
-        applied = concurrency
-    return {**item, "concurrency": applied, "request": {**item["request"], "concurrency": applied}}
-
-
-def pin_concurrency(record: Dict[str, Any]) -> int:
-    record["concurrency"] = profile_concurrency(record)
-    return record["concurrency"]
+def dataset_concurrency(suite_id: str, concurrency: int) -> int:
+    return suites.capped_concurrency(suites.resolved(suites.get(suite_id)), concurrency)
 
 
 def profile_concurrency(record: Dict[str, Any]) -> int:
@@ -810,6 +823,11 @@ def public(record: Dict[str, Any]) -> Dict[str, Any]:
     value["default_name"] = default_name(record)
     value["concurrency"] = profile_concurrency(record)
     for item in value.get("items") or []:
+        if item.get("status") == "pending":
+            try:
+                item["concurrency"] = dataset_concurrency(item["suite"], value["concurrency"])
+            except ValueError:
+                item["concurrency"] = value["concurrency"]
         item.pop("request", None)
         item.pop("route", None)
     return value

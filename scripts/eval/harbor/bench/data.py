@@ -26,6 +26,8 @@ import io
 import json
 import math
 import re
+from bisect import bisect_left
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -34,6 +36,7 @@ from scripts.eval.harbor.profiling import CONTEXT_PARTS, usage_values
 VALID = ("pass", "partial", "fail", "timeout")
 STATUSES = VALID + ("invalid", "running")
 Z95 = 1.959963984540054
+TTFT_BUCKETS_MS = (0,) + tuple(round(2 ** (i / 8), 3) for i in range(217))
 
 # Harbor exception types (harbor/agents/installed/base.py) that mean the model
 # provider, not the agent, failed the trial.
@@ -300,6 +303,39 @@ def performance_fields(ttfts, output, generation_ms):
             "tps": output * 1000 / generation_ms if generation_ms > 0 else None}
 
 
+def ttft_distribution(samples, summaries=()):
+    def bucket(value):
+        return TTFT_BUCKETS_MS[min(bisect_left(TTFT_BUCKETS_MS, value), len(TTFT_BUCKETS_MS) - 1)]
+
+    histogram = Counter(bucket(value) for value in samples)
+    total = sum(samples)
+    for summary in summaries:
+        entries = summary.get("ttft_histogram", ())
+        if "ttft_sum_ms" in summary:
+            total += summary["ttft_sum_ms"]
+        else:
+            total += sum(value * n for value, n in entries)
+        for value, n in entries:
+            histogram[bucket(value)] += n
+    buckets = sorted(histogram.items())
+    count = sum(histogram.values())
+
+    def quantile(q):
+        if not count:
+            return None
+        position = (count - 1) * q
+        lower = int(position)
+        end = 0
+        for i, (value, n) in enumerate(buckets):
+            end += n
+            if lower < end:
+                upper = buckets[i + 1][0] if lower + 1 == end and i + 1 < len(buckets) else value
+                return value + (upper - value) * (position - lower)
+
+    return {"ttft_histogram": buckets, "ttft_count": count, "ttft_sum_ms": total,
+            "ttft_ms": total / count if count else None, "ttft_p50_ms": quantile(.5), "ttft_p95_ms": quantile(.95)}
+
+
 def trial_order(row):
     return parse_time(row.get("started_at")) or dt.datetime.max.replace(tzinfo=dt.timezone.utc), row["trial"]
 
@@ -503,6 +539,7 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
     calls_by_id = tool_events(trial_dir)
     steps = []
     tools: Dict[str, int] = {}
+    skills: Dict[Optional[str], int] = {}
     for step in trajectory.get("steps") or []:
         if not isinstance(step, dict):
             continue
@@ -512,6 +549,12 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
                 continue
             name = str(call.get("function_name") or "?")
             tools[name] = tools.get(name, 0) + 1
+            if name == "Skill":
+                arguments = call.get("arguments")
+                skill = arguments.get("name") if isinstance(arguments, dict) else None
+                if not isinstance(skill, str) or not skill.strip():
+                    skill = None
+                skills[skill] = skills.get(skill, 0) + 1
             calls.append(
                 {
                     "id": call.get("tool_call_id"),
@@ -551,6 +594,7 @@ def trial_detail(trial_dir: Path) -> Dict[str, Any]:
         if isinstance(exception, dict)
         else "",
         "steps": steps,
+        "skills": sorted(skills.items(), key=lambda item: (-item[1], item[0] or "")) if steps else None,
         "tools": sorted(tools.items(), key=lambda item: (-item[1], item[0])),
         "tests": test_summary(trial_dir / "verifier"),
         "verifier_output": tail(trial_dir / "verifier" / "test-stdout.txt"),
@@ -821,6 +865,9 @@ def merge_summaries(summaries):
     result["ttft_samples_ms"] = ttfts
     result.update(performance_fields(ttfts, result["tps_output_tokens"] or 0, result["tps_generation_ms"] or 0))
     result["cost_by_status"] = {status: sum(s["cost_by_status"][status] for s in summaries) for status in VALID}
+    if any("ttft_histogram" in summary for summary in summaries):
+        result.pop("ttft_samples_ms")
+        result.update(ttft_distribution(ttfts, summaries))
     result.update(outcome_fields(result))
     return result
 

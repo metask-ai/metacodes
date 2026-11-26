@@ -35,7 +35,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-# Mirrors src/core/result_budget.zig. Kept as plain arithmetic rather than
+# Mirrors packages/kernel/src/result_budget.zig. Kept as plain arithmetic rather than
 # imported: this script must run against a checkout it was not built from.
 PER_RESULT_MIN_BYTES = 8 * 1024
 PER_RESULT_MAX_BYTES = 64 * 1024

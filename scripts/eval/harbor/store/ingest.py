@@ -618,6 +618,22 @@ def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result:
         result.trials_removed = len(gone)
 
 
+def refresh_job_projection(store: Store, name: str, log: Callable[[str], None]) -> JobResult:
+    with store.read() as tx:
+        row = tx.one("SELECT source_dir, inputs_digest FROM jobs WHERE name = ?", (name,))
+        stored = _stored_files(tx, name)
+        if row is None or any(r not in stored or not stored[r].sha256 for r in JOB_FILES):
+            raise ValueError(f"stored job {name} is missing its inputs")
+        entries = _entries(tx, JOB_FILES, stored)
+    with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
+        header = data.job_header(materialize(Path(temp), name, entries))
+    with store.transaction() as tx:
+        tx.execute(_upsert_sql("jobs", ("name",)), header_values(name, row[0], header, row[1]))
+    result = JobResult(name, "updated")
+    derive_trials(store, name, stored, result, log)
+    return result
+
+
 def refresh_projections(store: Store, log: Callable[[str], None] = lambda message: None) -> List[JobResult]:
     """Recompute stale projections of jobs that exist only in the store
     (copied from another machine, or whose directory was removed). A job
@@ -631,23 +647,10 @@ def refresh_projections(store: Store, log: Callable[[str], None] = lambda messag
         if not safe_name(name):
             log(f"bench store: ignoring stored job {name!r}: not a plain job name")
             continue
-        result = JobResult(name, "updated")
         try:
-            with store.read() as tx:
-                row = tx.one("SELECT source_dir, inputs_digest FROM jobs WHERE name = ?", (name,))
-                stored = _stored_files(tx, name)
-                if row is None or any(r not in stored or not stored[r].sha256 for r in JOB_FILES):
-                    continue
-                entries = _entries(tx, JOB_FILES, stored)
-            with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
-                header = data.job_header(materialize(Path(temp), name, entries))
-            with store.transaction() as tx:
-                tx.execute(_upsert_sql("jobs", ("name",)), header_values(name, row[0], header, row[1]))
+            results.append(refresh_job_projection(store, name, log))
         except Exception as exc:
             log(f"bench store: refreshing {name} failed: {type(exc).__name__}: {exc}")
-            continue
-        derive_trials(store, name, stored, result, log)
-        results.append(result)
     return results
 
 
@@ -852,6 +855,7 @@ class WorkerSync:
         self.interval = interval
         self.job_dir = Path(spec.get("jobs_dir", ".")) / str(spec.get("name", ""))
         self.records_dir = Path(spec.get("jobs_dir", ".")) / ".bench-runs"
+        self.worker_owned = bool(spec.get("result_owner"))
         self.config = None
         self.store: Optional[Store] = None
         self.stop = threading.Event()
@@ -869,6 +873,8 @@ class WorkerSync:
         return self.store
 
     def once(self, verify: bool = False) -> None:
+        if self.worker_owned:
+            return
         try:
             store = self._open()
             if store is not None and is_job_dir(self.job_dir):

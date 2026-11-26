@@ -343,7 +343,7 @@ an SDK embedder passes its own hook, or none.
 
 `daemon.json` pins `expected_build_id`, a hash over the service contract, the
 tinykg and tinykgd executables' digests, the engine version and its
-capabilities (`src/kg/kgd/identity.zig`). An update or reinstall that changes
+capabilities (`packages/coding/src/kg/kgd/identity.zig`). An update or reinstall that changes
 the TinyKG binaries leaves the pin naming the old ones. The next service then
 reports another id, and the transport refuses it: `BuildMismatch`, which a
 session reports as `pin_mismatch`. That error is separate from

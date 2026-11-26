@@ -706,7 +706,7 @@ not consent to.
 ## 9. Reference implementation: metacodes
 
 This section is informative for other implementations and binding for
-metacodes. Both sides of the protocol live in `src/skills/sealed/`:
+metacodes. Both sides of the protocol live in `packages/coding/src/skills/sealed/`:
 `protocol.zig` (objects, digests, envelope), `transport.zig` (client HTTP),
 `pin.zig`, `credentials.zig`, `provider.zig` and `ledger.zig` (client),
 `gateway.zig` (server). `tests/component/sealed_skill_test.zig` runs a pinned

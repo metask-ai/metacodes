@@ -44,7 +44,7 @@ beside the executable is the one this build was made with.
 
 ## 3. State root
 
-Resolution policy (host layer only, `src/util/state_root.zig`, pure
+Resolution policy (host layer only, `packages/base/src/util/state_root.zig`, pure
 `resolveFrom`), first match wins:
 
 1. `--state-dir <dir>` (argv[1] to also cover subcommands);
@@ -212,6 +212,6 @@ kernels and `tinykgd` as required runtime assets.
 `zig build test` builds both kernels from the checkout (`kernels:stage`,
 `-Dlean-kernels=auto|on|off`) into the build's own prefix and hands them to
 kernel-gated tests through `METACODES_TEST_<KIND>_KERNEL_PATH`; the digest
-comes from the provenance sidecar (`src/formal/test_kernel.zig`). CI runs with
+comes from the provenance sidecar (`packages/guard/src/formal/test_kernel.zig`). CI runs with
 `-Dlean-kernels=on` wherever elan is provisioned, so the gate cannot silently
 degrade to skips.

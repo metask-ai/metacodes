@@ -1,5 +1,8 @@
+import os
 import re
 import shlex
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -82,6 +85,23 @@ SCRIPT_SUITES_RUN_ELSEWHERE = {
 
 
 class GateManifestTest(unittest.TestCase):
+    def test_eval_preflight_reports_the_python_that_needs_repair(self):
+        script = str(ROOT / "scripts/check_eval_python.py")
+        good = subprocess.run([sys.executable, script], capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        isolated = [sys.executable, "-I", "-S"]
+        missing = subprocess.run([*isolated, script], capture_output=True, text=True)
+        self.assertNotEqual(missing.returncode, 0)
+        executable = subprocess.check_output(
+            [*isolated, "-c", "import sys; print(sys.executable)"], text=True,
+        ).rstrip("\r\n")
+        args = [executable, "-m", "pip", "install", "-r", "requirements-dev.txt"]
+        repair = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+        self.assertIn(repair, missing.stderr)
+        self.assertIn("-m venv .venv", missing.stderr)
+        activate = r"call .venv\Scripts\activate.bat" if os.name == "nt" else ". .venv/bin/activate"
+        self.assertIn(f"{activate}\npython -m pip install -r requirements-dev.txt\nzig build gate:pr", missing.stderr)
+
     def test_every_script_suite_runs_on_every_pull_request(self):
         """A suite nothing runs passes forever. Every scripts/tests module is
         named by a ci.yml step or a build.zig command (the `test` graph runs on
@@ -167,7 +187,7 @@ class GateManifestTest(unittest.TestCase):
             self.assertLess(record, names.index(suite), suite)
         self.assertGreater(names.index("- name: Upload the executed test IDs"), names.index("- name: Diff whitespace check"))
         workflow = "\n".join(lines)
-        self.assertIn("name: Test IDs (Linux)\n    needs: [release-fast-path, scope, gates-linux]", workflow)
+        self.assertIn("name: Test IDs (Linux)\n    needs: [release-fast-path, scope, gates-linux, migration-baseline, migration-replay]", workflow)
         self.assertIn("python3 scripts/test_ids.py collect --raw", workflow)
         self.assertIn("python3 scripts/test_ids.py ci-compare --head", workflow)
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
@@ -179,10 +199,10 @@ class GateManifestTest(unittest.TestCase):
         self.assertIn('recorded.test_runner = .{ .path = b.path("scripts/recording_test_runner.zig"), .mode = .server };', build,
                       "server mode keeps --test-timeout")
         self.assertIn("units_test_step.dependOn(&test_id_fixture_check.step);", build)
-        self.assertIn("run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform", workflow)
+        self.assertIn("run: zig test packages/base/src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform", workflow)
         self.assertIn("  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled]\n", workflow)
         self.assertIn('run.setEnvironmentVariable("METACODES_TEST_ROOT",', build)
-        self.assertIn("METACODES_TEST_ROOT: src/platform", workflow)
+        self.assertIn("METACODES_TEST_ROOT: packages/base/src/platform", workflow)
         self.assertIn("needs: [gates-linux, test-ids]", workflow)
 
     def test_the_checklist_runs_what_ci_selects(self):

@@ -1,0 +1,795 @@
+//! ToolContext：工具执行时拿到的所有依赖。
+//!
+//! 目的：从 agent_loop 传进工具的信息，让工具能做 abort 检查、权限钩子、
+//! cwd 解析等，而不必每个工具自己 @import util/abort.zig。
+//!
+//! 本期（M2）字段：
+//! - allocator：工具的 scratch allocator（owned output 用）
+//! - abort：AbortSignal 可空指针，工具可在长循环中检查或传给 spawnCaptureStdoutAbortable
+//!
+//! 本期留占位（M3+ 扩展）：
+//! - cwd：未来 cwd 解析用（暂使 process cwd）
+//! - permission：permission.Context，tool.checkPermissions 钩子会用
+//! - verbose：日志粒度
+
+const std = @import("std");
+const AbortSignal = @import("metacodes-base").util.abort.AbortSignal;
+const ReadState = @import("../core/read_state.zig").ReadState;
+const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+const AgentJobRegistry = @import("../core/agent_job_registry.zig").AgentJobRegistry;
+const PermissionContext = @import("metacodes-guard").permission_root.PermissionContext;
+const TaskStore = @import("../core/task_store.zig").TaskStore;
+const Client = @import("metacodes-ai").client.Client;
+const ToolDefinition = @import("metacodes-ai").json.ToolDefinition;
+const DynRegistry = @import("dynamic.zig").DynRegistry;
+pub const ToolCategory = @import("metacodes-guard").permission.category.ToolCategory;
+pub const ReplayDeclaration = @import("metacodes-guard").core.execution_effect.ReplayDeclaration;
+
+/// Shared recursion ceiling for every child-agent/fork mechanism.
+pub const MAX_AGENT_DEPTH: u8 = 3;
+
+pub const AskOption = @import("metacodes-guard").core.protocol.ui_request.AskOption;
+pub const AskQuestion = @import("metacodes-guard").core.protocol.ui_request.AskQuestion;
+
+/// L3 挂起:一个待异步前端处理的 custom UI 请求(工具填 ToolContext.pending_request,
+/// runJob → Slot.pending_payload,agent_loop emit ui_request_pending)。纯数据,可序列化落盘
+/// (suspend.json)。kind 标识界面类型(如 "video_timeline"),payload_json 是渲染规格。
+pub const PendingRequest = struct {
+    kind: []const u8,
+    payload_json: []const u8,
+};
+
+/// Kernel-owned capability installed only for the AgentLoop's serial code tool.
+/// The VM never receives a dispatcher or permission pointer.
+pub const CodeExecutor = struct {
+    ctx: *anyopaque,
+    executeFn: *const fn (*anyopaque, *const ToolContext, []const u8, u32) anyerror![]u8,
+};
+
+// ── 工具回调接口(仿 agent_loop.UsageSink:把裸 *anyopaque+*fn 对收成类型安全的接口值)──
+// 放中立 context 层:agent_loop.Options 和 ToolContext 都引用,零循环依赖
+// (agent_loop → tools.zig → context.zig,context 不反向 import agent_loop)。
+
+/// HostServices(L5):把"工具请求宿主(App)改其状态"的三类请求-响应回调聚合成**一个**接口。
+///
+/// 背景:SkillActivator / ToolActivator / WorktreeHook 三者本质相同——都是工具(执行期)
+/// 调宿主、宿主改自身状态(激活 skill 白黑名单 / 激活 deferred 工具 / worktree 栈 push-pop)。
+/// 它们**有返回值、是请求-响应**(非单向通知),故 L1 没把它们收进 CoreEvent 事件总线;
+/// 但它们在 App→ToolContext 路径上全部 `ctx = @ptrCast(app)`——同一个宿主、四个一样的裸指针 +
+/// 四个 trampoline。L5 收成一个 HostServices:一个 ctx(=app)+ 四个可空 fn-ptr。
+///
+/// **进程内能力**:这些改宿主内存,与可序列化的 CoreEvent 总线是两类东西(跨进程后端各自
+/// 用 RPC 实现 HostServices,不走事件总线)。不要混。
+///
+/// **可空字段**:不同路径提供的能力子集不同(subagent 只需 activateSkill;ToolSearch 只需
+/// activateTool;worktree 只需 push/pop)。null fn-ptr = 该能力不可用,对应方法按语义兜底
+/// (activate* 返 error.HostCapabilityUnavailable;worktree push/pop 同)。
+pub const HostServices = struct {
+    ctx: *anyopaque,
+    activateSkillFn: ?*const fn (ctx: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
+    activateToolFn: ?*const fn (ctx: *anyopaque, tool_name: []const u8) anyerror!void = null,
+    /// The host copies both paths into memory of its own (the caller's are per-call)
+    /// and makes `wt_path` the session's working root.
+    worktreePushFn: ?*const fn (ctx: *anyopaque, wt_path: []const u8, original_cwd: []const u8) anyerror!void = null,
+    /// The host drops the top entry, makes its `original_cwd` the working root again
+    /// and returns a copy in `allocator` (the caller's to free); null when empty.
+    worktreePopFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry = null,
+    /// The session's working root now (absolute; may move mid-Run with the
+    /// worktree hooks above). Borrowed: the host never frees a root it gave out.
+    workingRootFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
+
+    pub const Error = error{HostCapabilityUnavailable};
+
+    /// Skill 激活后把临时白/黑名单挂到宿主。无 activateSkillFn → HostCapabilityUnavailable。
+    pub fn activateSkill(self: HostServices, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void {
+        const f = self.activateSkillFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, skill_name, allowed, disallowed);
+    }
+    /// ToolSearch 激活 deferred 工具,记入宿主 activated 集。无 fn → HostCapabilityUnavailable。
+    pub fn activateTool(self: HostServices, tool_name: []const u8) anyerror!void {
+        const f = self.activateToolFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, tool_name);
+    }
+    /// EnterWorktree 压栈并切换工作根。无 fn → HostCapabilityUnavailable(工具映射成 WorktreeStateUnavailable)。
+    pub fn worktreePush(self: HostServices, wt_path: []const u8, original_cwd: []const u8) anyerror!void {
+        const f = self.worktreePushFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, wt_path, original_cwd);
+    }
+    /// ExitWorktree 弹栈并切回工作根。无 fn → HostCapabilityUnavailable。
+    pub fn worktreePop(self: HostServices, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry {
+        const f = self.worktreePopFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, allocator);
+    }
+    /// Whether EnterWorktree / ExitWorktree can work here at all: checked before
+    /// they touch the process cwd or git, so a host without the hooks never ends
+    /// up in a worktree it does not know about.
+    pub fn canSwitchWorktree(self: HostServices) bool {
+        return self.worktreePushFn != null and self.worktreePopFn != null;
+    }
+    /// The session's current working root, or null when the host does not track
+    /// one (each tool call then keeps the root its Run started with).
+    pub fn workingRoot(self: HostServices) ?[]const u8 {
+        const f = self.workingRootFn orelse return null;
+        const root = f(self.ctx);
+        return if (root.len > 0) root else null;
+    }
+
+    /// 投影成"只保留 skill 激活"的子集(其余能力清空)。subagent 用:它能激活 skill,但
+    /// **不能**碰父的 worktree 栈(并发后台 subagent 在独立线程,改父 worktree 栈=数据竞争)
+    /// 或父的 ToolSearch activated 集(隔离)。对齐 L5 前 subagent 只接 skill_activator 的语义。
+    pub fn skillOnly(self: HostServices) HostServices {
+        return .{ .ctx = self.ctx, .activateSkillFn = self.activateSkillFn };
+    }
+
+    /// Everything but the worktree hooks and the working root. For a main session
+    /// moved to the background (Ctrl+B): it shares the App with the foreground,
+    /// and EnterWorktree would chdir the whole process under it. It keeps the root
+    /// it was handed and cannot switch worktrees.
+    pub fn withoutWorktree(self: HostServices) HostServices {
+        return .{ .ctx = self.ctx, .activateSkillFn = self.activateSkillFn, .activateToolFn = self.activateToolFn };
+    }
+};
+
+/// 工具执行期进度回调(ToolContext 用,id/phase/text/count 签名)。
+/// 与 agent_loop 的 turn/tool 级 ProgressReporter 不同 —— 这是工具内进度(如 WebSearch 子请求)。
+pub const ToolProgressReporter = struct {
+    ctx: *anyopaque,
+    reportFn: *const fn (ctx: *anyopaque, id: []const u8, phase: ToolContext.ProgressPhase, text: []const u8, count: u32) void,
+    pub fn report(self: ToolProgressReporter, id: []const u8, phase: ToolContext.ProgressPhase, text: []const u8, count: u32) void {
+        self.reportFn(self.ctx, id, phase, text, count);
+    }
+};
+
+pub const ToolObservationSink = @import("metacodes-guard").tools.observation.Sink;
+pub const ProjectRuleGate = @import("project_rule_gate.zig").Gate;
+pub const ToolObservationOrigin = @import("metacodes-guard").tools.observation.Origin;
+pub const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
+pub const InlineResult = @import("../core/tool_result.zig").InlineResult;
+pub const ArtifactReceipt = @import("../core/tool_result.zig").ArtifactReceipt;
+pub const StructuredToolError = @import("../core/tool_result.zig").StructuredToolError;
+
+/// Host-only execution constraint installed after the formal recovery gate.
+/// It is not model input and cannot be selected through a tool argument.
+pub const ProjectEditMode = enum {
+    ordinary,
+    whole_file_exact,
+};
+
+/// Admission-fixed Run identity, passed by value down the execution chain.
+/// Immutable for the duration of one Run; never looked up from mutable state.
+pub const RunIdentity = struct {
+    session_id: @import("metacodes-kernel").session_id.SessionId,
+    run_id: u64,
+};
+
+/// Library-internal identity for Host tool execution. `host_session_ctx` is a
+/// type-erased anchor owned by whichever adapter registered it (the ABI facade
+/// registers its AbiSession); core only forwards it and never dereferences.
+/// Deliberately NOT named `session_ctx` (public callback ctx) nor
+/// `abi_session_ctx` (core must not name its consumers).
+pub const HostRunIdentity = struct {
+    identity: RunIdentity,
+    host_session_ctx: *anyopaque,
+};
+
+/// Typed dispatch boundary result. Slices are owned by `tool_ctx.allocator`
+/// (NOT implicitly an arena: ToolDispatcher is an independently callable core
+/// interface; tool_exec's arena caller merely degenerates deinit to arena
+/// lifetime). Callers release via `deinit(allocator)`.
+pub const ToolDispatchOutcome = union(enum) {
+    ok: ToolResultBody,
+    host_failed: ?[]u8,
+    host_rejected: ?[]u8,
+    host_fatal,
+
+    /// Frees owned slices and poisons the union; a second deinit is a bug and
+    /// must trap in Debug rather than silently double-free.
+    pub fn deinit(self: *ToolDispatchOutcome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ok => |*body| body.deinit(allocator),
+            .host_failed, .host_rejected => |maybe| if (maybe) |bytes| allocator.free(bytes),
+            .host_fatal => {},
+        }
+        self.* = undefined;
+    }
+};
+
+test "ToolDispatchOutcome.deinit releases every owned payload branch" {
+    const allocator = std.testing.allocator;
+
+    var ok: ToolDispatchOutcome = .{ .ok = ToolResultBody.initInline(try allocator.dupe(u8, "ok")) };
+    ok.deinit(allocator);
+
+    var failed_detail: ToolDispatchOutcome = .{ .host_failed = try allocator.dupe(u8, "failed") };
+    failed_detail.deinit(allocator);
+    var failed_empty: ToolDispatchOutcome = .{ .host_failed = null };
+    failed_empty.deinit(allocator);
+
+    var rejected_detail: ToolDispatchOutcome = .{ .host_rejected = try allocator.dupe(u8, "rejected") };
+    rejected_detail.deinit(allocator);
+    var rejected_empty: ToolDispatchOutcome = .{ .host_rejected = null };
+    rejected_empty.deinit(allocator);
+
+    var fatal: ToolDispatchOutcome = .host_fatal;
+    fatal.deinit(allocator);
+}
+
+/// Exact executor identity of a resolvable directory entry. `builtin` is the
+/// native in-process registry implementation; `host` covers the embedder
+/// callback executors (host_sync/host_stream), which are declared
+/// concurrency-capable by kind (shipped header contract), never guessed from
+/// tool names; `external` is every other executor (isolated processes, MCP
+/// connectors, run-local overlay tools).
+pub const ToolExecutorKind = enum { builtin, host, external };
+
+/// Admission-fixed per-name execution metadata. One resolution answers every
+/// metadata query, so builtin identity / permission category / replay
+/// declaration / scheduling flags come from the same lookup and cannot drift
+/// apart. `null` from `ToolDispatcher.metadata` means the name is not
+/// selectable in this directory: dispatch must fail (UnknownTool) and must
+/// never execute.
+pub const ToolMeta = struct {
+    kind: ToolExecutorKind,
+    category: ToolCategory,
+    /// Static candidate only. Missing metadata is always conservative.
+    replay: ReplayDeclaration,
+    prefetch_safe: bool,
+};
+
+/// Session-scoped tool directory used by embedders. The directory owns the
+/// advertised definitions and routes execution back to the exact selected
+/// entry, so a provider cannot escape a Session allowlist through the global
+/// built-in registry. Legacy App paths leave this null and keep using the
+/// process registry below `tools.zig`.
+pub const ToolDispatcher = struct {
+    ctx: *const anyopaque,
+    dispatchFn: *const fn (ctx: *const anyopaque, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome,
+    /// Required single metadata resolver. Every per-name query below derives
+    /// from the one `ToolMeta` it returns, so dispatch and metadata are
+    /// structurally forced through the same entry lookup — an implementation
+    /// cannot answer `isBuiltin` from one table and dispatch from another.
+    metadataFn: *const fn (ctx: *const anyopaque, name: []const u8) ?ToolMeta,
+    nameAtFn: *const fn (ctx: *const anyopaque, index: usize) ?[]const u8,
+
+    pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
+        return self.dispatchFn(self.ctx, tool_ctx, name, args);
+    }
+
+    pub fn metadata(self: ToolDispatcher, name: []const u8) ?ToolMeta {
+        return self.metadataFn(self.ctx, name);
+    }
+
+    pub fn nameAt(self: ToolDispatcher, index: usize) ?[]const u8 {
+        return self.nameAtFn(self.ctx, index);
+    }
+
+    // Unresolvable names take the conservative default of each derived query:
+    // never prefetched, not host-sync, not builtin, no category claim, replay
+    // `.never`.
+
+    pub fn prefetchSafe(self: ToolDispatcher, name: []const u8) bool {
+        const meta = self.metadata(name) orelse return false;
+        return meta.prefetch_safe;
+    }
+
+    pub fn isHostSync(self: ToolDispatcher, name: []const u8) bool {
+        const meta = self.metadata(name) orelse return false;
+        return meta.kind == .host;
+    }
+
+    pub fn isBuiltin(self: ToolDispatcher, name: []const u8) bool {
+        const meta = self.metadata(name) orelse return false;
+        return meta.kind == .builtin;
+    }
+
+    pub fn category(self: ToolDispatcher, name: []const u8) ?ToolCategory {
+        const meta = self.metadata(name) orelse return null;
+        return meta.category;
+    }
+
+    pub fn replayDeclaration(self: ToolDispatcher, name: []const u8) ReplayDeclaration {
+        const meta = self.metadata(name) orelse return .never;
+        return meta.replay;
+    }
+
+    /// Structural coverage check for wrapper stacks: nothing in the interface
+    /// forces `dispatchFn`'s resolvable names and `metadataFn` to stay in
+    /// sync, so a future wrapper can add a dispatchable name, forget the
+    /// metadata branch, and silently reintroduce split resolution. Walks the
+    /// advertised directory (`nameAt(0..)`) and returns the first name whose
+    /// `metadata` is null; null means every advertised name resolves.
+    /// Composition sites assert this in Debug so drift fails loudly.
+    pub fn validateMetadataCoverage(self: ToolDispatcher) ?[]const u8 {
+        var index: usize = 0;
+        while (self.nameAt(index)) |name| : (index += 1) {
+            if (self.metadata(name) == null) return name;
+        }
+        return null;
+    }
+};
+
+/// What one turn's provider request showed the model (`ToolContext.request_tools`).
+pub const RequestTools = struct {
+    /// The request's tools array: the tools callable this turn.
+    advertised: []const ToolDefinition,
+    /// The same catalog before deferred tools are dropped for not being
+    /// activated: also holds the deferred tools ToolSearch may still fetch.
+    catalog: []const ToolDefinition,
+
+    pub fn advertises(self: RequestTools, name: []const u8) bool {
+        return findDefinition(self.advertised, name) != null;
+    }
+
+    /// `name` is a deferred tool of this turn's catalog.
+    pub fn offersDeferred(self: RequestTools, name: []const u8) bool {
+        const definition = findDefinition(self.catalog, name) orelse return false;
+        return definition.deferred;
+    }
+
+    fn findDefinition(definitions: []const ToolDefinition, name: []const u8) ?*const ToolDefinition {
+        for (definitions) |*definition| {
+            if (std.mem.eql(u8, definition.name, name)) return definition;
+        }
+        return null;
+    }
+};
+
+pub const ToolExecutionPolicy = @import("metacodes-guard").permission.category.ToolExecutionPolicy;
+
+/// Name-level execution ceiling backed by the exact tool definitions selected
+/// for a child agent.  AgentDef filtering must constrain execution as well as
+/// provider-visible schemas: the child still shares the process DynRegistry,
+/// so schema filtering alone would let a guessed MCP tool name escape the
+/// allowlist.
+///
+/// `parent` is optional and is useful for synchronous nesting.  The selected
+/// definition set is always checked first, so no child can re-authorize a tool
+/// that AgentDef removed.
+pub const ToolSetExecutionPolicy = struct {
+    definitions: []const ToolDefinition,
+    parent: ?ToolExecutionPolicy = null,
+
+    pub fn executionPolicy(self: *const ToolSetExecutionPolicy) ToolExecutionPolicy {
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsToolAdapter,
+            .allowsInvocationFn = allowsInvocationAdapter,
+        };
+    }
+
+    fn contains(self: *const ToolSetExecutionPolicy, name: []const u8) bool {
+        for (self.definitions) |definition| {
+            if (std.mem.eql(u8, definition.name, name)) return true;
+        }
+        return false;
+    }
+
+    fn allowsToolAdapter(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const ToolSetExecutionPolicy = @ptrCast(@alignCast(raw));
+        if (!self.contains(name)) return false;
+        return if (self.parent) |parent| parent.allowsTool(name) else true;
+    }
+
+    fn allowsInvocationAdapter(raw: *const anyopaque, name: []const u8, arguments_json: []const u8) bool {
+        const self: *const ToolSetExecutionPolicy = @ptrCast(@alignCast(raw));
+        if (!self.contains(name)) return false;
+        return if (self.parent) |parent| parent.allowsInvocation(name, arguments_json) else true;
+    }
+};
+
+pub const ToolContext = struct {
+    /// Resolved Host opt-in; model input and plugins cannot enable it.
+    preview: @import("metacodes-ai").preview.Features = .none,
+    allocator: std.mem.Allocator,
+    abort: ?*const AbortSignal = null,
+    /// TinyKG 客户端(记忆/计划/DAG 真相源;设计 KG_DESIGN v3-final)。
+    /// null = 未配置(缺二进制)——KG 工具此时不会注册;non-null 但 !ready = degraded。
+    kg: ?*@import("../kg/client.zig").KgClient = null,
+    /// 本次 agent run 的无向量检索事实账本。lexical_plan 存在时必须非 null：
+    /// v2 seen state 完全由宿主管理；v1 兼容路径仍校验模型声明，并在同一锁内
+    /// 计算/提交真实命中增益。
+    /// legacy query-only 路径不读取它。由 agent_loop.run 创建，绝不进 TinyKG store。
+    kg_lexical_ledger: ?*@import("../kg/lexical_query_plan.zig").Ledger = null,
+    /// System-One advisor (`packages/coding/src/jev/advisor.zig`) for memory-plane judgments;
+    /// null = baseline only. Evidence, never authority: tools may annotate
+    /// their own results with it but never admit, deny or skip work on it.
+    jev: ?*@import("../jev/advisor.zig").Advisor = null,
+    /// The run's user request, for System-One judgments that need more than a
+    /// tool argument (KgRecall evidence). Empty when unknown or no advisor.
+    jev_request: []const u8 = "",
+    /// Set only during a learning pass (`core/learning_turn.zig`): the header a
+    /// `KgRemember` of kind `lesson` must carry, and the turn's lesson budget.
+    /// Null everywhere else, where kind `lesson` is refused.
+    lesson_binding: ?*@import("../kg/lesson.zig").Binding = null,
+    /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。任务锚指针
+    /// (kg_task_anchor)写到此;旧会话的 kg_root 指针仍从此读回。空串 = 未配置。
+    kg_projects_dir: []const u8 = "",
+    /// AutoMem memdir 绝对路径(B/C 合并:Write/Edit 落盘 memdir markdown 自动入图用)。
+    /// 空串=禁用。
+    memdir_abs: []const u8 = "",
+
+    /// 工具抛错时可选的富文本 detail:工具在 `return error.X` 前写 `*error_detail = msg`,
+    /// tool_exec 读到后用它替代通用的 "<tool> failed with X" 作为模型可见 detail。
+    /// msg 用 ctx.allocator 分配(errorToJson 会拷贝,arena 释放前读取安全)。null = 不支持。
+    error_detail: ?*?[]const u8 = null,
+    /// L3 挂起:工具发起的 custom UI 请求拿到 RequestOutcome.pending 时,在 `return error.UiPending`
+    /// 前把 `{kind, payload_json}` 写进这个槽;tool_exec(runJob)读到后填 Slot.pending_payload,
+    /// agent_loop 据此 emit ui_request_pending + 挂起。null = 不支持挂起(同步/无异步 backend)。
+    /// kind/payload 用 ctx.allocator 分配(逃逸需 runJob dupe 到父,见 tool_exec)。
+    pending_request: ?*?PendingRequest = null,
+    /// ReadState 表：Read 成功后会 record，Write/Edit 入口查 get 做 must-read-first 校验。
+    /// 单元测试可用 `simple` 构造跳过（无校验）。
+    read_state: ?*ReadState = null,
+    /// Edit/Write 旁路高亮缓存:finalizeWrite 把新旧全文 put 进来(key=progress_tool_id),
+    /// diff 工具卡渲染时取出做 tree-sitter 着色。null = 不缓存(headless/测试)。
+    edit_hl_cache: ?*@import("../core/edit_hl_cache.zig").EditHlCache = null,
+    /// LSP 被动诊断服务(Y2 Step3):Edit/Write finalizeWrite 写前 snapshotBaseline + 写后
+    /// getDiagnostics,把类型诊断 delta 附进工具结果给模型。null = 未装配(`--no-lsp`,或库调用方
+    /// 本就没接 Service)。CLI 默认非 null。
+    lsp: ?*@import("../lsp/service.zig").Service = null,
+    /// Swarm 会话状态(teams/teammates):TeamCreate/TeamDelete/SendMessage + Task 的
+    /// name+team_name spawn 分支用。null = 非 swarm-enabled 上下文(subagent/headless 恒 null:
+    /// teammate 不 spawn teammate,扁平 roster)。见 swarm/context.zig。
+    swarm: ?*@import("../swarm/context.zig").SwarmContext = null,
+    /// Bash 后台作业注册表：run_in_background + BashOutput + KillShell 用
+    jobs: ?*JobRegistry = null,
+    /// 后台 subagent 作业注册表：Task(run_in_background) + TaskOutput + TaskStop(agent_ id) 用
+    agent_jobs: ?*AgentJobRegistry = null,
+    /// 权限上下文(子执行据此派生 scoped ctx;工具读 mode / no_interactive_prompt)。
+    permission_ctx: ?*PermissionContext = null,
+    /// Task 清单：TaskCreate/Get/List/Update/Stop 共享的 scratchpad
+    tasks: ?*TaskStore = null,
+    /// 用于 Agent 工具 spawn 子 agent：共享 API client + tool defs + permission ctx
+    /// api_client 仅 Anthropic 具体 client(web_search server tool 用);非 Anthropic → null。
+    api_client: ?*Client = null,
+    /// Per-call provider construction capability. WebSearch requires this to
+    /// enter a parallel batch; null preserves the legacy shared-client serial
+    /// path for embedders that have not supplied isolated request resources.
+    provider_factory: ?@import("metacodes-ai").api.provider_factory.Factory = null,
+    /// P0.5:父 loop 的中立 Provider。skill/agent 同步 spawn 的子 loop 据此继承父 provider
+    /// (跨 provider 也正确);null = 无(纯单测)→ spawn 降级用 api_client.provider() 兜底。
+    provider: ?@import("metacodes-ai").api.provider.Provider = null,
+    tool_defs: ?[]const ToolDefinition = null,
+    /// 当前 agent 嵌套深度（父=0，子=1，孙=2…）。Agent 工具用它限制递归。
+    agent_depth: u8 = 0,
+    /// 运行时工具表（Skill/MCP）。agent_loop 在静态注册表未命中时回退到此。
+    dyn_registry: ?*const DynRegistry = null,
+    /// Optional immutable Session directory. When present it is the only
+    /// dispatch authority; tools not selected into it remain unexecutable even
+    /// though they exist in the process-wide built-in registry.
+    tool_dispatcher: ?ToolDispatcher = null,
+    code_executor: ?CodeExecutor = null,
+    /// Optional execution-context upper bound (for example a nested Skill
+    /// PolicyFrame). It is checked independently of Session dispatch and
+    /// permission so no child context can re-authorize a parent denial.
+    execution_policy: ?ToolExecutionPolicy = null,
+    /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)——三类"工具改宿主
+    /// 状态"的请求-响应回调收成一个接口。null = 无宿主(纯单测)。各能力可空,见 HostServices。
+    host_services: ?HostServices = null,
+    /// 用户是否显式触发(true = 用户 /name;false = 模型自主调用)。
+    /// 用于 disable-model-invocation 检查。
+    explicit_invocation: bool = false,
+    /// 当前 session id(${CLAUDE_SESSION_ID} 替换 + 日志相关)。
+    session_id: []const u8 = "",
+    /// Host tool 执行身份(admission 处固定,经 opts 显式传值)。可选字段 + null 默认:
+    /// 共享基础设施扩展规则——非 Host-tool 消费者(TUI/普通 loop/单测)零感知。
+    host_run: ?HostRunIdentity = null,
+    /// 本 agent loop 的**对外身份**(全局唯一,程序注入):KG claim 租约等跨进程/跨 loop
+    /// 协调用。与 `session`(UI 事件路由键)是不同概念——主 loop 两者恰好同值
+    /// (App.session_id,跨进程唯一:ms 时戳+monotonic ns);subagent 每次 spawn 独立
+    /// gen(路由仍归父视图,身份必须独立,否则并发 subagent 共享 sentinel 互相无防撞)。
+    /// **身份由程序赋予,绝不指望模型手填。**
+    agent_ident: @import("metacodes-kernel").session_id.SessionId = @import("metacodes-kernel").session_id.SessionId.single,
+    /// TinyKG lease holder identity override. Null means `agent_ident`.
+    /// Swarm uses the stable human-readable `name@team` here for both claim and
+    /// close; keeping it separate from the fixed-width session id prevents the
+    /// old split-brain state where one identity claimed and another tried to
+    /// close the same task. Host-injected only; never exposed as a model field.
+    kg_agent_ident: ?[]const u8 = null,
+    /// 当前 project root(${CLAUDE_PROJECT_DIR} 替换)。
+    project_dir: []const u8 = "",
+    /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。
+    disable_shell_execution: bool = false,
+    /// Sandbox 配置。非 null 且 enabled 时,Bash 命令包进平台沙箱(macOS sandbox-exec /
+    /// Linux bwrap,sandbox/exec.zig)。
+    sandbox: ?*const @import("metacodes-guard").sandbox.config.SandboxSettings = null,
+    /// 当前 cwd 绝对路径(sandbox profile 工作目录写权限)。空 = 用 process cwd。
+    cwd_abs: []const u8 = "",
+    /// 相对文件工具路径是否以 cwd_abs 为基准。AgentSession 开启；CLI 默认关闭以维持既有契约。
+    resolve_relative_paths: bool = false,
+    path_aliases: []const @import("metacodes-guard").tools.common.PathAlias = &.{},
+    /// 额外工作目录(--add-dir / additionalDirectories,绝对路径)。sandbox profile
+    /// 与 cwd 同级可写;权限侧由 permission_ctx.match_ctx.additional_dirs 消费。
+    additional_dirs: []const []const u8 = &.{},
+    /// HOME(sandbox profile ~/ 展开)。
+    home_dir: []const u8 = "",
+    /// This install's state root (util/state_root.zig), injected by the host:
+    /// worktrees, KG, telemetry and the Metask ledger live under it. "" = none.
+    state_root: []const u8 = "",
+    /// Session-scoped root for content-addressed tool-result artifacts.
+    /// Empty means persistence/recovery is unavailable and projection must
+    /// return an explicit non-recoverable fallback envelope.
+    artifact_root: []const u8 = "",
+    /// This turn's byte budget for model-visible results, derived once by
+    /// `agent_loop` from the provider context window and shared with
+    /// `result_projection`. A tool that bounds its own output sizes it from
+    /// here instead of a private constant, so the two layers cannot disagree
+    /// about what one result may cost. Plain data on purpose: an embedder with
+    /// no Provider keeps the `.floor` default rather than losing the field.
+    result_budget: @import("metacodes-kernel").result_budget.Budget = .floor,
+    /// Optional UI-independent counters shared by all execution depths in a
+    /// session. Atomic fields make parallel tools/subagents safe observers.
+    tool_result_metrics: ?*@import("../core/tool_result_metrics.zig").Metrics = null,
+    /// Run-level file-change journal (see core/file_change.zig). Carried here
+    /// only so that sub executions (Agent / Skill / TaskBatch) inherit the
+    /// parent's journal — a subagent's edits are still this Run's edits.
+    file_change_journal: ?*@import("metacodes-guard").core.file_change.Journal = null,
+    /// Subagent 定义集合(Task 工具据此找 subagent_type → AgentDef)。
+    agents: ?*const @import("../agents/set.zig").AgentSet = null,
+    /// 父 model(供 subagent model 字段 `inherit` 解析)。
+    parent_model: []const u8 = "",
+    /// 本 run 请求真会命名的模型(`model_override orelse provider.model()`)。只用于
+    /// 对模型说话(错误 detail 里点名),不参与路由。空 = 未知(纯单测)。
+    active_model: []const u8 = "",
+    /// `active_model` 能否收图(provider.supportsForModel(.image_input, override))。
+    /// Read 读到图片文件时据此**执行期**门控:false → 不读盘不编码,直接返回
+    /// capability_unsupported 并交代替代路径;null = 宿主没告知(纯单测/旧宿主)→ 不门控,
+    /// 图片照旧进 tool_result,由序列化层按方言发原生块或占位文本。
+    image_input_supported: ?bool = null,
+    /// The tools this turn's provider request showed the model, after every
+    /// runtime filter (`agent_loop.buildEffectiveToolSet`). Borrowed from the
+    /// turn: valid only while that turn's tools execute. null = no agent-loop
+    /// turn (unit tests, direct dispatch). ToolSearch answers from it, so its
+    /// miss text and `select:` agree with what the model was given (#287).
+    request_tools: ?RequestTools = null,
+    /// 当前 provider 的模型档位表(low/mid/high → {model, effort};App 启动时按
+    /// provider_kind 从 <state root>/config.json 选定)。null = 未配置:档位名
+    /// 一律 inherit 父模型,绝不回退硬编码模型 ID。
+    model_tiers: ?*const @import("metacodes-ai").api.model_tiers.ProviderTiers = null,
+    /// Skill 集合(供 subagent preload_skills 字段读取 skill body)。
+    skills: ?*const @import("../skills/skill.zig").SkillSet = null,
+    /// MCP session 列表(ListMcpResourcesTool / ReadMcpResourceTool 用)。
+    /// 不直接 import app.zig(防循环);用 anytype pointer 转译。
+    mcp_sessions: ?*const []@import("../core/mcp_session.zig").McpSessionEntry = null,
+    mcp_unavailable: []const @import("../core/mcp_session.zig").McpUnavailable = &.{},
+    mcp_late: ?@import("../core/mcp_session.zig").McpLateProbe = null,
+    /// Cron registry(CronCreate/Delete/List 用)。
+    cron_registry: ?*@import("../core/cron_registry.zig").CronRegistry = null,
+    /// 工具执行期进度回调(对齐 cc onProgress):工具(如 WebSearch 子请求)在执行**中**
+    /// 实时上报进度,驱动 TUI 刷新工具卡第二行(Searching: q / Found N results)。
+    /// 工具执行期进度。ctx 指 *RenderRegion(经 trampoline),tool_exec 注入。null = 无 TUI。见 ToolProgressReporter。
+    progress_reporter: ?ToolProgressReporter = null,
+    /// id = 该工具的 tool_use id(per-toolUse 多卡按它路由;tool_exec runJob 盖入)。flat 保留(per-job 数据非闭包)。
+    progress_tool_id: []const u8 = "",
+
+    /// UI-independent evidence emitted at the actual dispatch boundary. The
+    /// sink is host supplied and may fail closed; it is not a permission or
+    /// rule-promotion capability. `effect_slot` is installed by executeOne for
+    /// one synchronous dispatch and must never escape that call.
+    tool_observer: ?ToolObservationSink = null,
+    /// Optional deterministic/durable execution boundary. It is invoked only
+    /// after a tool intent has been accepted by `tool_observer`, immediately
+    /// before dispatch, and again after the terminal observation is accepted.
+    execution_boundary: ?@import("metacodes-guard").core.execution_effect.Boundary = null,
+    /// Hash-pinned project-specific formal gate. Unlike permission policy it
+    /// is evaluated inside executeOne at the actual dispatch seam, so TUI,
+    /// headless, Web, subagents, TaskBatch, and prefetch cannot bypass it.
+    project_rule_gate: ?ProjectRuleGate = null,
+    tool_observation_origin: ToolObservationOrigin = .authoritative,
+    effect_slot: ?*@import("metacodes-guard").tools.observation.EffectSlot = null,
+    /// Stable file-modification reporting channel (see core/file_change.zig).
+    /// `executeOne` installs one per dispatch; a file tool publishes one draft
+    /// per affected file. Absent (direct unit calls / legacy embedders) this is
+    /// a no-op, exactly like `effect_slot`.
+    file_change_sink: ?@import("metacodes-guard").core.file_change.Sink = null,
+    /// executeOne sets this only after a formal gate admits a Write whose
+    /// target was observed missing.  Write then uses O_EXCL so a file created
+    /// in the observation-to-open window is not silently truncated.
+    project_write_exclusive_create: bool = false,
+    /// executeOne sets this only for a Lean-admitted recovery Edit.  The
+    /// native Edit implementation then requires old_string to equal the full
+    /// bytes read from one O_NOFOLLOW RDWR descriptor and disables every
+    /// fuzzy/substring fallback.
+    project_edit_mode: ProjectEditMode = .ordinary,
+
+    /// **U6 A2:工具→父 backend 通知通路**。Task 生 subagent → emit agent_lifecycle;
+    /// TaskUpdate 改 DAG → emit tasks_changed。agent_loop(depth==0)注入,转发到 backend.emitEvent
+    /// (mirror progress_reporter/ProgressTramp)。null = 无(headless/子 agent/纯单测)→ 工具跳过 emit。
+    /// 限定子集(见 EventReporter):只能发 agent_lifecycle/tasks_changed,类型上禁发表达类事件。
+    event_reporter: ?@import("metacodes-guard").core.protocol.ui_event.EventReporter = null,
+
+    /// 子进程"仍在运行"心跳回调(spawn 层每 2s 调,Bash/WebFetch/Worktree 长命令用)。
+    /// 重构前是 tools/common.zig 的进程全局 g_progress_cb(多 Session 串台)。现 per-session 挂
+    /// ToolContext,传给 spawnCaptureWithStderrTimed。null = 不显示心跳(headless/非 tty)。
+    /// 比 progress_fn 简单:只报 (elapsed_ms, argv0),不分 phase——是 Bash spawn 的轻量 ticker。
+    spawn_tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null,
+
+    /// 统一 UI 请求回调(替代旧 ask_question_fn / 权限 dialog_runner 等多套)。
+    /// 工具(主线程)构造一个 UiRequest 交给 TUI backend,backend 停 watcher + 持渲染锁 +
+    /// 独占 fd0 渲染对应对话框,把用户选择写回 out。state 指向 *TuiBackend(经 trampoline)。
+    /// null = 无 TUI(headless/单测/子 agent)→ 各工具按语义兜底(ask→NotATty)。
+    /// req/out 借用(回调同步消费);ask_question 的 answers slice owned by allocator(caller free)。见 UiRequester。
+    ui_requester: ?@import("metacodes-guard").core.protocol.ui_request.UiRequester = null,
+    /// 本 ToolContext 归属的会话(UiRequest 路由到对应 session 视图)。默认 .single(N=1)。
+    /// agent_loop 构造 base_ctx 时从 opts.session 设。
+    /// **M6 待办**:与 PermissionContext.session 是同一概念的两份(见那里注释);M6 拆
+    /// SessionContext 后两者都从 SessionContext.id 取,本字段消失。
+    session: @import("metacodes-kernel").session_id.SessionId = @import("metacodes-kernel").session_id.SessionId.single,
+
+    /// 工具进度阶段(对齐 cc WebSearchProgress 两态)。
+    pub const ProgressPhase = enum { query_update, results_received };
+
+    /// 上报进度(null 安全)。text 借用,回调内须立即拷贝(不跨调用持有)。
+    /// id 自动用 self.progress_tool_id(per-toolUse 多卡路由)。
+    pub fn reportProgress(self: *const ToolContext, phase: ProgressPhase, text: []const u8, count: u32) void {
+        if (self.progress_reporter) |r| r.report(self.progress_tool_id, phase, text, count);
+    }
+
+    /// Attach target-file evidence observed by this dispatch. `after` is the
+    /// byte sequence the tool finished writing, not a race-free post-dispatch
+    /// re-observation. With no executeOne-installed slot (direct unit calls /
+    /// legacy embedders), this is deliberately a no-op rather than a second
+    /// observation path.
+    pub fn reportFileMutation(
+        self: *const ToolContext,
+        path: []const u8,
+        before: @import("metacodes-guard").tools.observation.BeforeContent,
+        after: []const u8,
+    ) void {
+        const slot = self.effect_slot orelse return;
+        const effect = @import("metacodes-guard").tools.observation.fileMutation(path, before, after).file_mutation_v1;
+        slot.recordFileMutation(path, effect);
+    }
+
+    /// Publish one file's actual modification on the supported contract. This
+    /// is a report, not an authorization: it grants nothing and it does not
+    /// replace the tool's own result rendering. Slices may live in the tool's
+    /// arena — the collector copies what it keeps before returning.
+    pub fn reportFileChange(self: *const ToolContext, draft: @import("metacodes-guard").core.file_change.Draft) void {
+        const sink = self.file_change_sink orelse return;
+        sink.publish(draft);
+    }
+
+    pub fn isPrefetchSafe(self: *const ToolContext, name: []const u8) bool {
+        return if (self.tool_dispatcher) |d| d.prefetchSafe(name) else true;
+    }
+
+    /// 发一个统一 UI 请求(同步阻塞)。有回调 + state → 调它写 out 返回 true;否则返回 false
+    /// (调用方按语义兜底:ask→NotATty)。req/out 调用方栈上提供。
+    /// 返回 RequestOutcome:answered=out 已写;pending=异步前端挂起(工具应返 error.UiPending);
+    /// unavailable=无 requester(工具按语义兜底)。
+    pub fn requestUi(
+        self: *const ToolContext,
+        allocator: std.mem.Allocator,
+        req: *const @import("metacodes-guard").core.protocol.ui_request.UiRequest,
+        out: *@import("metacodes-guard").core.protocol.ui_request.UiResponse,
+    ) anyerror!@import("metacodes-guard").core.protocol.ui_request.RequestOutcome {
+        const r = self.ui_requester orelse return .unavailable;
+        return try r.request(self.session, allocator, req, out);
+    }
+
+    /// L3:发起一个 custom UI 请求(动态 UI)。四态:
+    /// - answered:同步 backend 已渲染并写 out.custom(结果 JSON),返回它(borrow,arena 有效)。
+    /// - pending:异步 backend 已 stash 请求未阻塞 → 把 {kind,payload_json} 写进 pending_request 槽
+    ///   并返 error.UiPending(agent_loop 据此挂起)。**out 未写,不得读**。
+    /// - unavailable:无 requester(headless/子 agent/无 backend)→ error.CustomUiUnsupported(工具兜底)。
+    /// - unrenderable:前端声明了不渲染这个 kind → 同样 error.CustomUiUnsupported,另在 error_detail
+    ///   写明是前端渲染不了(工具兜底成功则这段 detail 不会出现)。
+    /// kind/payload_json 借用调用方内存;pending 时 dupe 进 pending_request(逃逸 runJob arena 由其负责)。
+    ///
+    /// **⚠️ error.UiPending 是控制信号,工具绝不能 catch 它**——必须让它一路冒泡到 tool_exec.runJob
+    /// (那里特判成挂起)。工具若 `requestUiCustom() catch {...}` 吞掉 UiPending,挂起静默失效、
+    /// 变成普通工具结果。**子 agent(Task)内的挂起目前未定义**(子 run 返 .suspended 后父怎么 resume
+    /// 子,无机制)——custom UI 工具只应在顶层用;子 agent 内发起 = future(见 L3 plan gap)。
+    pub fn requestUiCustom(
+        self: *const ToolContext,
+        allocator: std.mem.Allocator,
+        kind: []const u8,
+        payload_json: []const u8,
+    ) anyerror![]const u8 {
+        const ui_request = @import("metacodes-guard").core.protocol.ui_request;
+        const req = ui_request.UiRequest{ .custom = .{ .kind = kind, .payload_json = payload_json } };
+        var out: ui_request.UiResponse = undefined;
+        switch (try self.requestUi(allocator, &req, &out)) {
+            .answered => return switch (out) {
+                .custom => |j| j,
+                else => error.CustomUiUnsupported, // backend 返非 custom tag = 协议违例
+            },
+            .pending => {
+                const slot = self.pending_request orelse return error.CustomUiUnsupported;
+                slot.* = .{
+                    .kind = try allocator.dupe(u8, kind),
+                    .payload_json = try allocator.dupe(u8, payload_json),
+                };
+                return error.UiPending;
+            },
+            .unavailable => return error.CustomUiUnsupported,
+            .unrenderable => {
+                // Same fallback, honest wording: a tool that does not recover
+                // from it reports why the UI never appeared.
+                if (self.error_detail) |slot| slot.* = std.fmt.allocPrint(
+                    self.allocator,
+                    "The custom UI '{s}' was not shown: the frontend connected to this session did not declare that it renders this kind. This is not a decision by the user.",
+                    .{kind},
+                ) catch null;
+                return error.CustomUiUnsupported;
+            },
+        }
+    }
+
+    /// 便利构造：只需 allocator 的场景（大多数单元测试）。
+    pub fn simple(allocator: std.mem.Allocator) ToolContext {
+        return .{ .allocator = allocator };
+    }
+
+    /// 带 abort 的构造。
+    pub fn withAbort(allocator: std.mem.Allocator, abort: *const AbortSignal) ToolContext {
+        return .{ .allocator = allocator, .abort = abort };
+    }
+
+    /// 快捷：检查 abort 是否触发，若是返回 error.Aborted。
+    pub fn throwIfAborted(self: *const ToolContext) error{Aborted}!void {
+        if (self.abort) |a| return a.throwIfAborted();
+    }
+};
+
+test "simple ctx has no abort" {
+    const ctx = ToolContext.simple(std.testing.allocator);
+    try std.testing.expect(ctx.abort == null);
+    try ctx.throwIfAborted();
+}
+
+// ── 回调接口微测(仿 UsageSink:栈计数器作 ctx,调 method,断言计数器变)──
+const TestState = struct {
+    skill_hits: u32 = 0,
+    tool_hits: u32 = 0,
+    progress_hits: u32 = 0,
+    fn skillCb(ctx: *anyopaque, _: []const u8, _: []const []const u8, _: []const []const u8) anyerror!void {
+        const s: *TestState = @ptrCast(@alignCast(ctx));
+        s.skill_hits += 1;
+    }
+    fn toolCb(ctx: *anyopaque, _: []const u8) anyerror!void {
+        const s: *TestState = @ptrCast(@alignCast(ctx));
+        s.tool_hits += 1;
+    }
+    fn progressCb(ctx: *anyopaque, _: []const u8, _: ToolContext.ProgressPhase, _: []const u8, _: u32) void {
+        const s: *TestState = @ptrCast(@alignCast(ctx));
+        s.progress_hits += 1;
+    }
+};
+
+test "HostServices.activateSkill 经接口触达回调" {
+    var st = TestState{};
+    const hs = HostServices{ .ctx = @ptrCast(&st), .activateSkillFn = &TestState.skillCb };
+    try hs.activateSkill("foo", &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), st.skill_hits);
+}
+
+test "HostServices.activateTool 经接口触达回调" {
+    var st = TestState{};
+    const hs = HostServices{ .ctx = @ptrCast(&st), .activateToolFn = &TestState.toolCb };
+    try hs.activateTool("Bash");
+    try std.testing.expectEqual(@as(u32, 1), st.tool_hits);
+}
+
+test "HostServices: 缺失能力返 HostCapabilityUnavailable" {
+    var st = TestState{};
+    // 只接 activateSkill,不接 tool/worktree → 对应方法返 HostCapabilityUnavailable。
+    const hs = HostServices{ .ctx = @ptrCast(&st), .activateSkillFn = &TestState.skillCb };
+    try std.testing.expectError(error.HostCapabilityUnavailable, hs.activateTool("x"));
+    try std.testing.expectError(error.HostCapabilityUnavailable, hs.worktreePop(std.testing.allocator));
+}
+
+test "ToolProgressReporter.report 经接口触达回调" {
+    var st = TestState{};
+    const rep = ToolProgressReporter{ .ctx = @ptrCast(&st), .reportFn = &TestState.progressCb };
+    rep.report("tu1", .query_update, "searching", 0);
+    try std.testing.expectEqual(@as(u32, 1), st.progress_hits);
+}
+
+test "withAbort ctx propagates abort" {
+    var sig = AbortSignal.init();
+    sig.abort(.user_ctrl_c);
+    const ctx = ToolContext.withAbort(std.testing.allocator, &sig);
+    try std.testing.expectError(error.Aborted, ctx.throwIfAborted());
+}

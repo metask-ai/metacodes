@@ -5,7 +5,7 @@
 //! the TUI, or `App` would stop them compiling. It would not: the test module's
 //! root is `src/`, so *any* file under it is importable, and the only named
 //! module either subsystem needs is `platform`. Both gates were decorative —
-//! adding `src/client.zig` to the provider root compiles cleanly.
+//! adding `packages/ai/src/client.zig` to the provider root compiles cleanly.
 //!
 //! The boundary is a source-level rule, so this checks it at the source level:
 //! every `@import` in each subsystem must be on that subsystem's allowlist.
@@ -30,19 +30,25 @@
 //! compiled. This follows every `@import` from `src/lib.zig`, wherever it
 //! sits, and fails on each edge into the application side that `LIBRARY`'s
 //! baseline does not name. The baseline may only shrink: an entry whose edge
-//! is gone fails too, and no file under `src/core/` may have one at all.
+//! is gone fails too, and no file under `packages/coding/src/core/` may have one at all.
 //!
 //! The last rule is a ratchet for #445: `serve` and `--web` are to become
-//! transports over `src/core/session_host.zig`, so no file under `apps/cli/src/daemon/`
-//! or `apps/cli/src/web/` may drive the kernel by importing `src/core/agent_loop.zig`.
+//! transports over `packages/session/src/core/session_host.zig`, so no file under `apps/cli/src/daemon/`
+//! or `apps/cli/src/web/` may drive the kernel by importing `packages/coding/src/core/agent_loop.zig`.
 //! `HOST_KERNEL`'s baseline names the files that still do; like the library's,
 //! it may only shrink.
 //!
 //! The application side reaches the lower packages through one named module,
 //! `metacodes-internal`, rooted at `src/internal.zig`. Each use names the file
 //! it means, `@import("metacodes-internal").core.agent_loop`, so the rules
-//! above read it as an import of `src/core/agent_loop.zig`; a use that names no
+//! above read it as an import of `packages/coding/src/core/agent_loop.zig`; a use that names no
 //! file of the entry counts as an import nothing is allowed.
+//!
+//! Each lower package is a named module too, `metacodes-<package>`, rooted at
+//! `packages/<package>/src/root.zig`, and read the same way: a use names the
+//! file its namespace path re-exports, `@import("metacodes-base").util.log`,
+//! and an entry of `src/internal.zig` that is such a use names that file. The
+//! library's closure is followed from each package root it imports.
 
 const std = @import("std");
 
@@ -72,21 +78,21 @@ const SUBSYSTEMS = [_]Subsystem{
         // utilities, and the portable platform layer. Not the transport, not
         // a UI.
         .name = "provider kernel",
-        .dir = "src/provider",
+        .dir = "packages/ai/src/provider",
         .recursive = true,
         .modules = &.{ "std", "builtin", "platform" },
         .reaches = &.{
-            "src/types.zig",
-            "src/util/model.zig",
-            "src/util/pricing.zig",
-            "src/util/fs.zig",
-            "src/util/file_lock.zig",
-            "src/util/json_merge.zig",
-            "src/util/json.zig",
+            "packages/ai/src/types.zig",
+            "packages/base/src/util/model.zig",
+            "packages/base/src/util/pricing.zig",
+            "packages/base/src/util/fs.zig",
+            "packages/base/src/util/file_lock.zig",
+            "packages/base/src/util/json_merge.zig",
+            "packages/base/src/util/json.zig",
             // Reached through the files above.
-            "src/api/model_name.zig",
-            "src/util/log.zig",
-            "src/util/time.zig",
+            "packages/base/src/api/model_name.zig",
+            "packages/base/src/util/log.zig",
+            "packages/base/src/util/time.zig",
         },
     },
     .{
@@ -101,11 +107,11 @@ const SUBSYSTEMS = [_]Subsystem{
             "apps/cli/src/repl/tui/ansi.zig",
             "apps/cli/src/repl/tui/theme.zig",
             "apps/cli/src/repl/tui/term.zig",
-            "src/provider/ids.zig",
-            "src/provider/offer.zig",
-            "src/provider/controls.zig",
-            "src/provider/selection.zig",
-            "src/provider/control_plane.zig",
+            "packages/ai/src/provider/ids.zig",
+            "packages/ai/src/provider/offer.zig",
+            "packages/ai/src/provider/controls.zig",
+            "packages/ai/src/provider/selection.zig",
+            "packages/ai/src/provider/control_plane.zig",
         },
     },
     .{
@@ -114,7 +120,7 @@ const SUBSYSTEMS = [_]Subsystem{
         // `tool_invocation.zig` are its integration with the tool system, and
         // sit outside; `config.zig` and `launch.zig` are the CLI's imports.
         .name = "MCP client",
-        .dir = "src/mcp",
+        .dir = "packages/coding/src/mcp",
         .recursive = false,
         .only = &.{
             "canonical.zig",
@@ -140,62 +146,62 @@ const SUBSYSTEMS = [_]Subsystem{
         },
         .modules = &.{ "std", "builtin", "platform" },
         .reaches = &.{
-            "src/api/auth_header.zig",
-            "src/api/capability_activation.zig",
-            "src/api/dialect.zig",
-            "src/api/dialects/bedrock.zig",
-            "src/api/dialects/claude.zig",
-            "src/api/dialects/deepseek.zig",
-            "src/api/dialects/gemini.zig",
-            "src/api/dialects/glm.zig",
-            "src/api/dialects/kimi.zig",
-            "src/api/dialects/minimax.zig",
-            "src/api/dialects/mistral.zig",
-            "src/api/dialects/openai.zig",
-            "src/api/dialects/openai_compat.zig",
-            "src/api/dialects/openrouter.zig",
-            "src/api/dialects/qwen.zig",
-            "src/api/dialects/registry.zig",
-            "src/api/error_class.zig",
-            "src/api/http_connection.zig",
-            "src/api/http_status.zig",
-            "src/api/image_capability.zig",
-            "src/api/last_error.zig",
-            "src/api/model_adapter.zig",
-            "src/api/model_error.zig",
-            "src/api/model_name.zig",
-            "src/api/provider.zig",
-            "src/api/request.zig",
-            "src/api/request_overrides.zig",
-            "src/api/stream.zig",
-            "src/core/auth.zig",
-            "src/core/execution_effect.zig",
-            "src/core/recorder.zig",
-            "src/core/result_budget.zig",
-            "src/core/tool_error.zig",
-            "src/core/tool_result.zig",
-            "src/core/tool_result_artifact.zig",
-            "src/json.zig",
-            "src/mcp/config.zig",
-            "src/mcp/oauth.zig",
-            "src/mcp/url.zig",
-            "src/provider/controls.zig",
-            "src/provider/credential.zig",
-            "src/provider/ids.zig",
-            "src/provider/oauth.zig",
-            "src/provider/offer.zig",
-            "src/provider/profile.zig",
-            "src/provider/vendor.zig",
-            "src/tools/observation.zig",
-            "src/tools/test_tmp.zig",
-            "src/types.zig",
-            "src/util/abort.zig",
-            "src/util/fs.zig",
-            "src/util/json.zig",
-            "src/util/log.zig",
-            "src/util/time.zig",
-            "src/util/toml.zig",
-            "src/version.zig",
+            "packages/ai/src/api/auth_header.zig",
+            "packages/ai/src/api/capability_activation.zig",
+            "packages/ai/src/api/dialect.zig",
+            "packages/ai/src/api/dialects/bedrock.zig",
+            "packages/ai/src/api/dialects/claude.zig",
+            "packages/ai/src/api/dialects/deepseek.zig",
+            "packages/ai/src/api/dialects/gemini.zig",
+            "packages/ai/src/api/dialects/glm.zig",
+            "packages/ai/src/api/dialects/kimi.zig",
+            "packages/ai/src/api/dialects/minimax.zig",
+            "packages/ai/src/api/dialects/mistral.zig",
+            "packages/ai/src/api/dialects/openai.zig",
+            "packages/ai/src/api/dialects/openai_compat.zig",
+            "packages/ai/src/api/dialects/openrouter.zig",
+            "packages/ai/src/api/dialects/qwen.zig",
+            "packages/ai/src/api/dialects/registry.zig",
+            "packages/ai/src/api/error_class.zig",
+            "packages/ai/src/api/http_connection.zig",
+            "packages/ai/src/api/http_status.zig",
+            "packages/ai/src/api/image_capability.zig",
+            "packages/ai/src/api/last_error.zig",
+            "packages/ai/src/api/model_adapter.zig",
+            "packages/ai/src/api/model_error.zig",
+            "packages/base/src/api/model_name.zig",
+            "packages/ai/src/api/provider.zig",
+            "packages/ai/src/api/request.zig",
+            "packages/ai/src/api/request_overrides.zig",
+            "packages/ai/src/api/stream.zig",
+            "packages/ai/src/core/auth.zig",
+            "packages/guard/src/core/execution_effect.zig",
+            "packages/ai/src/core/recorder.zig",
+            "packages/kernel/src/result_budget.zig",
+            "packages/coding/src/core/tool_error.zig",
+            "packages/coding/src/core/tool_result.zig",
+            "packages/guard/src/core/tool_result_artifact.zig",
+            "packages/ai/src/json.zig",
+            "packages/coding/src/mcp/config.zig",
+            "packages/coding/src/mcp/oauth.zig",
+            "packages/coding/src/mcp/url.zig",
+            "packages/ai/src/provider/controls.zig",
+            "packages/ai/src/provider/credential.zig",
+            "packages/ai/src/provider/ids.zig",
+            "packages/ai/src/provider/oauth.zig",
+            "packages/ai/src/provider/offer.zig",
+            "packages/ai/src/provider/profile.zig",
+            "packages/ai/src/provider/vendor.zig",
+            "packages/guard/src/tools/observation.zig",
+            "packages/base/src/tools/test_tmp.zig",
+            "packages/ai/src/types.zig",
+            "packages/base/src/util/abort.zig",
+            "packages/base/src/util/fs.zig",
+            "packages/base/src/util/json.zig",
+            "packages/base/src/util/log.zig",
+            "packages/base/src/util/time.zig",
+            "packages/base/src/util/toml.zig",
+            "packages/base/src/version.zig",
         },
     },
 };
@@ -234,7 +240,7 @@ const LIBRARY = Library{
         "apps/cli/src/session_service.zig",
         "apps/cli/src/session_intent.zig",
     },
-    .unbaselined = &.{"src/core/"},
+    .unbaselined = &.{ "packages/kernel/src/", "packages/coding/src/core/", "packages/guard/src/core/", "packages/ai/src/core/", "packages/session/src/core/" },
     .baseline = &.{},
 };
 
@@ -262,7 +268,7 @@ const Ratchet = struct {
 const HOST_KERNEL = Ratchet{
     .name = "single session host (#445)",
     .dirs = &.{ "apps/cli/src/daemon/", "apps/cli/src/web/" },
-    .target = "src/core/agent_loop.zig",
+    .target = "packages/coding/src/core/agent_loop.zig",
     .baseline = &.{
         // The daemon's per-session driver runs an `App` Run itself.
         "apps/cli/src/daemon/app_driver.zig",
@@ -388,26 +394,54 @@ fn isListed(list: []const []const u8, name: []const u8) bool {
 /// name.
 const Internal = struct {
     entries: []const Entry = &.{},
+    packages: []const Package = &.{},
 
     const name = "metacodes-internal";
     const root = "src/internal.zig";
+    const package_names = [_][]const u8{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" };
+
+    const Package = struct {
+        module: []const u8,
+        root: []const u8,
+        entries: []const Entry,
+    };
 
     const Entry = struct {
         chain: []const u8,
         /// A repository-relative file, or the name of a named module.
         target: []const u8,
         module: bool,
+        /// The source after the closing quote of the entry's own `@import`:
+        /// the namespace path it spells into a module that is itself an entry.
+        forward: []const u8 = "",
     };
 
     fn load(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Internal {
+        var packages: std.ArrayList(Package) = .empty;
+        for (package_names) |package| {
+            const package_root = try std.fmt.allocPrint(allocator, "packages/{s}/src/root.zig", .{package});
+            const source = dir.readFileAllocOptions(io, package_root, allocator, .limited(4 * 1024 * 1024), .of(u8), 0) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            try packages.append(allocator, .{
+                .module = try std.fmt.allocPrint(allocator, "metacodes-{s}", .{package}),
+                .root = package_root,
+                .entries = try parseRoot(allocator, package_root, source),
+            });
+        }
         const source = dir.readFileAllocOptions(io, root, allocator, .limited(4 * 1024 * 1024), .of(u8), 0) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+            error.FileNotFound => return .{ .packages = packages.items },
             else => return err,
         };
-        return parse(allocator, source);
+        return .{ .entries = try parseRoot(allocator, root, source), .packages = packages.items };
     }
 
     fn parse(allocator: std.mem.Allocator, source: [:0]const u8) !Internal {
+        return .{ .entries = try parseRoot(allocator, root, source) };
+    }
+
+    fn parseRoot(allocator: std.mem.Allocator, root_path: []const u8, source: [:0]const u8) ![]const Entry {
         var entries: std.ArrayList(Entry) = .empty;
         var namespaces: std.ArrayList(struct { name: []const u8, depth: usize }) = .empty;
         var depth: usize = 0;
@@ -439,7 +473,7 @@ const Internal = struct {
                     if (index + 6 >= all.len or all[index + 6].tag != .string_literal) continue;
                     const literal = source[all[index + 6].loc.start + 1 .. all[index + 6].loc.end - 1];
                     var buffer: [512]u8 = undefined;
-                    const file = resolve(&buffer, root, literal);
+                    const file = resolve(&buffer, root_path, literal);
                     var chain: std.ArrayList(u8) = .empty;
                     for (namespaces.items) |namespace| {
                         try chain.appendSlice(allocator, namespace.name);
@@ -450,17 +484,48 @@ const Internal = struct {
                         .chain = chain.items,
                         .target = try allocator.dupe(u8, file orelse literal),
                         .module = file == null,
+                        .forward = source[all[index + 6].loc.end..],
                     });
                 },
                 else => {},
             }
         }
-        return .{ .entries = entries.items };
+        return entries.items;
+    }
+
+    /// The entries of the entry module `module`, or null when it is none.
+    fn entriesOf(internal: Internal, module: []const u8) ?[]const Entry {
+        if (std.mem.eql(u8, module, name)) return internal.entries;
+        for (internal.packages) |package| {
+            if (std.mem.eql(u8, package.module, module)) return package.entries;
+        }
+        return null;
+    }
+
+    /// The root file of the package module `module`, or null when it is none.
+    fn packageRoot(internal: Internal, module: []const u8) ?[]const u8 {
+        for (internal.packages) |package| {
+            if (std.mem.eql(u8, package.module, module)) return package.root;
+        }
+        return null;
+    }
+
+    /// The entry a use of the entry module `module` names, followed through
+    /// the package module an entry forwards to.
+    fn useOf(internal: Internal, module: []const u8, rest: []const u8) ?Entry {
+        const entries = internal.entriesOf(module) orelse return null;
+        const found = useIn(entries, rest) orelse return null;
+        if (!found.module or internal.entriesOf(found.target) == null) return found;
+        return internal.useOf(found.target, found.forward) orelse found;
     }
 
     /// The entry a use names: `rest` is the source after the closing quote
     /// of `@import("metacodes-internal"`.
     fn use(internal: Internal, rest: []const u8) ?Entry {
+        return internal.useOf(name, rest);
+    }
+
+    fn useIn(entries: []const Entry, rest: []const u8) ?Entry {
         var cursor = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
         cursor += 1;
         var chain_end: usize = 0;
@@ -477,7 +542,7 @@ const Internal = struct {
             if (chain_start == null) chain_start = start;
             chain_end = cursor;
             const spelled = rest[chain_start.?..chain_end];
-            for (internal.entries) |entry| {
+            for (entries) |entry| {
                 if (sameChain(entry.chain, spelled)) found = entry;
             }
         }
@@ -485,7 +550,11 @@ const Internal = struct {
     }
 
     fn fileOf(internal: Internal, rest: []const u8) ?[]const u8 {
-        const entry = internal.use(rest) orelse return null;
+        return internal.fileIn(name, rest);
+    }
+
+    fn fileIn(internal: Internal, module: []const u8, rest: []const u8) ?[]const u8 {
+        const entry = internal.useOf(module, rest) orelse return null;
         return if (entry.module) null else entry.target;
     }
 };
@@ -506,15 +575,13 @@ fn sameChain(chain: []const u8, spelled: []const u8) bool {
 /// resolved against `path`, or a file the internal entry re-exports.
 fn importedFile(buffer: []u8, internal: Internal, path: []const u8, target: []const u8, rest: []const u8) ?[]const u8 {
     if (resolve(buffer, path, target)) |resolved| return resolved;
-    if (!std.mem.eql(u8, target, Internal.name)) return null;
-    return internal.fileOf(rest);
+    return internal.fileIn(target, rest);
 }
 
 /// The named module `target`, imported at `rest`, stands for: the module a
 /// use of the internal entry names, or `target` itself.
 fn namedModule(internal: Internal, target: []const u8, rest: []const u8) []const u8 {
-    if (!std.mem.eql(u8, target, Internal.name)) return target;
-    const entry = internal.use(rest) orelse return target;
+    const entry = internal.useOf(target, rest) orelse return target;
     return if (entry.module) entry.target else target;
 }
 
@@ -570,7 +637,7 @@ pub fn main(init: std.process.Init) !void {
 /// every unlisted edge into the application side, every unreadable file, and
 /// every baseline entry whose edge no longer exists.
 fn checkLibrary(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, library: Library) !usize {
-    var walk: Walk = .{ .allocator = allocator };
+    var walk: Walk = .{ .allocator = allocator, .internal = try Internal.load(allocator, io, root) };
     const used = try allocator.alloc(bool, library.baseline.len);
     defer allocator.free(used);
     @memset(used, false);
@@ -617,8 +684,9 @@ fn checkLibraryFile(
         const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..found], '\n')) |newline| newline + 1 else 0;
         if (isProse(source[line_start..found])) continue;
         var buffer: [512]u8 = undefined;
-        // A named module is the build graph's business, not this check's.
-        const resolved = resolve(&buffer, path, target) orelse continue;
+        // A package module is followed from its root; any other named module
+        // is the build graph's business, not this check's.
+        const resolved = resolve(&buffer, path, target) orelse walk.internal.packageRoot(target) orelse continue;
         if (!isAppSide(library, resolved)) {
             try walk.visit(resolved, path);
             continue;
@@ -759,11 +827,11 @@ fn checkRatchetFile(source: []const u8, path: []const u8, ratchet: Ratchet, inte
         var buffer: [512]u8 = undefined;
         const target = source[start..end];
         const resolved = importedFile(&buffer, internal, path, target, source[end + 1 ..]) orelse {
-            if (!std.mem.eql(u8, target, Internal.name) or internal.use(source[end + 1 ..]) != null) continue;
+            if (internal.entriesOf(target) == null or internal.useOf(target, source[end + 1 ..]) != null) continue;
             violations.* += 1;
             std.debug.print(
-                "{s}:{d}: uses {s} without naming a file of {s}, so the {s} rule cannot see what it reaches\n",
-                .{ path, line, Internal.name, Internal.root, ratchet.name },
+                "{s}:{d}: uses {s} without naming a file it re-exports, so the {s} rule cannot see what it reaches\n",
+                .{ path, line, target, ratchet.name },
             );
             continue;
         };
@@ -774,7 +842,7 @@ fn checkRatchetFile(source: []const u8, path: []const u8, ratchet: Ratchet, inte
         }
         violations.* += 1;
         std.debug.print(
-            "{s}:{d}: imports {s}, which the {s} rule forbids; drive the kernel through src/core/session_host.zig\n",
+            "{s}:{d}: imports {s}, which the {s} rule forbids; drive the kernel through packages/session/src/core/session_host.zig\n",
             .{ path, line, ratchet.target, ratchet.name },
         );
     }
@@ -1237,6 +1305,47 @@ test "a use of the internal entry names the file its namespace path re-exports" 
     try std.testing.expectEqualStrings("platform", namedModule(internal, "metacodes-internal", ").platform.fs"));
     try std.testing.expectEqualStrings("metacodes-internal", namedModule(internal, "metacodes-internal", ").core.agent_loop"));
     try std.testing.expectEqualStrings("hl", namedModule(internal, "hl", ")"));
+}
+
+test "a use of a package module, direct or through the internal entry, names the file the package root re-exports" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const base_root =
+        \\pub const util = struct {
+        \\    pub const log = @import("util/log.zig");
+        \\};
+        \\pub const tools_root = @import("tools.zig");
+        \\pub const platform = @import("platform");
+        \\pub const RequestId = util.log.RequestId;
+    ;
+    const entry =
+        \\pub const platform = @import("metacodes-base").platform;
+        \\pub const util = struct {
+        \\    pub const log = @import("metacodes-base").util.log;
+        \\};
+        \\pub const base = @import("metacodes-base");
+    ;
+    const internal: Internal = .{
+        .entries = try Internal.parseRoot(allocator, Internal.root, entry),
+        .packages = &.{.{
+            .module = "metacodes-base",
+            .root = "packages/base/src/root.zig",
+            .entries = try Internal.parseRoot(allocator, "packages/base/src/root.zig", base_root),
+        }},
+    };
+    var buffer: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("packages/base/src/util/log.zig", importedFile(&buffer, internal, "packages/ai/src/client.zig", "metacodes-base", ").util.log.RequestId;").?);
+    try std.testing.expectEqualStrings("packages/base/src/tools.zig", importedFile(&buffer, internal, "packages/ai/src/client.zig", "metacodes-base", ").tools_root;").?);
+    try std.testing.expectEqualStrings("packages/base/src/util/log.zig", internal.fileOf(").util.log.RequestId;").?);
+    try std.testing.expect(importedFile(&buffer, internal, "packages/ai/src/client.zig", "metacodes-base", ").RequestId;") == null);
+    try std.testing.expect(importedFile(&buffer, internal, "packages/ai/src/client.zig", "metacodes-base", ");") == null);
+    try std.testing.expect(internal.fileOf(").base;") == null);
+    try std.testing.expectEqualStrings("platform", namedModule(internal, "metacodes-internal", ").platform.fs"));
+    try std.testing.expectEqualStrings("platform", namedModule(internal, "metacodes-base", ").platform.fs"));
+    try std.testing.expectEqualStrings("metacodes-base", namedModule(internal, "metacodes-base", ").RequestId"));
+    try std.testing.expectEqualStrings("packages/base/src/root.zig", internal.packageRoot("metacodes-base").?);
+    try std.testing.expect(internal.packageRoot("metacodes-internal") == null);
 }
 
 test "the picker's reach through the internal entry is held to its lists" {

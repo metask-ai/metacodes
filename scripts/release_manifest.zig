@@ -6,7 +6,7 @@
 //! Every value is read from its source, never typed: the version from
 //! `build.zig.zon` (passed in by the build graph), the commit and dirty state
 //! from git, the ABI numbers from `sdk/zig/types.zig`, the CLI contract
-//! constants from `src/release_contract.zig`, the ripgrep pin from
+//! constants from `packages/base/src/release_contract.zig`, the ripgrep pin from
 //! `vendor/ripgrep/manifest.json`, the TinyKG contract from `deps/tinykg.json`
 //! and its bundle commit from `vendor/tinykg/manifest.json`, and every digest
 //! from the installed file itself. The staged TinyKG binary must match its own

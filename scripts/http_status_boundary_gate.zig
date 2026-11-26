@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const boundary_path = "src/api/http_status.zig";
+const boundary_path = "packages/ai/src/api/http_status.zig";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();

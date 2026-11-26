@@ -89,7 +89,7 @@ anywhere; do not move files inside it.
 ## Release channels
 
 `release.version` is the repository version (`build.zig.zon`, mirrored by
-`src/version.zig`). A version without a pre-release part is the **stable**
+`packages/base/src/version.zig`). A version without a pre-release part is the **stable**
 channel: `release.tag` is the bare `X.Y.Z` git tag (the repository's tag
 convention, #47 Q1), the working tree must be clean, and `git describe --tags
 --exact-match HEAD` must equal the version — `release:manifest` refuses to

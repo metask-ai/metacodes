@@ -161,13 +161,13 @@ pub const UiBackend = struct {
 > ⚠️ 协议文件 2026-06-07 已从 `repl/`(UI 目录)移到 `core/protocol/`(中立位)——见 §8 库抽取。
 > 下列旧路径仅作历史参照;现行路径见 §8。
 
-- `src/core/protocol/ui_event.zig` —— CoreEvent / UiEvent / Phase(原 repl/ui_event.zig)
-- `src/core/protocol/ui_backend.zig` —— UiBackend vtable(原 repl/ui_backend.zig)
-- `src/core/protocol/ui_request.zig` —— UiRequest/UiResponse/UiRequestFn(原 repl/ui_request.zig)
+- `packages/guard/src/core/protocol/ui_event.zig` —— CoreEvent / UiEvent / Phase(原 repl/ui_event.zig)
+- `packages/coding/src/core/protocol/ui_backend.zig` —— UiBackend vtable(原 repl/ui_backend.zig)
+- `packages/guard/src/core/protocol/ui_request.zig` —— UiRequest/UiResponse/UiRequestFn(原 repl/ui_request.zig)
 - `apps/cli/src/repl/tui/tui_backend.zig` —— TuiBackend(渲染 + 键盘 + tick)
-- `src/core/writer_backend.zig` —— WriterBackend(print-only sink)
-- `src/core/headless_backend.zig` —— HeadlessBackend(JSON 行)
-- `src/core/agent_loop.zig` —— `run(... backend: *const UiBackend ...)`,只发 CoreEvent
+- `packages/coding/src/core/writer_backend.zig` —— WriterBackend(print-only sink)
+- `packages/coding/src/core/headless_backend.zig` —— HeadlessBackend(JSON 行)
+- `packages/coding/src/core/agent_loop.zig` —— `run(... backend: *const UiBackend ...)`,只发 CoreEvent
 - `apps/cli/src/repl/loop.zig` —— 编排:构造 backend、startInput/stopInput
 
 
@@ -226,5 +226,5 @@ UI 解耦(A–E)证明了 agent 循环层只经 UiBackend/CoreEvent 与 UI 通�
 `cc`=main.zig 不变(app + 52 测试零 churn);app 暂走相对路径,metacodes-core 供内部 app
 + example dogfood(P4 未做——test:lib 已强制边界,P4 动 cc 聚合器风险大无新增收益)。
 
-**关键文件**:`src/lib.zig`、`src/core/protocol/*`、`src/core/mcp_session.zig`、
+**关键文件**:`src/lib.zig`、`packages/coding/src/core/protocol/*`、`packages/coding/src/core/mcp_session.zig`、
 `example/main.zig`、`doc/LIB_API.md`、`build.zig`(module + test:lib + example step)、`build.zig.zon`。

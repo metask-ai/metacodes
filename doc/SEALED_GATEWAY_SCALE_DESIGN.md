@@ -74,8 +74,8 @@ client and its abort registry are built once per route instead of once per
 Step. It does **not** yet reuse the upstream TCP/TLS connection, because
 every provider client in this tree opens a fresh connection per request
 (`keep_alive = false`, a deliberate trade of handshake cost for immunity to
-stale pooled connections; see the header of `src/api/openai_client.zig`).
-That holds only with `src/api/http_connection.zig`: std applies
+stale pooled connections; see the header of `packages/ai/src/api/openai_client.zig`).
+That holds only with `packages/ai/src/api/http_connection.zig`: std applies
 `keep_alive = false` once a response head arrives, so until 2026-10-29 a
 connection whose send failed went back to the pool and every later request
 in the process failed on it. Every send now goes through that file, which
@@ -167,7 +167,7 @@ What the first runs found (numbers in [BENCHMARKS.md](BENCHMARKS.md) §1):
 - Every connection allocated and zeroed a cap-sized 16 MiB request buffer:
   4 ms per Step at concurrency 1 and the dominant cost. The buffer now
   starts at 64 KiB and grows to the declared length.
-- `src/api/connection_gate.zig` bounds request setup process-wide at 8, and
+- `packages/ai/src/api/connection_gate.zig` bounds request setup process-wide at 8, and
   its lease covers the wait for the response head — a model's time to first
   token. Throughput sat at 8 ÷ latency whatever the worker count (249
   Steps/s at 64 clients and 20 ms). The server raises the gate to its

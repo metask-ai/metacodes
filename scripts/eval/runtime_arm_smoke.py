@@ -347,7 +347,7 @@ def _version_output_smoke(binary: Path, expected_semver: str) -> None:
     """`--version` is a documented public surface (doc/API.md): the real binary
     prints exactly `metacodes <semver>` as its first stdout line (the build
     identity follows, #78) and exits 0.  The expected value comes from
-    build.zig.zon via build.zig, so a version bump that misses src/version.zig
+    build.zig.zon via build.zig, so a version bump that misses packages/base/src/version.zig
     (or vice versa) fails here instead of shipping a binary that mislabels
     itself."""
     completed = _run_version(binary, [])
@@ -356,7 +356,7 @@ def _version_output_smoke(binary: Path, expected_semver: str) -> None:
     _require(
         _version_line_matches(first_line, expected_semver),
         f"--version first line {first_line!r} != {expected!r} "
-        "(src/version.zig and build.zig.zon must agree; a -dev version may carry +<commit12>[.dirty])",
+        "(packages/base/src/version.zig and build.zig.zon must agree; a -dev version may carry +<commit12>[.dirty])",
     )
     _require(
         "\ncommit " in completed.stdout and "\nlayout " in completed.stdout,

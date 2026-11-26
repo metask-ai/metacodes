@@ -93,7 +93,7 @@ function measurementCards(s) {
     metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), `${s.initial_token_trials || 0} 次有数据`, false,
       s.initial_composition_mean ? stackBar(compositionSegments(s.initial_composition_mean), true) : null),
     metric('TPS（生成）', tps(s.tps), `${s.profiled_requests || 0}/${s.requests || 0} 个请求`),
-    metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_samples_ms?.length || 0} 个请求`),
+    metric('TTFT（均值）', ttft(s.ttft_ms), `P50 ${ttft(s.ttft_p50_ms)} · P95 ${ttft(s.ttft_p95_ms)} · ${s.ttft_count ?? s.ttft_samples_ms?.length ?? 0} 个请求`),
     metric('估算成本', usd(s.cost_usd), `${s.cost_trials || 0}/${s.trials || 0} 次有价格`),
     metric('至少通过一次', pct(s.solved_rate), `${s.tasks_solved || 0} / ${s.tasks_attempted || 0} 道`),
     metric('每题平均成本', usd(s.cost_per_task), `${s.task_cost_tasks || 0} 道`),
@@ -133,7 +133,6 @@ function setConnection(ok, message) {
 // ------------------------------------------------------------ routing
 function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
-  if (parts[0] === 'new') return { view: 'new' };
   if (parts[0] === 'settings') return { view: 'settings', tab: parts[1] || 'database' };
   if (parts[0] === 'providers') return { view: 'settings', tab: 'providers' };
   if (parts[0] === 'monitor') return { view: 'monitor', executor: parts[1] || null };
@@ -160,13 +159,13 @@ async function render() {
   if (state.busy) return;
   state.busy = true;
   state.editing = false;
+  if (location.hash === '#/new') history.replaceState(null, '', '#/');
   const hash = location.hash;
   const r = route();
   try {
-    $('.header-actions a.primary').hidden = true;
+    $('#create-run').hidden = true;
     let node;
-    if (r.view === 'new') node = await renderNewRun();
-    else if (r.view === 'settings') node = await renderSettings(r.tab);
+    if (r.view === 'settings') node = await renderSettings(r.tab);
     else if (r.view === 'monitor') node = await renderMonitor(r.executor);
     else if (r.view === 'run') node = await renderRun(r.name);
     else if (r.view === 'overview') node = await renderOverview();
@@ -178,7 +177,19 @@ async function render() {
     else node = await renderCompare(r.jobs, r.profile);
     // Keep open <details> and scroll position across a live refresh.
     const open = new Set([...document.querySelectorAll('#app details[open]')].map((d) => d.dataset.key));
+    const oldChart = $('.trace-chart');
+    const newChart = node.querySelector('.trace-chart');
+    const sameTrace = oldChart && newChart && oldChart.dataset.scope === newChart.dataset.scope;
+    const scrollLeft = sameTrace ? oldChart.parentElement.scrollLeft : 0;
+    const focused = document.activeElement;
+    const focusKey = sameTrace && oldChart.contains(focused) ? focused.dataset.key : null;
+    const focusScroller = sameTrace && oldChart.parentElement === focused;
     $('#app').replaceChildren(node);
+    if (sameTrace) {
+      newChart.parentElement.scrollLeft = scrollLeft;
+      const target = focusScroller ? newChart.parentElement : focusKey && newChart.querySelector(`[data-key="${CSS.escape(focusKey)}"]`);
+      if (target) target.focus({ preventScroll: true });
+    }
     for (const d of document.querySelectorAll('#app details')) if (open.has(d.dataset.key)) d.open = true;
     setConnection(true);
     $('#updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -240,10 +251,10 @@ function runAgain(b, onlyInvalid) {
   }
   state.suitePick = new Map([...wanted.keys()].map((id) => [id, null]));
   state.taskWanted = wanted;
-  location.hash = '#/new';
+  openRunDialog();
 }
 async function deleteProfile(b, button) {
-  if (!confirm(`删除Profile ${profileName(b)}？它的所有运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return false;
+  if (!confirm(`删除 Profile ${profileName(b)}？工作台会删除运行记录、本机评测结果和汇总。远程 worker 会保留作业详情。`)) return false;
   button.disabled = true;
   try { await api('/api/profile/delete', { id: b.id }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return false; }
@@ -251,7 +262,8 @@ async function deleteProfile(b, button) {
   return true;
 }
 async function deleteJob(j, button) {
-  if (!confirm(`删除评测结果 ${j.name}？它的运行记录、日志和评测结果都会从工作台和数据库删除，不能恢复。`)) return;
+  const impact = j.result_owner ? `工作台会删除运行记录和汇总，作业详情保留在 ${j.result_owner}。` : '工作台会删除运行记录、日志和评测结果，不能恢复。';
+  if (!confirm(`删除评测结果 ${j.name}？${impact}`)) return;
   button.disabled = true;
   try { await api('/api/job/delete', { name: j.name }); }
   catch (error) { button.disabled = false; setConnection(false, error.message); return; }
@@ -280,7 +292,7 @@ function itemActions(b, index) {
       const button = event.currentTarget;
       if (ITEM_ACTIONS[name].ask && !confirm(ITEM_ACTIONS[name].ask)) return;
       button.disabled = true;
-      try { await api('/api/profile/item', { id: b.id, index, action: name }); await render(); }
+      try { await api('/api/profile/item', { id: b.id, index: item.index ?? index, action: name }); await render(); }
       catch (error) { button.disabled = false; setConnection(false, error.message); }
     } }, ITEM_ACTIONS[name].label));
 }
@@ -364,7 +376,7 @@ async function renderOverview() {
   crumbs([]);
   const { profiles, jobs, runs, can_run: canRun } = await api('/api/jobs');
   state.live = profiles.some(profileActive) || jobs.some((j) => j.running) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
-  $('.header-actions a.primary').hidden = !canRun;
+  $('#create-run').hidden = !canRun;
   const chosen = profiles.filter((p) => state.selected.has(p.id));
   const rows = profiles.map((p) => h('tr', {},
     h('td', {}, h('input', { type: 'checkbox', checked: state.selected.has(p.id), 'aria-label': '对比 ' + profileName(p),
@@ -378,7 +390,7 @@ async function renderOverview() {
     h('thead', {}, h('tr', {}, heads.map((head) => h('th', { text: head })))), h('tbody', {}, rows)));
   const listing = panel('Profile 列表', profiles.length + ' 个', profiles.length
     ? table(['对比', 'Profile / 模型', 'MetaCodes 版本', '作业数', '状态', '首轮满分率', '最近运行'], rows)
-    : h('div', { class: 'empty' }, '还没有 Profile。', canRun ? link('#/new', '创建首个作业') : null));
+    : h('div', { class: 'empty' }, '还没有 Profile。', canRun ? h('button', { class: 'button', onclick: openRunDialog }, '创建首个作业') : null));
   const comparison = chosen.length < 2 ? null : panel('Profile 对比', '各 Profile 的最新结果', h('div', {},
     table(['Profile', '一次性完成率', '首轮满分率', '至少通过一次', '初始 Token', '每题平均成本', '每次通过成本', '通过 trial', '缓存命中率'],
       chosen.map((p) => h('tr', {}, [profileName(p), pct(p.summary.one_shot_pass_rate), pct(p.summary.first_pass_rate),
@@ -478,20 +490,22 @@ async function renderProfile(id) {
   const groups = groupedItems(b);
   const submissions = panel('作业', groups.length + ' 个', h('div', {}, groups.map((group) => {
     const active = group.entries.some(({ item }) => ['pending', 'running'].includes(item.status));
-    const action = active ? 'cancel' : 'run';
-    const button = b.can_run ? h('button', { type: 'button', class: 'button', onclick: async (event) => {
-      if (active && !confirm('取消' + group.label + '里的所有等待中和运行中评测？')) return;
+    const controlFor = (action, label, question) => h('button', { type: 'button', class: 'button', onclick: async (event) => {
+      if (question && !confirm(question)) return;
       const control = event.currentTarget;
       control.disabled = true;
       try {
         await api('/api/profile/submission', { id: b.id, submission: group.id, action });
         await render();
       } catch (error) { control.disabled = false; setConnection(false, error.message); }
-    } }, active ? '取消作业' : '重新运行作业') : null;
+    } }, label);
+    const controls = b.can_run ? h('div', { class: 'row-actions' }, active
+      ? controlFor('cancel', '取消作业', '取消' + group.label + '里的所有等待中和运行中评测？')
+      : [controlFor('run', '重新运行作业'), controlFor('delete', '删除作业', '从 Profile 删除' + group.label + '及其全部评测记录？已有运行结果将保留。')]) : null;
     const first = group.entries[0].item;
     return h('article', { class: 'submission' }, h('div', { class: 'panel-heading' },
       h('h3', {}, group.label, h('small', { class: 'muted', text: [when(first.queued_at), first.executor, group.entries.length + ' 项评测'].filter(Boolean).join(' · ') })),
-      button), itemTable(group.entries.map(({ item, index }) => itemRow(item, index)), ''));
+      controls), itemTable(group.entries.map(({ item, index }) => itemRow(item, index)), ''));
   })), b.can_run ? h('button', { class: 'button primary', onclick: () => runAgain(b, false) }, '创建作业') : null);
   // Per task: each (suite, model, task)'s latest attempts in order.
   const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
@@ -550,16 +564,20 @@ function concurrencyControl(b) {
   const input = h('input', { type: 'number', inputmode: 'numeric', min: 1, step: 1, required: true, value: b.concurrency ?? '',
     'aria-label': '并发数', onfocus: () => { state.editing = true; },
     onblur: () => { if (input.value === String(b.concurrency ?? '')) state.editing = false; } });
-  const feedback = h('span', { class: 'muted', role: 'status', text: profileActive(b)
-    ? '改后立即生效：调低时正在运行的 trial 跑完为止，不会被打断；排队中和之后运行的评测集也按新值运行'
-    : '之后在这个Profile上运行的评测集都按这个并发运行' });
+  const result = state.concurrencyResult;
+  const warning = result?.id === b.id && result.concurrency === b.concurrency &&
+    b.items.some((item) => item.run === result.run && item.status === 'running') && result.warning;
+  const hint = profileActive(b)
+    ? '排队中的评测集启动时使用新值。正在运行的 WorkBuddy 保持原并发，其他评测集会立即调整，已开始的 trial 会继续跑完。'
+    : '之后在这个 Profile 上运行的评测集都按这个并发运行';
+  const feedback = h('span', { class: 'muted', role: 'status', text: warning || hint });
   const form = h('form', { class: 'rename' }, input, h('button', { type: 'submit', class: 'button primary' }, '应用'), feedback);
   form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { state.editing = false; render(); } });
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     feedback.textContent = '正在应用…';
     try {
-      await api('/api/profile/concurrency', { id: b.id, concurrency: Number(input.value) });
+      state.concurrencyResult = await api('/api/profile/concurrency', { id: b.id, concurrency: Number(input.value) });
       state.editing = false;
       render();
     } catch (error) { feedback.textContent = error.message; }
@@ -676,12 +694,39 @@ const RUNNERS = { 'harbor-registry': 'Harbor 注册表', 'harbor-local': '本地
 // The LLM judge that scores a suite/run: model id and how it is reached.
 const judgeText = (j) => '评委 ' + j.model + (j.via === 'metask' ? '（Metask 网关）' : j.via === 'host_env' ? '（执行机器环境变量）' : '');
 
-async function renderNewRun() {
-  state.live = false;
-  navCurrent('overview');
-  $('#title').textContent = '创建作业';
-  crumbs([{ text: 'Profiles', href: '#/' }, { text: '选择 metacodes 版本和高级功能（即Profile），再选评测集' }]);
-  const c = await api('/api/workbench');
+function openRunDialog() {
+  if (document.querySelector('.run-dialog[open]')) return;
+  const dialog = h('dialog', { class: 'run-dialog', 'aria-label': '创建作业' });
+  const content = h('div', { text: '读取中…' });
+  const close = h('button', { class: 'button', onclick: () => dialog.close() }, '关闭');
+  dialog.append(close, content);
+  dialog.oncancel = (event) => { if (dialog.ariaBusy === 'true') event.preventDefault(); };
+  document.body.append(dialog);
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    if (!dialog.returnValue) clearRunDraft();
+  }, { once: true });
+  dialog.showModal();
+  async function refreshForm() {
+    if (!dialog.open || close.disabled) return;
+    try {
+      const config = await api('/api/workbench');
+      if (dialog.open && !close.disabled) content.replaceChildren(runForm(config, refreshForm, dialog, close));
+    } catch (error) {
+      content.textContent = error.message;
+    }
+  }
+  refreshForm();
+}
+
+function clearRunDraft() {
+  state.runDraft = null;
+  state.taskWanted = null;
+  state.suitePick = null;
+  state.pickBundle = null;
+}
+
+function runForm(c, refreshForm, dialog, close) {
   const suites = c.suites || [];
   const byId = new Map(suites.map((s) => [s.id, s]));
   // Selected suites, in the order picked: id -> {tasks, defaults, selected, error, loaded}.
@@ -784,7 +829,7 @@ async function renderNewRun() {
     }
     if (!c.can_run) reasons.push('只读模式，不能发起评测');
     if (!fixed && !bundles.length) reasons.push('还没有可用的 metacodes 版本');
-    submit.disabled = reasons.length > 0;
+    submit.disabled = close.disabled || reasons.length > 0;
     blocked.textContent = reasons.length ? '无法开始：' + reasons.join('；') : '';
     const modelText = chosenModels.size > 1 ? ` · ${chosenModels.size} 个模型` : '';
     submit.textContent = picked.length ? `创建作业（${picked.length} 个评测集 · ${total} 道题 × ${attempts.value || '?'} 次${modelText}）` : '创建作业';
@@ -870,7 +915,7 @@ async function renderNewRun() {
     } catch (e) { entry.error = e.message; }
     // Only the suite's latest request counts: an older one may be for another
     // executor, or for this one before a switch away and back.
-    if (state.suitePick.has(id) && state.taskTickets.get(id) === ticket) {
+    if (dialog.open && state.suitePick?.has(id) && state.taskTickets.get(id) === ticket) {
       if (!entry.error) state.taskWanted.delete(id);
       state.suitePick.set(id, entry); drawBoxes(); syncSubmit();
     }
@@ -885,7 +930,7 @@ async function renderNewRun() {
     if (modelMissing) notes.push(`上次的模型 ${modelMissing} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
-        state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; render();
+        clearRunDraft(); refreshForm();
       } }, '改为新的Profile')));
   }
   form.append(
@@ -908,6 +953,10 @@ async function renderNewRun() {
     h('div', { class: 'form-submit' }, submit, blocked, feedback));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    if (close.disabled) return;
+    close.disabled = true;
+    dialog.ariaBusy = 'true';
+    form.inert = true;
     submit.disabled = true;
     feedback.textContent = fixed ? '正在排队…' : '正在冻结 metacodes 版本并排队…';
     try {
@@ -922,11 +971,13 @@ async function renderNewRun() {
       }
       if (executorsList.length) request.executor = executor.value;
       const record = await api('/api/profiles/run', request);
-      state.suitePick = null;
-      state.runDraft = null;
-      state.taskWanted = null;
-      location.hash = profileHref(record);
+      dialog.close();
+      if (location.hash === profileHref(record)) render();
+      else location.hash = profileHref(record);
     } catch (error) {
+      close.disabled = false;
+      dialog.ariaBusy = 'false';
+      form.inert = false;
       feedback.textContent = error.message;
       syncSubmit();
     }
@@ -976,8 +1027,8 @@ async function renderNewRun() {
     setupBox.replaceChildren(...parts);
     for (const d of setupBox.querySelectorAll('details')) if (open.has(d.dataset.key)) d.open = true;
     const active = latest && latest.status === 'running';
-    if (active && route().view === 'new') { state.setupWatch = true; setTimeout(drawSetup, 2000); }
-    else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(render, 500); }
+    if (active && dialog.open) { state.setupWatch = true; setTimeout(drawSetup, 2000); }
+    else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(refreshForm, 500); }
   }
   // Any commit of the source repository, picked by its time, built on the
   // selected executor's node and then offered as a version like any other.
@@ -1000,7 +1051,7 @@ async function renderNewRun() {
       h('td', { class: 'num', text: new Date(x.committed_at).toLocaleString('zh-CN', { hour12: false }) }),
       h('td', { class: 'mono', text: x.commit.slice(0, 10) }), h('td', { text: x.subject }), h('td', { text: x.author }),
       h('td', {}, x.bundle
-        ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = x.bundle; render(); } }, '已编译 · 选用')
+        ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = x.bundle; refreshForm(); } }, '已编译 · 选用')
         : h('button', { type: 'button', class: 'button', onclick: () => startBuild(x.commit) }, '编译')))))));
   }
   async function startBuild(ref) {
@@ -1021,10 +1072,10 @@ async function renderNewRun() {
     buildState.replaceChildren(h('div', { class: 'setup-step' },
       h('p', {}, h('b', { text: `${title} · ${latest.ref}` }), h('span', { class: 'muted', text: ` · 在 ${latest.executor} 上编译` }),
         latest.error ? h('span', { text: ' · ' + latest.error }) : null, ' ', cancel,
-        latest.status === 'done' && latest.bundle ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = latest.bundle; render(); } }, '选用这个版本') : null),
+        latest.status === 'done' && latest.bundle ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = latest.bundle; refreshForm(); } }, '选用这个版本') : null),
       (latest.log || []).length ? h('pre', { class: 'muted', text: latest.log.join('\n') }) : null));
-    if (running && route().view === 'new' && commitBox.isConnected) setTimeout(drawBuild, 2000);
-    else if (state.buildWatch === latest.id && latest.status === 'done') { state.buildWatch = null; state.pickBundle = latest.bundle; setTimeout(render, 300); }
+    if (running && dialog.open && commitBox.isConnected) setTimeout(drawBuild, 2000);
+    else if (state.buildWatch === latest.id && latest.status === 'done') { state.buildWatch = null; state.pickBundle = latest.bundle; setTimeout(refreshForm, 300); }
     if (running) state.buildWatch = latest.id;
   }
   commitBox.append(
@@ -1053,9 +1104,17 @@ async function renderNewRun() {
 }
 
 async function renderRun(name) {
-  const run = await api('/api/run?name=' + encodeURIComponent(name));
+  const endpoint = '/api/run?name=' + encodeURIComponent(name);
+  const run = await api(endpoint);
   let results;
-  try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建评测记录' }); }
+  if (run.result_owner) {
+    const view = run.worker_summary?.view;
+    results = view ? panel('评测结果', run.result_owner, h('div', { class: 'panel-body' },
+      outcomeBar(view.summary.counts, view.summary.trials, true), legend(view.summary.counts),
+      link('#/job/' + encodeURIComponent(name), '查看评测详情'))) : null;
+  } else {
+    try { results = await renderJob(name); } catch (_) { results = h('div', { class: 'empty', text: '等待 Harbor 创建评测记录' }); }
+  }
   state.live = ['queued', 'starting', 'running', 'cancelling'].includes(run.status);
   navCurrent('overview');
   $('#title').textContent = RUN_STATUS[run.status] || run.status;
@@ -1074,7 +1133,14 @@ async function renderRun(name) {
     h('p', { text: `${run.suite_name ? run.suite_name + ' · ' : ''}${run.model} · ${run.tasks.length} 道题 × ${run.attempts} 次 · 并发 ${run.concurrency}${run.judge ? ' · ' + judgeText(run.judge) : ''}` }),
     run.error ? h('p', { class: 'muted', text: run.error }) : null,
     h('a', { class: 'mono', href: url, text: url }));
-  const log = h('details', { class: 'panel', 'data-key': 'runlog' }, h('summary', { text: '执行日志' }), h('pre', { text: run.log || '正在准备执行环境…' }));
+  const logText = h('pre', { text: run.log || '正在准备执行环境…' });
+  const log = h('details', { class: 'panel', 'data-key': 'runlog', ontoggle: async (event) => {
+    if (!event.currentTarget.open || !run.result_owner) return;
+    try {
+      const detail = await api(endpoint + '&log=1');
+      logText.textContent = [detail.log, detail.log_error].filter(Boolean).join('\n') || '暂无执行日志';
+    } catch (error) { logText.textContent = [run.log, error.message].filter(Boolean).join('\n'); }
+  } }, h('summary', { text: '执行日志' }), logText);
   return h('div', {}, panel('运行状态', RUN_STATUS[run.status], summary, h('div', { class: 'header-actions' }, copy, stop)), log, results);
 }
 
@@ -1098,6 +1164,12 @@ const COLUMNS = [
   ['elapsed_s', '总用时', (r) => r.elapsed_s ?? -1],
 ];
 
+function resultLocation(value) {
+  if (!value.result_owner) return null;
+  const source = value.detail_source === 'database' ? '共用数据库' : 'worker 节点';
+  return h('div', { class: 'muted', text: `作业所在节点 · ${value.result_owner}　详情来源 · ${source}` });
+}
+
 async function renderJob(name) {
   navCurrent('overview');
   const job = await api('/api/job?name=' + encodeURIComponent(name));
@@ -1114,6 +1186,7 @@ async function renderJob(name) {
     metric('输入 / 输出 Token', `${compact(s.input_tokens)} / ${compact(s.output_tokens)}`, `缓存 ${pct(s.input_tokens ? s.cache_tokens / s.input_tokens : null)}`));
 
   const identity = h('div', { class: 'panel-body' },
+    resultLocation(job),
     h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（Profile冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
@@ -1290,6 +1363,66 @@ function timePanel(t) {
     panel('工具耗时', `${timing.reduce((a, x) => a + x.calls, 0)} 次`, tools));
 }
 
+function tracePanel(steps, trial) {
+  if (!steps.length) return panel('轨迹', null, h('div', { class: 'empty', text: '还没有轨迹' }));
+  const scope = JSON.stringify([location.hash, trial]);
+  const previous = $('.trace-chart');
+  const activeKey = previous?.dataset.scope === scope ? previous.querySelector('[aria-pressed=true]')?.dataset.key : null;
+  const chart = h('div', { class: 'trace-chart', 'data-scope': scope });
+  const detail = h('div', { class: 'trace-detail' });
+  let selected;
+  let column = 1;
+  function span(label, kind, row, start, width, title, content) {
+    const button = h('button', { type: 'button', class: 'trace-span ' + kind, text: label, title, 'data-key': row + '-' + start,
+      'aria-pressed': 'false', onclick: () => {
+        if (selected) selected.setAttribute('aria-pressed', 'false');
+        selected = button;
+        selected.setAttribute('aria-pressed', 'true');
+        detail.replaceChildren(h('strong', { text: title }), ...content());
+      } });
+    button.style.gridRow = row;
+    button.style.gridColumn = start + ' / span ' + width;
+    chart.append(button);
+    if (!selected || button.dataset.key === activeKey) button.click();
+  }
+  function resultNodes(observations) {
+    return observations.flatMap(o => [h('b', { text: o.is_error ? '结果（错误）' : '结果' }), h('pre', { text: o.content })]);
+  }
+  for (const s of steps) {
+    const width = Math.max(1, s.tool_calls.length);
+    const label = s.source === 'user' ? '任务' : s.source === 'agent' ? 'Agent' : s.source;
+    const title = '#' + s.id + ' · ' + label;
+    const ids = new Set(s.tool_calls.map(call => call.id));
+    const unmatched = s.observations.filter(o => !ids.has(o.call));
+    span(title, 'step-span', 1, column, width, title, () => [
+      h('div', { class: 'msg-text', text: s.message }),
+      ...(s.reasoning ? [h('details', { class: 'reason' }, h('summary', { text: '思考过程' }), h('pre', { text: s.reasoning }))] : []),
+      ...resultNodes(unmatched)]);
+    s.tool_calls.forEach((call, i) => {
+      const results = s.observations.filter(o => o.call === call.id);
+      const error = results.some(o => o.is_error);
+      const duration = call.elapsed_ms == null ? '' : ' · ' + msf(call.elapsed_ms);
+      const name = call.name + duration + (error ? ' · 错误' : '');
+      span(name, error ? 'error-span' : 'tool-span', 2, column + i, 1, title + ' / ' + name, () => [
+        h('b', { text: '参数' }), h('pre', { text: call.arguments }), ...resultNodes(results)]);
+    });
+    column += width;
+  }
+  return panel('轨迹', steps.length + ' 步 · 按操作顺序排列', h('div', { class: 'panel-body' },
+    h('div', { class: 'trace-layout' }, h('div', { class: 'trace-labels' }, h('span', { text: '步骤' }),
+      h('span', { text: '工具' })), h('div', { class: 'trace-scroll', tabindex: '0' }, chart)), detail));
+}
+
+function usagePanel(title, counts, empty) {
+  if (!counts) return panel(title, null, h('div', { class: 'empty', text: '暂无统计数据' }));
+  const total = counts.reduce((sum, [, n]) => sum + n, 0);
+  const max = counts.reduce((largest, [, n]) => Math.max(largest, n), 1);
+  return panel(title, total + ' 次', counts.length ? h('div', { class: 'panel-body usage-bars' }, counts.map(([name, n]) =>
+    h('div', { class: 'usage-row' }, h('span', { class: 'tool-name', text: name ?? '名称未知' }),
+      h('div', { class: 'bar' }, h('span', { width: (100 * n / max) + '%' })), h('span', { class: 'num', text: n }))))
+    : h('div', { class: 'empty', text: empty }));
+}
+
 function trialBody(t) {
   const r = t.row;
   const metrics = h('section', { class: 'metrics' },
@@ -1317,32 +1450,10 @@ function trialBody(t) {
     .map((x) => h('div', { class: 'test' }, badge(x.status === 'passed' ? 'pass' : x.status === 'failed' ? 'fail' : 'invalid'),
       h('span', { class: 'mono', text: x.name.split('::').pop() }), x.message ? h('span', { class: 'msg', text: x.message }) : null)))
     : h('div', { class: 'empty', text: '判分没有写出逐条测试报告' });
-  const maxTool = Math.max(1, ...t.tools.map(([, n]) => n));
-  const tools = t.tools.length ? h('div', { class: 'panel-body bars' }, t.tools.map(([name, n]) =>
-    h('div', { class: 'bar-row' }, h('span', { class: 'tool-name', text: name }), h('div', { class: 'bar' }, h('span', { width: (100 * n / maxTool) + '%' })), h('span', { class: 'num', text: n }))))
-    : h('div', { class: 'empty', text: '没有工具调用' });
-  parts.push(h('div', { class: 'grid-2' }, panel('判分测试', t.tests ? `${t.tests.passed}/${t.tests.total} 通过` : null, tests), panel('工具使用', `${t.tools.reduce((a, [, n]) => a + n, 0)} 次`, tools)));
-
-  const steps = t.steps.map((s, i) => {
-    const body = h('div', { class: 'step-body' });
-    if (s.message) body.append(h('div', { class: 'msg-text', text: s.message }));
-    if (s.reasoning) body.append(h('details', { class: 'reason', 'data-key': `r${i}` }, h('summary', { text: '思考过程' }), h('pre', { text: s.reasoning })));
-    for (const c of s.tool_calls) {
-      const obs = s.observations.filter((o) => o.call === c.id);
-      body.append(h('details', { class: 'call', 'data-key': `c${i}-${c.id}` },
-        h('summary', {}, h('span', { class: 'tool-name', text: c.name }), c.elapsed_ms !== null && c.elapsed_ms !== undefined ? h('span', { class: 'num muted', text: msf(c.elapsed_ms) }) : null,
-          h('span', { class: 'faint', text: c.arguments.slice(0, 120) })),
-        h('pre', { text: c.arguments })));
-      for (const o of obs) body.append(h('details', { class: 'obs' + (o.is_error ? ' error' : ''), 'data-key': `o${i}-${o.call}` },
-        h('summary', {}, h('span', { text: o.is_error ? '结果（错误）' : '结果' }), h('span', { class: 'faint', text: o.content.slice(0, 120) })),
-        h('pre', { text: o.content })));
-    }
-    for (const o of s.observations.filter((o) => !s.tool_calls.some((c) => c.id === o.call))) {
-      body.append(h('details', { class: 'obs', 'data-key': `x${i}-${o.call}` }, h('summary', { text: '结果' }), h('pre', { text: o.content })));
-    }
-    return h('div', { class: 'step' }, h('div', { class: 'step-src' }, h('b', { text: s.source === 'agent' ? 'agent' : s.source === 'user' ? '任务' : s.source }), '#' + s.id), body);
-  });
-  parts.push(panel('轨迹', `${t.steps.length} 步`, h('div', { class: 'panel-body timeline' }, steps.length ? steps : h('div', { class: 'empty', text: '还没有轨迹' }))));
+  parts.push(panel('判分测试', t.tests ? `${t.tests.passed}/${t.tests.total} 通过` : null, tests));
+  parts.push(h('div', { class: 'grid-2' }, usagePanel('工具使用', t.tools, '没有工具调用'),
+    usagePanel('Skill 使用', t.skills, '没有 Skill 调用')));
+  parts.push(tracePanel(t.steps, r.trial));
   parts.push(h('div', { class: 'grid-2' },
     panel('判分输出', '末尾', h('div', { class: 'panel-body' }, t.verifier_output ? h('pre', { class: 'block', text: t.verifier_output }) : h('div', { class: 'empty', text: '无' }))),
     panel('metacodes stderr', '末尾', h('div', { class: 'panel-body' }, t.stderr ? h('pre', { class: 'block', text: t.stderr }) : h('div', { class: 'empty', text: '无' })))));
@@ -1356,7 +1467,7 @@ async function renderTrial(jobName, trialName) {
   state.live = r.status === 'running';
   $('#title').textContent = r.task;
   crumbs([{ text: 'Profiles', href: '#/' }, { text: jobName, href: '#/job/' + encodeURIComponent(jobName) }, { text: r.trial }]);
-  return h('div', {}, trialBody(t));
+  return h('div', {}, resultLocation(t), trialBody(t));
 }
 
 // ------------------------------------------------------------ compare
@@ -2129,7 +2240,7 @@ function mirrorsPanel(m) {
       await api('/api/setup', { executor: name, dry_run: false });
       state.executor = name;
       state.setupWatch = true;
-      location.hash = '#/new';
+      openRunDialog();
     } catch (error) { rerunNote.textContent = error.message; rerun.disabled = false; }
   });
   const todo = pending.length ? h('div', { class: 'panel-body' }, h('div', { class: 'callout mirror-pending' },
@@ -2204,16 +2315,36 @@ async function renderMonitor(name) {
 // ------------------------------------------------------------ refresh loop
 function tick() {
   const label = $('#countdown');
-  if (state.editing) { label.textContent = '编辑中'; return; }
+  if (document.querySelector('.run-dialog[open]') || state.editing) { label.textContent = '编辑中'; return; }
   if (!state.auto || !state.live) { label.textContent = state.live ? '已暂停' : '无运行中'; return; }
   state.countdown -= 1;
   label.textContent = state.countdown + 's';
   if (state.countdown <= 0) { state.countdown = REFRESH_S; render(); }
 }
 document.addEventListener('DOMContentLoaded', () => {
+  $('#create-run').addEventListener('click', openRunDialog);
   $('#refresh').addEventListener('click', () => { state.countdown = REFRESH_S; render(); });
   $('#auto').addEventListener('click', (e) => { state.auto = !state.auto; e.currentTarget.setAttribute('aria-pressed', String(state.auto)); tick(); });
-  window.addEventListener('hashchange', () => { state.countdown = REFRESH_S; window.scrollTo(0, 0); render(); });
+  window.addEventListener('hashchange', (event) => {
+    const dialog = document.querySelector('.run-dialog[open]');
+    if (dialog && dialog.ariaBusy !== 'true') {
+      if (new URL(event.newURL).hash.startsWith('#/settings/')) {
+        state.savedRun = { url: event.oldURL, runDraft: state.runDraft, taskWanted: state.taskWanted,
+          suitePick: state.suitePick, pickBundle: state.pickBundle, executor: state.executor };
+      }
+      clearRunDraft();
+      dialog.close('navigation');
+    }
+    if (!dialog && state.savedRun?.url === event.newURL) {
+      const { url, ...draft } = state.savedRun;
+      state.savedRun = null;
+      Object.assign(state, draft);
+      openRunDialog();
+    }
+    state.countdown = REFRESH_S;
+    window.scrollTo(0, 0);
+    render();
+  });
   render();
   state.timer = setInterval(tick, 1000);
 });

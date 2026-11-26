@@ -47,9 +47,35 @@ def main():
                     errors = []
                     page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
+                    page.wait_for_url('**/#/')
+                    page.get_by_role('heading', name='Profiles', exact=True).wait_for()
+                    assert page.get_by_role('dialog').count() == 0
+                    page.get_by_role('button', name='创建作业', exact=True).click()
                     page.get_by_role('button', name='清空', exact=True).click()
                     page.get_by_role('checkbox', name='fix-git', exact=True).check()
+                    page.locator('[name=name]').fill('draft profile')
+                    page.locator('[name=attempts]').fill('2')
+                    page.get_by_role('link', name='配置模型 Provider').click()
+                    page.wait_for_url('**/#/settings/providers')
+                    page.get_by_role('heading', name='系统配置', exact=True).wait_for()
+                    page.go_back()
+                    assert page.locator('[name=name]').input_value() == 'draft profile'
+                    assert page.locator('[name=attempts]').input_value() == '2'
+                    assert page.get_by_role('checkbox', name='fix-git', exact=True).is_checked()
                     page.locator('[name=attempts]').fill('1')
+                    pending = []
+                    page.route('**/api/profiles/run', lambda route: pending.append(route))
+                    page.locator('.form-submit button').click()
+                    page.wait_for_selector('dialog[aria-busy=true]')
+                    page.keyboard.press('Escape')
+                    assert page.get_by_role('dialog').is_visible()
+                    assert page.get_by_role('button', name='关闭', exact=True).is_disabled()
+                    page.locator('.run-form').evaluate('form => form.requestSubmit()')
+                    assert len(pending) == 1
+                    pending[0].fulfill(status=503, json={'error': 'test queue failure'})
+                    page.get_by_text('test queue failure', exact=True).wait_for()
+                    assert page.locator('[name=name]').input_value() == 'draft profile'
+                    page.unroute('**/api/profiles/run')
                     page.locator('.form-submit button').click()
                     page.wait_for_url('**/#/profile/*')
                     profile = page.url.split('/profile/')[1]
@@ -64,6 +90,11 @@ def main():
                     (trial / 'agent').mkdir()
                     (trial / 'agent/metacodes-output.jsonl').write_text(json.dumps(
                         {'type': 'result', 'stop_reason': 'end_turn', 'text': 'done'}))
+                    steps = [{'step_id': i, 'source': 'agent', 'tool_calls': [
+                        {'tool_call_id': str(i), 'function_name': 'Read', 'arguments': {'index': i}}]}
+                             for i in range(1, 31)]
+                    steps[0]['tool_calls'][0].update(function_name='Skill', arguments={'name': 'long-skill-' * 12})
+                    (trial / 'agent/trajectory.json').write_text(json.dumps({'steps': steps}))
                     (job / '.bench-metrics').mkdir()
                     (job / '.bench-metrics/fix-git__fake.jsonl').write_text('\n'.join(json.dumps(r) for r in [
                         {'request': 1, 'complete': True, 'input_tokens': 920, 'output_tokens': 10, 'ttft_ms': 100, 'generation_ms': 1000},
@@ -86,6 +117,27 @@ def main():
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/job/{name}/fix-git__fake')
                     page.get_by_text('920', exact=True).first.wait_for()
                     page.get_by_text('2,020', exact=True).first.wait_for()
+                    page.set_viewport_size({'width': 1120, 'height': 900})
+                    for route in (f'job/{name}/fix-git__fake', f'profile/{profile}/task/{name}/fix-git/fix-git__fake'):
+                        page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/{route}')
+                        page.wait_for_function("document.querySelector('.trace-chart')?.dataset.scope.includes(location.hash)")
+                        rows = page.locator('.usage-row')
+                        assert rows.count() == 3
+                        for row in rows.all():
+                            assert row.locator('.num').evaluate(
+                                "el => el.getBoundingClientRect().right <= Math.min(window.innerWidth, "
+                                "el.closest('.panel').getBoundingClientRect().right)")
+                        last = page.locator('.tool-span').last
+                        last.click()
+                        scroller = page.locator('.trace-scroll')
+                        offset = scroller.evaluate('el => el.scrollLeft')
+                        assert offset > 0
+                        for focused in (last, scroller):
+                            focused.focus()
+                            page.evaluate('render()')
+                            assert focused.evaluate('el => document.activeElement === el')
+                            assert scroller.evaluate('el => el.scrollLeft') == offset
+                            assert last.get_attribute('aria-pressed') == 'true'
                     manager.profiles.advance()
                     with patch.dict(os.environ, {'FAKE_BENCH_RELEASE_FILE': str(root / 'hold-standalone')}):
                         loose = manager.launch({'model': 'tokenjoy/test-model', 'tasks': ['fix-git']})['name']
@@ -104,7 +156,9 @@ def main():
                         wait_run(manager, loose)
                     page.set_viewport_size({'width': 390, 'height': 844})
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
+                    page.get_by_role('button', name='创建作业', exact=True).click()
                     page.locator('.form-submit button').wait_for()
+                    assert page.get_by_role('dialog').evaluate('d => d.scrollWidth <= d.clientWidth'), 'dialog overflow'
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'mobile overflow'
                     assert not errors, errors
                     browser.close()
