@@ -886,6 +886,33 @@ test "L2 serve: the daemon driver's run_done carries the model failure's detail 
     try expectModelFailureOnRunDone(a, daemon.srv.port);
 }
 
+const UdsFixture = struct {
+    server: *cc.daemon_uds.UdsServer,
+    dir: [:0]const u8,
+
+    fn start(fx: *AppFixture, daemon: *DaemonHost) !UdsFixture {
+        const arena = fx.arena.allocator();
+        const dir = try std.fmt.allocPrintSentinel(arena, "/tmp/mc-uds-{s}", .{&fx.tmp.sub_path}, 0);
+        const path = try std.fs.path.join(arena, &.{ dir, "daemon.sock" });
+        if (pfs.mkdir(dir.ptr, 0o700) != 0) return error.SocketDirectoryCreateFailed;
+        errdefer {
+            pnet.unlinkUnixPath(path);
+            _ = pfs.rmdir(dir.ptr);
+        }
+        const server = try cc.daemon_uds.UdsServer.start(std.testing.allocator, path, .{
+            .allocator = std.testing.allocator,
+            .resolver = &DaemonHost.resolve,
+            .resolver_ctx = @ptrCast(daemon),
+        });
+        return .{ .server = server, .dir = dir };
+    }
+
+    fn stop(self: UdsFixture) void {
+        self.server.stop();
+        std.debug.assert(pfs.rmdir(self.dir.ptr) == 0);
+    }
+};
+
 test "L2 serve: the UDS message op carries the same fields, checks and order" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // UDS is POSIX-only
     const a = std.testing.allocator;
@@ -898,18 +925,10 @@ test "L2 serve: the UDS message op carries the same fields, checks and order" {
     try daemon.start(fx.app);
     defer daemon.stop();
 
-    var nonce: [6]u8 = undefined;
-    if (!@import("platform").rng.randomBytes(&nonce)) return error.TestNoRandomness;
-    var path_buf: [256]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&path_buf, "{s}/mc-msgcfg-{s}.sock", .{ std.mem.trimEnd(u8, ppaths.tempDir(), "/"), &std.fmt.bytesToHex(nonce, .lower) });
-    const uds = try cc.daemon_uds.UdsServer.start(a, sock_path, .{
-        .allocator = a,
-        .resolver = &DaemonHost.resolve,
-        .resolver_ctx = @ptrCast(&daemon),
-    });
+    const uds = try UdsFixture.start(&fx, &daemon);
     defer uds.stop();
 
-    const conn = try pnet.connectUnix(sock_path);
+    const conn = try pnet.connectUnix(uds.server.path);
     defer pnet.closeSocket(conn);
     pnet.setRecvTimeoutMs(conn, 500);
 
@@ -1112,17 +1131,9 @@ test "L2 serve #447: HTTP and the UDS message op fill one bound; the next is 429
     defer daemon.stop();
 
     if (builtin.os.tag == .windows) return expectQueueBound(a, &fx, daemon.srv.port, null);
-    var nonce: [6]u8 = undefined;
-    if (!@import("platform").rng.randomBytes(&nonce)) return error.TestNoRandomness;
-    var path_buf: [256]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&path_buf, "{s}/mc-bound-{s}.sock", .{ std.mem.trimEnd(u8, ppaths.tempDir(), "/"), &std.fmt.bytesToHex(nonce, .lower) });
-    const uds = try cc.daemon_uds.UdsServer.start(a, sock_path, .{
-        .allocator = a,
-        .resolver = &DaemonHost.resolve,
-        .resolver_ctx = @ptrCast(&daemon),
-    });
+    const uds = try UdsFixture.start(&fx, &daemon);
     defer uds.stop();
-    const conn = try pnet.connectUnix(sock_path);
+    const conn = try pnet.connectUnix(uds.server.path);
     defer pnet.closeSocket(conn);
     pnet.setRecvTimeoutMs(conn, 500);
 
@@ -1467,15 +1478,7 @@ test "L2 serve: the daemon driver journals the same wire v1 lines; SSE and UDS a
     _ = try expectWireJournal(a, journal);
 
     if (builtin.os.tag == .windows) return; // UDS is POSIX-only
-    var nonce: [6]u8 = undefined;
-    if (!@import("platform").rng.randomBytes(&nonce)) return error.TestNoRandomness;
-    var path_buf: [256]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&path_buf, "{s}/mc-wire-{s}.sock", .{ std.mem.trimEnd(u8, ppaths.tempDir(), "/"), &std.fmt.bytesToHex(nonce, .lower) });
-    const uds = try cc.daemon_uds.UdsServer.start(a, sock_path, .{
-        .allocator = a,
-        .resolver = &DaemonHost.resolve,
-        .resolver_ctx = @ptrCast(&daemon),
-    });
+    const uds = try UdsFixture.start(&fx, &daemon);
     defer {
         // As serve shuts down: the journal's close ends the attachment, whose
         // thread waits on the journal, before the socket stops (`stop` closes
@@ -1483,7 +1486,7 @@ test "L2 serve: the daemon driver journals the same wire v1 lines; SSE and UDS a
         daemon.host.journal.close();
         uds.stop();
     }
-    const attached = try udsAttachLines(a, sock_path, fx.app.session_id.asSlice(), journal.len);
+    const attached = try udsAttachLines(a, uds.server.path, fx.app.session_id.asSlice(), journal.len);
     defer freeLines(a, attached);
     try std.testing.expect(attached.len >= journal.len);
     for (journal, attached[0..journal.len]) |journaled, line| try std.testing.expectEqualStrings(journaled, line);
