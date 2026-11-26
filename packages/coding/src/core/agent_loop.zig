@@ -1432,7 +1432,7 @@ const ToolAdmission = struct {
                 .input = tu.input,
                 .content = try tool_error.errorToJson(
                     "VerifierLeadsToolUnavailable",
-                    "tool '{s}' does not run in a verifier leads round: only Read, Grep and Glob do, and files cannot change",
+                    "tool '{s}' does not run in a verifier leads round: only Read does, and files cannot change",
                     .{tu.name},
                     allocator,
                 ),
@@ -1454,7 +1454,7 @@ const ToolAdmission = struct {
             var lslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
             lslot.content = try tool_error.errorToJson(
                 "LearningTurnToolUnavailable",
-                "tool '{s}' does not run in a learning turn: only Read, Grep, Glob, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
+                "tool '{s}' does not run in a learning turn: only Read, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
                 .{tu.name},
                 allocator,
             );

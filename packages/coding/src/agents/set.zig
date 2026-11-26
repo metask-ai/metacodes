@@ -272,12 +272,12 @@ fn readAllFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 // ============================================================================
 
 /// Explore 内置 — 快速只读探索代码库。
-const EXPLORE_DESC = "Fast, read-only agent for searching and analyzing code. Use for file discovery, code search, and codebase exploration. Specify thoroughness: \"quick\" / \"medium\" / \"very thorough\".";
+const EXPLORE_DESC = "Read-only agent for inspecting source files and following their references. Supply candidate paths from your workspace search. Specify thoroughness: \"quick\" / \"medium\" / \"very thorough\".";
 
 const EXPLORE_PROMPT =
     \\You are an Explore subagent. Your job is to help the parent agent locate code and answer "where is X?" / "which files reference Y?" / "what does Z look like?" questions.
     \\
-    \\You are read-only. Use Glob, Grep, and Read to find and analyze code. You CANNOT use Write or Edit.
+    \\You are read-only. Read the paths supplied by the parent, follow references in those files, and request narrower paths if needed. You CANNOT use Write or Edit.
     \\
     \\Return a concise summary that includes:
     \\- File paths (with line numbers where relevant)
@@ -294,7 +294,7 @@ const PLAN_DESC = "Research agent that gathers context before an implementation 
 const PLAN_PROMPT =
     \\You are a Plan subagent. Your job is to gather codebase context for the parent agent's planning step.
     \\
-    \\You are read-only. Use Glob, Grep, and Read for current code. When KgRecall and KgContext are listed under Allowed tools, use them if prior decisions, constraints, failures, or project terminology may materially affect the plan. You CANNOT use Write, Edit, or Bash for state-changing commands.
+    \\You are read-only. Read the files named by the parent and follow their imports or references. When KgRecall and KgContext are listed under Allowed tools, use them if prior decisions, constraints, failures, or project terminology may materially affect the plan. You CANNOT use Write, Edit, or Bash for state-changing commands.
     \\
     \\Return findings that directly inform the plan: which files need changes, dependencies, risks. Be specific.
     \\
@@ -318,8 +318,8 @@ fn injectBuiltins(set: *AgentSet) !void {
     // 只读由工具白名单构造保证,不靠权限模式:两者都只拿只读工具,permission_mode 留空
     // (继承父 mode)。Explore 不给 Bash——plan 模式移除前它的 Bash 在 .plan 下恒被 deny,
     // 白名单里留着只会让它在 bypass 父会话下变成可写。
-    try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{ "Read", "Grep", "Glob" }, &.{ "Write", "Edit", "Bash" }, "low", null, 30, .blue);
-    try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "Grep", "Glob", "KgRecall", "KgContext" }, &.{ "Write", "Edit", "Bash" }, "inherit", null, 30, .purple);
+    try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{"Read"}, &.{ "Write", "Edit", "Bash" }, "low", null, 30, .blue);
+    try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "KgRecall", "KgContext" }, &.{ "Write", "Edit", "Bash" }, "inherit", null, 30, .purple);
     try addBuiltin(set, "general-purpose", GENERAL_DESC, GENERAL_PROMPT, &.{}, &.{}, "inherit", null, 50, .green);
 }
 
@@ -450,7 +450,7 @@ test "AgentSet: Explore/Plan are read-only by tool allowlist, not by a permissio
     var set = AgentSet.init(testing.allocator);
     defer set.deinit();
     try injectBuiltins(&set);
-    const read_only = [_][]const u8{ "Read", "Grep", "Glob", "KgRecall", "KgContext" };
+    const read_only = [_][]const u8{ "Read", "KgRecall", "KgContext" };
     for ([_][]const u8{ "Explore", "Plan" }) |name| {
         const def = set.find(name).?;
         try testing.expect(def.permission_mode == null);

@@ -8,6 +8,38 @@ const common = @import("metacodes-guard").tools.common;
 const ToolContext = @import("context.zig").ToolContext;
 const util_json = @import("metacodes-base").util.json;
 
+pub fn wakeupExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const reg = ctx.cron_registry orelse return error.CronUnavailable;
+    const Input = struct {
+        stop: bool = false,
+        delaySeconds: ?i64 = null,
+        reason: ?[]const u8 = null,
+        prompt: ?[]const u8 = null,
+        noop: ?bool = null,
+    };
+    const input = try std.json.parseFromSlice(Input, ctx.allocator, args, .{ .ignore_unknown_fields = true });
+    defer input.deinit();
+    const call = input.value;
+    if (call.stop) return std.json.Stringify.valueAlloc(ctx.allocator, .{
+        .stopped = true,
+        .cancelledWakeups = @intFromBool(reg.stopWakeup()),
+    }, .{});
+    const requested = call.delaySeconds orelse return error.MissingSchedule;
+    const delay = std.math.clamp(requested, 60, 3600);
+    const reason = call.reason orelse return error.MissingReason;
+    const prompt = call.prompt orelse return error.MissingPrompt;
+    const noop = call.noop orelse return error.MissingNoop;
+    if (std.mem.trim(u8, prompt, " \r\n\t").len == 0) return error.EmptyPrompt;
+    if (std.mem.trim(u8, reason, " \r\n\t").len == 0) return error.MissingReason;
+    return std.json.Stringify.valueAlloc(ctx.allocator, .{
+        .scheduledFor = try reg.scheduleWakeup(delay, prompt),
+        .clampedDelaySeconds = delay,
+        .wasClamped = delay != requested,
+        .reason = reason,
+        .noop = noop,
+    }, .{});
+}
+
 pub fn createExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
     const reg = ctx.cron_registry orelse return error.CronUnavailable;
@@ -84,6 +116,7 @@ pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try util_json.writeJsonString(&out.writer, j.id.slice());
         try out.writer.writeAll(",\"cron\":");
         try util_json.writeJsonString(&out.writer, j.cron_expr);
+        if (j.dynamic_wakeup) try out.writer.writeAll(",\"kind\":\"loop\"");
         try out.writer.print(",\"recurring\":{},\"next_fire_unix\":{d}}}", .{ j.recurring, j.next_fire_unix });
     }
     try out.writer.print("],\"count\":{d}}}", .{reg.count()});
@@ -96,6 +129,43 @@ pub fn listExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
 const testing = std.testing;
 const CronRegistry = @import("../core/cron_registry.zig").CronRegistry;
+
+test "ScheduleWakeup replaces and stops only its own pending one-shot" {
+    const a = testing.allocator;
+    var reg = CronRegistry.init(a);
+    defer reg.deinit();
+    var ctx = ToolContext.simple(a);
+    ctx.cron_registry = &reg;
+    _ = try reg.create("* * * * *", null, "fixed", true);
+    const first = try wakeupExecute(&ctx, "{\"delaySeconds\":1,\"reason\":\"test\",\"prompt\":\"first\",\"noop\":true}");
+    defer a.free(first);
+    try testing.expect(std.mem.indexOf(u8, first, "\"clampedDelaySeconds\":60") != null);
+    const old_id = reg.pendingWakeup().?.id;
+    try testing.expectError(error.MissingNoop, wakeupExecute(&ctx, "{\"delaySeconds\":60,\"reason\":\"test\",\"prompt\":\"incomplete\"}"));
+    try testing.expect(old_id.eql(reg.pendingWakeup().?.id));
+    const next = try wakeupExecute(&ctx, "{\"delaySeconds\":4000,\"reason\":\"later\",\"prompt\":\"second\",\"noop\":false}");
+    defer a.free(next);
+    try testing.expect(std.mem.indexOf(u8, next, "\"clampedDelaySeconds\":3600") != null);
+    try testing.expectEqual(@as(usize, 2), reg.count());
+    try testing.expect(!reg.remove(old_id));
+    const listed = try listExecute(&ctx, "{}");
+    defer a.free(listed);
+    try testing.expect(std.mem.indexOf(u8, listed, "\"kind\":\"loop\"") != null);
+    const stop = try wakeupExecute(&ctx, "{\"stop\":true}");
+    defer a.free(stop);
+    try testing.expectEqual(@as(usize, 1), reg.count());
+    try testing.expect(reg.pendingWakeup() == null);
+    _ = try reg.scheduleWakeup(60, "third");
+    reg.jobs.items[1].next_fire_unix = 0;
+    const due = try reg.collectDue(a, 1);
+    defer a.free(due);
+    defer for (due) |prompt| a.free(prompt);
+    try testing.expectEqual(@as(usize, 1), due.len);
+    try testing.expectEqualStrings("third", due[0]);
+    try testing.expect(reg.pendingWakeup() == null);
+    try testing.expect(reg.jobs.items[0].recurring);
+    try testing.expectEqual(@as(usize, 0), reg.dueCount());
+}
 
 test "CronCreate: missing prompt errors" {
     const ctx = ToolContext.simple(testing.allocator);

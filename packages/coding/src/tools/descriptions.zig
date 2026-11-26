@@ -1,7 +1,7 @@
 //! 工具长描述生成(动态耦合)。
 //!
 //! 逐字移植 cc/src/tools/*/prompt.ts 的长描述,"Claude Code" → "MetaCode",
-//! 工具名用 cc-zig 实际名(Read/Write/Edit/Glob/Grep/Bash/Task)。
+//! 工具名用 cc-zig 实际名(Read/Write/Edit/Bash/Task)。
 //!
 //! 每个 describe* 函数签名:fn(allocator, *const PromptContext) anyerror![]u8,
 //! 返回 owned slice(调用方用 arena 管理,session 结束统一释放)。
@@ -26,7 +26,7 @@ const READ_DESC =
     \\Usage:
     \\- The file_path parameter must be an absolute path, not a relative path
     \\- By default, it reads up to 2000 lines starting from the beginning of the file
-    \\- Files larger than 256KB are rejected for a full read — pass offset+limit to read a range, or use Grep to find specific content
+    \\- Files larger than 256KB are rejected for a full read — pass offset+limit to read the lines you need
     \\- Very long single lines are truncated; the marker "[line truncated]" indicates this
     \\- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
     \\- When you already know which part of the file you need, only read that part. This can be important for larger files.
@@ -84,104 +84,22 @@ pub fn describeEdit(allocator: std.mem.Allocator, ctx: *const PromptContext) any
 }
 
 // ============================================================================
-// Glob — cc/src/tools/GlobTool/prompt.ts DESCRIPTION
-// 动态:多轮搜索建议用 Agent,仅当 Agent/Task 在工具集时才提。
-// ============================================================================
-pub fn describeGlob(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    const agent_line = if (ctx.hasTool("Task") or ctx.hasTool("Agent"))
-        "\n- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead"
-    else
-        "";
-    return std.fmt.allocPrint(allocator,
-        \\- Fast file pattern matching tool that works with any codebase size
-        \\- Supports glob patterns like "**/*.js" or "src/**/*.ts"
-        \\- Returns matching file paths sorted by modification time
-        \\- Use this tool when you need to find files by name patterns{s}
-    , .{agent_line});
-}
-
-// ============================================================================
-// Grep — cc/src/tools/GrepTool/prompt.ts getDescription
-// 动态:多轮搜索用 Agent 一句仅当 Agent/Task 在工具集时才提。
-// ============================================================================
-pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    // 用 concat 而非 allocPrint:描述里有大量字面 `{` `}`(ripgrep 正则),
-    // allocPrint 会把它们当格式占位符。concat 不做格式解析,安全。
-    const agent_line = if (ctx.hasTool("Task") or ctx.hasTool("Agent"))
-        "\n- Use Agent tool for open-ended searches requiring multiple rounds"
-    else
-        "";
-    return std.mem.concat(allocator, u8, &.{
-        \\A powerful search tool built on ripgrep
-        \\
-        \\Usage:
-        \\- ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.
-        \\- Supports full regex syntax (e.g., "log.*Error", "function\s+\w+")
-        \\- Filter files with glob parameter (e.g., "*.js", "**/*.tsx") or type parameter (e.g., "js", "py", "rust")
-        \\- Output modes: "content" shows matching lines, "files_with_matches" shows only file paths (default), "count" shows match counts
-        \\- Results are capped at 250 lines by default (head_limit); pass head_limit:0 for unlimited, or use offset to page. Prefer narrowing the pattern over fetching everything.
-        ,
-        agent_line,
-        "\n",
-        \\- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use `interface\{\}` to find `interface{}` in Go code)
-        \\- Multiline matching: By default patterns match within single lines only. For cross-line patterns like `struct \{[\s\S]*?field`, use `multiline: true`
-        \\- Searching a truncated tool result: pass its artifact_id instead of path. One search answers "where in this output is X" directly; paging the same result with ReadArtifact costs one round-trip per 32KB and re-sends the whole context each time. output_mode must be "content" or "count" (there is only one file to name), and path must be omitted.
-        ,
-    });
-}
-
-// ============================================================================
-// CodeMap — tree-sitter 结构大纲。无 cc 对应物,描述自拟。
-// 动态:若 FindSymbol 在工具集(或可经 ToolSearch 激活)则提一句"找定义用它"。
-// 引导力度对齐 Grep:给明确 use case + "prefer over whole-file Read"。
-// ============================================================================
-pub fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    // FindSymbol 现为默认工具(2026-06-08 从 deferred 提出),无需 ToolSearch 激活;
-    // 描述里直接引导"按名找单个定义用 FindSymbol"。
-    _ = ctx;
-    return std.mem.concat(allocator, u8, &.{
-        \\Produce a structural outline of SOURCE CODE — every function, type, class, constant, and method with its line number and signature — without reading the file bodies.
-        \\
-        \\Usage:
-        \\- This tool is for source code only and requires an installed language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd, …). For plain-text, config, JSON, Markdown, non-code files, or when no server is available, fall back to Read or Grep — the output names the reason when it cannot produce an outline.
-        \\- ALWAYS prefer CodeMap over reading a whole file when your goal is to LOCATE definitions (where is function X? what methods does this type have? what's the shape of this module?). It returns just the skeleton, costing a fraction of the tokens of a full Read.
-        \\- Pass a single file path to map one file, or a glob (e.g. `src/**/*`) to map many files at once — ideal for getting your bearings in an unfamiliar module or directory. The language of each file is inferred from its extension.
-        \\- Typical workflow: CodeMap to find WHERE something is defined → Read with offset+limit to pull just that range → Edit. Reserve a full-file Read for when you genuinely need the entire contents.
-        \\- Use Grep when you need to find all USES/occurrences of a string or regex; use CodeMap when you need the DEFINITIONS and overall structure.
-        ,
-        "\n- To jump straight to a single symbol's definition by name (when you don't know which file it lives in), use the FindSymbol tool instead.",
-        "\n",
-        \\- Supported languages: zig, typescript, tsx, python, c, bash. For other languages, fall back to Grep or Read.
-        ,
-    });
-}
-
-// ============================================================================
-// Bash — cc/src/tools/BashTool/prompt.ts
-// 动态:① background note;② Git 协议段(ctx.include_git);③ 只读 agent 提醒。
-// ============================================================================
 const BASH_GIT_SECTION =
     \\
     \\
     \\# Committing changes with git
-    \\
-    \\When the user asks you to create a new git commit, follow these steps carefully:
-    \\1. Run a git status, git diff, and git log in parallel to see staged/unstaged changes and recent commit message style.
-    \\2. Stage relevant files, then create the commit with a concise message focused on "why" rather than "what". Do NOT add co-author or tool attribution unless asked.
-    \\3. Do NOT use destructive flags. NEVER force-push, run `git reset --hard`, amend published commits, or use `--no-verify` to bypass hooks.
+    \\Commit when the user or the requested workflow calls for it. Use noninteractive Git commands and preserve the user's other work.
+    \\1. Inspect the working tree, index and recent history. Independent checks such as `git status --short`, `git diff`, `git diff --cached` and `git log -5 --oneline` can run together. The staged diff is what the commit will contain.
+    \\2. Stage paths belonging to this change by name. Inspect previously staged files for unrelated work and check for credentials or local configuration before committing. If someone else's changes are staged, preserve them and keep them out of this commit.
+    \\3. Match the repository's message style and explain the reason for the change. Create a new commit after staging and checking its contents. If a hook fails, the proposed commit did not land: fix the cause, stage that fix and retry. Amending HEAD at that point would change the preceding commit.
+    \\4. Verify the new commit and the remaining working tree with `git log -1 --oneline` and `git status --short`. Report any work still unstaged. Push only when the task includes publication.
+    \\Keep hooks, signing and Git configuration intact. Preserve existing history and local changes. Destructive resets, broad cleans and force-pushes can erase another person's work; check the target and obtain explicit authorization for destructive actions. Never force-push a shared branch.
     \\
     \\# Creating pull requests
-    \\
-    \\Use the `gh` command for GitHub operations. To create a PR:
-    \\1. Run git status / git diff / git log on the base branch in parallel to understand the full set of changes.
-    \\2. Push the branch with -u if needed, then create the PR with a summary and test plan.
-    \\3. NEVER force-push to shared branches or close others' PRs without confirmation.
-;
-
-const BASH_READONLY_NOTE =
-    \\
-    \\
-    \\NOTE: You are a read-only agent. Use Bash ONLY for read-only operations (ls, git status, git log, git diff, find, cat, head, tail). NEVER run state-changing commands (mkdir, touch, rm, cp, mv, git add, git commit, npm/pip install) or use redirection (>, >>) / heredocs to write files.
+    \\1. Identify the intended base and the current branch's upstream. Review the branch's entire change using `git log <base>..HEAD` and `git diff <base>...HEAD`; also check the working tree for changes the PR would leave behind.
+    \\2. Run the checks relevant to those changes. Summarize the user-visible effect, why it was needed, and the checks actually run. State outstanding validation separately.
+    \\3. Push the intended branch, setting its upstream if needed. Once the push succeeds, use `gh pr create` with the intended base and head. For a multiline description, pass a body file so quoting and formatting survive. If the branch already has a PR, update that PR.
+    \\4. Return the PR URL and its verification state. A successful local commit or push alone does not establish that a PR exists.
 ;
 
 const BASH_BACKGROUND_LIMIT_NOTE =
@@ -189,43 +107,68 @@ const BASH_BACKGROUND_LIMIT_NOTE =
     \\- A background job is stopped when it reaches its background time limit. With `run_in_background`, `timeout` sets that limit (default 1800000 ms = 30 minutes, maximum 7200000 ms = 2 hours); a command moved to the background after 15s gets the default. If a background job seems to be waiting for interactive input, you are told once: kill it with KillShell and re-run it non-interactively.
 ;
 
+pub fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    return std.mem.concat(allocator, u8, &.{
+        "Produce a structural outline of source code using its language server. Pass one file path or a glob to list definitions, line numbers and signatures. An unavailable language server is reported explicitly.",
+        if (ctx.hasTool("FindSymbol")) " Use FindSymbol to locate a named definition across files." else "",
+        if (ctx.hasTool("Read")) " Use Read with offset and limit to inspect a definition's body." else "",
+    });
+}
+
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
-    const background_limit_note = if (ctx.preview.background_watchdog) BASH_BACKGROUND_LIMIT_NOTE else "";
-    const git_section = if (ctx.include_git and !ctx.isReadonlyAgent()) BASH_GIT_SECTION else "";
-    const readonly_note = if (ctx.isReadonlyAgent()) BASH_READONLY_NOTE else "";
-    // 复刻 codex 第③层:平台化工具描述。Windows 上用系统自带 PowerShell 跑(零 git-bash),
-    // 故告诉模型产 **PowerShell** cmdlet 而非 bash 命令(codex 实证:比 bash→ps 翻译层更稳)。
-    if (@import("builtin").os.tag == .windows) {
-        return std.fmt.allocPrint(allocator,
-            \\Runs a PowerShell command (Windows) in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
-            \\
-            \\Usage:
-            \\- The command argument is required. Write **PowerShell** syntax (this runs via `powershell -NoProfile -Command`, not bash).
-            \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
-            \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-            \\- Use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms); do not append '&'.{s}
-            \\- VERY IMPORTANT: avoid search/read via the shell — use Grep, Glob, Read, LS tools instead of `Select-String`/`Get-Content`/`Get-ChildItem` for finding and reading files. If you still must grep, prefer ripgrep at `rg`.
-            \\- Chain multiple commands with ';'. DO NOT use newlines.
-            \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
-            \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
-            \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-            \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
-        , .{ background_limit_note, git_section, readonly_note });
-    }
-    return std.fmt.allocPrint(allocator,
-        \\Executes a given bash command in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
+    const windows = @import("builtin").os.tag == .windows;
+    const readonly = ctx.isReadonlyAgent();
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    const out = &text.writer;
+
+    try out.writeAll(if (windows)
+        "Run a Windows shell command. Use PowerShell syntax when PowerShell is installed; the fallback shell is cmd.exe."
+    else
+        "Run a shell command through /bin/sh. Use portable shell syntax, or invoke a specific interpreter when the task requires it.");
+    try out.writeAll(
         \\
-        \\Usage:
-        \\- The command argument is required.
-        \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
-        \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
-        \\- You can use the `run_in_background` parameter to run it in the background; when it exits you will be notified automatically with a `<task-notification>` message at your next turn, so do not poll or sleep-wait; use BashOutput to read its output (on a still-running job BashOutput waits for it to exit, up to wait_ms). You do not need to use '&' at the end of the command when using this parameter.{s}
-        \\- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`. Instead use Grep, Glob, or Agent to search. You MUST avoid read tools like `cat`, `head`, `tail`, and `ls`, and use Read and LS to read files.
-        \\- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all MetaCode users have pre-installed.
-        \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
-        \\- Output comes back as a JSON envelope with one field group per channel. A channel that exceeds the context budget is reduced to a head/tail preview marked "...[middle omitted]..." and its "<channel>_truncated" field is set to true.
-        \\- To get truncated output, read it — do not re-run the command. "<channel>_artifact_id" feeds ReadArtifact for any byte range, and Grep accepts the same artifact_id to search the whole capture in one call — prefer Grep when you are looking for something rather than paging.{s}{s}
-    , .{ background_limit_note, git_section, readonly_note });
+        \\Each call starts a fresh process in the session working directory. A directory change, variable assignment or shell option lasts only for that call. Supply the directory to the command when possible, e.g. `git -C "project with spaces" status --short`.
+        \\
+        \\# Choosing a tool
+    );
+    try out.writeAll("\nFind files with `rg --files -g \"*.zig\"` and literal text with `rg -n -F -- \"text\" src`. Scope searches to the project or a relevant subdirectory.");
+    try out.writeAll(if (windows)
+        " In PowerShell, Get-ChildItem can list matching files and Select-String with -SimpleMatch can search known files when rg is unavailable."
+    else
+        " If rg is unavailable, list files with `find src -type f -name '*.zig'` and search text with `grep -rnF -- 'text' src`.");
+    if (ctx.hasTool("Read")) try out.writeAll(" Use Read to inspect the matching lines.");
+    if (!readonly and ctx.hasTool("Edit")) try out.writeAll(" Use Edit for targeted replacements.");
+    if (!readonly and ctx.hasTool("Write")) try out.writeAll(" Use Write to create files.");
+
+    try out.writeAll(
+        \\
+        \\
+        \\# Running commands
+        \\Pass the command in `command`. Give the user a short description of its purpose, such as "Run the parser regression tests". Quote paths with spaces. Before creating files in an unfamiliar directory, verify the parent and destination.
+        \\Run independent inspections in parallel. Keep dependent operations in order: a successful build must finish before an install that consumes its output. If a prerequisite fails, inspect the error before continuing.
+    );
+    try out.writeAll(if (windows)
+        "\nIn PowerShell, use -LiteralPath for exact paths and check $LASTEXITCODE after a native executable before running a dependent step. Use a single shell for file operations; verify the resolved target before recursive deletion."
+    else
+        "\nUse `&&` when the next command requires the previous one to succeed. For independent checks, separate calls preserve each exit status.");
+    try out.writeAll(
+        \\
+        \\
+        \\# Long-running commands and results
+        \\The foreground timeout is in milliseconds. Set it to suit the work. For background work on a host with job support, set `run_in_background` and use the returned `job_id`. A long foreground call can also return a job ID while work continues. Starting a job does not mean it succeeded.
+    );
+    if (ctx.preview.background_watchdog) try out.writeAll(BASH_BACKGROUND_LIMIT_NOTE);
+    if (ctx.hasTool("BashOutput")) try out.writeAll(" Use BashOutput with that ID when you need the result: it waits for exit up to `wait_ms` by default. The CLI also delivers a completion notification. Avoid sleep loops and repeated empty polls.");
+    try out.writeAll("\nFor a completed command, inspect `exit_code`, `stdout` and `stderr`. A search exit code of 1 from rg means no match; check diagnostics for other failures. A channel marked truncated contains only a preview.");
+    if (ctx.hasTool("ReadArtifact")) try out.writeAll(" Pass the returned channel artifact ID to ReadArtifact and continue at `next_offset` to recover the omitted output.");
+    try out.writeAll(" Report the relevant finding or failure to the user; they may only see your summary.");
+    if (readonly) {
+        try out.writeAll("\n\nYou are a read-only agent. Limit shell use to inspection. Builds, installations, filesystem writes (including redirection), staging and commits can change state.");
+    } else if (ctx.include_git) {
+        try out.writeAll(BASH_GIT_SECTION);
+    }
+    return text.toOwnedSlice();
 }
 
 // ============================================================================
@@ -299,37 +242,6 @@ test "describeEdit contains exact-replacement marker" {
     defer a.free(d);
     try std.testing.expect(std.mem.indexOf(u8, d, "exact string replacements") != null);
     try std.testing.expect(std.mem.indexOf(u8, d, "replace_all") != null);
-}
-
-test "describeGrep contains ALWAYS-use-Grep + agent line only when Agent enabled" {
-    const a = std.testing.allocator;
-    const with_agent = PromptContext{ .enabled_tool_names = &.{ "Grep", "Task" } };
-    const d1 = try describeGrep(a, &with_agent);
-    defer a.free(d1);
-    try std.testing.expect(std.mem.indexOf(u8, d1, "ALWAYS use Grep") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d1, "open-ended searches") != null);
-
-    const no_agent = PromptContext{ .enabled_tool_names = &.{"Grep"} };
-    const d2 = try describeGrep(a, &no_agent);
-    defer a.free(d2);
-    try std.testing.expect(std.mem.indexOf(u8, d2, "open-ended searches") == null);
-}
-
-test "describeCodeMap guides toward definitions and prefers over whole-file Read" {
-    const a = std.testing.allocator;
-    const ctx = PromptContext{};
-    const d = try describeCodeMap(a, &ctx);
-    defer a.free(d);
-    try std.testing.expect(std.mem.indexOf(u8, d, "structural outline") != null);
-    // 核心引导:LOCATE 定义优先 CodeMap 而非整文件 Read
-    try std.testing.expect(std.mem.indexOf(u8, d, "prefer CodeMap over reading a whole file") != null);
-    // 提及 FindSymbol(已提为默认工具,不再需要 ToolSearch 激活)
-    try std.testing.expect(std.mem.indexOf(u8, d, "FindSymbol") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d, "ToolSearch") == null);
-    // 强调仅针对源代码
-    try std.testing.expect(std.mem.indexOf(u8, d, "source code only") != null);
-    // 含字面 glob 大括号不应导致格式化崩溃(用 concat 而非 allocPrint);语言中立 glob
-    try std.testing.expect(std.mem.indexOf(u8, d, "src/**/*`") != null);
 }
 
 test "describeBash includes Git section only when include_git and not readonly agent" {

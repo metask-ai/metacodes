@@ -23,11 +23,6 @@ test "L2 schema: Edit 缺 old_string → 拦" {
     try tools.validateRequired("Edit", "{\"file_path\":\"/x\",\"old_string\":\"a\",\"new_string\":\"b\"}");
 }
 
-test "L2 schema: Grep 缺 pattern → 拦" {
-    try std.testing.expectError(error.MissingPattern, tools.validateRequired("Grep", "{\"path\":\".\"}"));
-    try tools.validateRequired("Grep", "{\"pattern\":\"foo\"}");
-}
-
 test "L2 schema: Task 只需 prompt(subagent_type/description 有默认不必需)" {
     // 只给 prompt → 通过(subagent_type 缺省 general-purpose,不应被拦)
     try tools.validateRequired("Task", "{\"prompt\":\"do it\"}");

@@ -698,62 +698,32 @@ pub const Selection = struct {
 };
 
 test "Selection rejects names outside Runtime and dispatches only selected entries" {
-    var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Grep" });
+    var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Edit" });
     defer catalog.deinit();
     var selection = try Selection.init(std.testing.allocator, &catalog, &.{"Read"});
     defer selection.deinit();
 
     try std.testing.expect(selection.contains("Read"));
-    try std.testing.expect(!selection.contains("Grep"));
+    try std.testing.expect(!selection.contains("Edit"));
     try std.testing.expect(selection.dispatcher().isBuiltin("Read"));
-    try std.testing.expect(!selection.dispatcher().isBuiltin("Grep"));
+    try std.testing.expect(!selection.dispatcher().isBuiltin("Edit"));
     try std.testing.expect(selection.dispatcher().replayDeclaration("Read") == .read_only);
-    try std.testing.expect(selection.dispatcher().replayDeclaration("Grep") == .never);
+    try std.testing.expect(selection.dispatcher().replayDeclaration("Edit") == .never);
     try std.testing.expectError(error.ToolNotInRuntime, Selection.init(std.testing.allocator, &catalog, &.{"Bash"}));
 
     var ctx = tools.ToolContext{ .allocator = std.testing.allocator, .tool_dispatcher = selection.dispatcher() };
-    try std.testing.expectError(error.UnknownTool, tools.dispatch(&ctx, "Grep", "{}"));
+    try std.testing.expectError(error.UnknownTool, tools.dispatch(&ctx, "Edit", "{}"));
     const names = try tools.availableToolNames(&ctx, std.testing.allocator);
     defer std.testing.allocator.free(names);
     try std.testing.expectEqualStrings("Read", names);
-    try std.testing.expect(tools.suggestToolName(&ctx, "Grepp") == null);
-}
-
-test "builtin admission verifies runtime dependencies before advertisement" {
-    const toolchain = @import("metacodes-base").util.toolchain;
-
-    // 依赖不可解析:声明了 runtime_dependency 的内置(Glob/Grep)必须在准入时
-    // 被拒,而不是进 catalog 后首调返回 RipgrepNotFound。
-    toolchain.test_ripgrep_override = false;
-    defer toolchain.test_ripgrep_override = null;
-    try std.testing.expectError(
-        error.ToolDependencyUnavailable,
-        Catalog.initBuiltins(std.testing.allocator, &.{"Grep"}),
-    );
-    try std.testing.expectError(
-        error.ToolDependencyUnavailable,
-        Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Glob" }),
-    );
-
-    // 门只看真实依赖:同一环境下无依赖声明的内置不受影响。
-    var unaffected = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Write", "Bash" });
-    unaffected.deinit();
-
-    // 依赖可解析:Glob/Grep 正常准入并可被 Session 选择。
-    toolchain.test_ripgrep_override = true;
-    var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Glob", "Grep" });
-    defer catalog.deinit();
-    try std.testing.expect(catalog.find("Glob") != null);
-    try std.testing.expect(catalog.find("Grep") != null);
+    try std.testing.expect(tools.suggestToolName(&ctx, "Editp") == null);
 }
 
 test "Selection redescribes builtin tool descriptions via describe_fn (缺陷 A)" {
     // 缺陷 A:Selection.init 必须调 redescribeForContext,让 describe_fn 生成平台化动态长描述,
-    // 而非静态短句(builtin.description)。Bash 的 describe_fn 输出 "Executes a given bash command"(POSIX)
-    // 或 "Runs a PowerShell command"(Windows),静态短句是 "Execute a bash command"。
-    var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Bash", "Grep" });
+    var catalog = try Catalog.initBuiltins(std.testing.allocator, &.{ "Read", "Bash" });
     defer catalog.deinit();
-    var selection = try Selection.init(std.testing.allocator, &catalog, &.{ "Read", "Bash", "Grep" });
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{ "Read", "Bash" });
     defer selection.deinit();
 
     // 找 Bash 的 definition,断言描述已被 describe_fn 重写为长描述。
@@ -762,14 +732,11 @@ test "Selection redescribes builtin tool descriptions via describe_fn (缺陷 A)
         if (std.mem.eql(u8, d.name, "Bash")) bash_desc = d.description;
     }
     try std.testing.expect(bash_desc.len > 0);
-    // 静态短句是 "Execute a bash command";describe_fn 输出 "Executes a given bash command"(POSIX)
-    // 或 "Runs a PowerShell command"(Windows)。断言不再是静态短句。
-    try std.testing.expect(!std.mem.eql(u8, bash_desc, "Execute a bash command"));
-    // POSIX 上含 "Executes a given bash command";Windows 上含 "PowerShell"。
+    try std.testing.expect(!std.mem.eql(u8, bash_desc, tools.getTool("Bash").?.description));
     if (@import("builtin").os.tag == .windows) {
         try std.testing.expect(std.mem.indexOf(u8, bash_desc, "PowerShell") != null);
     } else {
-        try std.testing.expect(std.mem.indexOf(u8, bash_desc, "Executes a given bash command") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bash_desc, "/bin/sh") != null);
     }
 }
 

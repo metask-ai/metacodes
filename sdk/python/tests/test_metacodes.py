@@ -265,28 +265,10 @@ class PythonSdkTest(unittest.TestCase):
         self.assertIn("ExecuteCode", [tool["name"] for tool in provider.requests[0]["tools"]])
         self.assertNotIn("INTERMEDIATE_MUST_STAY_LOCAL", str(provider.requests))
 
-    def test_runtime_points_rg_bin_at_the_bundled_ripgrep(self) -> None:
-        library = _native.load()
-        if library.ripgrep is None:
-            self.skipTest("this library ships no ripgrep beside it")
-        saved = os.environ.pop("RG_BIN", None)
-        try:
-            with metacodes.Runtime(tools=["Grep"]):
-                self.assertEqual(os.environ.get("RG_BIN"), str(library.ripgrep))
-        finally:
-            if saved is None:
-                os.environ.pop("RG_BIN", None)
-            else:
-                os.environ["RG_BIN"] = saved
-
-    def test_builtin_grep_finds_text_in_the_workspace(self) -> None:
-        (self.root / "src.txt").write_text("alpha\nneedle-7731\nomega\n", encoding="utf-8")
-        script = [("tool", "Grep", {"pattern": "needle-[0-9]+", "output_mode": "content"}), ("echo",)]
-        with MockProvider(script) as provider:
-            with metacodes.Runtime(tools=["Grep"]) as runtime:
-                session = self.session(runtime, provider)
-                result = session.run("find the needle")
-        self.assertIn("needle-7731", result.text)
+    def test_unsupported_workspace_tools_are_rejected(self) -> None:
+        for name in ("Glob", "Grep", "CodeMap", "FindSymbol"):
+            with self.subTest(tool=name), self.assertRaisesRegex(ValueError, "unknown built-in tools"):
+                metacodes.Runtime(tools=[name])
 
     def test_permission_request_reaches_the_handler_and_deny_holds(self) -> None:
         requests = []

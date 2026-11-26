@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from . import _native as n
 
-DEFAULT_TOOLS = ("Read", "Glob", "Grep")
+DEFAULT_TOOLS = ("Read",)
 # The CLI agent loop's own default (packages/coding/src/core/agent_loop.zig Options.max_turns).
 DEFAULT_MAX_TURNS = 400
 
@@ -312,7 +312,7 @@ class Runtime:
     """An AgentCore Runtime: the tool catalog sessions select from.
 
     ``tools`` names the built-in tools (``Read``, ``Write``, ``Edit``,
-    ``Glob``, ``Grep``, ``Bash``, ``BashOutput``, ``KillShell``,
+    ``Bash``, ``BashOutput``, ``KillShell``,
     ``WebSearch``, ``WebFetch``, ``AskUserQuestion``, ``ExecuteCode``); ``host_tools`` adds
     :class:`Tool` objects implemented in Python.
     """
@@ -333,9 +333,6 @@ class Runtime:
         self._lib = n.load(library)
         self.tools = tuple(tools)
         self.host_tools = tuple(host_tools)
-        if {"Glob", "Grep"} & set(self.tools) and "RG_BIN" not in os.environ:
-            if self._lib.ripgrep is not None:
-                os.environ["RG_BIN"] = str(self._lib.ripgrep)
         self._arena = n.ViewArena()
         self._results: Dict[int, Any] = {}
         self._results_lock = threading.Lock()

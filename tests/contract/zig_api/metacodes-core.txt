@@ -127,9 +127,9 @@ metacodes-core.plugin.first_party.Profile.coding_interactive
 metacodes-core.plugin.first_party.Profile.offline_coding
 metacodes-core.plugin.first_party.Profile.parse: fn parse(raw: []const u8) ?Profile
 metacodes-core.plugin.first_party.Profile.canonical: fn canonical(self: Profile) []const u8
-metacodes-core.plugin.first_party.CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell", "WebSearch", "WebFetch", }
-metacodes-core.plugin.first_party.MINIMAL_TOOLS: const = [_][]const u8{ "Read", "Glob", "Grep", }
-metacodes-core.plugin.first_party.OFFLINE_CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell", }
+metacodes-core.plugin.first_party.CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Bash", "BashOutput", "KillShell", "WebSearch", "WebFetch", }
+metacodes-core.plugin.first_party.MINIMAL_TOOLS: const = [_][]const u8{ "Read", }
+metacodes-core.plugin.first_party.OFFLINE_CODING_TOOLS: const = [_][]const u8{ "Read", "Write", "Edit", "Bash", "BashOutput", "KillShell", }
 metacodes-core.plugin.first_party.PREVIEW_TOOLS: const = [_][]const u8{"ExecuteCode"}
 metacodes-core.plugin.first_party.INTERACTION_TOOLS: const = [_][]const u8{"AskUserQuestion"}
 metacodes-core.plugin.first_party.ARTIFACT_TOOLS: const = [_][]const u8{"ReadArtifact"}
@@ -515,7 +515,7 @@ metacodes-core.agent_session.CronAccessError: const = error{ OutOfMemory, Sessio
 metacodes-core.agent_session.DEFAULT_BUILTIN_TOOLS: const = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS
 metacodes-core.agent_session.SESSION_BUILTIN_TOOLS: const = DEFAULT_BUILTIN_TOOLS ++ first_party_plugins.PREVIEW_TOOLS ++ [_][]const u8{"AskUserQuestion"}
 metacodes-core.agent_session.TEAM_BUILTIN_TOOLS: const = [_][]const u8{ "TeamCreate", "TeamDelete", "SendMessage", "SpawnTeammate" }
-metacodes-core.agent_session.CRON_BUILTIN_TOOLS: const = [_][]const u8{ "CronCreate", "CronDelete", "CronList" }
+metacodes-core.agent_session.CRON_BUILTIN_TOOLS: const = [_][]const u8{ "CronCreate", "CronDelete", "CronList", "ScheduleWakeup" }
 metacodes-core.agent_session.isCronBuiltin: fn isCronBuiltin(name: []const u8) bool
 metacodes-core.agent_session.isTeamBuiltin: fn isTeamBuiltin(name: []const u8) bool
 metacodes-core.agent_session.isSessionBuiltin: fn isSessionBuiltin(name: []const u8) bool
@@ -4169,6 +4169,7 @@ metacodes-core.cron_registry.freeViews: fn freeViews(allocator: std.mem.Allocato
 metacodes-core.cron_registry.dupeViews: fn dupeViews(allocator: std.mem.Allocator, views: []const JobView) error{OutOfMemory}![]JobView
 metacodes-core.cron_registry.CronJob: struct
 metacodes-core.cron_registry.CronJob.id: JobId
+metacodes-core.cron_registry.CronJob.dynamic_wakeup: bool = false
 metacodes-core.cron_registry.CronJob.cron_expr: []const u8
 metacodes-core.cron_registry.CronJob.prompt: []const u8
 metacodes-core.cron_registry.CronJob.recurring: bool
@@ -4180,6 +4181,9 @@ metacodes-core.cron_registry.CronRegistry.jobs: std.ArrayList(CronJob)
 metacodes-core.cron_registry.CronRegistry.init: fn init(allocator: std.mem.Allocator) CronRegistry
 metacodes-core.cron_registry.CronRegistry.deinit: fn deinit(self: *CronRegistry) void
 metacodes-core.cron_registry.CronRegistry.create: fn create( self: *CronRegistry, cron_expr: []const u8, delay_seconds: ?i64, prompt: []const u8, recurring: bool, ) !JobId
+metacodes-core.cron_registry.CronRegistry.pendingWakeup: fn pendingWakeup(self: *const CronRegistry) ?CronJob
+metacodes-core.cron_registry.CronRegistry.stopWakeup: fn stopWakeup(self: *CronRegistry) bool
+metacodes-core.cron_registry.CronRegistry.scheduleWakeup: fn scheduleWakeup(self: *CronRegistry, delay_seconds: i64, prompt: []const u8) !i64
 metacodes-core.cron_registry.CronRegistry.delete: fn delete(self: *CronRegistry, id: []const u8) bool
 metacodes-core.cron_registry.CronRegistry.remove: fn remove(self: *CronRegistry, id: JobId) bool
 metacodes-core.cron_registry.CronRegistry.clear: fn clear(self: *CronRegistry) usize
@@ -5437,7 +5441,7 @@ metacodes-core.teamwork_issues.Ledger.render: fn render(self: *const Ledger, gpa
 metacodes-core.teamwork_reviewer: file
 metacodes-core.teamwork_reviewer.charter: const = <1903 bytes, sha256 4afee1819ae6>
 metacodes-core.teamwork_reviewer.charterSha256: fn charterSha256() [64]u8
-metacodes-core.teamwork_reviewer.tools: const = [_][]const u8{ "Read", "Grep", "Glob", "Bash" }
+metacodes-core.teamwork_reviewer.tools: const = [_][]const u8{ "Read", "Bash" }
 metacodes-core.teamwork_reviewer.max_review_bytes: const = 256 * 1024
 metacodes-core.teamwork_reviewer.Evidence: struct
 metacodes-core.teamwork_reviewer.Evidence.command: []const u8
@@ -9661,8 +9665,6 @@ metacodes-core.tools.descriptions: file
 metacodes-core.tools.descriptions.describeRead: fn describeRead(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeWrite: fn describeWrite(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeEdit: fn describeEdit(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
-metacodes-core.tools.descriptions.describeGlob: fn describeGlob(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
-metacodes-core.tools.descriptions.describeGrep: fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeCodeMap: fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeBash: fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
 metacodes-core.tools.descriptions.describeTask: fn describeTask(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8
@@ -9702,7 +9704,7 @@ metacodes-core.tools.ToolEntry.preview_feature: ?@import("preview.zig").Feature 
 metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <43571 bytes, sha256 3ecb6ce4fdf5>
+metacodes-core.tools.registry: const []const ToolEntry = <43076 bytes, sha256 830c538fc02f>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8

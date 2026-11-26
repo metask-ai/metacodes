@@ -201,48 +201,6 @@ test "L2 smoke: Edit old_string 未找到 → 错误(不静默成功)" {
 // Grep / Glob(依赖 ripgrep;CI 无 rg 则 skip,不误判)
 // ============================================================================
 
-test "L2 smoke: Grep 在临时文件里匹配已知串(content 模式带行号)" {
-    const a = std.testing.allocator;
-    var ctx = simpleCtx(a);
-    var dir_buf: [512]u8 = undefined;
-    const dir = smokeDir(&dir_buf);
-    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
-    var path_buf: [512]u8 = undefined;
-    const path = sub(&path_buf, dir, "grep.txt");
-    defer pfs.unlinkPath(path.ptr) catch {};
-    var args_buf: [1024]u8 = undefined;
-    const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"alpha\\nNEEDLE_777\\nbeta\"}}", .{path}));
-    a.free(wout);
-
-    const out = dispatchOk(&ctx, "Grep", try std.fmt.bufPrint(&args_buf, "{{\"pattern\":\"NEEDLE_777\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path})) catch |err| {
-        if (err == error.RipgrepNotFound) return error.SkipZigTest;
-        return err;
-    };
-    defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "NEEDLE_777") != null);
-}
-
-test "L2 smoke: Glob 匹配临时目录下文件" {
-    const a = std.testing.allocator;
-    var ctx = simpleCtx(a);
-    var dir_buf: [512]u8 = undefined;
-    const dir = smokeDir(&dir_buf);
-    defer _ = pfs.rmdir(dir.ptr); // 非空则失败无害;最后一个用例清掉它
-    var path_buf: [512]u8 = undefined;
-    const path = sub(&path_buf, dir, "glob-uniq.md");
-    defer pfs.unlinkPath(path.ptr) catch {};
-    var args_buf: [1024]u8 = undefined;
-    const wout = try dispatchOk(&ctx, "Write", try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\",\"content\":\"x\"}}", .{path}));
-    a.free(wout);
-
-    const out = dispatchOk(&ctx, "Glob", try std.fmt.bufPrint(&args_buf, "{{\"pattern\":\"glob-uniq.md\",\"path\":\"{s}\"}}", .{dir})) catch |err| {
-        if (err == error.RipgrepNotFound) return error.SkipZigTest;
-        return err;
-    };
-    defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "glob-uniq.md") != null);
-}
-
 // ============================================================================
 // Task 工具族(本地 scratchpad,需 ctx.tasks)
 // ============================================================================

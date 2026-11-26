@@ -124,12 +124,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                     var why_buf: [symbol_provider.capability.WHY_BUF]u8 = undefined;
                     var out: std.Io.Writer.Allocating = .init(allocator);
                     defer out.deinit();
-                    try out.writer.print("{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content. No outline was available: ", .{ s.size, MAX_FILE_BYTES });
+                    try out.writer.print("{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit to inspect the lines you need. No outline was available: ", .{ s.size, MAX_FILE_BYTES });
                     try util_json.writeJsonString(&out.writer, u.why(&why_buf));
                     try out.writer.writeAll(".\"}");
                     return try out.toOwnedSlice();
                 }
-                return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}", .{ s.size, MAX_FILE_BYTES });
+                return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit to inspect the lines you need.\"}}", .{ s.size, MAX_FILE_BYTES });
             }
         }
     }
@@ -221,7 +221,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (!already and total_lines > 150 and symbol_provider.hasSymbolsFor(ctx, path)) {
             if (ctx.read_state) |rs| rs.markHinted(path);
             defer allocator.free(rendered);
-            return try std.fmt.allocPrint(allocator, "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>", .{ rendered, total_lines });
+            return try std.fmt.allocPrint(allocator, "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, request Read with outline=true to see symbol names and line numbers.</system-reminder>", .{ rendered, total_lines });
         }
     }
     return rendered;
@@ -251,7 +251,7 @@ fn emptyBodyOrOutlineNote(allocator: std.mem.Allocator, gap: ?symbol_provider.Un
 fn appendTruncNote(allocator: std.mem.Allocator, rendered: []const u8, resume_line: usize) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}\n… [output truncated at {d} bytes to protect the context window. To continue, Read this file again with offset={d} (and an optional limit). Or use Grep to jump to specific content.]",
+        "{s}\n… [output truncated at {d} bytes to protect the context window. To continue, Read this file again with offset={d} (and an optional limit).]",
         .{ rendered, MAX_READ_OUTPUT_BYTES, resume_line },
     );
 }
@@ -265,7 +265,7 @@ fn countLines(s: []const u8) usize {
 fn appendLongLineNote(allocator: std.mem.Allocator, rendered: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}\n… [output truncated: this content is a single line longer than {d} bytes (each line is also per-line-truncated). offset paging can't advance within one line — use Grep to find specific content.]",
+        "{s}\n… [output truncated: this content is a single line longer than {d} bytes (each line is also per-line-truncated). offset paging can't advance within one line — use a workspace text search if available.]",
         .{ rendered, MAX_READ_OUTPUT_BYTES },
     );
 }
@@ -976,7 +976,7 @@ test "Read 弱提示:LSP 在位 + >150行 + zls 真装了 → CodeMap reminder;�
         const r = try execute(&ctx, try std.fmt.bufPrint(&args_buf, "{{\"path\":\"{s}\"}}", .{path}));
         defer a.free(r);
         try std.testing.expectEqual(want_hint, std.mem.indexOf(u8, r, "<system-reminder>") != null);
-        try std.testing.expectEqual(want_hint, std.mem.indexOf(u8, r, "CodeMap") != null);
+        try std.testing.expectEqual(want_hint, std.mem.indexOf(u8, r, "outline=true") != null);
     }
     // 小源码文件(10 行)→ 不带 reminder
     {

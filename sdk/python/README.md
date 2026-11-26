@@ -7,7 +7,7 @@ compiler, no third-party dependencies, Python 3.9 or newer.
 ```python
 import metacodes
 
-with metacodes.Runtime(tools=["Read", "Glob", "Grep"]) as runtime:
+with metacodes.Runtime(tools=["Read"]) as runtime:
     session = runtime.session(
         "claude-sonnet-4-5",          # any model your provider serves
         provider="anthropic",         # or "openai", "gemini"

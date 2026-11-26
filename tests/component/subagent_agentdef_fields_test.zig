@@ -596,7 +596,7 @@ test "L2 AgentDef.tools/disallowed_tools: 白名单与黑名单共同裁剪真�
     defer client.deinit();
     var agents = cc.agents_set.AgentSet.init(a);
     defer agents.deinit();
-    try addAgent(a, &agents, "---\nname: readonly-custom\ntools: Read, Write, Grep\ndisallowedTools: Write\n---\nInspect without editing.");
+    try addAgent(a, &agents, "---\nname: readonly-custom\ntools: Read, Write, ReadArtifact\ndisallowedTools: Write\n---\nInspect without editing.");
     const defs = try cc.tools.toToolDefinitions(a);
     defer a.free(defs);
     const perm = cc.permission.createContext(.bypass_permissions, a);
@@ -606,7 +606,7 @@ test "L2 AgentDef.tools/disallowed_tools: 白名单与黑名单共同裁剪真�
     defer a.free(out);
     const tools = (srv.lastRequest() orelse return error.NoRequestCaptured).jsonField("tools") orelse return error.ToolsFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Read\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Grep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"ReadArtifact\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Write\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Bash\"") == null);
 }
@@ -639,8 +639,11 @@ test "L2 Plan runtime tool snapshot keeps TinyKG capability and system prompt al
     const system = cap.jsonField("system") orelse return error.SystemFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"KgRecall\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"KgContext\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, system, "- Allowed tools: Read, Glob, Grep\\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system, "- Allowed tools: Read, Glob, Grep, KgRecall") == null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "- Allowed tools: Read\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Read\"") != null);
+    for ([_][]const u8{ "\"name\":\"Glob\"", "\"name\":\"Grep\"", "\"name\":\"Bash\"" }) |removed| {
+        try std.testing.expect(std.mem.indexOf(u8, tools, removed) == null);
+    }
 }
 
 test "L2 AgentDef.preload_skills: skill 正文进入真实子请求 system" {

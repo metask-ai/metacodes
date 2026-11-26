@@ -103,11 +103,8 @@ test "L2 回归锚点: 核心工具的具名字段+类型(人读快照)" {
     // 文件工具
     try std.testing.expect(std.mem.indexOf(u8, body, "\"file_path\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"old_string\":{\"type\":\"string\"") != null);
-    // Bash / Grep
     try std.testing.expect(std.mem.indexOf(u8, body, "\"command\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"pattern\":{\"type\":\"string\"") != null);
-    // 可选字段同样必须序列化进请求体(Grep.glob 非 required,模型仍须看得见才会传)。
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"glob\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"timeout\":{\"type\":\"integer\"") != null);
     // 不应再出现"required 点名字段但 properties 空 {}"的自相矛盾形态
     try std.testing.expect(std.mem.indexOf(u8, body, "\"properties\":{\"") != null);
 }

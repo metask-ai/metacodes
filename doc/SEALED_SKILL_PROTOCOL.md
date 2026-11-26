@@ -431,7 +431,7 @@ publish time, and pinned by the user at install time.
   "arguments": ["folder"],
   "creator": {"id": "cr_…", "display_name": "…"},
   "tools": {
-    "allow": ["Read", "Glob", "Grep", "Bash(python3 *)", "mcp__playwright__*"],
+    "allow": ["Read", "Bash(python3 *)", "mcp__playwright__*"],
     "deny": ["Bash(rm *)"]
   },
   "confirmation": {"required_for": ["Write", "Edit", "mcp__playwright__browser_click"]},
@@ -723,8 +723,7 @@ state; an allowlist violation is refused locally; the bearer token gates the
 gateway; a stale pin is refused before any model call; narration between
 calls never reaches the client; a sealed reference file is read on the
 gateway without a Step while a public asset is installed and read on the
-client; a Glob and a Grep under `sealed/` are answered on the gateway
-without a Step while a Glob over the Skill directory goes to the client; a
+client; the gateway handles declared sealed reads locally; a
 call whose result class is undeclared is refused before it runs; the fork's
 codebase context reaches the gateway only under `repository_structure`; a
 final that quotes a sealed line comes back with the passage replaced and
@@ -912,15 +911,9 @@ shared with the instance that holds it.
   gateway's own environment. Its tool dispatcher executes nothing: every
   tool use is marked pending, the loop suspends on the batch
   (`Options.suspend_all_pending`), and the batch is the Step. The one thing
-  the dispatcher serves itself is a `Read`, `Glob` or `Grep` whose target
-  lies under `<base_dir>/sealed/`, and only when the manifest admits the
-  tool: the client's own tool implementation runs against the package's
-  sealed directory — a Read rendered as the client's would be, a Glob or
-  Grep with every path it prints rewritten to the client's
-  `<base_dir>/sealed` — and the loop goes on inside the same Step. A search
-  over the Skill directory as a whole is forwarded unchanged and sees the
-  public assets only; a sealed tool the manifest does not admit is forwarded
-  too, so the client refuses it as it would any other. A later Step resumes
+  the dispatcher serves itself is a `Read` of a declared file under
+  `<base_dir>/sealed` that the manifest allows. It renders the file locally;
+  other tool calls go to the client for its normal permission checks. A later Step resumes
   the loop with the client's results and the gateway's own as one user turn
   (`resumeRunWithResults`), so the API's tool_use/tool_result pairing holds.
 - **Stateless runs.** The loop's continuation — the conversation's active

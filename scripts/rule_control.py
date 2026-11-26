@@ -292,8 +292,8 @@ def _upload_step_slice(job: str) -> str | None:
 
 
 def _strip_zig_comments(source: str) -> str:
-    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
-    return re.sub(r"//.*$", "", source, flags=re.MULTILINE)
+    tokens = r"""\\\\[^\n]*|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|(?P<comment>//[^\n]*)"""
+    return re.sub(tokens, lambda match: "" if match["comment"] is not None else match[0], source)
 
 
 def _module_string_constant(source: str, name: str) -> str | None:

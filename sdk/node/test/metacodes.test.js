@@ -186,15 +186,10 @@ test('the built-in Read tool reads the workspace', { skip }, async (t) => {
   assert.match(result.text, /the secret is 42/);
 });
 
-test('Runtime points RG_BIN at the ripgrep staged beside the library', { skip }, (t) => {
-  const saved = process.env.RG_BIN;
-  delete process.env.RG_BIN;
-  t.after(() => { if (saved === undefined) delete process.env.RG_BIN; else process.env.RG_BIN = saved; });
-  const runtime = new metacodes.Runtime({ tools: ['Grep'] });
-  t.after(() => runtime.close());
-  const staged = path.join(__dirname, '..', 'prebuilds', `${process.platform}-${process.arch}`, 'rg');
-  if (!fs.existsSync(staged)) return t.skip('no ripgrep staged');
-  assert.ok(process.env.RG_BIN && fs.realpathSync(process.env.RG_BIN) === fs.realpathSync(staged));
+test('unsupported workspace builtins are rejected', () => {
+  for (const name of ['Glob', 'Grep', 'CodeMap', 'FindSymbol']) {
+    assert.throws(() => new metacodes.Runtime({ tools: [name] }), /unknown built-in tools/);
+  }
 });
 
 test('a permission request reaches the handler and a deny holds', { skip }, async (t) => {

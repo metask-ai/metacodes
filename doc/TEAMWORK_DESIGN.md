@@ -281,7 +281,7 @@ seat 留下余量,否则 `BudgetExhausted`。
 评审是否成立由 runtime 按机制判定,不看 seat 自己怎么说。
 
 **内置、不可被遮蔽**:宪章 `reviewer.charter` 是编译期常量(原创文本),`charterSha256()` 供运行
-记录;工具为 `Read`、`Grep`、`Glob`、`Bash`(`reviewer.tools`)。teamwork seat 从不经过
+记录;工具为 `Read`、`Bash`(`reviewer.tools`)。teamwork seat 从不经过
 `AgentDef` 查找(同 [ISOLATED_VERIFIER_DESIGN.md](ISOLATED_VERIFIER_DESIGN.md) §2),所以项目里
 名为 `reviewer` 的 agent 只影响 `Agent` 工具,不影响 teamwork 评审;有单元测试固定这一点。
 
@@ -436,7 +436,7 @@ Windows 上 teamwork 不启动:`teamwork run`/`resume`/`mcp`、REPL `/teamwork` 
 `Run.start`/`Run.reopen` 在写入任何运行状态前返回 `UnsupportedPlatform`(Windows 没有 seat
 沙箱后端,也不计算批准、审计与合回所绑定的工作区树 id)。没有可用 bwrap(未安装、或内核/容器
 不允许所需命名空间)的 Linux,在模型请求前即拒绝 seat,不会因探测失败而把原生文件操作切换成无沙箱模式。Read/Write/Edit 等原生文件工具
-经 `metacodes-fs-helper` 在沙箱内打开文件;Grep/Glob 的搜索命令也经过相同边界。
+经 `metacodes-fs-helper` 在沙箱内打开文件。
 两个后端都允许写工作区(构建缓存),所以对非 implementer seat,Bash 挡不住对工作区
 的改动;reviewer 仍由工作区树 id 检查兜底。完整边界见 [沙箱执行](SANDBOX_DESIGN.md)。
 

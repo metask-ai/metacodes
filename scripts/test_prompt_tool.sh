@@ -32,13 +32,11 @@ echo "--- 工具长描述进 defs ---"
 check "Read  (cat -n format)"             "$FULL" "cat -n format"
 check "Write (must-read-first)"           "$FULL" "MUST use the Read tool first"
 check "Edit  (exact replacements)"        "$FULL" "exact string replacements"
-check "Grep  (ALWAYS use Grep)"           "$FULL" "ALWAYS use Grep"
-check "Glob  (pattern matching)"          "$FULL" "Fast file pattern matching"
+check "Bash workspace search" "$FULL" "rg --files"
 check "Bash  (Git 段,主对话应含)"        "$FULL" "Committing changes with git"
 
 echo "--- USING_TOOLS 段动态条目(全量应都在)---"
-check "Grep 子条"   "$FULL" "use Grep instead of grep"
-check "Glob 子条"   "$FULL" "use Glob instead of find"
+check "Bash search guidance" "$FULL" "Bash for workspace searches"
 check "任务管理条"  "$FULL" "TaskCreate tool"
 
 # --- 2) 动态裁剪说明 ---

@@ -206,22 +206,14 @@ receipt 或 bounded structured error。两种 executor 不能同时存在，也�
 所有入口共用同一个 MCP client;`mcp_runtime.Client` 的中断参数是 `?*const AbortSignal`,
 模块布局与保留差异见 [MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)。
 
-首方 byte-zero 工具为 `Glob`、`Grep`、`CodeMap`、`FindSymbol`、`Bash`、
+首方 byte-zero 工具为 `CodeMap`、`FindSymbol`、`Bash`、
 `ListMcpResourcesTool`、`ReadMcpResourceTool` 和 `WebFetch`。Bash 的 JobRegistry、
-MCP stdio、大型 WebFetch/curl、ripgrep 与代码索引输出都在子进程/生产者发出第一个字节前
+MCP stdio、大型 WebFetch/curl、Bash 输出都在子进程/生产者发出第一个字节前
 取得私有 capture；小而完整的最终投影仍可安全降为 inline。`Write`、`Edit`、
 `ApplyPatch`、`NotebookEdit` 明确归类为 `input_derived`：它们不复制一个未知外部输出流，
 不能与 byte-zero 迁移缺口混为一谈。
 
-`ToolEntry.runtime_dependency` 声明工具执行必需的进程外可执行依赖（当前仅
-`ripgrep`，`Glob`/`Grep` 声明之）。catalog 准入按声明探测可用性：解析不到 `rg`
-时 Runtime 创建返回 `error.ToolDependencyUnavailable`，而不是把工具广告给
-Provider 后在首次调用时报 `RipgrepNotFound`。嵌入宿主可用
-`util_toolchain.ripgrepPath()` 预探测（开发布局解析顺序：`RG_BIN` → `PATH` → 宿主可执行
-文件同目录 → 常见安装位；`util_toolchain.setLayout(.release)` 之后为 `RG_BIN` →
-宿主可执行文件同目录 → `PATH`,不再查询固定位置——metacodes 可执行文件按
-`-Drelease-layout` 在启动时设定,嵌入宿主自行决定,#79），据此决定是否在工具集中包含
-`Glob`/`Grep`。
+最小宿主配置提供 `Read`。启用 `Bash` 的宿主可以通过 shell 使用 `rg` 搜索工作区。
 
 Spool 在固定内存中增量计算 SHA-256、保存 1152-byte head 与 384-byte rolling tail，
 并以 no-replace 原语原子发布到 Session 级 CAS；POSIX hard-link 发布会在 receipt
@@ -377,8 +369,10 @@ team 成员由 Host 在 create/restore 时提供，不进 checkpoint。AgentCore
 
 ### 定时 prompt（cron，issue #445）
 
-`RuntimeConfig.enable_cron` 打开后，cron 工具（`CronCreate`/`CronDelete`/`CronList`）
+`RuntimeConfig.enable_cron` 打开后，cron 工具（`CronCreate`/`CronDelete`/`CronList`/`ScheduleWakeup`）
 进入目录（不能经显式 `builtin_tools` 列表进入）；选了其中任一工具的 `AgentSession`
+可用 `ScheduleWakeup` 安排一次 60–3600 秒后的回访。重复安排会替换上一次回访，
+`stop:true` 取消待执行的回访，独立的 cron 计划继续运行。Session
 自带一个 `CronRegistry`，随 Session 生灭、不落盘、不进 checkpoint。工具只负责登记：
 到期的 prompt 由 Host 在 Session 空闲时用 `takeDueCronPrompts(allocator, limit)` 取走
 （运行中 `error.SessionBusy`；至多 `limit` 条，超出的仍保持到期、原样留待下次），

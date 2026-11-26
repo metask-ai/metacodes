@@ -946,74 +946,7 @@ test "L2 sealed: sealed files are read on the gateway without a Step; public ass
     try std.testing.expect(std.mem.indexOf(u8, ledger, "SEALED_NOTE_MARKER") == null);
 }
 
-/// Glob results are `repository_structure` (§5): declared, so the Glob over
-/// the Skill directory may run on the client.
 const SEARCH_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\",\"Glob\",\"Grep\"]},\"egress\":{\"classes\":[\"file_contents\",\"repository_structure\"]}}";
-
-test "L2 sealed: Glob and Grep under sealed/ are answered on the gateway; a Glob over the Skill directory goes to the client" {
-    _ = cc.util_toolchain.ripgrepPath() catch return error.SkipZigTest;
-    const a = std.testing.allocator;
-    var lab: Lab = undefined;
-    // The brain names paths under the base directory it was told — the
-    // catalog's canonical spelling of the pin directory (brainVisibleRoot).
-    const brain_root = try brainVisibleRoot(a, "cc-zig-sealed-search");
-    defer a.free(brain_root);
-    const base = try std.fmt.allocPrint(a, "{s}/state/sealed-skills/erp-post", .{brain_root});
-    defer a.free(base);
-    const glob_sealed = try std.fmt.allocPrint(a, "{{\"pattern\":\"**/*.md\",\"path\":\"{s}/sealed\"}}", .{base});
-    defer a.free(glob_sealed);
-    const grep_sealed = try std.fmt.allocPrint(a, "{{\"pattern\":\"SEALED_NOTE_MARKER\",\"path\":\"{s}/sealed\",\"output_mode\":\"content\"}}", .{base});
-    defer a.free(grep_sealed);
-    const glob_public = try std.fmt.allocPrint(a, "{{\"pattern\":\"**/*.py\",\"path\":\"{s}\"}}", .{base});
-    defer a.free(glob_public);
-    const glob_sealed_sse = try toolCallSse(a, "Glob", glob_sealed);
-    defer a.free(glob_sealed_sse);
-    const grep_sealed_sse = try toolCallSse(a, "Grep", grep_sealed);
-    defer a.free(grep_sealed_sse);
-    const glob_public_sse = try toolCallSse(a, "Glob", glob_public);
-    defer a.free(glob_public_sse);
-    try lab.startWithFiles(a, "cc-zig-sealed-search", &.{ glob_sealed_sse, grep_sealed_sse, glob_public_sse, FINAL_SSE }, SEARCH_MANIFEST, .{}, &.{
-        .{ .path = "sealed/notes.md", .bytes = "SEALED_NOTE_MARKER: the rule nobody else reads\n" },
-        .{ .path = "sealed/sub/rules.md", .bytes = "SEALED_RULE_MARKER threshold\n" },
-        .{ .path = "scripts/post.py", .bytes = "print('PUBLIC_SCRIPT_MARKER')\n" },
-    });
-    defer lab.stop();
-    try lab.install("");
-    try lab.loadCatalog();
-
-    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
-    defer a.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "SEALED_") == null);
-
-    // Four model turns: the two sealed searches were answered inside the
-    // first Step; the Glob over the Skill directory went to the client as the
-    // only tool_calls Step and saw the public asset.
-    try std.testing.expectEqual(@as(usize, 4), lab.model.requestCount());
-    const after_glob = lab.model.requestAt(1) orelse return error.NoModelRequest;
-    try std.testing.expect(std.mem.indexOf(u8, after_glob.body(), "sealed/notes.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_glob.body(), "sealed/sub/rules.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_glob.body(), "numFiles\\\":2") != null);
-    const after_grep = lab.model.requestAt(2) orelse return error.NoModelRequest;
-    try std.testing.expect(std.mem.indexOf(u8, after_grep.body(), "notes.md:1:SEALED_NOTE_MARKER: the rule nobody else reads") != null);
-    try std.testing.expect(std.mem.indexOf(u8, after_grep.body(), "SEALED_RULE_MARKER") == null);
-    const after_public = lab.model.requestAt(3) orelse return error.NoModelRequest;
-    try std.testing.expect(std.mem.indexOf(u8, after_public.body(), "post.py") != null);
-    // The brain was shown the client's sealed directory, never the gateway's
-    // package directory, in either separator spelling.
-    const requests = try lab.allModelRequests(a);
-    defer a.free(requests);
-    try std.testing.expect(std.mem.indexOf(u8, requests, "packages/erp-post") == null);
-    try std.testing.expect(std.mem.indexOf(u8, requests, "packages\\\\erp-post") == null);
-    // One Step crossed the wire — the public Glob — then the final; nothing
-    // sealed in the ledger.
-    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
-    defer a.free(ledger);
-    try std.testing.expectEqual(@as(usize, 2), countOccurrences(ledger, "\"kind\":\"step\""));
-    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"name\":\"Glob\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"name\":\"Grep\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, ledger, "SEALED_") == null);
-}
 
 // ── Egress classes (§5, §6.1, §6.2) ─────────────────────────────────────────
 

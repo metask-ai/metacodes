@@ -11,7 +11,7 @@
 - test_e2e_codemap_explicit:点名 CodeMap → 验 schema 在真模型下可用(path 参数)。
 - test_e2e_codemap_spontaneous:**不点名**,只描述"给我这个文件的结构/定义都在哪"。
   这才是引导的真正考验——成功要求模型自发选 CodeMap 而非整文件 Read。
-  真模型漂移大:接受 CodeMap;若模型仍退回 Read/Grep 则 SkipTest(引导未命中,
+  真模型漂移大:接受 CodeMap;若模型仍退回 Read/Bash 则 SkipTest(引导未命中,
   非 regression——区别于"调了 CodeMap 但参数错"那种 AssertionError)。
 
 跳过:TTY_SKIP_MODEL=1。
@@ -83,7 +83,7 @@ def test_e2e_codemap_spontaneous(bin_path):
 
     这是本次改动的核心验证点。真模型漂移:
       - 命中 CodeMap → PASS(引导生效)。
-      - 仍退回 Read/Grep(全 attempt)→ SkipTest(引导未命中,非代码 regression)。
+      - 仍退回 Read/Bash(全 attempt)→ SkipTest(引导未命中,非代码 regression)。
     """
     require_model()
     cwd = _sample_cwd()
@@ -98,9 +98,25 @@ def test_e2e_codemap_spontaneous(bin_path):
         if tool_called(uses, "CodeMap", ["path"]):
             return  # 引导生效:模型自发选了 CodeMap
         time.sleep(0.5)
-    # 没命中:区分"退回 Read/Grep"(漂移→Skip)vs 完全没调工具(也 Skip,非 regression)
+    # 没命中:区分"退回 Read/Bash"(漂移→Skip)vs 完全没调工具(也 Skip,非 regression)
     _raw, _home, uses = last
     names = sorted({u["name"] for u in uses})
     raise SkipTest(
         "spontaneous CodeMap 未命中(真模型漂移,非 regression)。本轮调用的工具: %s" % names
     )
+
+
+def test_e2e_read_source_outline(bin_path):
+    require_model()
+    with tempfile.TemporaryDirectory() as cwd:
+        with open(os.path.join(cwd, "sample.zig"), "w", encoding="utf-8") as sample:
+            sample.write("pub fn sample() void {}\n")
+        assert_tool_e2e(
+            bin_path,
+            "Use Read with outline=true on sample.zig and report its symbols.",
+            "Read",
+            required_keys=["file_path", "outline"],
+            cwd=cwd,
+            require_card=False,
+            wait_s=14,
+        )

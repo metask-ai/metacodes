@@ -89,7 +89,7 @@ verifier's `SpawnOptions` add the following:
 | `system_prompt` | `VERIFIER_CHARTER`, a comptime constant; its SHA-256 goes in the record | Same charter on every run; charter drift shows up in the record |
 | `prompt` | The verifier packet (§2.2) | The only user message |
 | `kg` | `null` | `spawnAgentSink` would otherwise clone the parent's `KgClient` (`cloneForThread`). `KgRecall` and `KgContext` are not permanently disabled for subagents (`agents/filter.zig`), so they would reach outcome rows and lessons |
-| `tool_defs_override` | `Bash`, `Read`, `Grep`, `Glob` | No file-writing tools, no `Agent`, no web or MCP tools, no Skills. `KgRemember` is permanently disabled for subagents anyway |
+| `tool_defs_override` | `Bash`, `Read` | No file-writing tools, no `Agent`, no web or MCP tools, no Skills. `KgRemember` is permanently disabled for subagents anyway |
 | `dyn_registry`, `mcp_sessions`, `host_services` | `null` | Skills and MCP servers can carry project memory and side channels |
 | `read_state`, `file_change_journal`, `tool_result_metrics` | `null` (fresh) | Probe activity never enters the actor's read-before-write state or file-change evidence |
 | `jobs`, `agent_jobs` | `null` | No background job outlives the verdict |
@@ -477,8 +477,7 @@ still has a continuation in its budget, the host runs **one leads round**:
    asks for **evidence leads**: commands to run, files to read, test names,
    inputs that exercise each item. It says that changing files is not
    possible in this round.
-2. The actor gets at most `LEADS_MAX_TURNS = 3` model turns. Only `Read`,
-   `Grep` and `Glob` run. Every other call is refused with a tool error, the
+2. The actor gets at most `LEADS_MAX_TURNS = 3` model turns. Only `Read` runs. Every other call is refused with a tool error, the
    same mechanism as `learning_turn.allowedDuringPass`. The candidate is
    therefore the tree the verifier judged, and the host checks this: T′ must
    equal T after the round, or the result is `unavailable`

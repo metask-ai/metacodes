@@ -427,7 +427,7 @@ def _fixture(root: Path) -> dict:
             {
                 "role": "runtime_asset", "name": "ripgrep", "path": "bin/rg", "sha256": digests["bin/rg"], "version": "15.2.0",
                 "revision": "e89fff89ac", "upstream": "https://github.com/BurntSushi/ripgrep", "license": "MIT OR Unlicense",
-                "license_path": "share/licenses/ripgrep-LICENSE-MIT", "purpose": "Glob/Grep execution dependency",
+                "license_path": "share/licenses/ripgrep-LICENSE-MIT", "purpose": "bundled workspace search executable",
             },
             dict(tinykg_common, role="runtime_asset", name="tinykg", path="vendor/tinykg/tinykg", sha256=digests["vendor/tinykg/tinykg"],
                  provenance_path="vendor/tinykg/tinykg.provenance.json", compat={"storage_format_version": "3", "store_schema_version": "3"},
@@ -450,7 +450,7 @@ def _fixture(root: Path) -> dict:
         ],
         "compatibility": {
             "requires": [{"component": "tinykg", "cli_version": "0.2.x", "storage_format_version": "3", "store_schema_version": "3"}],
-            "fails_without": [{"component": "ripgrep", "effect": "Grep / Glob unavailable"}],
+            "fails_without": [{"component": "ripgrep", "effect": "bundled rg unavailable"}],
             "degraded_without": [
                 {"component": "tinykg", "effect": "KG memory/task degrade; agent loop unaffected"},
                 {"component": "tinykgd", "effect": "no shared KG service; sessions use the exclusive TinyKG CLI store"},

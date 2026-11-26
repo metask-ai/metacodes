@@ -7,7 +7,7 @@ time. The repository owns manually reviewed upstream release binaries under
 This script selects the artifact for an explicit target, re-verifies its hash
 and binary format, and copies it into a destination directory under the
 canonical runtime name (`rg` / `rg.exe`) — used by `zig build agentcore:bundle`
-to ship the Glob/Grep execution dependency inside the AgentCore bundle.
+to ship the bundled workspace search executable inside the AgentCore bundle.
 """
 
 from __future__ import annotations

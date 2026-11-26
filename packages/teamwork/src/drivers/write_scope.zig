@@ -37,13 +37,13 @@ const reviewer = @import("../reviewer.zig");
 const PathBuf = [std.fs.max_path_bytes]u8;
 
 /// The implementer's tools.
-pub const implementer_tools = [_][]const u8{ "Read", "Grep", "Glob", "Write", "Edit", "Bash" };
+pub const implementer_tools = [_][]const u8{ "Read", "Write", "Edit", "Bash" };
 /// The reviewer's: `reviewer.tools` (read-only plus Bash for tests) and
 /// Write, confined to the seat directory, for `handoff.md` and `review.json`.
 pub const reviewer_tools = reviewer.tools ++ [_][]const u8{"Write"};
 /// Every other role's: read, run read-only or sandboxed commands, and write
 /// its own seat files.
-pub const planner_tools = [_][]const u8{ "Read", "Grep", "Glob", "Bash", "Write" };
+pub const planner_tools = [_][]const u8{ "Read", "Bash", "Write" };
 
 /// The tools a metacodes seat of `role` is offered. Anything else (Agent,
 /// MCP, Skills, web, KG writes, ApplyPatch, NotebookEdit) is neither
@@ -187,7 +187,7 @@ pub const Scope = struct {
         if (!contains(self.tools, name)) return false;
         if (file_target.Tool.fromName(name)) |tool| return self.allowsFileWrite(tool, arguments_json);
         if (std.mem.eql(u8, name, "Bash")) return self.allowsBash(arguments_json);
-        return true; // Read, Grep, Glob
+        return true;
     }
 
     /// The physical path a Write/Edit call targets, as the tool resolves it,
@@ -443,4 +443,12 @@ test "write scope: the reviewer's tools are reviewer.tools plus Write" {
     try testing.expect(contains(toolsFor(.reviewer), "Write"));
     try testing.expect(!contains(toolsFor(.reviewer), "Edit"));
     try testing.expect(contains(toolsFor(.implementer), "Edit"));
+}
+
+test "teamwork roles exclude standalone workspace navigation and search tools" {
+    for (std.enums.values(types.Role)) |role| {
+        for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
+            try testing.expect(!contains(toolsFor(role), name));
+        }
+    }
 }
