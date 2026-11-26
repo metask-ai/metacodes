@@ -89,8 +89,12 @@ def pins():
     event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
     base = git('rev-parse', 'HEAD^1')
     pr = event['pull_request']
-    require(base == pr['base']['sha'] and git('rev-parse', 'HEAD^2') == pr['head']['sha'],
-            'tested merge parents differ from the event')
+    head = git('rev-parse', 'HEAD^2')
+    event_base = pr['base']['sha']
+    event_head = pr['head']['sha']
+    require(base == event_base and head == event_head,
+            f'tested merge parents differ from the event: merge={merge} '
+            f'event_base={event_base} parent1={base} event_head={event_head} parent2={head}')
     return dict(base=base, tree=git('rev-parse', 'HEAD^1^{tree}'), merge=merge, head_tree=git('rev-parse', 'HEAD^{tree}'))
 
 
