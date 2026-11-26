@@ -59,11 +59,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--ruleset", type=int, default=23764453)
-    parser.add_argument("--apply", action="store_true", help="write the reviewed migration; requires repository rule administration")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="write the reviewed migration; requires repository rule administration")
+    mode.add_argument("--check", action="store_true", help="verify the effective direct-merge rules on main")
     args = parser.parse_args(argv)
     try:
         if not REPO.fullmatch(args.repo) or args.ruleset < 1:
             raise PolicyError("a repository and a positive ruleset ID are required")
+        if args.check:
+            require_direct_merge(github_api(f"repos/{args.repo}/rules/branches/main"))
+            return 0
         path = f"repos/{args.repo}/rulesets/{args.ruleset}"
         current = github_api(path)
         desired = migrate(current)

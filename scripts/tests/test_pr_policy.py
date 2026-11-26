@@ -23,6 +23,14 @@ def ruleset():
 
 
 class PolicyTest(unittest.TestCase):
+    def test_check_reads_effective_rules_without_migrating_them(self):
+        for strict in (False, True):
+            rules = migrate(ruleset())["rules"]
+            rules[2]["parameters"]["strict_required_status_checks_policy"] = strict
+            with self.subTest(strict=strict), patch("pr_policy.github_api", return_value=rules) as api, patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(main(["--check"]), 0 if strict else 1)
+                api.assert_called_once_with("repos/metask-ai/metacodes/rules/branches/main")
+
     def test_hidden_bypass_actors_prevent_any_policy_write(self):
         limited = ruleset()
         del limited["bypass_actors"]

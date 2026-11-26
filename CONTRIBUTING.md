@@ -83,6 +83,8 @@ reviewer (human or agent) applies. The ideas behind it:
 ## Pull requests
 
 - Open the PR against `metask-ai/metacodes` and request independent review.
+- Follow the [direct merge commands](doc/CI_DESIGN.md#3-pr-only-validation-and-merge-policy)
+  when merging a reviewed PR into main.
 - Keep each pull request to one outcome and describe it from the user's side.
 - Run `zig build gate:pr` and paste the tail of its `Build Summary` into the
   pull request template. Judge a build by its exit code, not by the word

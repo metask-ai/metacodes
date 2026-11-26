@@ -195,7 +195,9 @@ Submit PRs to **metask-ai/metacodes**, including when `origin` is a fork.
 Keep the branch current with main and request independent review after each
 push. Resolve blocking findings and repeat review and CI after repairs.
 Merge only the reviewed head once all required checks and upstream reviews
-pass, with strict branch protection and no admin bypass.
+pass. Use the [direct merge commands](doc/CI_DESIGN.md#3-pr-only-validation-and-merge-policy)
+to verify effective upstream rules and bind the merge to the reviewed commit.
+Pause on a failed preflight.
 
 ## Definition of done
 

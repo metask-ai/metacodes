@@ -213,6 +213,21 @@ must require branches to be up to date and must not require a merge queue.
 If main advances, merge main into the PR branch and repeat review and CI.
 A busy main can therefore still require several updates.
 
+Immediately before a direct merge into upstream `main`, set `PR_NUMBER` to
+the approved PR and `REVIEWED_SHA` to the full commit ID recorded in its
+independent review. Confirm the required checks passed for that same commit.
+Run these commands together:
+
+```sh
+python3 .github/pr-policy.py --check &&
+  gh pr merge "${PR_NUMBER:?}" --repo metask-ai/metacodes --squash --match-head-commit "${REVIEWED_SHA:?}"
+```
+
+The read-only preflight checks the rules currently enforced on `main`.
+If it fails, pause delivery and ask a repository administrator to verify the
+rules. The merge request binds the reviewed commit so a concurrent push
+requires another review and CI run.
+
 ### Policy migration
 
 After deploying the workflow, a repository rules administrator
