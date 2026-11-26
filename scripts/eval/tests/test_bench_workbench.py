@@ -1545,11 +1545,6 @@ class LayeringTest(unittest.TestCase):
                 with self.subTest(module=f'{package}/{path.name}'):
                     self.assertIn(f'@embedFile("eval/harbor/{package}/{path.name}")', assets)
 
-
-if __name__ == '__main__':
-    unittest.main()
-
-
 class StopServiceConnectionTest(unittest.TestCase):
     def test_shutdown_accepts_a_truncated_response(self):
         from unittest.mock import Mock
@@ -1562,3 +1557,8 @@ class StopServiceConnectionTest(unittest.TestCase):
             unittest.mock.call("api/stop", {}),
             unittest.mock.call("api/workbench"),
         ])
+
+if __name__ == '__main__':
+    unittest.main()
+
+
