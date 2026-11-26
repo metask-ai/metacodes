@@ -1,5 +1,8 @@
+import os
 import re
 import shlex
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -82,6 +85,23 @@ SCRIPT_SUITES_RUN_ELSEWHERE = {
 
 
 class GateManifestTest(unittest.TestCase):
+    def test_eval_preflight_reports_the_python_that_needs_repair(self):
+        script = str(ROOT / "scripts/check_eval_python.py")
+        good = subprocess.run([sys.executable, script], capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        isolated = [sys.executable, "-I", "-S"]
+        missing = subprocess.run([*isolated, script], capture_output=True, text=True)
+        self.assertNotEqual(missing.returncode, 0)
+        executable = subprocess.check_output(
+            [*isolated, "-c", "import sys; print(sys.executable)"], text=True,
+        ).rstrip("\r\n")
+        args = [executable, "-m", "pip", "install", "-r", "requirements-dev.txt"]
+        repair = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+        self.assertIn(repair, missing.stderr)
+        self.assertIn("-m venv .venv", missing.stderr)
+        activate = r"call .venv\Scripts\activate.bat" if os.name == "nt" else ". .venv/bin/activate"
+        self.assertIn(f"{activate}\npython -m pip install -r requirements-dev.txt\nzig build gate:pr", missing.stderr)
+
     def test_every_script_suite_runs_on_every_pull_request(self):
         """A suite nothing runs passes forever. Every scripts/tests module is
         named by a ci.yml step or a build.zig command (the `test` graph runs on
@@ -183,7 +203,7 @@ class GateManifestTest(unittest.TestCase):
         self.assertIn("  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled]\n", workflow)
         self.assertIn('run.setEnvironmentVariable("METACODES_TEST_ROOT",', build)
         self.assertIn("METACODES_TEST_ROOT: src/platform", workflow)
-        self.assertIn("needs: [gates-linux, test-ids, scope]", workflow)
+        self.assertIn("needs: [gates-linux, test-ids]", workflow)
 
     def test_the_checklist_runs_what_ci_selects(self):
         """The checklist's suite is `test:affected`: scripts/ci_scope.py's
