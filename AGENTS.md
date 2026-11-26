@@ -119,10 +119,11 @@ These rules apply to the entire repository.
   `core/tool_exec` and `core/protocol/` are the loop with every peripheral
   attached, pi's `AgentSession`, and belong to `coding`, except the three
   protocol files `PermissionContext` is typed with (`ui_event`, `ui_request`,
-  `permission_choice`), which belong to `guard`. Nothing calls the minimal
-  loop yet; `agent_loop` moves onto it capability by capability from
-  migration step 3.2b, and until then `agent_loop.Options` keeps its public
-  shape.
+  `permission_choice`), which belong to `guard`. `agent_loop` and `tool_exec`
+  run on `kernel` for provider history projection (`appendHistoryMessage`),
+  turn driving (`drive`), assistant message draft assembly (`AssistantDraft`),
+  and tool batch dispatch/worker execution (`executor.dispatchBatches`,
+  `executor.runWindow`), while `agent_loop.Options` keeps its public shape.
 - `cli` reaches the lower packages only through the `metacodes-internal`
   module, rooted at `src/internal.zig` (in `facade`, and not part of
   `metacodes-core`). Every module rooted at a `cli` file imports it, and `cli`

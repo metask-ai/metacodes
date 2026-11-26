@@ -422,28 +422,40 @@ pub const AssistantDraft = struct {
             for (draft.reasoning.items) |json| draft.gpa.free(json);
             draft.reasoning.clearRetainingCapacity();
         }
-        while (draft.reasoning.items.len > 0) {
-            const json = draft.reasoning.orderedRemove(0);
-            errdefer draft.gpa.free(json);
-            const owned_model = try draft.gpa.dupe(u8, model);
-            errdefer draft.gpa.free(owned_model);
-            try draft.blocks.append(draft.gpa, .{ .reasoning_item = .{ .model = owned_model, .json = json } });
+        const extra = draft.reasoning.items.len +
+            @as(usize, @intFromBool(draft.thinking.items.len > 0)) +
+            @as(usize, @intFromBool(draft.text.items.len > 0)) +
+            draft.tool_uses.items.len;
+        try draft.blocks.ensureUnusedCapacity(draft.gpa, extra);
+        if (draft.reasoning.items.len > 0) {
+            const models = try draft.gpa.alloc([]u8, draft.reasoning.items.len);
+            var duped: usize = 0;
+            errdefer {
+                for (models[0..duped]) |owned_model| draft.gpa.free(owned_model);
+                draft.gpa.free(models);
+            }
+            for (models) |*slot| {
+                slot.* = try draft.gpa.dupe(u8, model);
+                duped += 1;
+            }
+            defer draft.gpa.free(models);
+            for (draft.reasoning.items, models) |json, owned_model| {
+                draft.blocks.appendAssumeCapacity(.{ .reasoning_item = .{ .model = owned_model, .json = json } });
+            }
+            draft.reasoning.clearRetainingCapacity();
         }
         if (draft.thinking.items.len > 0) {
             const owned = try draft.gpa.dupe(u8, draft.thinking.items);
-            errdefer draft.gpa.free(owned);
-            try draft.blocks.append(draft.gpa, .{ .thinking = owned });
+            draft.blocks.appendAssumeCapacity(.{ .thinking = owned });
         }
         if (draft.text.items.len > 0) {
             const owned = try draft.gpa.dupe(u8, draft.text.items);
-            errdefer draft.gpa.free(owned);
-            try draft.blocks.append(draft.gpa, .{ .text = owned });
+            draft.blocks.appendAssumeCapacity(.{ .text = owned });
         }
-        while (draft.tool_uses.items.len > 0) {
-            const tool_use = draft.tool_uses.orderedRemove(0);
-            errdefer freeToolUse(draft.gpa, tool_use);
-            try draft.blocks.append(draft.gpa, .{ .tool_use = tool_use });
+        for (draft.tool_uses.items) |tool_use| {
+            draft.blocks.appendAssumeCapacity(.{ .tool_use = tool_use });
         }
+        draft.tool_uses.clearRetainingCapacity();
         if (draft.blocks.items.len == 0) return null;
         return try draft.blocks.toOwnedSlice(draft.gpa);
     }
