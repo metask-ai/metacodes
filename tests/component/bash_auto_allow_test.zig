@@ -447,6 +447,11 @@ test "L2 a sandbox profile that cannot be written fails the call instead of runn
     _ = pfs.mkdir(dir.ptr, 0o755);
     defer cc.util_fs.testing.rmrfBestEffort(dir);
 
+    var log_file = try harness.LogFile.create("seatbelt-profile");
+    defer log_file.deinit();
+    const previous_log = cc.util_log.setLogFileFdForTest(log_file.fd);
+    defer cc.util_log.restoreForTest(previous_log);
+
     // The profile goes to TMPDIR: point it at a directory that does not exist
     // for this one call, and restore it before anything else runs.
     const saved: ?[:0]u8 = if (std.c.getenv("TMPDIR")) |value| try a.dupeZ(u8, std.mem.span(value)) else null;
@@ -464,4 +469,6 @@ test "L2 a sandbox profile that cannot be written fails the call instead of runn
     try std.testing.expectError(error.SandboxUnavailable, cc.tools.dispatch(&ctx, "Bash", args));
     var ran_buf: [640]u8 = undefined;
     try std.testing.expect(!pfs.exists((try pathZ(&ran_buf, dir, "ran")).ptr));
+    var log_buf: [8192]u8 = undefined;
+    try std.testing.expect(contains(try log_file.readAll(&log_buf), "open Seatbelt temporary profile failed errno=NOENT(2)"));
 }
