@@ -3991,12 +3991,14 @@ pub const App = struct {
         const previous_model = app.activeModel();
         const previous_window = app.api_client.resolveMaxInputTokens();
         const current_window = app.api_client.resolveMaxInputTokensFor(model_id);
-        const needs_previous_model_compact = shouldQueueModelSwitchCompact(previous_model, model_id, previous_window, current_window);
+        const sized_for_model = app.pending_previous_model_for_compact orelse previous_model;
+        const sized_for_window = app.pending_previous_model_context_window orelse previous_window;
+        const needs_previous_model_compact = shouldQueueModelSwitchCompact(sized_for_model, model_id, sized_for_window, current_window);
 
         const model = try app.allocator.dupe(u8, model_id);
         errdefer app.allocator.free(model);
         const previous_model_copy = if (needs_previous_model_compact)
-            try app.allocator.dupe(u8, previous_model)
+            try app.allocator.dupe(u8, sized_for_model)
         else
             null;
         errdefer if (previous_model_copy) |m| app.allocator.free(m);
@@ -4027,7 +4029,7 @@ pub const App = struct {
 
         if (app.pending_previous_model_for_compact) |old| app.allocator.free(old);
         app.pending_previous_model_for_compact = previous_model_copy;
-        app.pending_previous_model_context_window = if (needs_previous_model_compact) previous_window else null;
+        app.pending_previous_model_context_window = if (needs_previous_model_compact) sized_for_window else null;
         app.pending_current_model_context_window = if (needs_previous_model_compact) current_window else null;
 
         // U4:model 单写侧 emit(syncModelMirrors 后,activeModel() 已是新值)。

@@ -49,6 +49,7 @@ comptime {
     _ = @import("component/mcp_add_remove_test.zig");
     _ = @import("component/cli_command_prompt_test.zig");
     _ = @import("component/prompt_model_identity_test.zig");
+    _ = @import("component/model_switch_compact_test.zig");
     _ = @import("component/max_tokens_exhaustion_test.zig");
     _ = @import("component/symbol_capability_test.zig");
     _ = @import("component/kg_integration_test.zig");

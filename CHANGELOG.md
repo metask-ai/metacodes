@@ -450,6 +450,16 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **Picking the current model again no longer drops the compaction a
+  switch queued.** A switch to a model with a smaller context window queues a
+  compaction for the next turn. Choosing the same model again in `/model`
+  before that turn, or a `/login` that binds the session's route again,
+  cleared it, and the next request carried a conversation sized for the
+  larger window; a further switch to a model between the two windows cleared
+  it too. Every switch before the next turn is now measured against the
+  model the conversation was last sized for: switching back to it clears the
+  compaction, and any narrower one keeps it.
+
 - **`providers` shows and forgets what a removed provider left behind, and
   fails when it cannot remove it.** `providers list` also lists an id that
   has only a stored key (`keys/<id>.json`) or login (`oauth/<id>.json`)
