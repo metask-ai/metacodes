@@ -56,6 +56,13 @@ def test_enter_after_a_paste_without_markers_sends_it_as_one_message(bin_path):
         a._fail(f"expected one message holding both lines once each: {texts}")
 
 
+def test_a_line_written_together_with_its_enter_is_sent(bin_path):
+    a, requests = _run(bin_path, [_raw(b"ONE_LINE_AND_ENTER\r"), wait_for(REPLY), "strictsleep:0.5"])
+    texts = [_last_user_text(body) for body in requests]
+    if len(texts) != 1 or texts[0].strip() != "ONE_LINE_AND_ENTER":
+        a._fail(f"a line written with its Enter, as tmux send-keys writes it, was not sent: {texts}")
+
+
 def test_enter_150ms_after_an_ime_commit_still_submits(bin_path):
     a, requests = _run(bin_path, [_raw("你好世界".encode("utf-8")), "strictsleep:0.15", _raw(b"\r"),
                                   wait_for(REPLY), "strictsleep:0.5"])

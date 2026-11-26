@@ -411,16 +411,18 @@ status, compatibility boundaries, and entry points are defined by
   pastes.** Without bracketed paste markers (a terminal that does not support
   them, the classic Windows console, a multiplexer that drops them) a paste
   reaches the TUI as ordinary keys, and its first line break submitted the
-  first line. A line break now counts as part of a paste when it arrives in
-  the same burst as the text around it: at least four bytes before it came
-  within 10 ms of each other and of it, or more input follows within 10 ms.
-  Such line breaks go into the prompt as newlines (a CR LF pair as one), so
-  the paste waits for Enter. Only the prompt's own text takes this: the
-  permission and question dialogs, the model picker and the menus over the
-  prompt still read keys written together one by one, Enter included. A
-  typed Enter, an Enter after an input method commits several characters at
-  once, and a paste that carries markers work as before; a paste as short as
-  `abc` plus its line break still submits.
+  first line. A line break now counts as part of a paste when more input
+  follows it within 10 ms, or when an earlier line break of the same burst
+  (bytes within 10 ms of each other) already did. Such line breaks go into
+  the prompt as newlines (a CR LF pair as one), so a multi-line paste waits
+  for Enter, with or without a line break at its end. One line written
+  together with its Enter, as a script or `tmux send-keys` writes it, is
+  still sent, and so is a one-line paste that ends in a line break. Only the
+  prompt's own text takes this: the permission and question dialogs, the
+  model picker and the menus over the prompt still read keys written
+  together one by one, Enter included. A typed Enter, an Enter after an
+  input method commits several characters at once, and a paste that carries
+  markers work as before.
 
 - **Ctrl+_, Shift+Backspace, Shift+Space, Alt+Enter and Ctrl+H, I, J, M
   and [ work in terminals that report modified keys.** Under the kitty
