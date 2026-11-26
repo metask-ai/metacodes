@@ -2578,14 +2578,31 @@ test "shouldEnableKittyKeyboard: 要探测的终端只在答了 Kitty flags 时�
     }
 }
 
+fn savedEnv(name: [*:0]const u8) !?[:0]u8 {
+    return if (std.c.getenv(name)) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+}
+
+fn restoreEnv(name: [*:0]const u8, saved: ?[:0]u8) void {
+    if (saved) |value| {
+        ppaths.setEnv(name, value.ptr);
+        testing.allocator.free(value);
+    } else ppaths.unsetEnv(name);
+}
+
 test "keyboardPolicy: METACODES_NO_KEYBOARD_ENHANCEMENT keeps the protocol off for every terminal, and keyboardSummary says why" {
     const previous_answer = g_kitty_answered.load(.acquire);
     defer recordKeyboardProbe(previous_answer);
-    const previous = if (std.c.getenv(no_keyboard_enhancement_env)) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
-    defer if (previous) |value| {
-        ppaths.setEnv(no_keyboard_enhancement_env, value.ptr);
-        testing.allocator.free(value);
-    } else ppaths.unsetEnv(no_keyboard_enhancement_env);
+    const saved_term = try savedEnv("TERM");
+    defer restoreEnv("TERM", saved_term);
+    const saved_opt_out = try savedEnv(no_keyboard_enhancement_env);
+    defer restoreEnv(no_keyboard_enhancement_env, saved_opt_out);
+    ppaths.setEnv("TERM", "xterm-kitty");
+
+    ppaths.unsetEnv(no_keyboard_enhancement_env);
+    try testing.expect(!keyboardEnhancementOptedOut());
+    try testing.expectEqual(KeyboardPolicy.enable, keyboardPolicy());
+    try testing.expect(shouldEnableKittyKeyboard());
+    try testing.expectEqualStrings("on (Kitty protocol, modifyOtherKeys) · METACODES_NO_KEYBOARD_ENHANCEMENT=1 turns it off", keyboardSummary());
 
     ppaths.setEnv(no_keyboard_enhancement_env, "1");
     for ([_]bool{ true, false }) |answered| {
@@ -2596,12 +2613,6 @@ test "keyboardPolicy: METACODES_NO_KEYBOARD_ENHANCEMENT keeps the protocol off f
         try testing.expectEqualStrings("off · METACODES_NO_KEYBOARD_ENHANCEMENT is set", keyboardSummary());
         try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
     }
-
-    ppaths.unsetEnv(no_keyboard_enhancement_env);
-    recordKeyboardProbe(true);
-    try testing.expect(!keyboardEnhancementOptedOut());
-    const expected = if (shouldEnableKittyKeyboard()) "on (Kitty protocol, modifyOtherKeys) · METACODES_NO_KEYBOARD_ENHANCEMENT=1 turns it off" else "off";
-    try testing.expectEqualStrings(expected, keyboardSummary());
 }
 
 test "KeyParser: 迟到的终端应答整条吃掉,不漏成字符" {
