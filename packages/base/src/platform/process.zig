@@ -484,8 +484,6 @@ pub const PipeChild = struct {
         }
     }
 
-    /// 终止子进程并回收。POSIX：SIGTERM→200ms→WNOHANG 查→顽固则 SIGKILL→阻塞收尸（防 ignore-TERM
-    /// 的 server 令 waitpid 永挂）；Windows：TerminateProcess+WaitForSingleObject+CloseHandle。
     pub fn terminate(self: *const PipeChild) void {
         if (is_windows) {
             _ = TerminateProcess(self.proc, 1);
@@ -496,12 +494,8 @@ pub const PipeChild = struct {
             const req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
             var rem: std.c.timespec = undefined;
             _ = std.c.nanosleep(&req, &rem);
-            var status: c_int = 0;
-            const WNOHANG: c_int = 1;
-            if (std.c.waitpid(self.proc, &status, WNOHANG) == 0) {
-                _ = std.c.kill(-self.proc, std.c.SIG.KILL);
-                _ = waitpidRetry(self.proc);
-            }
+            _ = std.c.kill(-self.proc, std.c.SIG.KILL);
+            _ = waitpidRetry(self.proc);
         }
     }
 };
@@ -2525,6 +2519,34 @@ test "spawnPipes 双向 echo（写 stdin 读回 stdout）" {
     child.closeStdout();
     child.terminate();
     try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "ping-pong-99") != null);
+}
+
+test "PipeChild.terminate kills TERM-ignoring descendants after the leader exits" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    var child = try spawnPipes(&.{ "/bin/sh", "-c", "sh -c 'trap \"\" TERM; printf ready; sleep 10' & read line; exit 0", null }, true, null);
+    defer child.closeStdout();
+    var terminated = false;
+    defer if (!terminated) child.terminate();
+    defer child.closeStdin();
+    try std.testing.expect(child.pollReadable(2000));
+    var ready: [5]u8 = undefined;
+    var total: usize = 0;
+    while (total < ready.len) {
+        try std.testing.expect(child.pollReadable(2000));
+        const n = child.read(ready[total..]);
+        try std.testing.expect(n > 0);
+        total += @intCast(n);
+    }
+    try std.testing.expectEqualStrings("ready", &ready);
+    try std.testing.expectEqual(@as(isize, 5), child.write("exit\n"));
+    child.terminate();
+    terminated = true;
+    try std.testing.expect(child.pollReadable(2000));
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), child.read(&buf));
+    var status: c_int = 0;
+    try std.testing.expectEqual(@as(std.c.pid_t, -1), std.c.waitpid(child.proc, &status, 1));
+    try std.testing.expect(std.c.errno(-1) == .CHILD);
 }
 
 test "openPipeCloexec marks both ends close-on-exec" {
