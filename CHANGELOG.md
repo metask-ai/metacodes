@@ -450,6 +450,16 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **A long paste no longer sends another session's text** (#764). A paste
+  of more than 3 lines or 1600 bytes is stored as `pastes/<N>.txt` in the
+  state directory, and the box holds `[Pasted text #N +M lines]` until the
+  line is sent. Every process counted `N` from 1 and overwrote the file of
+  that name, so two sessions sharing a state directory sent each other's
+  pastes, and a placeholder recalled with ↑ from an earlier session sent this
+  session's paste of the same number. A paste now takes the number after the
+  highest one stored and creates its file exclusively; a number another
+  process takes first moves it on to the next. Placeholders look as before,
+  and the files an earlier version stored still expand.
 
 - **`bench pull` also pulls verifier and sidecar images.** It took only the
   first `docker_image` of a task's `task.toml`, which in the FrontierHarness

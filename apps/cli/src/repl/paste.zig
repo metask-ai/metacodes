@@ -6,11 +6,11 @@
 //!   - 大粘贴 → 写到 <state_root>/pastes/<n>.txt，buffer 里只放占位符
 //!     `[Pasted text #N +M lines]`，避免大段文字吃满 prompt + 终端刷屏。
 //!
-//! 占位符里的 #N 是本 session 内递增的粘贴编号；+M 是行数。
 //! 占位符 → 真实内容的还原由调用方在提交时做（expandPlaceholders）。
 
 const std = @import("std");
 const pfs = @import("metacodes-internal").platform.fs;
+const pdir = @import("metacodes-internal").platform.dir;
 const LineEditor = @import("input.zig").LineEditor;
 
 /// 触发外部存储的阈值：行数 > 此值 或 字节数 > 此值。
@@ -34,8 +34,8 @@ fn countLines(text: []const u8) usize {
 }
 
 /// 把一段粘贴写到 <state_root>/pastes/<id>.txt。返回占位符（owned）。
-/// id 由调用方维护（session 内递增）。失败时返回 null → 调用方退回内联。
-pub fn store(allocator: std.mem.Allocator, state_root: []const u8, id: usize, text: []const u8) !?[]u8 {
+/// 失败时返回 null → 调用方退回内联。
+pub fn store(allocator: std.mem.Allocator, state_root: []const u8, text: []const u8) !?[]u8 {
     const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}/pastes", .{state_root}, 0);
     defer allocator.free(dir_z);
     // mkdir:先建状态根(单层),再建 pastes
@@ -44,21 +44,62 @@ pub fn store(allocator: std.mem.Allocator, state_root: []const u8, id: usize, te
     _ = pfs.mkdir(parent_z.ptr, 0o700);
     _ = pfs.mkdir(dir_z.ptr, 0o700);
 
-    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/pastes/{d}.txt", .{ state_root, id }, 0);
-    defer allocator.free(path_z);
-
-    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return null;
-    defer _ = pfs.close(fd);
+    const file = (try claim(allocator, dir_z, highestId(dir_z) +| 1)) orelse return null;
+    defer allocator.free(file.path);
     var pos: usize = 0;
     while (pos < text.len) {
-        const n = pfs.write(fd, text[pos..][0 .. text.len - pos]); // no EINTR: regular file
-        if (n <= 0) return null;
+        const n = pfs.write(file.fd, text[pos..]); // no EINTR: regular file
+        if (n <= 0) {
+            pfs.close(file.fd);
+            pfs.unlinkPath(file.path.ptr) catch {};
+            return null;
+        }
         pos += @intCast(n);
     }
+    pfs.close(file.fd);
 
     // 占位符计数对齐真 cc:+M 的 M = 总行数 − 1(4 行→+3,20 行→+19)。
-    return try std.fmt.allocPrint(allocator, "[Pasted text #{d} +{d} lines]", .{ id, countLines(text) -| 1 });
+    return try std.fmt.allocPrint(allocator, "[Pasted text #{d} +{d} lines]", .{ file.id, countLines(text) -| 1 });
+}
+
+const ClaimedFile = struct {
+    id: usize,
+    fd: c_int,
+    path: [:0]u8,
+};
+
+const max_claim_attempts = 64;
+
+fn claim(allocator: std.mem.Allocator, dir_z: [:0]const u8, first_id: usize) !?ClaimedFile {
+    var id = first_id;
+    for (0..max_claim_attempts) |_| {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{d}.txt", .{ dir_z, id }, 0);
+        const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+        if (fd >= 0) return .{ .id = id, .fd = fd, .path = path };
+        const taken = pfs.lastErrnoIs(.EXIST);
+        allocator.free(path);
+        if (!taken) return null;
+        id +|= 1;
+    }
+    return null;
+}
+
+fn highestId(dir_z: [:0]const u8) usize {
+    var it = pdir.open(dir_z.ptr) orelse return 0;
+    defer pdir.close(&it);
+    var highest: usize = 0;
+    while (pdir.next(&it)) |entry| {
+        if (fileId(entry.name)) |id| highest = @max(highest, id);
+    }
+    return highest;
+}
+
+fn fileId(name: []const u8) ?usize {
+    if (!std.mem.endsWith(u8, name, ".txt")) return null;
+    const digits = name[0 .. name.len - ".txt".len];
+    if (digits.len == 0) return null;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return null;
+    return std.fmt.parseUnsigned(usize, digits, 10) catch null;
 }
 
 /// 读回某个粘贴文件的内容（提交时 expand 用）。
@@ -132,8 +173,7 @@ pub fn insert(
 
     if (isLarge(text)) {
         if (state_root.len > 0) {
-            g_paste_id += 1;
-            if (store(allocator, state_root, g_paste_id, text) catch null) |placeholder| {
+            if (store(allocator, state_root, text) catch null) |placeholder| {
                 defer allocator.free(placeholder);
                 try insertAtCursor(editor, allocator, placeholder);
                 return;
@@ -156,9 +196,6 @@ fn insertAtCursor(editor: *LineEditor, allocator: std.mem.Allocator, text: []con
     try editor.setLine(nl.items);
     editor.cursor = new_cursor;
 }
-
-/// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
-var g_paste_id: usize = 0;
 
 // ============================================================================
 // Tests
@@ -199,7 +236,7 @@ test "store + load + expand round trip" {
     }
 
     const text = "line A\nline B\nline C\n";
-    const placeholder = (try store(a, state_root, 1, text)).?;
+    const placeholder = (try store(a, state_root, text)).?;
     defer a.free(placeholder);
     try testing.expect(std.mem.indexOf(u8, placeholder, "[Pasted text #1") != null);
 
@@ -225,7 +262,7 @@ test "store placeholder count = lines - 1 (cc v2.1.172)" {
     defer @import("metacodes-internal").util.fs.testing.rmrfBestEffort(state_root);
     defer {
         var pz: [256]u8 = undefined;
-        inline for (.{ 4, 20 }) |id| {
+        inline for (.{ 1, 2 }) |id| {
             const p = std.fmt.bufPrintZ(&pz, "{s}/pastes/{d}.txt", .{ state_root, id }) catch unreachable;
             pfs.unlinkPath(p.ptr) catch {};
         }
@@ -233,7 +270,7 @@ test "store placeholder count = lines - 1 (cc v2.1.172)" {
 
     // 4 行 → "+3 lines"
     const four = "L0\nL1\nL2\nL3";
-    const ph4 = (try store(a, state_root, 4, four)).?;
+    const ph4 = (try store(a, state_root, four)).?;
     defer a.free(ph4);
     try testing.expect(std.mem.indexOf(u8, ph4, "+3 lines") != null);
 
@@ -244,7 +281,7 @@ test "store placeholder count = lines - 1 (cc v2.1.172)" {
         const seg = std.fmt.bufPrint(buf[w..], "R{d}\n", .{i}) catch unreachable;
         w += seg.len;
     }
-    const ph20 = (try store(a, state_root, 20, buf[0 .. w - 1])).?; // 去掉末尾 \n → 恰 20 行
+    const ph20 = (try store(a, state_root, buf[0 .. w - 1])).?; // 去掉末尾 \n → 恰 20 行
     defer a.free(ph20);
     try testing.expect(std.mem.indexOf(u8, ph20, "+19 lines") != null);
 }
@@ -261,4 +298,81 @@ test "expandPlaceholders missing file keeps placeholder" {
     const r = try expandPlaceholders(a, "/tmp/cc-zig-nonexistent-state_root", "[Pasted text #999 +3 lines]");
     defer a.free(r);
     try testing.expectEqualStrings("[Pasted text #999 +3 lines]", r);
+}
+
+fn freshStateRoot(buf: []u8) [:0]const u8 {
+    const root = @import("metacodes-internal").util.fs.testing.uniqueDir(buf, "cc-zig-paste-numbers");
+    _ = pfs.mkdir(root.ptr, 0o700);
+    return root;
+}
+
+fn writePasteFile(state_root: []const u8, name: []const u8, bytes: []const u8) !void {
+    var dir_buf: [600]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "{s}/pastes", .{state_root});
+    _ = pfs.mkdir(dir.ptr, 0o700);
+    var path_buf: [700]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = bytes });
+}
+
+fn expectExpands(state_root: []const u8, line: []const u8, want: []const u8) !void {
+    const got = try expandPlaceholders(testing.allocator, state_root, line);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+test "a paste stored while another one waits in the same state root gets the next number and leaves it whole (#764)" {
+    const a = testing.allocator;
+    var buf: [512]u8 = undefined;
+    const state_root = freshStateRoot(&buf);
+    defer @import("metacodes-internal").util.fs.testing.rmrfBestEffort(state_root);
+
+    const waiting = (try store(a, state_root, "A0\nA1\nA2\nA3\nA4")).?;
+    defer a.free(waiting);
+    try testing.expectEqualStrings("[Pasted text #1 +4 lines]", waiting);
+
+    const sent_first = (try store(a, state_root, "B0\nB1\nB2\nB3\nB4\nB5")).?;
+    defer a.free(sent_first);
+    try testing.expectEqualStrings("[Pasted text #2 +5 lines]", sent_first);
+
+    try expectExpands(state_root, sent_first, "B0\nB1\nB2\nB3\nB4\nB5");
+    try expectExpands(state_root, waiting, "A0\nA1\nA2\nA3\nA4");
+}
+
+test "a number another process takes between the scan and the create moves the paste on to the next free one" {
+    const a = testing.allocator;
+    var buf: [512]u8 = undefined;
+    const state_root = freshStateRoot(&buf);
+    defer @import("metacodes-internal").util.fs.testing.rmrfBestEffort(state_root);
+    try writePasteFile(state_root, "1.txt", "TAKEN_ONE");
+    try writePasteFile(state_root, "2.txt", "TAKEN_TWO");
+
+    var dir_buf: [600]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "{s}/pastes", .{state_root});
+    const file = (try claim(a, dir, 1)).?;
+    defer a.free(file.path);
+    pfs.close(file.fd);
+
+    try testing.expectEqual(@as(usize, 3), file.id);
+    try expectExpands(state_root, "[Pasted text #1 +0 lines]", "TAKEN_ONE");
+    try expectExpands(state_root, "[Pasted text #2 +0 lines]", "TAKEN_TWO");
+}
+
+test "pastes an earlier version stored keep expanding and new pastes are numbered after the highest of them" {
+    const a = testing.allocator;
+    var buf: [512]u8 = undefined;
+    const state_root = freshStateRoot(&buf);
+    defer @import("metacodes-internal").util.fs.testing.rmrfBestEffort(state_root);
+    try writePasteFile(state_root, "3.txt", "OLD_THREE\nOLD_THREE_B\nOLD_THREE_C");
+    try writePasteFile(state_root, "7.txt", "OLD_SEVEN\nOLD_SEVEN_B\nOLD_SEVEN_C");
+    for ([_][]const u8{ "notes.txt", "12.txt.bak", "x99.txt", "99x.txt", "1_00.txt", ".txt", "40" }) |name|
+        try writePasteFile(state_root, name, "not a paste");
+
+    const placeholder = (try store(a, state_root, "N0\nN1\nN2\nN3")).?;
+    defer a.free(placeholder);
+
+    try testing.expectEqualStrings("[Pasted text #8 +3 lines]", placeholder);
+    try expectExpands(state_root, "[Pasted text #3 +2 lines]", "OLD_THREE\nOLD_THREE_B\nOLD_THREE_C");
+    try expectExpands(state_root, "[Pasted text #7 +2 lines]", "OLD_SEVEN\nOLD_SEVEN_B\nOLD_SEVEN_C");
+    try expectExpands(state_root, placeholder, "N0\nN1\nN2\nN3");
 }
