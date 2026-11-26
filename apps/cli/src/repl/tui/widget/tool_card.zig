@@ -1811,8 +1811,15 @@ fn jsonStringFirstLine(alloc: std.mem.Allocator, escaped: []const u8) ![]u8 {
             'f' => try raw.append(alloc, 0x0c),
             'u' => {
                 if (i + 4 > escaped.len) break;
-                const cp = std.fmt.parseInt(u21, escaped[i .. i + 4], 16) catch break;
+                const unit = std.fmt.parseInt(u16, escaped[i .. i + 4], 16) catch break;
                 i += 4;
+                const cp: u21 = joined: {
+                    if (!std.unicode.utf16IsHighSurrogate(unit) or i + 6 > escaped.len or !std.mem.startsWith(u8, escaped[i..], "\\u")) break :joined unit;
+                    const low = std.fmt.parseInt(u16, escaped[i + 2 .. i + 6], 16) catch break :joined unit;
+                    const pair = std.unicode.utf16DecodeSurrogatePair(&.{ unit, low }) catch break :joined unit;
+                    i += 6;
+                    break :joined pair;
+                };
                 var buf: [4]u8 = undefined;
                 const n = std.unicode.utf8Encode(cp, &buf) catch {
                     try raw.appendSlice(alloc, REPLACEMENT_CHAR);
@@ -2831,6 +2838,21 @@ test "an MCP error, wrapped as the tool error the pipeline reports, shows the se
     try testing.expect(std.mem.indexOfScalar(u8, truncated, 0x1b) == null);
     try testing.expect(std.mem.indexOf(u8, truncated, "first block") == null);
     try testing.expect(std.mem.indexOf(u8, truncated, "truncated") == null);
+
+    const paired_detail = "{\"content\":[{\"type\":\"text\",\"text\":\"build \\ud83d\\ude00 failed; lone \\ud83d, \\ude00; doubled \\ud83d\\ud83d\\ude00\\nmore text goes o" ++ "\n[MCP error truncated: original_bytes=70000]";
+    const paired = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = paired_detail, .recoverable = true } }, .{});
+    defer a.free(paired);
+    const emoji = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", paired, .err, 0, .{});
+    defer a.free(emoji);
+    try capture.expectContains(emoji, "build \u{1F600} failed; lone " ++ REPLACEMENT_CHAR ++ ", " ++ REPLACEMENT_CHAR ++ "; doubled " ++ REPLACEMENT_CHAR ++ "\u{1F600}");
+    try testing.expect(std.mem.indexOf(u8, emoji, "more text") == null);
+
+    const cut_pair_detail = "{\"content\":[{\"type\":\"text\",\"text\":\"ends in \\ud83d\\ude" ++ "\n[MCP error truncated: original_bytes=70000]";
+    const cut_pair = try std.json.Stringify.valueAlloc(a, .{ .@"error" = .{ .code = "other", .category = "user_error", .detail = cut_pair_detail, .recoverable = true } }, .{});
+    defer a.free(cut_pair);
+    const half = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", cut_pair, .err, 0, .{});
+    defer a.free(half);
+    try capture.expectContains(half, "ends in " ++ REPLACEMENT_CHAR);
 
     const direct = try renderResult(a, theme_mod.monochrome, "mcp__plc__echo", "{}", result, .err, 0, .{});
     defer a.free(direct);
