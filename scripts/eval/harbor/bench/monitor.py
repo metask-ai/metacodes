@@ -13,15 +13,15 @@ from typing import Dict, List, Optional, Tuple
 
 from scripts.eval.harbor.bench import executors
 from scripts.eval.harbor.bench.executors import Executor, SshExecutor, shell_argv
-from scripts.eval.harbor.bench.runner import atomic_json, settings
+from scripts.eval.harbor.bench.runner import settings
 from scripts.eval.harbor.bench.setup import APT_CACHE_LABEL, APT_CACHE_NAME
 
 PROBE_SOURCE = Path(__file__).with_name("monitor_probe.py")
 RUN_RECORDS = ".bench-runs"
 MIRROR_SETTINGS = ("pypi_index", "docker_mirrors", "ghcr_mirror", "container_mirrors", "download_cache")
 UNSET = (None, "", [], {}, False)
-BACKUPS = "backups"
-BACKUPS_KEPT = 20
+BACKUPS = executors.BACKUPS
+BACKUPS_KEPT = executors.BACKUPS_KEPT
 SNAPSHOT_SECONDS = 10.0
 TARGET_SECONDS = 60.0
 USAGE_SECONDS = 600.0
@@ -132,17 +132,6 @@ def mirror_settings(executor: Executor, probed: Optional[Dict], targets: Dict[st
             "pending": [{"step": step, "title": titles[step], "reason": reason} for step, reason in pending.items()]}
 
 
-def backup(config_path: Path) -> Path:
-    directory = config_path.parent / BACKUPS
-    directory.mkdir(mode=0o700, exist_ok=True)
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    target = directory / f"{config_path.stem}-{stamp}{config_path.suffix}"
-    shutil.copy2(config_path, target)
-    for old in sorted(directory.glob(f"{config_path.stem}-*{config_path.suffix}"))[:-BACKUPS_KEPT]:
-        old.unlink()
-    return target
-
-
 def save_mirrors(config_path: Path, payload) -> str:
     if not isinstance(payload, dict) or set(payload) - {"executor", "settings"}:
         raise ValueError("只接受 executor、settings")
@@ -167,12 +156,9 @@ def save_mirrors(config_path: Path, payload) -> str:
             entry.pop(key, None)
         else:
             entry[key] = value
-    executors.parse(entry)
-    updated = {**cfg, "executors": entries[:index] + [entry] + entries[index + 1:]}
-    executors.configured(updated)
-    if entry != entries[index]:
-        backup(Path(config_path))
-        atomic_json(Path(config_path), updated)
+    def change(updated):
+        updated["executors"][index] = entry
+    executors.update_config(Path(config_path), cfg, name, change)
     return name
 
 
