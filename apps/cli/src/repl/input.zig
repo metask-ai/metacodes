@@ -3045,7 +3045,7 @@ fn readEditorKey(fd: c_int, parser: *KeyParser) !Key {
     while (true) {
         if (platform_term.waitReadable(fd, 2000) <= 0) return error.TestUnexpectedResult;
         var b: [1]u8 = undefined;
-        if (platform_term.readInput(fd, &b) != 1) return error.TestUnexpectedResult;
+        if (platform_term.readInput(fd, &b) != 1) return error.TestUnexpectedResult; // no EINTR: waitReadable reported data
         if (parser.feedEditorRead(fd, b[0])) |key| return key;
     }
 }
