@@ -161,6 +161,21 @@ def test_no_probe_env_skips_the_question(bin_path):
     assert KITTY_ENABLE not in raw, "没探测的认不出的终端照旧不发"
 
 
+def test_no_keyboard_enhancement_env_skips_the_question_and_keeps_kitty_off(bin_path):
+    _posix_only()
+    raw = _run(bin_path, [
+        QUERY_SENT,
+        "raw:\\x1b[?1u\\x1b[?62c",
+        wait_for('Try "fix typecheck errors"'),
+        "type:x", "key:shift_enter", "type:y",
+        wait_for(BACKSLASH_HINT),
+    ], _unknown_terminal(METACODES_NO_KEYBOARD_ENHANCEMENT="1"))
+    assert KITTY_QUERY not in raw, "METACODES_NO_KEYBOARD_ENHANCEMENT should skip the Kitty question"
+    assert KITTY_ENABLE not in raw, "METACODES_NO_KEYBOARD_ENHANCEMENT should keep Kitty off even when the terminal answers"
+    _, screen = _screen(raw)
+    assert BACKSLASH_HINT in screen, "with the protocol off the multi-line hint should be \\+⏎:\n" + screen
+
+
 # A full answer set, arriving after the probe stopped waiting (a slow link).
 LATE_ANSWERS = "raw:\\x1b]11;rgb:ffff/ffff/ffff\\x1b\\\\\\x1b[?1u\\x1b[?62;22c"
 

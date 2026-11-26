@@ -4051,6 +4051,7 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     } else {
         cmd_output.print("Config problems:  none\n", .{});
     }
+    cmd_output.print("Keyboard:         {s}\n", .{input.keyboardSummary()});
     cmd_output.print("Home:             {s}\n", .{@import("metacodes-internal").platform.paths.homeDir() orelse "unset"});
     if (util_fs.getCwd(allocator)) |cwd| {
         defer allocator.free(cwd);

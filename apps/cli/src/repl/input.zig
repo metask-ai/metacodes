@@ -858,8 +858,15 @@ fn nonEmptyEnv(name: [*:0]const u8) bool {
     return if (envValue(name)) |v| v.len > 0 else false;
 }
 
+pub const no_keyboard_enhancement_env = "METACODES_NO_KEYBOARD_ENHANCEMENT";
+
+pub fn keyboardEnhancementOptedOut() bool {
+    return envValue(no_keyboard_enhancement_env) != null;
+}
+
 /// 读真实 env 调 classifyKittyKeyboard。
 pub fn keyboardPolicy() KeyboardPolicy {
+    if (keyboardEnhancementOptedOut()) return .disable;
     const term = envValue("TERM");
     const multiplexer: Multiplexer = if (nonEmptyEnv("TMUX"))
         .tmux
@@ -902,6 +909,12 @@ pub fn shouldEnableKittyKeyboard() bool {
 pub fn newlineHint() []const u8 {
     const shift_newline = shouldEnableKittyKeyboard() or platform_term.keyRecordsTypeText() or g_newline_binding.load(.acquire);
     return if (shift_newline) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
+}
+
+pub fn keyboardSummary() []const u8 {
+    if (keyboardEnhancementOptedOut()) return "off · " ++ no_keyboard_enhancement_env ++ " is set";
+    if (shouldEnableKittyKeyboard()) return "on (Kitty protocol, modifyOtherKeys) · " ++ no_keyboard_enhancement_env ++ "=1 turns it off";
+    return "off";
 }
 
 /// 终端配置里的 Shift+Enter 绑定(发 ESC CR,KeyParser 读成 .shift_enter)此刻生效与否:启动时据
@@ -2563,6 +2576,32 @@ test "shouldEnableKittyKeyboard: 要探测的终端只在答了 Kitty flags 时�
         try testing.expectEqual(expected, shouldEnableKittyKeyboard());
         try testing.expectEqualStrings(if (expected) shift else backslash, newlineHint());
     }
+}
+
+test "keyboardPolicy: METACODES_NO_KEYBOARD_ENHANCEMENT keeps the protocol off for every terminal, and keyboardSummary says why" {
+    const previous_answer = g_kitty_answered.load(.acquire);
+    defer recordKeyboardProbe(previous_answer);
+    const previous = if (std.c.getenv(no_keyboard_enhancement_env)) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+    defer if (previous) |value| {
+        ppaths.setEnv(no_keyboard_enhancement_env, value.ptr);
+        testing.allocator.free(value);
+    } else ppaths.unsetEnv(no_keyboard_enhancement_env);
+
+    ppaths.setEnv(no_keyboard_enhancement_env, "1");
+    for ([_]bool{ true, false }) |answered| {
+        recordKeyboardProbe(answered);
+        try testing.expect(keyboardEnhancementOptedOut());
+        try testing.expectEqual(KeyboardPolicy.disable, keyboardPolicy());
+        try testing.expect(!shouldEnableKittyKeyboard());
+        try testing.expectEqualStrings("off · METACODES_NO_KEYBOARD_ENHANCEMENT is set", keyboardSummary());
+        try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
+    }
+
+    ppaths.unsetEnv(no_keyboard_enhancement_env);
+    recordKeyboardProbe(true);
+    try testing.expect(!keyboardEnhancementOptedOut());
+    const expected = if (shouldEnableKittyKeyboard()) "on (Kitty protocol, modifyOtherKeys) · METACODES_NO_KEYBOARD_ENHANCEMENT=1 turns it off" else "off";
+    try testing.expectEqualStrings(expected, keyboardSummary());
 }
 
 test "KeyParser: 迟到的终端应答整条吃掉,不漏成字符" {

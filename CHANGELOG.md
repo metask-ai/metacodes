@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`METACODES_NO_KEYBOARD_ENHANCEMENT` keeps the TUI's keyboard protocol
+  off.** Set to any value, it stops the interactive TUI from turning on the
+  Kitty keyboard protocol and xterm modifyOtherKeys in any terminal, and from
+  asking a terminal it does not recognize about them at startup. Starting,
+  being stopped and continued, handing the terminal to `$EDITOR` and leaving
+  then send neither their on nor their off sequences. It is the way out for a
+  terminal or multiplexer that garbles keys with the protocol on; where the
+  protocol was what made Shift+Enter a newline, end the line with `\` and
+  press Enter, or bind Shift+Enter to `ESC CR`. `/doctor` shows whether the
+  protocol is on and why, and `/terminal-setup` names the variable when it is
+  set ([TERMINAL_SETUP.md](doc/TERMINAL_SETUP.md#turning-the-keyboard-protocol-off)).
+
 - **Background Bash jobs can get a time limit and a stuck-prompt notice**
   (preview feature `background_watchdog`, off by default). With
   `--preview=background_watchdog`, a `run_in_background` job stops when it

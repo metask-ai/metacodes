@@ -3,7 +3,8 @@
 //! metacodes reads as a newline.
 //!
 //! Terminals that speak the Kitty keyboard protocol need nothing (metacodes
-//! turns it on, `repl/input.zig`). Apple Terminal speaks no such protocol and
+//! turns it on, `repl/input.zig`, unless `METACODES_NO_KEYBOARD_ENHANCEMENT`
+//! is set). Apple Terminal speaks no such protocol and
 //! VS Code's xterm.js is on the protocol's deny-list, so on both Shift+Enter is
 //! a plain Return. Their own configuration can bind it instead:
 //! - Apple Terminal: Shift+Return in the profile's key map (`apple_terminal.zig`);
@@ -26,6 +27,7 @@ const util_time = @import("metacodes-internal").util.time;
 const files = @import("files.zig");
 const vscode = @import("vscode.zig");
 const apple = @import("apple_terminal.zig");
+const input = @import("../../repl/input.zig");
 
 /// What Shift+Enter sends once set up: ESC CR.
 pub const newline_sequence = "\x1b\r";
@@ -50,6 +52,7 @@ pub const Env = struct {
     appdata: ?[]const u8 = null,
     xdg_config_home: ?[]const u8 = null,
     home: ?[]const u8 = null,
+    no_keyboard_enhancement: bool = false,
     os: Os = switch (builtin.os.tag) {
         .macos => .macos,
         .windows => .windows,
@@ -89,6 +92,7 @@ pub const Env = struct {
             .appdata = env.get("APPDATA"),
             .xdg_config_home = env.get("XDG_CONFIG_HOME"),
             .home = paths.homeDir(),
+            .no_keyboard_enhancement = input.keyboardEnhancementOptedOut(),
         };
     }
 };
@@ -289,6 +293,7 @@ pub fn run(gpa: std.mem.Allocator, ctx: Context, req: Request, out: *std.Io.Writ
 
 fn runIn(arena: std.mem.Allocator, ctx: Context, req: Request, out: *std.Io.Writer) !Report {
     if (req.action == .restore) return restoreAll(arena, ctx, req.target, out);
+    if (ctx.env.no_keyboard_enhancement) say(out, "{s} is set: metacodes keeps the Kitty keyboard protocol and modifyOtherKeys off in every terminal.", .{input.no_keyboard_enhancement_env});
     const target: Target = req.target orelse switch (detect(ctx.env)) {
         .apple_terminal => .apple_terminal,
         .vscode => .{ .vscode = vscode.product(arena, ctx.env) },
@@ -300,6 +305,10 @@ fn runIn(arena: std.mem.Allocator, ctx: Context, req: Request, out: *std.Io.Writ
             return .{ .outcome = .refused };
         },
         .native => |name| {
+            if (ctx.env.no_keyboard_enhancement) {
+                say(out, "Terminal: {s}. With the protocol off, Shift+Enter arrives as a plain Return and submits: unset the variable for a newline from Shift+Enter, or end a line with \\ and press Enter.", .{name});
+                return .{ .outcome = .unchanged };
+            }
             say(out, "Terminal: {s}. It reports Shift+Enter distinctly and metacodes turns its keyboard protocol on there: Shift+Enter already inserts a newline. Nothing to set up.", .{name});
             return .{ .outcome = .unchanged };
         },
@@ -866,7 +875,6 @@ fn appleLive(arena: std.mem.Allocator, entry: Record.AppleEntry, terminal_pid: ?
 const testing = std.testing;
 
 test "the newline sequence is what KeyParser reads as Shift+Enter" {
-    const input = @import("../../repl/input.zig");
     var parser: input.KeyParser = .{};
     var keys: std.ArrayList(input.Key) = .empty;
     defer keys.deinit(testing.allocator);
@@ -896,7 +904,6 @@ test "detect: the terminals with a setup, the native ones, and the rest" {
 }
 
 test "detect: the native terminals are the ones input.zig turns the keyboard protocol on for" {
-    const input = @import("../../repl/input.zig");
     for (native_term_programs) |entry| try testing.expect(input.classifyKittyKeyboard(entry[0], "xterm-256color", .none) == .enable);
     try testing.expect(input.classifyKittyKeyboard(null, "xterm-kitty", .none) == .enable);
     try testing.expect(input.classifyKittyKeyboard(null, "xterm-ghostty", .none) == .enable);
@@ -1322,6 +1329,39 @@ test "run: native terminals, tmux and unknown ones change nothing" {
     try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(.{ .term_program = "vscode", .remote_session = true }), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "workbench.action.terminal.sendSequence") != null);
     try testing.expect(!files.exists(try h.join(&.{"state"})));
+}
+
+test "run: with METACODES_NO_KEYBOARD_ENHANCEMENT set the report names it and no terminal is said to insert a newline" {
+    const h = try Harness.init();
+    defer h.deinit();
+    for ([_][]const u8{ "iTerm.app", "ghostty", "WezTerm", "WarpTerminal", "Hyper" }) |term_program| {
+        h.reset();
+        try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .term_program = term_program, .no_keyboard_enhancement = true }), .{}, &h.out.writer).outcome);
+        try testing.expect(std.mem.startsWith(u8, h.report(), input.no_keyboard_enhancement_env ++ " is set"));
+        try testing.expect(std.mem.indexOf(u8, h.report(), "already inserts a newline") == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, h.report(), "\\e\\r") != null);
+    h.reset();
+    _ = run(testing.allocator, try h.ctx(.{ .term = "xterm-kitty", .no_keyboard_enhancement = true }), .{}, &h.out.writer);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "Terminal: kitty. With the protocol off, Shift+Enter arrives as a plain Return and submits") != null);
+    h.reset();
+    _ = run(testing.allocator, try h.ctx(.{ .term = "xterm-kitty" }), .{}, &h.out.writer);
+    try testing.expect(std.mem.indexOf(u8, h.report(), input.no_keyboard_enhancement_env) == null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "already inserts a newline") != null);
+}
+
+test "Env.fromProcess reads METACODES_NO_KEYBOARD_ENHANCEMENT the way the REPL does" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const previous = if (std.c.getenv(input.no_keyboard_enhancement_env)) |raw| try arena_state.allocator().dupeZ(u8, std.mem.span(raw)) else null;
+    defer if (previous) |value| paths.setEnv(input.no_keyboard_enhancement_env, value.ptr) else paths.unsetEnv(input.no_keyboard_enhancement_env);
+    const values: []const ?[*:0]const u8 = if (builtin.os.tag == .windows) &.{ null, "1", "0" } else &.{ null, "1", "0", "" };
+    for (values) |value| {
+        if (value) |v| paths.setEnv(input.no_keyboard_enhancement_env, v) else paths.unsetEnv(input.no_keyboard_enhancement_env);
+        const env = try Env.fromProcess(arena_state.allocator());
+        try testing.expectEqual(value != null, env.no_keyboard_enhancement);
+        try testing.expectEqual(input.keyboardEnhancementOptedOut(), env.no_keyboard_enhancement);
+    }
 }
 
 test "appleLive: only a Terminal reopened since setup, with the mapping still there" {

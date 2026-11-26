@@ -634,6 +634,10 @@ an unpinned kernel or daemon may be absent. `metacodes terminal-setup
 or a VS Code build's `keybindings.json` after a backup, and `--restore` undoes
 it; it exits 0 when the terminal is set up or needs nothing, 1 when it left the
 terminal alone or the change failed ([TERMINAL_SETUP.md](TERMINAL_SETUP.md)).
+`METACODES_NO_KEYBOARD_ENHANCEMENT` (any value) keeps the interactive TUI from
+turning on the Kitty keyboard protocol and xterm modifyOtherKeys in any
+terminal, and from asking the terminal about them at startup
+([TERMINAL_SETUP.md](TERMINAL_SETUP.md#turning-the-keyboard-protocol-off)).
 On macOS and Linux the interactive TUI reports the mouse (`ESC[?1002h`,
 `ESC[?1006h`) while it reads keys, so dragging with the left button copies
 the text under the drag when the button is released: the TUI sends it as OSC
