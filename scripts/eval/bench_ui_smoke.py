@@ -110,7 +110,7 @@ def main():
                     assert '#/run/' in page.locator('.run-state a').get_attribute('href')
                     if args.screenshot:
                         page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/profile/{profile}')
-                        page.locator('.submission').wait_for()
+                        page.locator('.profile-banner').wait_for()
                         page.screenshot(path=str(args.screenshot), full_page=True)
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/settings')
                     page.get_by_text(str(manager.jobs_dir), exact=True).wait_for()

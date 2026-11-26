@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -285,6 +286,55 @@ class LeaderboardTest(unittest.TestCase):
         jobs = {job["name"]: job for job in Workbench(data.Library([self.root])).leaderboard(None)["boards"][0]["jobs"]}
         self.assertEqual(jobs["rewarded-crash"]["score"], 0.0)
 
+    def test_leaderboard_and_job_view_attach_profile_versions_and_keep_latest_per_profile(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        for name, started, reward in (
+            ("p1-old", "2026-11-24T08:00:00Z", 0.0),
+            ("p1-new", "2026-11-25T08:00:00Z", 1.0),
+            ("p2-run", "2026-11-25T09:00:00Z", 0.5),
+            ("p1-partial", "2026-11-25T10:00:00Z", 1.0),
+        ):
+            job = _job(root, name, "same-model", planned=2)
+            _write(job / "result.json", {"started_at": started, "finished_at": started, "n_total_trials": 2})
+            _trial(job, "task0__aaa", reward=reward)
+            if name != "p1-partial":
+                _trial(job, "task1__aaa", reward=reward)
+        profiles_dir = root / ".bench-profiles"
+        _write(profiles_dir / "prof-a.json", {
+            "id": "prof-a", "name": "v0.13.0-formal-gate", "status": "finished",
+            "created_at": "2026-11-25T00:00:00Z", "features": ["formal-gate"],
+            "metacodes": {"label": "0.13.0"},
+            "items": [
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-old", "status": "finished", "tasks": ["task0", "task1"]},
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-new", "status": "finished", "tasks": ["task0", "task1"]},
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-partial", "status": "finished", "tasks": ["task0"]},
+            ],
+        })
+        _write(profiles_dir / "prof-b.json", {
+            "id": "prof-b", "name": "v0.12.0-baseline", "status": "finished",
+            "created_at": "2026-11-24T00:00:00Z", "features": [],
+            "metacodes": {"label": "0.12.0"},
+            "items": [
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p2-run", "status": "finished", "tasks": ["task0", "task1"]},
+            ],
+        })
+        wb = Workbench(data.Library([root]))
+        self.addCleanup(wb.close)
+        board = wb.leaderboard("terminal-bench-2.1")
+        subset = board["boards"][1]
+        ranked = [j for j in subset["jobs"] if j["ranked"]]
+        self.assertEqual([j["name"] for j in ranked], ["p1-new", "p2-run"])
+        self.assertEqual([j["profile_name"] for j in ranked], ["v0.13.0-formal-gate", "v0.12.0-baseline"])
+        self.assertEqual([j["profile_version"] for j in ranked], ["0.13.0", "0.12.0"])
+        self.assertEqual(ranked[0]["profile_features"], ["formal-gate"])
+        self.assertEqual(board["unranked"], [])
+        job_detail = wb.job("p1-new")
+        self.assertEqual(job_detail["profile"], "prof-a")
+        self.assertEqual(job_detail["profile_name"], "v0.13.0-formal-gate")
+        self.assertEqual(job_detail["profile_version"], "0.13.0")
+        self.assertEqual(job_detail["profile_features"], ["formal-gate"])
+
 
 class ServerTest(unittest.TestCase):
     def setUp(self):
@@ -352,6 +402,158 @@ class ServerTest(unittest.TestCase):
                 status, _, body = self.get(path)
                 self.assertEqual(status, 404)
                 self.assertNotIn(str(self.root).encode(), body)
+
+
+class ViewerLogicTest(unittest.TestCase):
+    VIEWER_JS = Path(__file__).resolve().parents[1] / "harbor" / "viewer" / "static" / "viewer.js"
+
+    def _run_js(self, script: str):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required to execute viewer.js unit tests")
+        harness = f"""
+const fs = require('fs');
+const vm = require('vm');
+class FakeNode {{
+  constructor(tag) {{
+    this.tagName = tag;
+    this.children = [];
+    this.attrs = {{}};
+    this.style = {{}};
+    this.classList = {{ toggle() {{}} }};
+    this._value = '';
+    this._listeners = {{}};
+  }}
+  append(...items) {{
+    for (const item of items) {{
+      if (item === null || item === undefined || item === false) continue;
+      if (typeof item === 'string') this.children.push({{ textContent: item, children: [] }});
+      else this.children.push(item);
+    }}
+  }}
+  replaceChildren(...items) {{ this.children = []; this.append(...items); }}
+  setAttribute(k, v) {{ this.attrs[k] = v; if (k === 'value') this._value = v; if (k === 'selected') this.selected = true; }}
+  addEventListener(type, fn) {{ (this._listeners[type] = this._listeners[type] || []).push(fn); }}
+  dispatch(type) {{ for (const fn of this._listeners[type] || []) fn({{ target: this, currentTarget: this }}); }}
+  get value() {{
+    if (this.tagName === 'select') {{
+      const picked = this.children.find((c) => c.selected) || this.children[0];
+      return this._value || (picked ? picked._value : '');
+    }}
+    return this._value;
+  }}
+  set value(v) {{ this._value = v; }}
+  get textContent() {{
+    if (this._text !== undefined) return this._text;
+    return this.children.map((c) => c.textContent || '').join('');
+  }}
+  set textContent(v) {{ this._text = String(v); }}
+}}
+const nodes = {{ '#title': new FakeNode('h1'), '#crumbs': new FakeNode('div') }};
+const ctx = {{
+  Node: FakeNode,
+  URL: {{ createObjectURL: () => '', revokeObjectURL: () => {{}} }},
+  Blob: class {{}},
+  setTimeout, clearTimeout, setInterval: () => 0,
+  location: {{ hash: '#/' }},
+  history: {{ replaceState() {{}} }},
+  window: {{ addEventListener() {{}}, scrollTo() {{}} }},
+  document: {{
+    createElement: (tag) => new FakeNode(tag),
+    createTextNode: (t) => ({{ textContent: String(t), children: [] }}),
+    querySelector: (sel) => nodes[sel] || null,
+    querySelectorAll: () => [],
+    addEventListener() {{}},
+  }},
+}};
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync({json.dumps(str(self.VIEWER_JS))}, 'utf8'), ctx);
+{script}
+"""
+        proc = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", check=True)
+        return json.loads(proc.stdout)
+
+    def test_cross_profile_compare_dock_prefers_same_model_full_run_and_lists_all_jobs(self):
+        result = self._run_js("""
+const chosen = [
+  {
+    id: 'prof-a', name: 'Profile A',
+    items: [
+      { submission: 's1', suite: 'fh', suite_name: 'FH', model: 'model-x', tasks: ['t1', 't2', 't3', 't4'],
+        started_at: '2026-11-24T10:00:00Z', job: { name: 'a-x', planned: 4, started_at: '2026-11-24T10:00:00Z' } },
+      { submission: 's2', suite: 'fh', suite_name: 'FH', model: 'model-y', tasks: ['t1', 't2', 't3', 't4'],
+        started_at: '2026-11-24T11:00:00Z', job: { name: 'a-y', planned: 4, started_at: '2026-11-24T11:00:00Z' } },
+      { submission: 's3', suite: 'fh', suite_name: 'FH', model: 'model-y', tasks: ['t1'],
+        started_at: '2026-11-24T12:00:00Z', job: { name: 'a-retry', planned: 1, started_at: '2026-11-24T12:00:00Z' } },
+    ],
+  },
+  {
+    id: 'prof-b', name: 'Profile B',
+    items: [
+      { submission: 's1', suite: 'fh', suite_name: 'FH', model: 'model-x', tasks: ['t1', 't2', 't3', 't4'],
+        started_at: '2026-11-24T10:30:00Z', job: { name: 'b-x', planned: 4, started_at: '2026-11-24T10:30:00Z' } },
+    ],
+  },
+];
+const dock = vm.runInContext('multiProfileCompareDock', ctx)(chosen);
+const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+const all = walk(dock);
+const link = all.find((n) => n.tagName === 'a');
+const selects = all.filter((n) => n.tagName === 'select');
+const profASelect = selects[1];
+const optionsA = profASelect.children.map((o) => o._value);
+const defaultHref = link.href;
+profASelect.value = 'a-y';
+profASelect.dispatch('change');
+const switchedHref = link.href;
+console.log(JSON.stringify({ defaultHref, switchedHref, optionsA }));
+""")
+        self.assertEqual(result["defaultHref"], "#/compare/a-x,b-x")
+        self.assertEqual(set(result["optionsA"]), {"a-x", "a-y", "a-retry"})
+        self.assertEqual(result["switchedHref"], "#/compare/a-y,b-x")
+
+    def test_compare_summary_uses_common_task_cost_delta_matching_frontier(self):
+        result = self._run_js("""
+const jobs = {
+  'job-a': {
+    name: 'job-a', model: 'm', profile_name: 'Profile A', profile_version: '0.12.0', profile_features: [],
+    running: false, suite_name: 'FH',
+    summary: { cost_per_task: 0.0155, cost_per_pass: 0.0155, tasks_solved: 2, tasks_attempted: 2,
+               total_tokens: 2000, token_trials: 2, cache_hit_rate: 0.5 },
+    rows: [
+      { task: 't1', trial: 't1__a', first_attempt: true, status: 'pass', cost_usd: 0.030, total_tokens: 1000, elapsed_s: 10 },
+      { task: 't2', trial: 't2__a', first_attempt: true, status: 'pass', cost_usd: 0.001, total_tokens: 1000, elapsed_s: 10 },
+    ],
+  },
+  'job-b': {
+    name: 'job-b', model: 'm', profile_name: 'Profile B', profile_version: '0.13.0', profile_features: ['formal-gate'],
+    running: false, suite_name: 'FH',
+    summary: { cost_per_task: 0.020, cost_per_pass: 0.020, tasks_solved: 1, tasks_attempted: 1,
+               total_tokens: 1000, token_trials: 1, cache_hit_rate: 0.6 },
+    rows: [
+      { task: 't1', trial: 't1__b', first_attempt: true, status: 'pass', cost_usd: 0.020, total_tokens: 1000, elapsed_s: 10 },
+    ],
+  },
+};
+ctx.api = async (url) => jobs[decodeURIComponent(url.split('name=')[1])];
+(async () => {
+  const root = await vm.runInContext('renderCompare', ctx)(['job-a', 'job-b'], null);
+  const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+  const tables = walk(root).filter((n) => n.tagName === 'table');
+  const summaryRows = walk(tables[0]).filter((n) => n.tagName === 'tr').slice(1);
+  const cells = summaryRows.map((tr) => tr.children.map((td) => td.textContent));
+  console.log(JSON.stringify({ cells }));
+})();
+""")
+        row_a, row_b = result["cells"]
+        self.assertIn("$0.030", row_a[3])
+        self.assertEqual(row_a[4], "")
+        self.assertIn("$0.020", row_b[3])
+        self.assertIn("-33%", row_b[3])
+        self.assertNotIn("+29%", row_b[3])
+        self.assertIn("前沿", row_b[4])
+        self.assertIn("$0.015", row_a[5])
+        self.assertIn("$0.020", row_b[5])
 
 
 if __name__ == "__main__":
