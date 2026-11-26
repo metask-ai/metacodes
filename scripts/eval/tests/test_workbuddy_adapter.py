@@ -854,7 +854,7 @@ class WorkBuddyTraceTest(unittest.TestCase):
         # runtime while every fixture-driven test stays green.  Pin the
         # constant to the schema the Zig emitter actually ships.
         zig = (
-            Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig"
+            Path(__file__).resolve().parents[3] / "packages/guard/src/tools/observation.zig"
         ).read_text(encoding="utf-8")
         emitted = None
         for line in zig.splitlines():
@@ -878,8 +878,8 @@ class WorkBuddyTraceTest(unittest.TestCase):
         # prevent.
         constants: dict[tuple[str, str], str] = {}
         for source in (
-            root / "src" / "tools" / "observation.zig",
-            root / "src" / "core" / "tool_observation_journal.zig",
+            root / "packages/guard/src/tools/observation.zig",
+            root / "packages/guard/src/core/tool_observation_journal.zig",
         ):
             for name, value in pattern.findall(source.read_text(encoding="utf-8")):
                 if re.search(r"_V\d+$", name):
@@ -992,7 +992,7 @@ class WorkBuddyTraceTest(unittest.TestCase):
 
     def test_zig_rule_filter_proof_literal_is_in_the_python_roster(self):
         zig = (
-            Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig"
+            Path(__file__).resolve().parents[3] / "packages/guard/src/tools/observation.zig"
         ).read_text(encoding="utf-8")
         proofs = set(re.findall(r'"(MetaCodesControl\.[A-Za-z0-9_.]+)"', zig))
         self.assertGreaterEqual(len(proofs), 1)
@@ -1001,7 +1001,7 @@ class WorkBuddyTraceTest(unittest.TestCase):
 
     def test_every_zig_effect_union_tag_is_handled_by_progress_analysis(self):
         zig = (
-            Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig"
+            Path(__file__).resolve().parents[3] / "packages/guard/src/tools/observation.zig"
         ).read_text(encoding="utf-8")
         match = re.search(
             r"pub const Effect = union\(enum\) \{\n(.*?)\n\};", zig, re.S
