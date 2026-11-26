@@ -155,16 +155,11 @@ class Setup:
 
     def update_config(self, describe, change: Callable[[Dict], None]):
         """Read-modify-write workbench.json, keeping keys others own."""
-        if not self.note_action("更新 " + str(self.config_path) + "：" + describe):
-            return
-        cfg = self.settings()
-        change(cfg)
-        data_path = self.config_path
-        from scripts.eval.harbor.bench.runner import atomic_json
-        atomic_json(data_path, cfg)
-        self.cfg = cfg
-        # Later steps see what earlier ones wrote (egress, mirrors).
-        self.executor = executors.find(cfg, self.executor.name)
+        cfg = self.cfg if self.dry_run else self.settings()
+        write = self.note_action("更新 " + str(self.config_path) + "：" + describe)
+        updated = executors.update_config(self.config_path, cfg, self.executor.name, change, write=write)
+        self.cfg = updated
+        self.executor = executors.find(updated, self.executor.name)
 
     def entry(self) -> Dict:
         """The executor's own entry in workbench.json, as written."""
@@ -952,16 +947,24 @@ def step_network(s: Setup):
         proposals.append(("docker_mirrors", list(DEFAULT_DOCKER_MIRRORS), "Docker Hub 镜像加速"))
     if "ghcr" in bad and "ghcr_mirror" not in entry:
         proposals.append(("ghcr_mirror", DEFAULT_GHCR_MIRROR, "ghcr.io 镜像"))
-    needs_direct = "apt" in (entry.get("container_mirrors") or {}) or bool(entry.get("download_cache"))
-    if bad & {"github", "pypi"} and "egress" not in entry and not needs_direct:
+    if bad & {"github", "pypi"} and "egress" not in entry:
         # Task verifiers download uv, Python and packages at test time.
         proposals.append(("egress", "workbench", "任务容器经工作台出网"))
     if not proposals:
         slow = "、".join(NETWORK_LABELS.get(k, k) for k in sorted(bad))
         return "ok", ("网络可达" if not bad else f"{slow} 较慢或不可达；executors 中已有对应配置，未做修改")
-    for key, value, _ in proposals:
+    accepted = []
+    for key, value, why in proposals:
+        try:
+            s.set_executor_value(key, value)
+        except ValueError as exc:
+            s.log(f"跳过建议 {key}：{exc}")
+            continue
         s.proposed[key] = value
-        s.set_executor_value(key, value)
+        accepted.append((key, value, why))
+    proposals = accepted
+    if not proposals:
+        return "ok", "网络建议均未通过配置校验，未做修改"
     detail = "；".join(f"{why}：{key} = {json.dumps(value, ensure_ascii=False)}" for key, value, why in proposals)
     blocked = "、".join(NETWORK_LABELS.get(k, k) for k in sorted(bad))
     return ("planned" if s.dry_run else "done"), f"{blocked} 较慢或不可达，" + ("建议" if s.dry_run else "已设置") + detail

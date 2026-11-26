@@ -808,6 +808,32 @@ class ExecutorConfigTest(unittest.TestCase):
 
 
 class ExecutorEntryTest(SetupFixture):
+    def test_rejected_executor_changes_leave_config_and_backups_untouched(self):
+        for cached in ({"download_cache": True}, {"container_mirrors": {"apt": "http://deb.debian.org/debian"}}):
+            with self.subTest(cached=cached):
+                self.add_ssh_executor(**cached)
+                before = self.config.read_bytes()
+                backups = list(self.config.parent.glob("backups/*"))
+                state = setup.Setup(self.config, "relay-4090")
+                state.step = {"commands": [], "log": []}
+                with self.assertRaisesRegex(ValueError, "direct"):
+                    state.set_executor_value("egress", "workbench")
+                self.assertEqual(self.config.read_bytes(), before)
+                self.assertEqual(list(self.config.parent.glob("backups/*")), backups)
+                self.assertEqual(state.executor.egress, "direct")
+
+    def test_dry_run_validates_and_keeps_proposals_in_memory(self):
+        self.add_ssh_executor()
+        before = self.config.read_bytes()
+        state = setup.Setup(self.config, "relay-4090", dry_run=True)
+        state.step = {"commands": [], "log": []}
+        state.set_executor_value("download_cache", True)
+        with self.assertRaisesRegex(ValueError, "direct"):
+            state.set_executor_value("egress", "workbench")
+        self.assertTrue(state.executor.download_cache)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse((self.config.parent / "backups").exists())
+
     def test_harbor_path_with_space_and_at_parses_and_a_bad_entry_spares_the_others(self):
         relay = executors.parse({"name": "relay", "kind": "ssh", "host": "h",
                                  "harbor": "/home/a b@corp/.local/bin/harbor", "python": "/opt/py 3/bin/python3"})

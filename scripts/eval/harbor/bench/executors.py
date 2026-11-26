@@ -24,6 +24,8 @@ Python 3.9, stdlib only. Every subprocess is spawned with an argv list.
 """
 from __future__ import annotations
 
+import copy
+import datetime as dt
 import hashlib
 import ipaddress
 import json
@@ -508,6 +510,38 @@ def configured(cfg, invalid: Optional[List[Tuple[str, str]]] = None) -> Tuple[Li
         broken = next((p for n, p in problems if n == default), None)
         raise ValueError("default_executor 配置无效：" + broken if broken else "default_executor 不在 executors 中")
     return result, default
+
+
+BACKUPS = "backups"
+BACKUPS_KEPT = 20
+
+
+def backup(config_path: Path) -> Path:
+    directory = config_path.parent / BACKUPS
+    directory.mkdir(mode=0o700, exist_ok=True)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    target = directory / f"{config_path.stem}-{stamp}{config_path.suffix}"
+    shutil.copy2(config_path, target)
+    for old in sorted(directory.glob(f"{config_path.stem}-*{config_path.suffix}"))[:-BACKUPS_KEPT]:
+        old.unlink()
+    return target
+
+
+def update_config(config_path: Path, cfg: Dict, name: str, change: Callable[[Dict], None], *, write=True) -> Dict:
+    from scripts.eval.harbor.bench.runner import atomic_json
+
+    updated = copy.deepcopy(cfg)
+    change(updated)
+    for entry in updated.get("executors") or []:
+        if isinstance(entry, dict) and entry.get("name") == name:
+            parse(entry)
+    configured(updated)
+    find(updated, name)
+    if write and updated != cfg:
+        if config_path.exists():
+            backup(config_path)
+        atomic_json(config_path, updated)
+    return updated
 
 
 def find(cfg, name: Optional[str]) -> Executor:
