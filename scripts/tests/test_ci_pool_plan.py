@@ -34,9 +34,14 @@ def iso(when: float) -> str:
 
 
 def job(status: str, created: float = NOW - 30, labels=(LABEL,), name: str = MACOS.pool_job,
-        conclusion: str = "") -> dict:
-    return {"name": name, "status": status, "labels": list(labels), "created_at": iso(created),
-            "conclusion": conclusion or None}
+        conclusion: str = "", started=None, completed=None) -> dict:
+    entry = {"name": name, "status": status, "labels": list(labels), "created_at": iso(created),
+             "conclusion": conclusion or None}
+    if started is not None:
+        entry["started_at"] = iso(started)
+    if completed is not None:
+        entry["completed_at"] = iso(completed)
+    return entry
 
 
 def decide(pool=plan.Occupancy(0, 0, 0.0), switch=ON, **kwargs):
@@ -164,11 +169,16 @@ class StandDownTest(unittest.TestCase):
     def test_only_a_finished_watch_means_the_hosted_legs_took_over(self) -> None:
         for platform in plan.PLATFORMS.values():
             with self.subTest(platform=platform.name):
-                self.assertTrue(plan.should_stand_down([job("completed", name=platform.watch_job)], platform.watch_job))
+                self.assertTrue(plan.should_stand_down(
+                    [job("completed", name=platform.watch_job, conclusion="success")], platform.watch_job))
+                for bad_conclusion in ("failure", "cancelled", ""):
+                    self.assertFalse(plan.should_stand_down(
+                        [job("completed", name=platform.watch_job, conclusion=bad_conclusion)], platform.watch_job))
                 self.assertFalse(plan.should_stand_down([job("in_progress", name=platform.watch_job)], platform.watch_job))
                 self.assertFalse(plan.should_stand_down([], platform.watch_job))
         other = plan.PLATFORMS["windows"].watch_job
-        self.assertFalse(plan.should_stand_down([job("completed", name=other)], MACOS.watch_job))
+        self.assertFalse(plan.should_stand_down(
+            [job("completed", name=other, conclusion="success")], MACOS.watch_job))
 
 
 def needs(platform, mode="", plan_result="success", hosted="", watch="", fallback="", vm=""):
@@ -355,12 +365,18 @@ class CommandTest(unittest.TestCase):
 
     def test_stand_down_sets_fast_path(self) -> None:
         for platform in plan.PLATFORMS.values():
-            for watch_status, release_fast_path, expected in (("completed", "false", "true"),
-                                                              ("in_progress", "false", "false"),
-                                                              ("in_progress", "true", "true")):
-                with self.subTest(platform=platform.name, watch=watch_status, fast=release_fast_path):
-                    api = FakeAPI({ATTEMPT_JOBS: {"jobs": [job(watch_status, name=platform.watch_job)]}})
-                    env_file = self.tmp / f"env-{platform.name}-{watch_status}-{release_fast_path}"
+            for watch_status, watch_conclusion, release_fast_path, expected in (
+                ("completed", "success", "false", "true"),
+                ("completed", "failure", "false", "false"),
+                ("completed", "cancelled", "false", "false"),
+                ("in_progress", "", "false", "false"),
+                ("in_progress", "", "true", "true"),
+            ):
+                with self.subTest(platform=platform.name, watch=watch_status, conclusion=watch_conclusion,
+                                  fast=release_fast_path):
+                    api = FakeAPI({ATTEMPT_JOBS: {"jobs": [job(watch_status, name=platform.watch_job,
+                                                               conclusion=watch_conclusion)]}})
+                    env_file = self.tmp / f"env-{platform.name}-{watch_status}-{watch_conclusion}-{release_fast_path}"
                     self.run_main(["stand-down", "--platform", platform.name, "--github-env", str(env_file)], api,
                                   env={"RELEASE_FAST_PATH": release_fast_path})
                     self.assertEqual(env_file.read_text(encoding="utf-8"), f"FAST_PATH={expected}\n")
@@ -370,6 +386,82 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(self.run_main(["verdict", "--platform", "windows"], env={"NEEDS": json.dumps(passing)}), 0)
         self.assertEqual(self.run_main(["verdict", "--platform", "macos"], env={"NEEDS": json.dumps(passing)}), 1)
         self.assertEqual(self.run_main(["verdict", "--platform", "windows"], env={"NEEDS": "{}"}), 1)
+
+    def test_verdict_recovers_pool_success_when_watch_fails_without_vm_result(self) -> None:
+        for platform in plan.PLATFORMS.values():
+            watch_lost = needs(platform, "self-hosted", hosted="skipped", watch="failure")
+            watch_job = job("completed", name=platform.watch_job, conclusion="failure",
+                            started=NOW - 3000, completed=NOW)
+            pool_passed = job("completed", name=platform.pool_job, conclusion="success",
+                              started=NOW - 2900, completed=NOW - 1000)
+
+            with self.subTest(platform=platform.name, case="pool_passed_before_watch_ended"):
+                api = FakeAPI({ATTEMPT_JOBS: {"jobs": [pool_passed, watch_job]}})
+                self.assertEqual(
+                    self.run_main(["verdict", "--platform", platform.name], api, env={"NEEDS": json.dumps(watch_lost)}),
+                    0,
+                )
+                self.assertEqual(api.seen, [(ATTEMPT_JOBS, "Bearer t")])
+
+            for case, jobs_payload in (
+                ("pool_failed", [job("completed", name=platform.pool_job, conclusion="failure",
+                                     started=NOW - 2900, completed=NOW - 1000), watch_job]),
+                ("pool_in_progress", [job("in_progress", name=platform.pool_job, started=NOW - 2900), watch_job]),
+                ("pool_queued", [job("queued", name=platform.pool_job), watch_job]),
+                ("pool_missing", [watch_job]),
+                ("pool_started_at_watch_end", [job("completed", name=platform.pool_job, conclusion="success",
+                                                   started=NOW, completed=NOW + 10), watch_job]),
+                ("pool_started_after_watch_end", [job("completed", name=platform.pool_job, conclusion="success",
+                                                      started=NOW + 5, completed=NOW + 20), watch_job]),
+                ("pool_missing_started_at", [job("completed", name=platform.pool_job, conclusion="success",
+                                                 completed=NOW - 1000), watch_job]),
+                ("watch_missing_completed_at", [pool_passed, job("completed", name=platform.watch_job,
+                                                                 conclusion="failure", started=NOW - 3000)]),
+            ):
+                with self.subTest(platform=platform.name, case=case):
+                    api = FakeAPI({ATTEMPT_JOBS: {"jobs": jobs_payload}})
+                    self.assertEqual(
+                        self.run_main(["verdict", "--platform", platform.name], api,
+                                      env={"NEEDS": json.dumps(watch_lost)}),
+                        1,
+                    )
+
+            with self.subTest(platform=platform.name, case="api_error_fails_closed"):
+                api = FakeAPI({ATTEMPT_JOBS: OSError("github unavailable")})
+                self.assertEqual(
+                    self.run_main(["verdict", "--platform", platform.name], api, env={"NEEDS": json.dumps(watch_lost)}),
+                    1,
+                )
+
+            with self.subTest(platform=platform.name, case="both_mode_requires_hosted_success"):
+                both_hosted_ok = needs(platform, "both", hosted="success", watch="failure")
+                both_hosted_bad = needs(platform, "both", hosted="failure", watch="failure")
+                api_ok = FakeAPI({ATTEMPT_JOBS: {"jobs": [pool_passed, watch_job]}})
+                api_bad = FakeAPI({ATTEMPT_JOBS: {"jobs": [pool_passed, watch_job]}})
+                self.assertEqual(
+                    self.run_main(["verdict", "--platform", platform.name], api_ok,
+                                  env={"NEEDS": json.dumps(both_hosted_ok)}),
+                    0,
+                )
+                self.assertEqual(
+                    self.run_main(["verdict", "--platform", platform.name], api_bad,
+                                  env={"NEEDS": json.dumps(both_hosted_bad)}),
+                    1,
+                )
+
+            with self.subTest(platform=platform.name, case="no_api_call_when_vm_result_present_or_cancelled"):
+                for no_recovery in (
+                    needs(platform, "self-hosted", hosted="skipped", watch="failure", fallback="false", vm="failure"),
+                    needs(platform, "self-hosted", hosted="skipped", watch="failure", fallback="false", vm="success"),
+                    needs(platform, "self-hosted", hosted="skipped", watch="cancelled"),
+                ):
+                    api = FakeAPI({})
+                    self.assertEqual(
+                        self.run_main(["verdict", "--platform", platform.name], api,
+                                      env={"NEEDS": json.dumps(no_recovery)}),
+                        1,
+                    )
+                    self.assertEqual(api.seen, [])
 
 
 def load(name: str) -> dict:
@@ -466,6 +558,7 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(spec["needs"], ["runner-plan", watch_id, hosted_id])
                 self.assertEqual(spec["if"], "${{ always() }}")
                 self.assertEqual(spec["steps"][-1]["run"], f"python3 scripts/ci_pool_plan.py verdict --platform {name}")
+                self.assertEqual(spec["steps"][-1]["env"]["GH_TOKEN"], "${{ github.token }}")
                 self.assertEqual(spec["steps"][-1]["env"]["NEEDS"], "${{ toJSON(needs) }}")
                 evidence = self.jobs["full-pr-evidence"]["needs"]
                 self.assertIn(result_id, evidence)

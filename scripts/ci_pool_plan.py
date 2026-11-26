@@ -233,11 +233,60 @@ def watch_step(jobs: Sequence[dict], since: float, now: float, timeout_seconds: 
 
 
 def should_stand_down(jobs: Sequence[dict], watch: str) -> bool:
-    """The watch finishes before the pool job starts only when it fell back."""
-    return any(job.get("name") == watch and job.get("status") == "completed" for job in jobs)
+    """The watch finishes successfully before the pool job starts only when it fell back."""
+    return any(
+        job.get("name") == watch
+        and job.get("status") == "completed"
+        and job.get("conclusion") == "success"
+        for job in jobs
+    )
 
 
-def verdict(needs: Dict[str, dict], platform: Platform) -> Tuple[bool, str]:
+def can_recover_watch_failure(needs: Dict[str, dict], platform: Platform) -> bool:
+    """True only when the watch failed without fallback or vm_result in a
+    self-hosted or both run."""
+    plan = needs.get(PLAN_JOB) or {}
+    outputs = plan.get("outputs") or {}
+    mode = outputs.get(f"{platform.name}_mode", "") if plan.get("result") == "success" else ""
+    if mode not in ("self-hosted", "both"):
+        return False
+    watch = needs.get(platform.watch_id) or {}
+    watched = watch.get("outputs") or {}
+    return (
+        watch.get("result") == "failure"
+        and watched.get("fallback") != "true"
+        and watched.get("vm_result", "") == ""
+    )
+
+
+def pool_job_passed_after_watch_failure(jobs: Sequence[dict], platform: Platform) -> Tuple[bool, str]:
+    """When the watch failed without writing vm_result (e.g. lost hosted runner),
+    verify via this attempt's jobs whether the pool job started before the watch
+    ended and completed with success."""
+    pool = next((job for job in jobs if job.get("name") == platform.pool_job), None)
+    if pool is None:
+        return False, "pool job missing"
+    if pool.get("status") != "completed":
+        return False, f"pool job {pool.get('status') or 'unknown'}"
+    if pool.get("conclusion") != "success":
+        return False, f"pool job {pool.get('conclusion') or 'unknown'}"
+    watch = next((job for job in jobs if job.get("name") == platform.watch_job), None)
+    if watch is None or watch.get("status") != "completed":
+        return False, "watch job completion time unknown"
+    try:
+        pool_started = parse_time(pool.get("started_at"))
+        watch_completed = parse_time(watch.get("completed_at"))
+    except ValueError:
+        return False, "job timestamps invalid"
+    if pool_started is None or watch_completed is None:
+        return False, "job timestamps missing"
+    if pool_started >= watch_completed:
+        return False, "pool job did not start before watch ended"
+    return True, "pool job success (verified via GitHub API after watch failure)"
+
+
+def verdict(needs: Dict[str, dict], platform: Platform,
+            recovered_pool: Optional[Tuple[bool, str]] = None) -> Tuple[bool, str]:
     """The required `Gates (<OS>)` check over the plan, the watch and the
     hosted legs (never the pool job itself)."""
     plan = needs.get(PLAN_JOB) or {}
@@ -251,9 +300,16 @@ def verdict(needs: Dict[str, dict], platform: Platform) -> Tuple[bool, str]:
     if mode == "self-hosted":
         if fallback:
             return hosted == "success", f"self-hosted, fell back to the hosted legs: {hosted or 'none'}"
+        if watch.get("result") == "failure" and vm == "" and recovered_pool is not None:
+            passed, detail = recovered_pool
+            return passed, f"self-hosted: {detail}, watch failure"
         passed = watch.get("result") == "success" and vm == "success"
         return passed, f"self-hosted: pool job {vm or 'unknown'}, watch {watch.get('result') or 'none'}"
     if mode == "both":
+        if not fallback and watch.get("result") == "failure" and vm == "" and recovered_pool is not None:
+            pool_passed, detail = recovered_pool
+            passed = hosted == "success" and pool_passed
+            return passed, f"both: hosted legs {hosted or 'none'}, {detail}, watch failure"
         passed = hosted == "success" and (vm == "success" or fallback)
         return passed, f"both: hosted legs {hosted or 'none'}, pool job {vm or ('not taken' if fallback else 'unknown')}"
     return hosted == "success", f"hosted ({mode or 'no plan'}): hosted legs {hosted or 'none'}"
@@ -393,7 +449,18 @@ def cmd_stand_down(args: argparse.Namespace, env: Dict[str, str]) -> int:
 
 
 def cmd_verdict(args: argparse.Namespace, env: Dict[str, str]) -> int:
-    passed, reason = verdict(json.loads(env.get("NEEDS") or "{}"), PLATFORMS[args.platform])
+    platform = PLATFORMS[args.platform]
+    needs = json.loads(env.get("NEEDS") or "{}")
+    recovered_pool: Optional[Tuple[bool, str]] = None
+    if can_recover_watch_failure(needs, platform):
+        try:
+            jobs = github_from_env(env).this_attempt_jobs(
+                env["GITHUB_RUN_ID"], env.get("GITHUB_RUN_ATTEMPT", "1")
+            )
+            recovered_pool = pool_job_passed_after_watch_failure(jobs, platform)
+        except Exception as exc:
+            recovered_pool = (False, f"pool job unknown (GitHub API lookup failed: {exc})")
+    passed, reason = verdict(needs, platform, recovered_pool=recovered_pool)
     print(("pass: " if passed else "fail: ") + reason)
     return 0 if passed else 1
 
