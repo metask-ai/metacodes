@@ -1024,6 +1024,10 @@ pub fn insideGnuScreen() bool {
     return nonEmptyEnv("STY");
 }
 
+pub fn insideTmux() bool {
+    return nonEmptyEnv("TMUX");
+}
+
 fn kittyTerm(term: []const u8) bool {
     if (std.mem.indexOf(u8, term, "kitty") != null) return true; // xterm-kitty 等
     return std.mem.eql(u8, term, "xterm-ghostty");

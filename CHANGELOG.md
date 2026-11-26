@@ -585,6 +585,11 @@ status, compatibility boundaries, and entry points are defined by
   that names kitty or Ghostty turns the protocol on, drag-to-copy stays off
   inside screen, and X10 mouse reports are dropped everywhere.
 
+- **Inside tmux the hint to run an agent in the background says
+  `ctrl+b ctrl+b`.** tmux takes the first Ctrl+B as its prefix, so pressing
+  it once as the hint said did nothing, and the next key went to tmux as a
+  command: `d` detached the session.
+
 - **A reply that broke off and is sent again says so.** The text that was
   shown stays, with a dim line under it saying the reply broke off, is
   discarded and is being retried. The first retry showed nothing.

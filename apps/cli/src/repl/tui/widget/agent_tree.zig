@@ -25,6 +25,7 @@ const tool_card = @import("tool_card.zig");
 const util_time = @import("metacodes-internal").util.time;
 const progress = @import("metacodes-internal").teamwork.progress;
 const teamwork_types = @import("metacodes-internal").teamwork.types;
+const input = @import("../../input.zig");
 
 const JobSnapshot = registry.AgentJobRegistry.JobSnapshot;
 const JobStatus = registry.JobStatus;
@@ -96,13 +97,17 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, jobs: []const JobSnapshot, no
         if (min_start != std.math.maxInt(i64) and now_ms - min_start >= BACKGROUND_HINT_MS) {
             try out.appendSlice(alloc, "     ");
             try out.appendSlice(alloc, th.dim);
-            try out.appendSlice(alloc, "(ctrl+b to run in background)");
+            try out.appendSlice(alloc, backgroundHint());
             try out.appendSlice(alloc, th.reset);
             try out.append(alloc, '\n');
         }
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+fn backgroundHint() []const u8 {
+    return if (input.insideTmux()) "(ctrl+b ctrl+b to run in background)" else "(ctrl+b to run in background)";
 }
 
 pub fn renderTeamwork(alloc: std.mem.Allocator, th: Theme, snapshot: progress.Snapshot, max_cols: ?usize) ![]u8 {
@@ -289,6 +294,7 @@ fn plural(n: anytype) []const u8 {
 const testing = std.testing;
 const theme_mod = @import("../theme.zig");
 const capture = @import("../test_capture.zig");
+const ppaths = @import("metacodes-internal").platform.paths;
 
 fn mkSnap(id: []u8, status: JobStatus, desc: []u8, agent_type: []u8, tool_calls: u32, tokens: u64, current_tool: []u8, current_tool_input: []u8) JobSnapshot {
     return .{
@@ -387,6 +393,12 @@ test "agent_tree: 混合 type → 标题退回通用 Running N agents" {
 }
 
 test "agent_tree: ctrl+b 提示在起后 2s 出现" {
+    const saved_tmux = if (std.c.getenv("TMUX")) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+    defer if (saved_tmux) |value| {
+        ppaths.setEnv("TMUX", value.ptr);
+        testing.allocator.free(value);
+    } else ppaths.unsetEnv("TMUX");
+    ppaths.unsetEnv("TMUX");
     var id = "agent_1".*;
     var desc = "Summarize".*;
     var atype = "Explore".*;
@@ -403,6 +415,26 @@ test "agent_tree: ctrl+b 提示在起后 2s 出现" {
     const s2 = try render(testing.allocator, theme_mod.monochrome, &jobs, 3500);
     defer testing.allocator.free(s2);
     try capture.expectContains(s2, "(ctrl+b to run in background)");
+}
+
+test "agent_tree: inside tmux the hint asks for ctrl+b twice, since tmux takes the first as its prefix" {
+    const saved_tmux = if (std.c.getenv("TMUX")) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+    defer if (saved_tmux) |value| {
+        ppaths.setEnv("TMUX", value.ptr);
+        testing.allocator.free(value);
+    } else ppaths.unsetEnv("TMUX");
+    ppaths.setEnv("TMUX", "/tmp/tmux-0/default,1,0");
+    var id = "agent_1".*;
+    var desc = "Summarize".*;
+    var atype = "Explore".*;
+    var empty = "".*;
+    var jobs = [_]JobSnapshot{
+        mkSnap(&id, .running, &desc, &atype, 0, 0, empty[0..0], empty[0..0]),
+    };
+    jobs[0].started_ms = 1000;
+    const shown = try render(testing.allocator, theme_mod.monochrome, &jobs, 3500);
+    defer testing.allocator.free(shown);
+    try capture.expectContains(shown, "(ctrl+b ctrl+b to run in background)");
 }
 
 test "agent_tree: 超 MAX_SHOWN 折叠 +M more" {
