@@ -54,6 +54,7 @@ const SleptTime = struct {
     ns: u64 = 0,
 
     fn wait(self: *SleptTime, cond: *sync.Condition, mutex: *sync.Mutex, slice_ns: u64) void {
+        if (@import("builtin").is_test) AbortAtFirstSlice.beginSlice(slice_ns);
         if (!cond.timedWait(mutex, slice_ns)) self.ns += slice_ns;
     }
 };
@@ -784,31 +785,31 @@ fn expectWokenOften(wakeups: u64) !void {
     }
 }
 
-fn expectEndsSoonAfterAbort(wait: []const u8, after_abort_ms: i64) !void {
-    if (after_abort_ms >= @as(i64, 2 * WAIT_POLL_MS)) {
-        std.debug.print("the {s} wait ended {d} ms after the abort\n", .{ wait, after_abort_ms });
-        return error.AbortNotSeen;
-    }
-}
+const AbortAtFirstSlice = struct {
+    threadlocal var active: ?*AbortAtFirstSlice = null;
 
-const WaiterAbort = struct {
-    waiter: std.Thread.Id,
-    on: std.atomic.Value(bool) = .init(false),
-    at_ms: std.atomic.Value(i64) = .init(0),
+    slices: usize = 0,
+    longest_slice_ns: u64 = 0,
+    observed: bool = false,
 
-    fn check(self: *WaiterAbort) transport_mod.AbortCheck {
-        return .{ .ctx = self, .isAbortedFn = isAborted };
+    fn beginSlice(slice_ns: u64) void {
+        const self = active orelse return;
+        self.slices += 1;
+        self.longest_slice_ns = @max(self.longest_slice_ns, slice_ns);
     }
 
     fn isAborted(ctx: *anyopaque) bool {
-        const self: *WaiterAbort = @ptrCast(@alignCast(ctx));
-        return std.Thread.getCurrentId() == self.waiter and self.on.load(.acquire);
+        const self: *AbortAtFirstSlice = @ptrCast(@alignCast(ctx));
+        if (active != self or self.slices == 0) return false;
+        self.observed = true;
+        return true;
     }
 
-    fn fireAfter(self: *WaiterAbort, delay_ms: u64) void {
-        util_time.sleepMs(delay_ms);
-        self.at_ms.store(util_time.nowMs(), .release);
-        self.on.store(true, .release);
+    fn expectEnded(self: AbortAtFirstSlice, started_ms: i64) !void {
+        try testing.expect(self.observed);
+        try testing.expectEqual(@as(usize, 1), self.slices);
+        try testing.expect(self.longest_slice_ns <= WAIT_POLL_MS * std.time.ns_per_ms);
+        try testing.expect(util_time.nowMs() - started_ms < WAIT_HANG_MS);
     }
 };
 
@@ -890,25 +891,22 @@ test "Client: a request wait woken by diagnostics for another file still lasts i
 }
 
 test "Client: an abort still ends a wait at its next poll slice (#741)" {
-    var abort: WaiterAbort = .{ .waiter = std.Thread.getCurrentId() };
-    const cl = try startMock(testing.allocator, abort.check());
+    var abort: AbortAtFirstSlice = .{};
+    const cl = try startMock(testing.allocator, .{ .ctx = &abort, .isAbortedFn = AbortAtFirstSlice.isAborted });
     defer cl.shutdown();
     const path = "/tmp/proj/quiet.zig";
     const token = try cl.openFile(path, "a\n");
 
-    const diagnostics_firer = try std.Thread.spawn(.{}, WaiterAbort.fireAfter, .{ &abort, 2 * WAIT_POLL_MS });
+    AbortAtFirstSlice.active = &abort;
+    defer AbortAtFirstSlice.active = null;
+    const diagnostics_started = util_time.nowMs();
     const outcome = cl.waitForDiagnostics(path, token, 10 * WAIT_POLL_MS);
-    const diagnostics_ended = util_time.nowMs();
-    diagnostics_firer.join();
     try testing.expectEqual(DiagnosticsWait.aborted, outcome);
-    try expectEndsSoonAfterAbort("diagnostics", diagnostics_ended - abort.at_ms.load(.acquire));
+    try abort.expectEnded(diagnostics_started);
 
-    abort.on.store(false, .release);
-    const request_firer = try std.Thread.spawn(.{}, WaiterAbort.fireAfter, .{ &abort, 2 * WAIT_POLL_MS });
+    abort = .{};
+    const request_started = util_time.nowMs();
     const answer = cl.sendRequest("mock/unanswered", null, 10 * WAIT_POLL_MS);
-    const request_ended = util_time.nowMs();
-    request_firer.join();
-    abort.on.store(false, .release);
     try testing.expectError(error.Timeout, answer);
-    try expectEndsSoonAfterAbort("request", request_ended - abort.at_ms.load(.acquire));
+    try abort.expectEnded(request_started);
 }
