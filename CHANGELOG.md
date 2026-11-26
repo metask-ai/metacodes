@@ -407,6 +407,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A multi-line paste waits for Enter in terminals that do not mark
+  pastes.** Without bracketed paste markers (a terminal that does not support
+  them, the classic Windows console, a multiplexer that drops them) a paste
+  reaches the TUI as ordinary keys, and its first line break submitted the
+  first line. A line break now counts as part of a paste when it arrives in
+  the same burst as the text around it: at least four bytes before it came
+  within 10 ms of each other and of it, or more input follows within 10 ms.
+  Such line breaks go into the prompt as newlines (a CR LF pair as one), so
+  the paste waits for Enter. A typed Enter, an Enter after an input method
+  commits several characters at once, and a paste that carries markers work
+  as before; a paste as short as `abc` plus its line break still submits.
+
 - **Ctrl+_, Shift+Backspace, Shift+Space, Alt+Enter and Ctrl+H, I, J, M
   and [ work in terminals that report modified keys.** Under the kitty
   keyboard protocol (Ghostty, kitty, Alacritty 0.16 and later, iTerm2 3.7.7
