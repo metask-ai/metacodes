@@ -83,6 +83,53 @@ def test_up_with_caps_lock_on_recalls_history_at_the_prompt(bin_path):
     TTYAssert(raw).assert_input_echo("keep me")
 
 
+def test_shift_backspace_and_ctrl_h_in_both_encodings_delete_a_character(bin_path):
+    raw = run(bin_path, [READY, "type:hello worlds", "raw:\\x1b[127;2u", "raw:\\x1b[27;2;127~", "raw:\\x1b[104;5u",
+                         "raw:\\x1b[27;5;104~", "raw:\\x1b[127;66u", "sleep:0.3"], per_key_drain=0.15)
+    TTYAssert(raw).assert_input_echo("hello w")
+
+
+def test_every_ctrl_underscore_spelling_undoes(bin_path):
+    for undo in ("raw:\\x1b[45;6u", "raw:\\x1b[47;5u", "raw:\\x1b[27;6;45~", "raw:\\x1b[27;5;95~"):
+        raw = run(bin_path, [READY, "type:hello", "raw:\\x7f", undo, "sleep:0.3"], per_key_drain=0.15)
+        TTYAssert(raw).assert_input_echo("hello")
+
+
+def test_shift_space_in_both_encodings_types_a_space(bin_path):
+    raw = run(bin_path, [READY, "type:a", "raw:\\x1b[27;2;32~", "type:b", "raw:\\x1b[32;2u", "type:c",
+                         "raw:\\x1b[27;66;32~", "type:d", "sleep:0.3"], per_key_drain=0.15)
+    TTYAssert(raw).assert_input_echo("a b c d")
+
+
+def test_alt_enter_in_both_encodings_starts_a_new_line(bin_path):
+    raw = run(bin_path, [READY, "type:line1", "raw:\\x1b[13;3u", "type:line2", "raw:\\x1b[27;3;13~", "type:line3",
+                         "sleep:0.3"], per_key_drain=0.15)
+    a = TTYAssert(raw)
+    a.assert_box_height(3)
+    top = a.box_top_row()
+    a.assert_line_contains(top + 1, "line1")
+    a.assert_line_contains(top + 2, "line2")
+    a.assert_line_contains(top + 3, "line3")
+
+
+def test_ctrl_j_and_ctrl_m_in_both_encodings_submit(bin_path):
+    for enter in ("raw:\\x1b[106;5u", "raw:\\x1b[27;5;106~", "raw:\\x1b[109;5u", "raw:\\x1b[27;5;109~"):
+        raw = run(bin_path, [READY, "type:/task-test:widget", enter, wait_for("◼", 5), "sleep:0.3"],
+                  per_key_drain=0.15)
+        final, a = _final_text(raw)
+        assert "◼" in final, f"{enter} did not submit /task-test:\n" + final
+        a.assert_box_present()
+
+
+def test_ctrl_bracket_in_both_encodings_is_esc(bin_path):
+    for esc in ("raw:\\x1b[91;5u", "raw:\\x1b[27;5;91~"):
+        raw = run(bin_path, [READY, "type:keep me", esc, wait_for("Esc again to clear", 5)], per_key_drain=0.15)
+        a = TTYAssert(raw)
+        a.assert_input_echo("keep me")
+        if not any(sc.find_row("Esc again to clear") is not None for sc in a.frame_screens):
+            a._fail(f"{esc} did not act as Esc on a draft")
+
+
 # ── 生成期键:CSI-u 在 agent 运行期生效 ─────────────────────────────────────
 
 def _slow_turn():

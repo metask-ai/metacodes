@@ -367,7 +367,7 @@ pub const KeyParser = struct {
                 if (b == 'R') return .{ .cursor_position = .{ .row = saturate16(self.num1), .col = saturate16(self.num2) } };
                 const modifier = KeyModifier.fromParam(self.num2);
                 if (b == 'u') return decodeModifiedKey(self.num1, modifier);
-                if (modifier != .none) return .unknown;
+                if (modifier != KeyModifier.none) return .unknown;
                 if (b == '~') return tildeKey(self.num1);
                 return if (self.num1 == 1) cursorKey(b) else .unknown;
             },
@@ -487,53 +487,67 @@ fn saturate16(value: u32) u16 {
     return @intCast(@min(value, std.math.maxInt(u16)));
 }
 
-const KeyModifier = enum {
-    none,
-    shift,
-    alt,
-    ctrl,
-    other,
+const KeyModifier = packed struct(u32) {
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+    super: bool = false,
+    hyper: bool = false,
+    meta: bool = false,
+    caps_lock: bool = false,
+    num_lock: bool = false,
+    unassigned: u24 = 0,
+
+    const none: KeyModifier = .{};
+    const shift_only: KeyModifier = .{ .shift = true };
+    const alt_only: KeyModifier = .{ .alt = true };
+    const ctrl_only: KeyModifier = .{ .ctrl = true };
+    const ctrl_shift: KeyModifier = .{ .ctrl = true, .shift = true };
 
     fn fromParam(param: u32) KeyModifier {
-        if (param <= 1) return .none;
-        const lock_bits: u32 = 64 | 128;
-        return switch ((param - 1) & ~lock_bits) {
-            0 => .none,
-            1 => .shift,
-            2 => .alt,
-            4 => .ctrl,
-            else => .other,
-        };
+        var modifier: KeyModifier = @bitCast(param -| 1);
+        modifier.caps_lock = false;
+        modifier.num_lock = false;
+        return modifier;
     }
 };
+
+fn printableKey(codepoint: u32) Key {
+    return if (codepoint >= 0x20 and codepoint <= 0x7e) Key{ .char = @intCast(codepoint) } else .unknown;
+}
 
 fn decodeModifiedKey(codepoint: u32, modifier: KeyModifier) Key {
     return switch (codepoint) {
         9 => switch (modifier) {
-            .none => .tab,
-            .shift => .shift_tab,
+            KeyModifier.none => .tab,
+            KeyModifier.shift_only => .shift_tab,
             else => .unknown,
         },
-        13 => switch (modifier) {
-            .shift => .shift_enter,
-            .ctrl => .ctrl_enter,
+        13 => if (modifier.alt) .shift_enter else switch (modifier) {
+            KeyModifier.shift_only => .shift_enter,
+            KeyModifier.ctrl_only => .ctrl_enter,
             else => .enter,
         },
         // 带修饰的 Esc(Shift/Ctrl+Esc)仍是 Esc:取消、关闭对它的每个使用方都一样
         // (反向搜索、transcript viewer 旧的自解码 CSI-u 就只看 codepoint 27)。
         27 => .esc,
+        127 => switch (modifier) {
+            KeyModifier.none, KeyModifier.shift_only => .backspace,
+            else => .unknown,
+        },
         else => switch (modifier) {
             // ASCII 可打印 → char(兼容把纯文本也 CSI-u 编码的终端)。
-            .none => if (codepoint >= 0x20 and codepoint <= 0x7e) Key{ .char = @intCast(codepoint) } else .unknown,
-            .ctrl => ctrlLetterKey(codepoint),
+            KeyModifier.none, KeyModifier.shift_only => printableKey(codepoint),
+            KeyModifier.ctrl_only => ctrlLetterKey(codepoint),
+            KeyModifier.ctrl_shift => if (codepoint == '-') .ctrl_underscore else .unknown,
             // Alt+字母:Kitty disambiguate 把 Alt+B/Alt+F 编成 CSI-u(旧编码 ESC b
             // 与"ESC 再按 b"有歧义),不认的话开了协议的终端上词跳转就没了。
-            .alt => switch (codepoint) {
+            KeyModifier.alt_only => switch (codepoint) {
                 98, 66 => .alt_b,
                 102, 70 => .alt_f,
                 else => .unknown,
             },
-            .shift, .other => .unknown,
+            else => .unknown,
         },
     };
 }
@@ -559,6 +573,11 @@ fn ctrlLetterKey(codepoint: u32) Key {
         119, 87 => .ctrl_w, // 'w'
         121, 89 => .ctrl_y, // 'y'
         95 => .ctrl_underscore, // '_' — undo
+        47 => .ctrl_underscore,
+        104, 72 => .backspace,
+        105, 73 => .tab,
+        106, 74, 109, 77 => .enter,
+        91 => .esc,
         else => .unknown,
     };
 }
@@ -1830,8 +1849,8 @@ test "KeyParser: CSI Delete still works" {
 
 test "KeyParser: CSI u with unknown mod falls back to Enter" {
     var p = KeyParser{};
-    // ESC [ 13 ; 3 u  (mod=3 = Alt，我们不关心)
-    for ([_]u8{ 0x1b, '[', '1', '3', ';', '3' }) |b| try testing.expect(p.feed(b) == null);
+    // ESC [ 13 ; 9 u  (mod=9 = Super，我们不关心)
+    for ([_]u8{ 0x1b, '[', '1', '3', ';', '9' }) |b| try testing.expect(p.feed(b) == null);
     try testing.expect(p.feed('u').? == .enter);
 }
 
@@ -2009,6 +2028,54 @@ test "KeyParser: modifyOtherKeys CSI 27;mod;key~ decodes through the CSI u table
     try expectSequence("\x1b[27;5;95~", .ctrl_underscore);
     try expectSequence("\x1b[27;3;98~", .alt_b);
     try expectSequence("\x1b[27;3;102~", .alt_f);
+}
+
+fn expectBothEncodings(codepoint: u32, modifier: u32, expected: Key) !void {
+    var buf: [32]u8 = undefined;
+    for ([_]u32{ 0, 64, 128, 192 }) |locks| {
+        try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[{d};{d}u", .{ codepoint, modifier + locks }), expected);
+        try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[27;{d};{d}~", .{ modifier + locks, codepoint }), expected);
+    }
+}
+
+test "KeyParser: Ctrl+_, Shift+Backspace, Ctrl+H/I/J/M/[ and Shift+Space decode in CSI u and modifyOtherKeys as their legacy bytes do" {
+    const cases = [_]struct { u32, u32, u8 }{
+        .{ 45, 6, 0x1f },
+        .{ 47, 5, 0x1f },
+        .{ 95, 5, 0x1f },
+        .{ 127, 2, 0x7f },
+        .{ 127, 1, 0x7f },
+        .{ 104, 5, 0x08 },
+        .{ 72, 5, 0x08 },
+        .{ 105, 5, '\t' },
+        .{ 106, 5, '\n' },
+        .{ 109, 5, '\r' },
+        .{ 32, 2, ' ' },
+        .{ 32, 5, 0x00 },
+    };
+    for (cases) |c| try expectBothEncodings(c[0], c[1], byteToKey(c[2]));
+    try expectBothEncodings(91, 5, .esc);
+    var buf: [8]Key = undefined;
+    try testing.expectEqualSlices(Key, &.{.esc}, parseAll("\x1b", &buf));
+}
+
+test "KeyParser: Enter with the Alt bit is Shift+Enter in CSI u and modifyOtherKeys, as ESC CR is" {
+    for ([_]u32{ 3, 4, 7, 8 }) |modifier| try expectBothEncodings(13, modifier, .shift_enter);
+    var p = KeyParser{};
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expectEqual(Key.shift_enter, p.feedQueued('\r', false).?);
+    try expectBothEncodings(13, 2, .shift_enter);
+    try expectBothEncodings(13, 5, .ctrl_enter);
+    try expectBothEncodings(13, 1, .enter);
+    try expectBothEncodings(13, 6, .enter);
+    try expectBothEncodings(13, 9, .enter);
+}
+
+test "KeyParser: a printable key with only Shift is that character in CSI u and modifyOtherKeys" {
+    try expectBothEncodings(65, 2, .{ .char = 'A' });
+    try expectBothEncodings(95, 2, .{ .char = '_' });
+    try expectBothEncodings(126, 2, .{ .char = '~' });
+    try expectBothEncodings(31, 2, .unknown);
 }
 
 test "KeyParser: unknown modifyOtherKeys combos are one .unknown and leave no characters" {
@@ -2545,6 +2612,82 @@ fn parseAll(stream: []const u8, out: []Key) []Key {
         }
     }
     return out[0..n];
+}
+
+fn parseChunks(stream: []const u8, cuts: []const usize, out: []Key) []Key {
+    var p = KeyParser{};
+    var n: usize = 0;
+    var start: usize = 0;
+    for (0..cuts.len + 1) |i| {
+        const end = if (i < cuts.len) cuts[i] else stream.len;
+        const chunk = stream[start..end];
+        for (chunk, 0..) |b, j| {
+            if (p.feedQueued(b, j + 1 < chunk.len)) |k| {
+                out[n] = k;
+                n += 1;
+            }
+            while (p.drain()) |k| {
+                out[n] = k;
+                n += 1;
+            }
+        }
+        start = end;
+    }
+    if (p.flushEsc()) |k| {
+        out[n] = k;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "KeyParser: a stream of legacy, CSI u and modifyOtherKeys keys decodes the same however the reads split it" {
+    const stream = "a\x1b[1~\x1b[4~\x1b[7~\x1b[8~\x1b[1;65A\x1b[3;129~" ++
+        "\x1b[45;6u\x1b[27;6;45~\x1b[47;5u\x1b[27;5;95~\x1f" ++
+        "\x1b[127;2u\x1b[27;2;127~\x1b[104;5u\x7f\x08" ++
+        "\x1b[106;5u\x1b[27;5;109~\x1b[105;5u\t\x1b[91;5u" ++
+        "\x1b[13;3u\x1b[27;3;13~\x1b[13;2u\x1b[27;2;32~\x1b[32;66u" ++
+        "\x1b[9;2u\x1b[Z\x1b[99;5u\x1b[98;3u\x1bf\x1b\x1b[B" ++
+        "\x1b[200~x\x1b[201~\x1b[12;40R\x1b[1;2A\x1b[27;7;120~z";
+    const expected = [_]Key{ .{ .char = 'a' }, .home, .end, .home, .end, .up, .delete } ++
+        [_]Key{.ctrl_underscore} ** 5 ++
+        [_]Key{.backspace} ** 5 ++
+        [_]Key{ .enter, .enter, .tab, .tab, .esc } ++
+        [_]Key{.shift_enter} ** 3 ++ [_]Key{.{ .char = ' ' }} ** 2 ++
+        [_]Key{ .shift_tab, .shift_tab, .ctrl_c, .alt_b, .alt_f, .esc, .down } ++
+        [_]Key{ .paste_begin, .{ .char = 'x' }, .paste_end, .{ .cursor_position = .{ .row = 12, .col = 40 } }, .unknown, .unknown, .{ .char = 'z' } };
+    var buf: [64]Key = undefined;
+    try testing.expectEqualSlices(Key, &expected, parseChunks(stream, &.{}, &buf));
+    try testing.expectEqualSlices(Key, &expected, parseAll(stream, &buf));
+
+    for (1..stream.len) |cut| {
+        errdefer std.debug.print("one cut at byte {d}\n", .{cut});
+        try testing.expectEqualSlices(Key, &expected, parseChunks(stream, &.{cut}, &buf));
+    }
+    var cuts: [stream.len]usize = undefined;
+    for (1..stream.len) |size| {
+        errdefer std.debug.print("reads of {d} bytes\n", .{size});
+        var n: usize = 0;
+        var at = size;
+        while (at < stream.len) : (at += size) {
+            cuts[n] = at;
+            n += 1;
+        }
+        try testing.expectEqualSlices(Key, &expected, parseChunks(stream, cuts[0..n], &buf));
+    }
+    var prng = std.Random.DefaultPrng.init(0x6b657973);
+    const random = prng.random();
+    for (0..500) |round| {
+        errdefer std.debug.print("random split round {d}\n", .{round});
+        var n: usize = 0;
+        var at: usize = 0;
+        while (true) {
+            at += random.intRangeAtMost(usize, 1, 12);
+            if (at >= stream.len) break;
+            cuts[n] = at;
+            n += 1;
+        }
+        try testing.expectEqualSlices(Key, &expected, parseChunks(stream, cuts[0..n], &buf));
+    }
 }
 
 /// `stream` read the way platform/terminal.zig reads a console that sends

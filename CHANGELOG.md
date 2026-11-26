@@ -395,6 +395,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Ctrl+_, Shift+Backspace, Shift+Space, Alt+Enter and Ctrl+H, I, J, M
+  and [ work in terminals that report modified keys.** Under the kitty
+  keyboard protocol (Ghostty, kitty, Alacritty 0.16 and later, iTerm2 3.7.7
+  and later) and xterm modifyOtherKeys (tmux with `extended-keys`, WezTerm)
+  these keys arrive as sequences such as `ESC [ 127 ; 2 u` or
+  `ESC [ 27 ; 2 ; 32 ~`, and the key parser had no entry for them: Ctrl+_
+  (`ESC [ 45 ; 6 u`, `ESC [ 47 ; 5 u`) did not undo, Shift+Backspace and
+  Ctrl+H did not delete, Shift+Space was lost, Ctrl+J and Ctrl+M did not
+  submit, Ctrl+I did not complete, Ctrl+[ was not Esc, and Alt+Enter
+  submitted the draft instead of starting a new line. Each now does what its
+  legacy byte does in both encodings, with or without Caps Lock and Num Lock:
+  Enter with Alt starts a new line as `ESC CR` does, and a printable key with
+  only Shift is that character.
+
 - **Home and End work in tmux, GNU screen, the Linux console and rxvt.**
   These send Home as `ESC [ 1 ~` and End as `ESC [ 4 ~` (rxvt `ESC [ 7 ~`
   and `ESC [ 8 ~`), and the key parser knew Home and End only as
