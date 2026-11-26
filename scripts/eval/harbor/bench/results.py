@@ -103,16 +103,30 @@ def worker_result(node, operation, directory, trial=None):
                     "source": str(directory.resolve())}
         with store.read() as tx:
             source = tx.one("SELECT source_dir, projection FROM jobs WHERE name = ?", (name,))
-            stale_trials = tx.one("SELECT 1 FROM trials WHERE job = ? AND projection <> ? LIMIT 1",
-                                  (name, ingest.PROJECTION))
         if not source or source[0] != str(directory.resolve()):
             return None
-        if source[1] != ingest.PROJECTION or stale_trials:
-            with ingest.root_lock(directory.parent):
-                ingest.refresh_job_projection(store, name, ingest.stderr_log)
         if operation == "job":
+            with store.read() as tx:
+                stale_trials = tx.one("SELECT 1 FROM trials WHERE job = ? AND projection <> ? LIMIT 1",
+                                      (name, ingest.PROJECTION))
+            if source[1] != ingest.PROJECTION or stale_trials:
+                with ingest.root_lock(directory.parent):
+                    ingest.refresh_job_projection(store, name, ingest.stderr_log)
             return library.job_view(name)
         if operation == "trial" and isinstance(trial, str) and data.NAME.fullmatch(trial):
+            target = library.trial_record(name, trial)
+            if target and (source[1] != ingest.PROJECTION or target[1] != ingest.PROJECTION):
+                with ingest.root_lock(directory.parent):
+                    with store.read() as tx:
+                        source = tx.one("SELECT source_dir, projection FROM jobs WHERE name = ?", (name,))
+                    if not source or source[0] != str(directory.resolve()):
+                        return None
+                    target = library.trial_record(name, trial)
+                    if target:
+                        if source[1] != ingest.PROJECTION:
+                            ingest.refresh_job_header(store, name)
+                        if target[1] != ingest.PROJECTION:
+                            ingest.refresh_trial_projection(store, name, target[0], ingest.stderr_log)
             return library.trial_view(name, trial)
         raise ValueError("未知的作业查询")
     finally:
