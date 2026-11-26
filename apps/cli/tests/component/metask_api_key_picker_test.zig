@@ -505,6 +505,48 @@ test "L2 metask api-key route: with no gateway answer the compiled inventory sta
     try std.testing.expectEqualStrings("claude-sonnet-4-6", currentModel(app).?);
 }
 
+test "L2 metask api-key route: a pick for every future session stays current when the gateway's models arrive later" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    try case.setEnv("METACODES_NO_PROBE", "1");
+    try case.setEnv("DEEPSEEK_API_KEY", "fake-deepseek-key");
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const argv = [_][*:0]const u8{ "metacodes", "--model", "claude-sonnet-4-6" };
+
+    const started_on = blk: {
+        const probe = try App.init(allocator, io_runtime.io(), try case.config(&argv), SESSION_KEY);
+        defer probe.deinit();
+        const host = try probe.providerHost();
+        break :blk (host.kernel.currentOfferId() orelse return error.NoStartupRoute).render();
+    };
+    var config = try case.config(&argv);
+    config.selected_offer_id = &started_on;
+    const app = try App.init(allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+    const host = try app.providerHost();
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(try cc.provider_ids.OfferId.parse(&started_on)));
+
+    const deepseek = for (host.kernel.catalogSnapshot().items()) |*candidate| {
+        if (candidate.provider_id.eqlText("deepseek") and std.mem.eql(u8, candidate.request_model_id, "deepseek-v4-pro")) break candidate;
+    } else return error.OfferMissing;
+    const deepseek_offer = deepseek.offer_id;
+    try std.testing.expect(try app.commitModelSelection(.{
+        .offer_id = deepseek.offer_id,
+        .offer_revision = deepseek.offer_revision,
+        .controls = .{},
+        .scope = .global,
+    }) == .committed);
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(deepseek_offer));
+
+    const gateway = app.metask_key_route.?.gateway_origin;
+    app.adoptMetaskKeyModels(try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{gateway}), "{\"object\":\"list\",\"data\":[{\"id\":\"claude-sonnet-4-6\",\"max_tokens\":8192}]}");
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(deepseek_offer));
+    try std.testing.expectEqualStrings("deepseek-v4-pro", currentModel(app).?);
+}
+
 test "L2 metask api-key route: a --base-url session with no gateway answer marks no compiled offer" {
     var case: Case = undefined;
     try case.init();

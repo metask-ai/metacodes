@@ -538,6 +538,7 @@ pub const App = struct {
     /// Why the last committed selection was not written durably, if it was not.
     /// The route is live regardless; what is lost is surviving a `/resume`.
     last_persist_error: ?[]const u8 = null,
+    session_follows_global: bool = false,
     /// 模型档位表(<state root>/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("metacodes-internal").api.model_tiers.TierTable = null,
     /// `config.json` `model_prices`, installed for every cost meter while this App lives.
@@ -2996,6 +2997,7 @@ pub const App = struct {
     /// — the one that actually breaks a session — the turn-boundary OAuth
     /// refresh, which keys on the effective selection, never runs.
     fn seedStartupSelection(app: *App, host: *provider_host_mod.Host) void {
+        if (app.session_follows_global) return;
         // An unbound session started on no route (#484, #485): the offer a
         // flag named lacks its credential, and seeding it would have the
         // picker and `/providers` mark as current a route nothing is sent on.
@@ -3491,6 +3493,17 @@ pub const App = struct {
                 try app.bindOrRevert(host, accepted);
                 app.applyCommittedReasoning(accepted.selection);
                 if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
+                switch (accepted.scope) {
+                    .global => {
+                        host.kernel.forgetSessionSelection();
+                        app.session_follows_global = true;
+                        app.forgetPersistedSessionSelection() catch |err| {
+                            app.last_persist_error = @errorName(err);
+                        };
+                    },
+                    .session => app.session_follows_global = false,
+                    else => {},
+                }
                 // A session-scoped choice is durable *for this session*: it has
                 // to survive a resume, and it must not reach any other session,
                 // which is why it goes to the session's own file.
@@ -3575,6 +3588,15 @@ pub const App = struct {
         var store = app.sessionSelectionStore() orelse return;
         defer store.deinit();
         _ = try provider_config_store.setSessionSelection(&store, selection, null, null);
+    }
+
+    fn forgetPersistedSessionSelection(app: *App) !void {
+        var store = app.sessionSelectionStore() orelse return;
+        defer store.deinit();
+        var document = store.load() catch return;
+        defer document.deinit();
+        if (document.session_selection == null) return;
+        _ = try provider_config_store.setSessionSelection(&store, null, null, null);
     }
 
     /// Restore this session's own selection, if it committed one before.

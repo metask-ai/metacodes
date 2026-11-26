@@ -533,6 +533,10 @@ fn deviceSessionConfig(setup: std.mem.Allocator, relay_origin: []const u8) ![]u8
 /// An App on the Metask device sign-in's route at `metask_origin`, in a case
 /// initialised with `deviceSessionConfig`. Both providers have a live login.
 fn deviceSessionApp(case: *Case, metask_origin: []const u8, io: std.Io) !*App {
+    return deviceSessionAppOn(case, metask_origin, io, null);
+}
+
+fn deviceSessionAppOn(case: *Case, metask_origin: []const u8, io: std.Io, selected_offer: ?[]const u8) !*App {
     try case.setEnv("RELAY_TOKEN", RELAY_KEY);
     const now = cc.util_time.nowUnix();
     try case.storeOAuthLogin("metask", .{
@@ -557,6 +561,7 @@ fn deviceSessionApp(case: *Case, metask_origin: []const u8, io: std.Io) !*App {
     config.base_url = try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{metask_origin});
     config.model = "glm-5.3-flash";
     config.model_explicit = true;
+    config.selected_offer_id = selected_offer;
     return App.init(std.testing.allocator, io, config, METASK_ACCESS);
 }
 
@@ -642,6 +647,51 @@ fn commitIn(app: *App, provider: []const u8, model: []const u8, credential: ?[]c
     if (outcome != .committed) return error.CommitRefused;
 }
 
+fn expectCurrentRoute(app: *App, offer: cc.provider_ids.OfferId) !void {
+    const host = try app.providerHost();
+    try std.testing.expect(host.kernel.sessionSelection() == null);
+    try std.testing.expect(host.kernel.currentOfferId().?.eql(offer));
+    var listing = try app.listModelOffers();
+    defer listing.deinit(app.allocator);
+    try std.testing.expect(listing.current.?.eql(offer));
+    try app.refreshModelPicker();
+    try std.testing.expect(app.model_picker.current_offer.?.eql(offer));
+}
+
+test "L2 credential scope: a pick for every future session is this session's current route too, over the route it started on" {
+    var metask = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, GATEWAY_MODELS }, 0);
+    defer metask.stop();
+    var relay = try harness.MockServer.startCassette(&.{ANTHROPIC_END_TURN_SSE}, 0);
+    defer relay.stop();
+
+    var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup.deinit();
+    var io_runtime = @import("platform").signal.threadedIo(setup.allocator(), .{});
+    defer io_runtime.deinit();
+    var case: Case = undefined;
+    try case.init(try deviceSessionConfig(setup.allocator(), try originOf(setup.allocator(), relay)));
+    defer case.deinit();
+    const metask_origin = try originOf(setup.allocator(), metask);
+    const started_on_text = blk: {
+        const probe = try deviceSessionApp(&case, metask_origin, io_runtime.io());
+        defer probe.deinit();
+        break :blk try offerIdText(probe, "metask", "glm-5.3-flash", null);
+    };
+    const app = try deviceSessionAppOn(&case, metask_origin, io_runtime.io(), &started_on_text);
+    defer app.deinit();
+    const host = try app.providerHost();
+    const relay_offer = try cc.provider_ids.OfferId.parse(&(try offerIdText(app, "relay", "relay-model", null)));
+    try std.testing.expect(host.kernel.sessionSelection() != null);
+    const started_on = host.kernel.currentOfferId() orelse return error.NoStartupSelection;
+    try std.testing.expect(!started_on.eql(relay_offer));
+
+    try commitIn(app, "relay", "relay-model", null, .global);
+    try expectCurrentRoute(app, relay_offer);
+    try sendOneTurn(app);
+    try std.testing.expect(sentBearer(relay, relay.requestCount() - 1, RELAY_KEY));
+    try expectCurrentRoute(app, relay_offer);
+}
+
 test "L2 credential scope: a pick for every future session takes the turn's token refresh along" {
     var metask = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
     defer metask.stop();
@@ -661,9 +711,10 @@ test "L2 credential scope: a pick for every future session takes the turn's toke
     // This session's pick: a Metask model, on the device sign-in.
     try commitIn(app, "metask", "glm-5.3-flash", null, .session);
     // Then the relay with Tab on "every future session". The clients move to
-    // it; the kernel's session scope still holds the Metask pick, and a
-    // narrower scope wins.
+    // it.
     try commitIn(app, "relay", "relay-model", null, .global);
+    try expectCurrentRoute(app, try cc.provider_ids.OfferId.parse(&(try offerIdText(app, "relay", "relay-model", null))));
+    try std.testing.expect(!(try app.restoreSessionSelection()));
     // The next turn: its token refresh, then the request.
     const replaced = try app.refreshRouteCredential();
     try sendOneTurn(app);

@@ -450,6 +450,16 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **Choosing a model for every future session in `/model` makes it this
+  session's current route too.** The route the session started on stayed
+  recorded as the session's own choice, which outranks the default, so
+  `/model` and `/providers` went on marking the old route as current and the
+  token refresh at the start of a turn went on following it, while the
+  session already ran on the new route; a `/resume` brought the old choice
+  back. A pick for every future session now clears the session's own choice,
+  live and in its saved state, and the route the session started on is not
+  put back over it later.
+
 - **A teammate's report reaches an idle team lead without a key press.**
   When a teammate finished while the lead's prompt was waiting for input,
   its report sat in the lead's inbox until the user pressed Enter. The idle
