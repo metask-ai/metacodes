@@ -120,7 +120,6 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/theme", .desc = "Show or switch the color theme" },
     .{ .name = "/tools", .desc = "List available tools" },
     .{ .name = "/transcript", .desc = "Browse the conversation (Ctrl+X Ctrl+O)" },
-    .{ .name = "/vim", .desc = "Toggle vim key bindings" },
 };
 
 comptime {

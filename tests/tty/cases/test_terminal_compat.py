@@ -147,24 +147,6 @@ def test_esc_then_enter_pressed_apart_still_submits(bin_path):
     assert "abc" in _screen_text(raw), "the submitted prompt should be echoed above the box"
 
 
-def test_vim_insert_esc_then_enter_apart_goes_normal_then_submits(bin_path):
-    events = [READY, "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc"]
-    raw = run(bin_path, events + SEPARATE_ESC_ENTER + ["sleep:0.8"], env=APPLE, per_key_drain=0.02)
-    a = TTYAssert(raw)
-    a.assert_input_echo("")  # Esc → NORMAL, Enter → submit, as before ESC CR was a key
-
-
-def test_vim_insert_esc_cr_in_one_write_is_a_newline(bin_path):
-    events = [READY, "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc",
-              "raw:\\x1b\\x0d", "type:def", "sleep:0.4"]
-    raw = run(bin_path, events, env=APPLE, per_key_drain=0.02)
-    a = TTYAssert(raw)
-    a.assert_box_height(2)
-    top = a.box_top_row()
-    a.assert_line_contains(top + 1, "abc")
-    a.assert_line_contains(top + 2, "def")
-
-
 def _reverse_search_hel(bin_path, keys):
     # A history with "hello" (seeded, so no turn runs), Ctrl+R, "hel", then `keys`.
     state = case_tmpdir("cc-tty-revsearch-")

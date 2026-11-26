@@ -304,6 +304,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The TUI no longer offers `/vim`.** It is gone from the slash menu,
+  completion and `/help`, and typing it reports an unknown command like any
+  other mistyped name. Web and daemon hosts that send `/vim` through
+  `POST /command` are not affected.
+
 - **API failure notices are in English.** The line under `API request
   failed` mixed Chinese into an English screen, e.g. `HTTP 429(重试 4 次后放弃):
   …`. It now reads `HTTP 429 (gave up after 4 attempts): …`, and the named

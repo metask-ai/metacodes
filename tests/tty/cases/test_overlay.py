@@ -91,7 +91,7 @@ def test_help_esc_repeated_no_border_accumulation(bin_path):
 def test_esc_then_char_not_swallowed(bin_path):
     # 回归:ESC 后紧跟普通字符,该字符不被吞(早期 bug:feed 在 esc_seen 态兑现 ESC 时丢字节)。
     # 场景:先开 help(? ),再一次性发 ESC+'k'(raw 两字节连发,模拟终端把快速两次按键合批送来)。
-    #   - ESC → 关 help(非 vim 下 esc 在空框是 dispatch 消费);
+    #   - ESC → 关 help(esc 在空框是 dispatch 消费);
     #   - 'k' → 进输入框(不能被吞)。
     # raw:\x1bk 让两字节无 per_key_drain 间隔进内核缓冲,loop 逐字节 read:0x1b→esc_seen,
     # 紧接读到 'k' 在 esc_seen 态兑现 ESC + pending 'k';drain 接线把 'k' 喂到 editor。

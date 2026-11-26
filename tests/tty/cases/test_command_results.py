@@ -52,6 +52,20 @@ def test_unknown_command_replaces_its_echo_with_a_suggestion(bin_path):
         a._fail("an unknown command is reported in place of its echo")
 
 
+def test_vim_is_an_unknown_command_in_the_tui(bin_path):
+    raw = run(bin_path, submit("/vim", "Unknown command"))
+    a = TTYAssert(raw)
+    row = a.final.find_row("Unknown command: /vim")
+    if row is None:
+        a._fail("/vim should be reported as an unknown command")
+    if "Did you mean /vim" in a.final.line_text(row):
+        a._fail("the suggestion must not offer /vim")
+    if a.final.find_row("Editor mode") is not None:
+        a._fail("/vim must not switch the editor mode")
+    a.assert_input_echo("")
+    a.assert_box_present()
+
+
 def test_exit_says_goodbye_under_the_echo(bin_path):
     raw = run(bin_path, submit("/exit", "Goodbye"))
     a = TTYAssert(raw)

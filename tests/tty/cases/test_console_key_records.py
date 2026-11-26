@@ -3,9 +3,9 @@
 The REPL turns win32-input-mode on so that Shift+Enter is not Enter. From then
 on the console sends every key as a record `CSI Vk;Sc;Uc;Kd;Cs;Rc _`, key-ups
 and modifier keys included, and every reader of the console input must read
-the keys the records stand for, not the records: the permission dialog, the
-question dialog and vim's normal mode each read keys outside the prompt's own
-key parser. These cases press keys as records on Windows (the pseudo console
+the keys the records stand for, not the records: the permission dialog and the
+question dialog each read keys outside the prompt's own key parser. These cases
+press keys as records on Windows (the pseudo console
 takes records written to it, as Windows Terminal sends them) and as the VT
 bytes the same keys send everywhere else, and expect the same outcome.
 
@@ -19,7 +19,7 @@ import sys
 
 from tty_driver import READY, case_tmpdir, run, wait_for
 from asserts import TTYAssert
-from slow_mock_server import SlowMockServer, simple_text, slow_text_then_end, slow_text_then_tooluse
+from slow_mock_server import SlowMockServer, slow_text_then_end, slow_text_then_tooluse
 
 WINDOWS = sys.platform == "win32"
 
@@ -162,25 +162,3 @@ def test_question_dialog_ctrl_c_record_cancels(bin_path):
     text = _result_text(result) if result is not None else ""
     if "InputAborted" not in text or "Teal" in text or "Amber" in text:
         a._fail(f"Ctrl+C did not cancel the question: tool_result={text!r}")
-
-
-def test_vim_normal_mode_reads_records(bin_path):
-    # Esc leaves insert mode with the cursor on the last character; h h l
-    # moves it to the second, k and j stay on the one line, i inserts there.
-    with SlowMockServer([simple_text("VIM_OK")]) as srv:
-        raw = run(
-            bin_path,
-            [READY, "type:/vim", "key:enter", wait_for("Editor mode: vim")]
-            + press("abc", "esc") + ["sleep:0.4"]
-            + press("h", "h", "l", "k", "j", "i", "X", "enter")
-            + [wait_for("VIM_OK", 15), "sleep:0.3"],
-            base_url=srv.url,
-            startup_drain=0.8,
-            per_key_drain=0.05,
-        )
-        requests = list(srv.requests)
-    a = TTYAssert(raw)
-    if not requests:
-        a._fail("Enter in vim's normal mode did not submit")
-    if b"aXbc" not in requests[0]:
-        a._fail(f"vim's normal-mode keys went wrong: request={requests[0][-300:]!r}")

@@ -21,8 +21,8 @@ VS Code binding sends, so a binding Claude Code installed already counts.
 
 metacodes takes `ESC CR` for a newline only when the two bytes arrive together,
 as a terminal writes them for one key press. An Esc you press and then an
-Enter are two keys even when they come quickly: in vim mode Esc still goes to
-NORMAL and Enter submits, and in reverse search Esc still cancels. Pasted text
+Enter are two keys even when they come quickly: in reverse search Esc still
+cancels. Pasted text
 keeps its line breaks. Terminals that send `ESC CR` for Alt+Enter (xterm, VTE
 terminals such as GNOME Terminal, Konsole, Alacritty) now get a newline from
 Alt+Enter too.
