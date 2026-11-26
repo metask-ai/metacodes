@@ -562,6 +562,7 @@ pub const SpawnFn = *const fn (a: std.mem.Allocator, p: SpawnProcessParams) anye
 pub fn spawnTeammateProcess(
     sw: *swarm_ctx.SwarmContext,
     name_raw: []const u8,
+    prompt: []const u8,
     worktree_path: []const u8, // 空 = 无 worktree(共享 cwd)
     worktree_base: []const u8, // 非空且 worktree_path 非空 → createWorktree(git 起点,如 HEAD)
     repo: []const u8, // git repo 根(git -C;lead 的 project_dir)。空退回进程 cwd
@@ -637,19 +638,15 @@ pub fn spawnTeammateProcess(
     }
 
     // ③ fork+exec(或 mock)。
-    var flags: [3][]const u8 = undefined;
+    var flags_arena = std.heap.ArenaAllocator.init(a);
+    defer flags_arena.deinit();
+    const fa = flags_arena.allocator();
+    var flags: std.ArrayList([]const u8) = .empty;
     var preview_arg: [@import("metacodes-ai").preview.Features.max_arg_len]u8 = undefined;
-    var flag_count: usize = 0;
-    if (!lsp_enabled) {
-        flags[flag_count] = "--no-lsp";
-        flag_count += 1;
-    }
-    flags[flag_count] = "--no-preview";
-    flag_count += 1;
-    if (!sw.preview.eql(.none)) {
-        flags[flag_count] = sw.preview.enableArg(&preview_arg);
-        flag_count += 1;
-    }
+    if (!lsp_enabled) try flags.append(fa, "--no-lsp");
+    try flags.append(fa, "--no-preview");
+    if (!sw.preview.eql(.none)) try flags.append(fa, sw.preview.enableArg(&preview_arg));
+    if (sw.teammate_args) |host_args| try host_args.append(fa, &flags);
     const pid = try spawn_fn(a, .{
         .name = name_s,
         .team = sw.team_sanitized,
@@ -657,7 +654,7 @@ pub fn spawnTeammateProcess(
         .lease_id = lease_id.asSlice(),
         .cwd = effective_wt,
         .state_root = sw.state_root,
-        .extra_flags = flags[0..flag_count],
+        .extra_flags = flags.items,
     });
     // The child is live but not yet owned by process_teammates. Any
     // allocation/append failure below must terminate and reap it before the
@@ -673,6 +670,12 @@ pub fn spawnTeammateProcess(
             process_mod.killJob(@intCast(pid));
             process_mod.reapBlocking(@intCast(pid));
         }
+    }
+
+    if (prompt.len > 0) {
+        var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const inbox = team_mod.inboxPath(sw.state_root, sw.team_sanitized, name_s, &inbox_buf);
+        try mailbox.deliverWithIdentity(a, inbox, sw.self_name, prompt, null, null, sw.session.asSlice(), sw.senderLease().asSlice());
     }
 
     // ④ 记录供关闭清理。

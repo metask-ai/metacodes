@@ -1572,7 +1572,7 @@ pub const MetaskSignInDialog = struct {
 
     /// Lets go of the worker (a step still running frees it when it ends).
     pub fn deinit(self: *MetaskSignInDialog) void {
-        if (self.worker) |worker| worker.release();
+        if (self.worker) |worker| worker.cancelAndRelease();
         self.worker = null;
         self.models.deinit();
     }

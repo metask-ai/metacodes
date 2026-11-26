@@ -3878,10 +3878,7 @@ fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: 
         return 1;
     };
     defer host.destroy();
-    const profile = host.registry.find(name) orelse {
-        std.debug.print("error: unknown provider '{s}'\n", .{name});
-        return 2;
-    };
+    const profile = host.registry.find(name) orelse return @import("app/providers_cli.zig").logoutLeftover(allocator, state_dir, name);
     return logoutProviderProfile(allocator, state_dir, profile, @import("metacodes-internal").api.oauth_revoke.DEFAULT_WAIT_MS);
 }
 
@@ -6055,6 +6052,7 @@ test {
     _ = &@import("app/sign_out.zig");
     _ = &@import("app/startup_order.zig");
     _ = &@import("app/presets.zig");
+    _ = &@import("app/teammate_route.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");

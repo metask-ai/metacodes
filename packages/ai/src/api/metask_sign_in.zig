@@ -130,6 +130,16 @@ pub const Worker = struct {
         }
     }
 
+    /// Cancel the sign-in and wait for its worker step to finish before
+    /// releasing the dialog's ownership. Dialog teardown uses this path when
+    /// the process is about to leave, so a detached worker cannot outlive the
+    /// allocator and report a leak on the way out.
+    pub fn cancelAndRelease(self: *Worker) void {
+        self.cancel();
+        self.join();
+        if (self.owners.fetchSub(1, .acq_rel) == 1) self.destroy();
+    }
+
     /// Everything released, secrets zeroed.
     fn destroy(self: *Worker) void {
         const allocator = self.allocator;

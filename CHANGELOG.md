@@ -421,6 +421,92 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A process teammate starts on the task it was given.** `Task` with a
+  teammate name under `--teammate-mode process` started the teammate
+  without its prompt: the teammate came online and waited until the lead
+  sent it a message. The prompt now goes to the teammate's inbox from the
+  lead as soon as it is started, the way a message from the lead does.
+
+- **A process teammate runs on the lead's route.** A teammate started with
+  `--teammate-mode process` chose its route again in its own worktree: it
+  could land on another provider or model than the lead, without the lead's
+  reasoning effort, and with `"global_default": false` in `config.json` it
+  stopped before its first request. The lead now names the route it is on
+  when it starts the teammate (`--provider`, `--channel`, `--model` and, when
+  set, `--reasoning-effort`), including a route it moved to with `/model`.
+
+- **A teammate's report is no longer shown as if the user had typed it.**
+  A report the lead's inbox brought in, between turns or while the lead sat
+  idle at the prompt, started the lead's next turn as it should, but was
+  echoed into the conversation as `❯ <teammate-status …>` or
+  `❯ <teammate-message …>`, like a prompt the user had written. It still
+  starts that turn and reaches the model unchanged; only what the user
+  queued during a reply is echoed now.
+
+- **`/login metask` without the TUI moves the session to the new
+  sign-in.** With standard input not a terminal, `/login metask` stored a
+  second Metask sign-in and revoked the first (#561), but the session went
+  on sending the first sign-in's token, which Metask then refused. When the
+  new sign-in is for the gateway the session runs on, the session now lets
+  go of the sign-in it held and the next turn sends the new one; when it is
+  for another gateway, `/login` says so and points to `/model` or a restart.
+
+- **Choosing a model for every future session in `/model` makes it this
+  session's current route too.** The route the session started on stayed
+  recorded as the session's own choice, which outranks the default, so
+  `/model` and `/providers` went on marking the old route as current and the
+  token refresh at the start of a turn went on following it, while the
+  session already ran on the new route; a `/resume` brought the old choice
+  back. A pick for every future session now clears the session's own choice,
+  live and in its saved state, and the route the session started on is not
+  put back over it later.
+
+- **A teammate's report reaches an idle team lead without a key press.**
+  When a teammate finished while the lead's prompt was waiting for input,
+  its report sat in the lead's inbox until the user pressed Enter. The idle
+  prompt now picks it up within a fifth of a second and starts the lead's
+  next turn with it, under the same conditions as a scheduled prompt that
+  falls due: a model is set up and the box is empty, so a draft being typed
+  is never interrupted.
+
+- **Picking the current model again no longer drops the compaction a
+  switch queued.** A switch to a model with a smaller context window queues a
+  compaction for the next turn. Choosing the same model again in `/model`
+  before that turn, or a `/login` that binds the session's route again,
+  cleared it, and the next request carried a conversation sized for the
+  larger window; a further switch to a model between the two windows cleared
+  it too. Every switch before the next turn is now measured against the
+  model the conversation was last sized for: switching back to it clears the
+  compaction, and any narrower one keeps it.
+
+- **`providers` shows and forgets what a removed provider left behind, and
+  fails when it cannot remove it.** `providers list` also lists an id that
+  has only a stored key (`keys/<id>.json`) or login (`oauth/<id>.json`)
+  left, with where each one is, and `logout --provider <id>` forgets them
+  for an id with no definition instead of answering `unknown provider`; with
+  no definition to name a revocation endpoint, the login is not revoked at
+  the server, and it says so. `providers remove`, and that `logout`, exit 1
+  when a stored key or login could not be removed: `remove` used to warn and
+  exit 0.
+
+- **A dialog left open no longer keeps a closed terminal waiting 45
+  seconds** (#763). With `/help`, `/skills` or a `/login` pane open, a closed
+  terminal (SIGHUP) or a `kill` (SIGTERM) went unnoticed until the 45-second
+  limit ended the process outright, without the resume hint. The pane now
+  closes as Ctrl+C closes it, a sign-in in progress included, and the REPL
+  leaves at once, as it does from an idle prompt.
+
+- **A long paste no longer sends another session's text** (#764). A paste
+  of more than 3 lines or 1600 bytes is stored as `pastes/<N>.txt` in the
+  state directory, and the box holds `[Pasted text #N +M lines]` until the
+  line is sent. Every process counted `N` from 1 and overwrote the file of
+  that name, so two sessions sharing a state directory sent each other's
+  pastes, and a placeholder recalled with ↑ from an earlier session sent this
+  session's paste of the same number. A paste now takes the number after the
+  highest one stored and creates its file exclusively; a number another
+  process takes first moves it on to the next. Placeholders look as before,
+  and the files an earlier version stored still expand.
+
 - **Inside tmux the multi-line hint says `\ + ⏎ for newline`.** It said
   `shift + ⏎ for newline`, but under tmux's default configuration
   Shift+Enter arrives as Enter and submits.

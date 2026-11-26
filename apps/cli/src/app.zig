@@ -118,6 +118,7 @@ const route_strings_mod = @import("app/route_strings.zig");
 pub const route_state_mod = @import("app/route_state.zig");
 const sign_out_mod = @import("app/sign_out.zig");
 const presets_mod = @import("app/presets.zig");
+const teammate_route = @import("app/teammate_route.zig");
 const providers_cli_mod = @import("app/providers_cli.zig");
 const provider_startup_mod = @import("metacodes-internal").provider.startup;
 const kg_provider_audit = @import("metacodes-internal").kg.provider_audit;
@@ -538,6 +539,7 @@ pub const App = struct {
     /// Why the last committed selection was not written durably, if it was not.
     /// The route is live regardless; what is lost is surviving a `/resume`.
     last_persist_error: ?[]const u8 = null,
+    session_follows_global: bool = false,
     /// 模型档位表(<state root>/config.json 的 model_tiers;null=未配置)。
     model_tiers_table: ?@import("metacodes-internal").api.model_tiers.TierTable = null,
     /// `config.json` `model_prices`, installed for every cost meter while this App lives.
@@ -1291,6 +1293,7 @@ pub const App = struct {
             .dialect_resolver = app_dialect_resolver,
             .limits = model_limits,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
+            .teammate_args = .{ .ctx = app, .appendFn = appendTeammateArgs },
         };
 
         // LSP 服务(默认开,`--no-lsp` 关)。**建 Service ≠ 起 language server**:这里只装一个
@@ -1440,6 +1443,32 @@ pub const App = struct {
     /// `activeModel()` is only the placeholder the clients were built with.
     pub fn displayModel(app: *const App) []const u8 {
         return if (app.unbound() != null) "not set" else app.activeModel();
+    }
+
+    pub fn appendTeammateRouteArgs(app: *App, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        if (app.unbound() != null) return;
+        try teammate_route.appendArgs(out, arena, app.teammateRoute());
+    }
+
+    fn appendTeammateArgs(ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        return app.appendTeammateRouteArgs(arena, out);
+    }
+
+    fn teammateRoute(app: *App) teammate_route.Route {
+        const effort = app.config.reasoning_effort;
+        if (app.provider_host) |host| {
+            if (host.kernel.currentOfferId()) |current| {
+                const found = host.kernel.catalogSnapshot().find(current) orelse
+                    (if (host.retired) |*previous| previous.find(current) else null);
+                if (found) |offer| return .ofOffer(offer, effort);
+            }
+        }
+        return .{
+            .provider = app.config.resolved_provider_id orelse app.config.provider_profile,
+            .model = app.activeModel(),
+            .reasoning_effort = effort,
+        };
     }
 
     /// The banner's model line: `not set — /login, or configure .env`, or the
@@ -2243,6 +2272,25 @@ pub const App = struct {
         return true;
     }
 
+    pub const MetaskLoginAdoption = enum { not_on_metask, adopted, other_gateway };
+
+    pub fn adoptMetaskLogin(app: *App) MetaskLoginAdoption {
+        const live = app.liveRoute() orelse return .not_on_metask;
+        if (!live.oauth or !live.provider.eqlText("metask")) return .not_on_metask;
+        const running = std.mem.trimEnd(u8, MetaskKeyRoute.gatewayOriginOf(app.api_client.base_url) orelse return .not_on_metask, "/");
+        var stored = provider_oauth_mod.Session.initHome(app.allocator, app.stateRoot(), provider_ids_mod.Slug.lit("metask")) catch return .other_gateway;
+        defer stored.deinit();
+        if (!(stored.load() catch false)) return .other_gateway;
+        const tokens = stored.tokens orelse return .other_gateway;
+        if (!std.mem.eql(u8, std.mem.trimEnd(u8, tokens.gateway_url orelse "", "/"), running)) return .other_gateway;
+        if (app.oauth_session_provider) |id| if (id.eqlText("metask")) {
+            if (app.oauth_session) |*held| held.deinit();
+            app.oauth_session = null;
+            app.oauth_session_provider = null;
+        };
+        return .adopted;
+    }
+
     /// Drop the Metask material this process holds, for `/logout`: the
     /// device session, the key route and the account's key list, the key
     /// picked in `/models`, and `--api-key` when it was Metask's. From here
@@ -2996,6 +3044,7 @@ pub const App = struct {
     /// — the one that actually breaks a session — the turn-boundary OAuth
     /// refresh, which keys on the effective selection, never runs.
     fn seedStartupSelection(app: *App, host: *provider_host_mod.Host) void {
+        if (app.session_follows_global) return;
         // An unbound session started on no route (#484, #485): the offer a
         // flag named lacks its credential, and seeding it would have the
         // picker and `/providers` mark as current a route nothing is sent on.
@@ -3491,6 +3540,17 @@ pub const App = struct {
                 try app.bindOrRevert(host, accepted);
                 app.applyCommittedReasoning(accepted.selection);
                 if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
+                switch (accepted.scope) {
+                    .global => {
+                        host.kernel.forgetSessionSelection();
+                        app.session_follows_global = true;
+                        app.forgetPersistedSessionSelection() catch |err| {
+                            app.last_persist_error = @errorName(err);
+                        };
+                    },
+                    .session => app.session_follows_global = false,
+                    else => {},
+                }
                 // A session-scoped choice is durable *for this session*: it has
                 // to survive a resume, and it must not reach any other session,
                 // which is why it goes to the session's own file.
@@ -3575,6 +3635,15 @@ pub const App = struct {
         var store = app.sessionSelectionStore() orelse return;
         defer store.deinit();
         _ = try provider_config_store.setSessionSelection(&store, selection, null, null);
+    }
+
+    fn forgetPersistedSessionSelection(app: *App) !void {
+        var store = app.sessionSelectionStore() orelse return;
+        defer store.deinit();
+        var document = store.load() catch return;
+        defer document.deinit();
+        if (document.session_selection == null) return;
+        _ = try provider_config_store.setSessionSelection(&store, null, null, null);
     }
 
     /// Restore this session's own selection, if it committed one before.
@@ -3991,12 +4060,14 @@ pub const App = struct {
         const previous_model = app.activeModel();
         const previous_window = app.api_client.resolveMaxInputTokens();
         const current_window = app.api_client.resolveMaxInputTokensFor(model_id);
-        const needs_previous_model_compact = shouldQueueModelSwitchCompact(previous_model, model_id, previous_window, current_window);
+        const sized_for_model = app.pending_previous_model_for_compact orelse previous_model;
+        const sized_for_window = app.pending_previous_model_context_window orelse previous_window;
+        const needs_previous_model_compact = shouldQueueModelSwitchCompact(sized_for_model, model_id, sized_for_window, current_window);
 
         const model = try app.allocator.dupe(u8, model_id);
         errdefer app.allocator.free(model);
         const previous_model_copy = if (needs_previous_model_compact)
-            try app.allocator.dupe(u8, previous_model)
+            try app.allocator.dupe(u8, sized_for_model)
         else
             null;
         errdefer if (previous_model_copy) |m| app.allocator.free(m);
@@ -4027,7 +4098,7 @@ pub const App = struct {
 
         if (app.pending_previous_model_for_compact) |old| app.allocator.free(old);
         app.pending_previous_model_for_compact = previous_model_copy;
-        app.pending_previous_model_context_window = if (needs_previous_model_compact) previous_window else null;
+        app.pending_previous_model_context_window = if (needs_previous_model_compact) sized_for_window else null;
         app.pending_current_model_context_window = if (needs_previous_model_compact) current_window else null;
 
         // U4:model 单写侧 emit(syncModelMirrors 后,activeModel() 已是新值)。

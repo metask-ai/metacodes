@@ -10,7 +10,8 @@
 //!   is written, inside the store's lock (`config_store.putCustomProvider`).
 //! - `probe <id> | --base-url <url> --protocol <wire>` asks the endpoint which
 //!   models it serves (`api/model_probe.zig`) and stores nothing.
-//! - `list` shows the definitions and where each one's key comes from.
+//! - `list` shows the definitions and where each one's key comes from, and
+//!   the ids that have only a stored key or login left.
 //! - `remove <id>` removes the definition, its settings (`providers.<id>`),
 //!   its stored key and login, and a stored default that was one of its
 //!   models.
@@ -23,6 +24,7 @@
 
 const std = @import("std");
 const pfs = @import("metacodes-internal").platform.fs;
+const pdir = @import("metacodes-internal").platform.dir;
 const ids = @import("metacodes-internal").provider.ids;
 const profile_mod = @import("metacodes-internal").provider.profile;
 const custom_provider = @import("metacodes-internal").provider.custom_provider;
@@ -784,8 +786,10 @@ const Cli = struct {
         var out: std.Io.Writer.Allocating = .init(arena);
         const w = &out.writer;
         const profiles = definitions.profiles();
+        const left = self.leftovers(profiles) catch return outOfMemory();
         if (profiles.len == 0) {
             w.print("No providers of your own in {s}. Add one: {s} providers add <id> --base-url <url> --protocol <wire> --model <model>\n", .{ file.path, self.command }) catch {};
+            writeLeftovers(w, left, self.command);
             stdoutWrite(out.written());
             return 0;
         }
@@ -809,8 +813,60 @@ const Cli = struct {
             w.print("\n  key:    {s}\n", .{self.keyDescription(profile)}) catch {};
         }
         w.print("{d} provider(s) of your own in {s}. A change applies at the next start; `{s} --check-providers` lists every route.\n", .{ profiles.len, file.path, self.command }) catch {};
+        writeLeftovers(w, left, self.command);
         stdoutWrite(out.written());
         return 0;
+    }
+
+    fn leftovers(self: Cli, defined: []const profile_mod.ProviderProfile) error{OutOfMemory}![]const Leftover {
+        const arena = self.arena;
+        const placeholder = Slug.lit("leftover");
+        var dirs: [2]?[]const u8 = .{ null, null };
+        if (api_key_store.pathFor(arena, self.state_root, placeholder)) |path| dirs[0] = std.fs.path.dirname(path) else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoHome => {},
+        }
+        if (try self.loginPath(placeholder)) |path| dirs[1] = std.fs.path.dirname(path);
+        var names: std.ArrayList([]const u8) = .empty;
+        for (dirs) |maybe_dir| {
+            const dir = maybe_dir orelse continue;
+            var it = pdir.open((try arena.dupeZ(u8, dir)).ptr) orelse continue;
+            defer pdir.close(&it);
+            while (pdir.next(&it)) |entry| {
+                if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+                const name = entry.name[0 .. entry.name.len - ".json".len];
+                _ = Slug.parse(name) catch continue;
+                if (builtinNamed(name) != null) continue;
+                for (defined) |*profile| {
+                    if (profile.id.eqlText(name)) break;
+                } else {
+                    for (names.items) |seen| {
+                        if (std.mem.eql(u8, seen, name)) break;
+                    } else try names.append(arena, try arena.dupe(u8, name));
+                }
+            }
+        }
+        std.mem.sort([]const u8, names.items, {}, lessThan);
+        var found: std.ArrayList(Leftover) = .empty;
+        for (names.items) |name| {
+            const id = Slug.parse(name) catch continue;
+            const login: ?[]const u8 = if (try self.loginPath(id)) |path|
+                (if (pfs.exists((try arena.dupeZ(u8, path)).ptr)) path else null)
+            else
+                null;
+            const key: ?[]const u8 = if (self.storedKeyExists(id)) self.keyPath(id) else null;
+            if (key == null and login == null) continue;
+            try found.append(arena, .{ .id = name, .key = key, .login = login });
+        }
+        return found.items;
+    }
+
+    fn loginPath(self: Cli, id: Slug) error{OutOfMemory}!?[]const u8 {
+        const session = provider_oauth.Session.initHome(self.arena, self.state_root, id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        return session.path;
     }
 
     /// Where `profile`'s key comes from, in the order a session reads them
@@ -867,7 +923,7 @@ const Cli = struct {
         if (removed.login) std.debug.print("Removed its stored login (oauth/{s}.json); it was not revoked at the server.\n", .{id_text});
         if (removed.login_left) std.debug.print("warning: its stored login (oauth/{s}.json) could not be removed\n", .{id_text});
         std.debug.print("This takes effect at the next start; a session running now keeps it until then.\n", .{});
-        return 0;
+        return if (removed.key_left or removed.login_left) 1 else 0;
     }
 
     // ── interactive add ──────────────────────────────────────────────────
@@ -1120,6 +1176,23 @@ pub fn removeProvider(gpa: std.mem.Allocator, state_root: []const u8, id: Slug) 
         out.default_forgotten = removed.default_forgotten;
         out.revision = removed.result.config_revision;
     }
+    const credentials = forgetCredentials(gpa, state_root, id, stored_key);
+    out.key = credentials.key;
+    out.key_left = credentials.key_left;
+    out.login = credentials.login;
+    out.login_left = credentials.login_left;
+    return out;
+}
+
+const Credentials = struct {
+    key: bool = false,
+    key_left: bool = false,
+    login: bool = false,
+    login_left: bool = false,
+};
+
+fn forgetCredentials(gpa: std.mem.Allocator, state_root: []const u8, id: Slug, stored_key: bool) Credentials {
+    var out: Credentials = .{};
     if (stored_key) {
         if (api_key_store.remove(gpa, state_root, id)) |gone| {
             out.key = gone;
@@ -1129,6 +1202,54 @@ pub fn removeProvider(gpa: std.mem.Allocator, state_root: []const u8, id: Slug) 
         out.login = gone;
     } else |_| out.login_left = true;
     return out;
+}
+
+const Leftover = struct {
+    id: []const u8,
+    key: ?[]const u8,
+    login: ?[]const u8,
+};
+
+fn writeLeftovers(w: *std.Io.Writer, left: []const Leftover, command: []const u8) void {
+    for (left) |entry| {
+        w.print("{s}  (no definition left)\n", .{entry.id}) catch {};
+        if (entry.key) |path| w.print("  key:    stored in {s}\n", .{path}) catch {};
+        if (entry.login) |path| w.print("  login:  stored in {s}\n", .{path}) catch {};
+    }
+    if (left.len > 0) w.print("{d} id(s) with only a stored key or login left; `{s} providers remove <id>` removes it.\n", .{ left.len, command }) catch {};
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+pub fn logoutLeftover(gpa: std.mem.Allocator, state_root: []const u8, name: []const u8) u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const id = Slug.parse(name) catch return unknownProvider(name);
+    const key_path = api_key_store.pathFor(arena, state_root, id) catch |err| switch (err) {
+        error.OutOfMemory => return outOfMemory(),
+        error.NoHome => return unknownProvider(name),
+    };
+    const login_path = (provider_oauth.Session.initHome(arena, state_root, id) catch |err| switch (err) {
+        error.OutOfMemory => return outOfMemory(),
+        else => return unknownProvider(name),
+    }).path;
+    const stored_key = pfs.exists(arena.dupeZ(u8, key_path) catch return outOfMemory());
+    const stored_login = pfs.exists(arena.dupeZ(u8, login_path) catch return outOfMemory());
+    if (!stored_key and !stored_login) return unknownProvider(name);
+    const forgotten = forgetCredentials(gpa, state_root, id, stored_key);
+    if (forgotten.key) std.debug.print("Removed the stored key for {s} ({s}).\n", .{ name, key_path });
+    if (forgotten.key_left) std.debug.print("warning: the stored key for {s} could not be removed: {s}\n", .{ name, key_path });
+    if (forgotten.login) std.debug.print("Removed the stored login for {s} ({s}); {s} is not defined here, so it was not revoked at the server.\n", .{ name, login_path, name });
+    if (forgotten.login_left) std.debug.print("warning: the stored login for {s} could not be removed: {s}\n", .{ name, login_path });
+    return if (forgotten.key_left or forgotten.login_left) 1 else 0;
+}
+
+fn unknownProvider(name: []const u8) u8 {
+    std.debug.print("error: unknown provider '{s}'\n", .{name});
+    return 2;
 }
 
 /// Whether a login is stored for `id`, at the path `Session.removeStored`

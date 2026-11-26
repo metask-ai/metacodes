@@ -104,7 +104,7 @@ DEFAULT_MODELS = [
 
 class MetaskMock:
     def __init__(self, keys=None, reply="METASK_MOCK_REPLY", models=None, userinfo_stalls=False,
-                 distinct_sessions=False, revoke_answers=()):
+                 distinct_sessions=False, revoke_answers=(), sign_in_gateways=()):
         # [(name, secret)]: the keys an older sign-in's key route lists.
         self.keys = [("dev key", KEY_SECRET), ("ops key", OTHER_KEY_SECRET)] if keys is None else keys
         self.models = DEFAULT_MODELS if models is None else models
@@ -122,6 +122,8 @@ class MetaskMock:
         self.sessions = []
         # The status each revocation in turn is answered with (None: held).
         self.revoke_answers = list(revoke_answers)
+        # The gateway the n-th sign-in names (None or missing: this server).
+        self.sign_in_gateways = list(sign_in_gateways)
 
     def _issue(self):
         """The tokens a sign-in (a code or a device code) is answered with."""
@@ -207,9 +209,13 @@ class MetaskMock:
                     # A sign-in is a new authorization; a refresh keeps its own.
                     access, refresh = (outer._issue() if signs_in
                                        else refreshes[0] if refreshes else (ACCESS_TOKEN, REFRESH_TOKEN))
+                    gateway = outer.origin
+                    index = len(outer.sessions) - 1
+                    if signs_in and outer.distinct_sessions and 0 <= index < len(outer.sign_in_gateways):
+                        gateway = outer.sign_in_gateways[index] or outer.origin
                     token = {"access_token": access, "refresh_token": refresh,
                              "token_type": "bearer", "expires_in": 3600,
-                             "gateway_url": outer.origin, "models_url": f"{outer.origin}/v1/models",
+                             "gateway_url": gateway, "models_url": f"{gateway}/v1/models",
                              "client_name": "metacodes", "scope": "read model:invoke"}
                     return self._send(200, json.dumps(token).encode())
                 if self.path.startswith("/v1/messages"):

@@ -23,6 +23,15 @@ pub const ProcessTeammate = struct {
 
 pub const Scheduler = enum { in_process, host };
 
+pub const TeammateArgs = struct {
+    ctx: *anyopaque,
+    appendFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void,
+
+    pub fn append(self: TeammateArgs, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        return self.appendFn(self.ctx, arena, out);
+    }
+};
+
 /// Issue #277: a teammate the lead model asked for, for the host scheduler to
 /// create. Owned by `SwarmContext.allocator`.
 pub const SpawnRequest = struct {
@@ -59,6 +68,7 @@ pub const SwarmContext = struct {
     /// SW6:teammate spawn 后端。true = 进程外(fork+exec metacodes --teammate,cwd/worktree 隔离);
     /// false = 进程内线程(默认,SW1)。lead 从 config.teammate_out_of_process 设。
     out_of_process: bool = false,
+    teammate_args: ?TeammateArgs = null,
     /// Issue #277: who runs teammates. `in_process` is the CLI (threads, or
     /// `--teammate-mode process` children). `host` is AgentCore: the runtime
     /// starts no teammate; the lead's `Task(name)` records a pending spawn

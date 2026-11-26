@@ -4956,6 +4956,10 @@ metacodes-core.swarm_context.ProcessTeammate.repo: []u8
 metacodes-core.swarm_context.Scheduler: enum
 metacodes-core.swarm_context.Scheduler.in_process
 metacodes-core.swarm_context.Scheduler.host
+metacodes-core.swarm_context.TeammateArgs: struct
+metacodes-core.swarm_context.TeammateArgs.ctx: *anyopaque
+metacodes-core.swarm_context.TeammateArgs.appendFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void
+metacodes-core.swarm_context.TeammateArgs.append: fn append(self: TeammateArgs, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void
 metacodes-core.swarm_context.SpawnRequest: struct
 metacodes-core.swarm_context.SpawnRequest.name: []u8
 metacodes-core.swarm_context.SpawnRequest.prompt: []u8
@@ -4971,6 +4975,7 @@ metacodes-core.swarm_context.SwarmContext.state_root: []const u8 = ""
 metacodes-core.swarm_context.SwarmContext.self_name: []const u8 = team_mod.TEAM_LEAD_NAME
 metacodes-core.swarm_context.SwarmContext.is_lead: bool = true
 metacodes-core.swarm_context.SwarmContext.out_of_process: bool = false
+metacodes-core.swarm_context.SwarmContext.teammate_args: ?TeammateArgs = null
 metacodes-core.swarm_context.SwarmContext.scheduler: Scheduler = .in_process
 metacodes-core.swarm_context.SwarmContext.pending_spawns: std.ArrayList(SpawnRequest) = .empty
 metacodes-core.swarm_context.SwarmContext.team_sanitized: []u8 = &.{}

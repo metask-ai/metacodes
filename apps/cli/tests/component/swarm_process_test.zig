@@ -63,7 +63,7 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     defer sw.deinit();
 
     g_mock_name_len = 0;
-    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true);
+    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true);
     try std.testing.expectEqual(@as(i64, 99999), pid);
     // mock 收到 name。
     try std.testing.expectEqualStrings("worker", g_mock_name[0..g_mock_name_len]);
@@ -93,7 +93,7 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
     var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
-    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true));
+    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true));
 }
 
 test "L2 SW6: process teammate rejects a parent session different from swarm routing" {
@@ -111,7 +111,7 @@ test "L2 SW6: process teammate rejects a parent session different from swarm rou
     defer sw.deinit();
     try std.testing.expectError(
         error.SessionMismatch,
-        tp.spawnTeammateProcess(&sw, "worker", "", "", "", "fedcba987654321001234567", null, &mockSpawn, true),
+        tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "fedcba987654321001234567", null, &mockSpawn, true),
     );
     var cfg: [std.fs.max_path_bytes]u8 = undefined;
     var after = team.load(a, team.configPath(home, "proj", &cfg)) orelse return error.NoConfig;
@@ -300,13 +300,113 @@ test "L2: lead LSP and preview settings reach the teammate process" {
         sw.preview = scenario.preview;
 
         g_mock_flags_len = 0;
-        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, scenario.lsp);
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, scenario.lsp);
         // 两侧都断言:开着时不得平白多塞 flag,关着时必须带上。
         try std.testing.expectEqual(!scenario.lsp, mockSawFlag("--no-lsp"));
         try std.testing.expect(mockSawFlag("--no-preview"));
         if (scenario.flag) |flag| try std.testing.expect(mockSawFlag(flag));
         try std.testing.expectEqual(@as(usize, if (scenario.lsp) 1 else 2) + @intFromBool(scenario.flag != null), g_mock_flags_len);
     }
+}
+
+const RouteHost = struct {
+    calls: usize = 0,
+
+    fn append(ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        const self: *RouteHost = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        try out.appendSlice(arena, &.{ "--provider", try arena.dupe(u8, "prov-x"), "--model", try arena.dupe(u8, "x-model"), "--reasoning-effort", "high" });
+    }
+};
+
+fn expectMockFlags(expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, g_mock_flags_len);
+    for (expected, g_mock_flags[0..g_mock_flags_len], g_mock_flag_lens[0..g_mock_flags_len]) |want, *got, n| {
+        try std.testing.expectEqualStrings(want, got[0..n]);
+    }
+}
+
+test "L2: the arguments the host adds for a process teammate follow the lead's own flags, and none come without a host" {
+    const a = std.testing.allocator;
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-hostargs");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    for ([_]bool{ true, false }) |with_host| {
+        var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
+        var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
+        defer tf.deinit();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
+
+        var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
+        defer sw.deinit();
+        var host: RouteHost = .{};
+        if (with_host) sw.teammate_args = .{ .ctx = &host, .appendFn = RouteHost.append };
+
+        g_mock_flags_len = 0;
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, false);
+        if (with_host) {
+            try std.testing.expectEqual(@as(usize, 1), host.calls);
+            try expectMockFlags(&.{ "--no-lsp", "--no-preview", "--provider", "prov-x", "--model", "x-model", "--reasoning-effort", "high" });
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), host.calls);
+            try expectMockFlags(&.{ "--no-lsp", "--no-preview" });
+        }
+    }
+}
+
+test "L2: a process teammate's inbox holds its Task prompt from the lead once it is spawned" {
+    const a = std.testing.allocator;
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-prompt");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+    try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
+    var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
+    defer tf.deinit();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
+
+    var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
+    defer sw.deinit();
+    _ = try tp.spawnTeammateProcess(&sw, "worker", "Count the files under src/", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true);
+
+    var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var unread = try cc.swarm_mailbox.readUnread(a, team.inboxPath(home, "proj", "worker", &inbox_buf));
+    defer unread.deinit();
+    try std.testing.expectEqual(@as(usize, 1), unread.items.items.len);
+    const message = unread.items.items[0];
+    try std.testing.expectEqualStrings(team.TEAM_LEAD_NAME, message.from);
+    try std.testing.expectEqualStrings("Count the files under src/", message.text);
+    try std.testing.expectEqualStrings(test_session.asSlice(), message.session_id.?);
+    try std.testing.expectEqualStrings(sw.senderLease().asSlice(), message.lease_id.?);
+}
+
+test "L2: a teammate's own parser takes the route arguments after its identity as the route its start names" {
+    const a = std.testing.allocator;
+    const argv = try tp.buildTeammateArgv(a, "/usr/local/bin/metacodes", .{
+        .name = "bob",
+        .team = "proj",
+        .cwd = "/tmp/wt",
+        .state_root = "/srv/lead-state",
+        .extra_flags = &.{ "--no-preview", "--provider", "prov-x", "--channel", "primary", "--model", "x-model", "--reasoning-effort", "high" },
+    });
+    defer tp.freeArgv(a, argv);
+    var parse_argv: std.ArrayList([*:0]const u8) = .empty;
+    defer parse_argv.deinit(a);
+    for (argv) |item| try parse_argv.append(a, item orelse continue);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const config = cc.parseArgsForTest(parse_argv.items, arena.allocator());
+    try std.testing.expect(config.parse_error == null);
+    try std.testing.expectEqualStrings("prov-x", config.provider_profile.?);
+    try std.testing.expectEqualStrings("primary", config.provider_channel.?);
+    try std.testing.expectEqualStrings("x-model", config.model);
+    try std.testing.expect(config.model_explicit);
+    try std.testing.expectEqual(cc.types_mod.ReasoningEffort.high, config.reasoning_effort.?);
+    try std.testing.expectEqualStrings("bob", config.teammate_name);
 }
 
 test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 --no-lsp" {
