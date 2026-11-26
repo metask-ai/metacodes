@@ -450,6 +450,14 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **A process teammate runs on the lead's route.** A teammate started with
+  `--teammate-mode process` chose its route again in its own worktree: it
+  could land on another provider or model than the lead, without the lead's
+  reasoning effort, and with `"global_default": false` in `config.json` it
+  stopped before its first request. The lead now names the route it is on
+  when it starts the teammate (`--provider`, `--channel`, `--model` and, when
+  set, `--reasoning-effort`), including a route it moved to with `/model`.
+
 - **A teammate's report is no longer shown as if the user had typed it.**
   A report the lead's inbox brought in, between turns or while the lead sat
   idle at the prompt, started the lead's next turn as it should, but was

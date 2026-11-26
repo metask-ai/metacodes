@@ -118,6 +118,7 @@ const route_strings_mod = @import("app/route_strings.zig");
 pub const route_state_mod = @import("app/route_state.zig");
 const sign_out_mod = @import("app/sign_out.zig");
 const presets_mod = @import("app/presets.zig");
+const teammate_route = @import("app/teammate_route.zig");
 const providers_cli_mod = @import("app/providers_cli.zig");
 const provider_startup_mod = @import("metacodes-internal").provider.startup;
 const kg_provider_audit = @import("metacodes-internal").kg.provider_audit;
@@ -1292,6 +1293,7 @@ pub const App = struct {
             .dialect_resolver = app_dialect_resolver,
             .limits = model_limits,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
+            .teammate_args = .{ .ctx = app, .appendFn = appendTeammateArgs },
         };
 
         // LSP 服务(默认开,`--no-lsp` 关)。**建 Service ≠ 起 language server**:这里只装一个
@@ -1441,6 +1443,32 @@ pub const App = struct {
     /// `activeModel()` is only the placeholder the clients were built with.
     pub fn displayModel(app: *const App) []const u8 {
         return if (app.unbound() != null) "not set" else app.activeModel();
+    }
+
+    pub fn appendTeammateRouteArgs(app: *App, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        if (app.unbound() != null) return;
+        try teammate_route.appendArgs(out, arena, app.teammateRoute());
+    }
+
+    fn appendTeammateArgs(ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        return app.appendTeammateRouteArgs(arena, out);
+    }
+
+    fn teammateRoute(app: *App) teammate_route.Route {
+        const effort = app.config.reasoning_effort;
+        if (app.provider_host) |host| {
+            if (host.kernel.currentOfferId()) |current| {
+                const found = host.kernel.catalogSnapshot().find(current) orelse
+                    (if (host.retired) |*previous| previous.find(current) else null);
+                if (found) |offer| return .ofOffer(offer, effort);
+            }
+        }
+        return .{
+            .provider = app.config.resolved_provider_id orelse app.config.provider_profile,
+            .model = app.activeModel(),
+            .reasoning_effort = effort,
+        };
     }
 
     /// The banner's model line: `not set — /login, or configure .env`, or the

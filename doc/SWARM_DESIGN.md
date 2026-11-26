@@ -81,6 +81,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 - **`--teammate` runtime**:身份 CLI args(--agent-name/--team-name/--parent-session-id/--teammate-lease-id/--teammate-cwd);worktree chdir + **同步更新 app.cwd_abs/project_dir**(光 chdir 没用,工具用 cwd_abs 解析路径);mailbox 消息循环(waitForWork 镜像 in-process);fail-closed 权限。
 - **lead-spawn**:`--teammate-mode process` → Task(name) 走 `spawnTeammateProcess`(createWorktree `git -C repo` + 登记 member `backend_type=process`/worktree_path + `forkExecTeammate` fork **零分配**只 async-signal-safe + 追踪 `process_teammates` 供 deinit kill+removeWorktree)。
+- **线路继承**:子进程不在自己的 worktree 里按启动顺序重新选线路。`SwarmContext.teammate_args` 是宿主往每个进程 teammate 命令行追加参数的口子,只管追加,不认识线路;不设时参数和以前一样。CLI 的 App 在 spawn 时给出 lead 当时生效的线路:`--provider`、`--channel`、`--model`(`/model` 切过就是切过之后的),有推理强度时加 `--reasoning-effort`。子进程按启动顺序第 1 级(命令行点名)解析,所以 `"global_default": false` 时也能起来。lead 没有线路(unbound)时不加参数。
 - **进程启动绑定**:父 session 在 `App.init` 之前注入子进程配置，保证 KG、prompt、权限
   和 transcript 从第一帧就使用同一个 session；子进程另生成独立的 agent identity，避免把
   协调身份和会话路由身份混用。team 名必须是 canonical sanitized 形式，成员从持久化配置

@@ -6052,6 +6052,7 @@ test {
     _ = &@import("app/sign_out.zig");
     _ = &@import("app/startup_order.zig");
     _ = &@import("app/presets.zig");
+    _ = &@import("app/teammate_route.zig");
     _ = &@import("app/release_source.zig");
     _ = &@import("app/unit_archive.zig");
     _ = &@import("app/release_fetch.zig");
