@@ -464,6 +464,7 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+
 - **A reply that broke off and is sent again says so.** The text that was
   shown stays, with a dim line under it saying the reply broke off, is
   discarded and is being retried. The first retry showed nothing.
