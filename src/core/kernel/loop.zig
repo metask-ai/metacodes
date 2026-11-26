@@ -226,23 +226,26 @@ fn buildRequest(arena: std.mem.Allocator, options: Options) !types.Request {
         content[0] = .{ .text = summary };
         try request.messages.append(arena, .{ .role = .assistant, .content = content });
     };
-    for (conversation.activeMessages()) |item| {
-        if (!carriesContent(item)) continue;
-        const content = try arena.alloc(ai.ApiContent, item.blocks.len);
-        for (item.blocks, content) |block, *part| part.* = switch (block) {
-            .text => |text| .{ .text = text },
-            .thinking => |text| .{ .thinking = text },
-            .tool_use => |tool_use| .{ .tool_use = .{ .id = tool_use.id, .name = tool_use.name, .input = tool_use.input } },
-            .tool_result => |result| .{ .tool_result = .{ .tool_use_id = result.tool_use_id, .content = result.content, .is_error = result.is_error } },
-            .image => |image| .{ .image = .{ .media_type = image.media_type, .data = image.data } },
-            .reasoning_item => |item_block| .{ .reasoning_item = .{ .model = item_block.model, .json = item_block.json } },
-        };
-        try request.messages.append(arena, .{ .role = item.role, .content = content });
-    }
+    for (conversation.activeMessages()) |item| try appendHistoryMessage(&request.messages, arena, item);
     for (options.tools) |tool| {
         try request.tools.append(arena, .{ .name = tool.name, .description = tool.description, .input_schema = tool.input_schema });
     }
     return request;
+}
+
+pub fn appendHistoryMessage(out: *std.ArrayList(ai.ApiMessage), allocator: std.mem.Allocator, item: message.Message) !void {
+    if (!carriesContent(item)) return;
+    const content = try allocator.alloc(ai.ApiContent, item.blocks.len);
+    errdefer allocator.free(content);
+    for (item.blocks, content) |block, *part| part.* = switch (block) {
+        .text => |text| .{ .text = text },
+        .thinking => |text| .{ .thinking = text },
+        .tool_use => |tool_use| .{ .tool_use = .{ .id = tool_use.id, .name = tool_use.name, .input = tool_use.input } },
+        .tool_result => |result| .{ .tool_result = .{ .tool_use_id = result.tool_use_id, .content = result.content, .is_error = result.is_error } },
+        .image => |image| .{ .image = .{ .media_type = image.media_type, .data = image.data } },
+        .reasoning_item => |item_block| .{ .reasoning_item = .{ .model = item_block.model, .json = item_block.json } },
+    };
+    try out.append(allocator, .{ .role = item.role, .content = content });
 }
 
 fn carriesContent(item: message.Message) bool {
