@@ -415,9 +415,12 @@ status, compatibility boundaries, and entry points are defined by
   the same burst as the text around it: at least four bytes before it came
   within 10 ms of each other and of it, or more input follows within 10 ms.
   Such line breaks go into the prompt as newlines (a CR LF pair as one), so
-  the paste waits for Enter. A typed Enter, an Enter after an input method
-  commits several characters at once, and a paste that carries markers work
-  as before; a paste as short as `abc` plus its line break still submits.
+  the paste waits for Enter. Only the prompt's own text takes this: the
+  permission and question dialogs, the model picker and the menus over the
+  prompt still read keys written together one by one, Enter included. A
+  typed Enter, an Enter after an input method commits several characters at
+  once, and a paste that carries markers work as before; a paste as short as
+  `abc` plus its line break still submits.
 
 - **Ctrl+_, Shift+Backspace, Shift+Space, Alt+Enter and Ctrl+H, I, J, M
   and [ work in terminals that report modified keys.** Under the kitty

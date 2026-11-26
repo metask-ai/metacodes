@@ -222,6 +222,10 @@ pub const KeyParser = struct {
     /// 不管后面排着什么都不算同批:Esc 之后紧跟的 Enter 记录也已在队列里。终端一次写出的
     /// ESC CR(VS Code 的绑定)经 ConPTY 原样是两个字节,照旧算。
     pub fn feedRead(self: *KeyParser, fd: c_int, b: u8) ?Key {
+        return self.feedQueued(b, b == 0x1b and !platform_term.lastReadWasKeyRecord() and platform_term.waitReadable(fd, 0) > 0);
+    }
+
+    pub fn feedEditorRead(self: *KeyParser, fd: c_int, b: u8) ?Key {
         const now_ns = util_time.nowNs();
         const gap_ms = self.burst.gapMs(now_ns);
         const queued = platform_term.waitReadable(fd, 0) > 0;
@@ -2970,13 +2974,41 @@ test "paste burst: splitting a write into back-to-back writes anywhere never cha
     }
 }
 
+fn readEditorKey(fd: c_int, parser: *KeyParser) !Key {
+    if (parser.drain()) |key| return key;
+    while (true) {
+        if (platform_term.waitReadable(fd, 2000) <= 0) return error.TestUnexpectedResult;
+        var b: [1]u8 = undefined;
+        if (platform_term.readInput(fd, &b) != 1) return error.TestUnexpectedResult;
+        if (parser.feedEditorRead(fd, b[0])) |key| return key;
+    }
+}
+
 fn readKeys(fd: c_int, parser: *KeyParser, count: usize, out: []Key) ![]Key {
-    for (out[0..count]) |*slot| {
-        const read = readKey(fd, parser);
+    for (out[0..count]) |*slot| slot.* = try readEditorKey(fd, parser);
+    return out[0..count];
+}
+
+test "feedRead: outside the prompt's editor keys written together each count, Enter included" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var parser = KeyParser{};
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[B\x1b[B\x1b[B\rabc\r"));
+    var keys: [8]Key = undefined;
+    for (&keys) |*slot| {
+        const read = readKey(fds[0], &parser);
         if (read != .key) return error.TestUnexpectedResult;
         slot.* = read.key;
     }
-    return out[0..count];
+    try testing.expectEqualSlices(Key, &.{ .down, .down, .down, .enter, .{ .char = 'a' }, .{ .char = 'b' }, .{ .char = 'c' }, .enter }, &keys);
+
+    var editor = KeyParser{};
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[B\x1b[B\x1b[B\r"));
+    var buf: [4]Key = undefined;
+    try testing.expectEqualSlices(Key, &.{ .down, .down, .down, .shift_enter }, try readKeys(fds[0], &editor, 4, &buf));
 }
 
 test "feedRead: a multi-line burst written at once gives line breaks, and Enter 60 ms later submits" {
@@ -3006,9 +3038,7 @@ test "feedRead: bytes already waiting count as one burst however slowly they are
     var n: usize = 0;
     try testing.expect(pfs.writeAll(fds[1], "line one\rline two\r"));
     for (0..18) |_| {
-        const read = readKey(fds[0], &parser);
-        if (read != .key) return error.TestUnexpectedResult;
-        n += typedText(&.{read.key}, text[n..]).len;
+        n += typedText(&.{try readEditorKey(fds[0], &parser)}, text[n..]).len;
         @import("metacodes-internal").platform.sync.sleepMs(15);
     }
     try testing.expectEqualStrings("line one\nline two\n", text[0..n]);
