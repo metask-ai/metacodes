@@ -696,13 +696,13 @@ pub fn resumeSuspended(
     const suspend_state = @import("metacodes-internal").core.suspend_state;
     const transcript = @import("metacodes-internal").core.transcript;
     const dir = app.sessionDir() orelse {
-        std.debug.print("error: resume 需要 session 目录(--session/持久化 transcript)\n", .{});
+        std.debug.print("error: resuming needs a session directory (--session, or a saved transcript)\n", .{});
         return 1;
     };
 
     // 读挂起点(tool_use_id/kind/completed_results)。缺 suspend.json = 无挂起可恢复。
     const state = suspend_state.read(dir, allocator) catch |e| {
-        std.debug.print("error: 读 suspend.json 失败({s})——该 session 无待恢复挂起?\n", .{@errorName(e)});
+        std.debug.print("error: could not read suspend.json ({s}); does this session have a suspended run to resume?\n", .{@errorName(e)});
         return 1;
     };
     defer suspend_state.freeState(state, allocator);
@@ -719,7 +719,7 @@ pub fn resumeSuspended(
                 .{},
             );
         } else {
-            std.debug.print("error: loadTranscript 失败({s})\n", .{@errorName(e)});
+            std.debug.print("error: could not load the transcript ({s})\n", .{@errorName(e)});
         }
         return 1;
     };
@@ -784,7 +784,7 @@ pub fn resumeSuspended(
         allocator,
     ) catch |err| {
         try run_control.finishRun(@errorName(err));
-        std.debug.print("error: resumeRun 失败({s})\n", .{@errorName(err)});
+        std.debug.print("error: resuming the run failed ({s})\n", .{@errorName(err)});
         return 1;
     };
     try run_control.finishRun(@tagName(result.stop_reason));
@@ -795,9 +795,9 @@ pub fn resumeSuspended(
     if (result.suspend_info) |si| {
         defer si.deinit();
         suspend_state.writeFromSuspendInfo(dir, si, allocator) catch |e| {
-            std.debug.print("warning: suspend.json 重写失败: {s}\n", .{@errorName(e)});
+            std.debug.print("warning: could not rewrite suspend.json: {s}\n", .{@errorName(e)});
         };
-        std.debug.print("⏸ 再次挂起 (kind={s}) — 续 resume from: {s}\n", .{ si.kind, dir });
+        std.debug.print("⏸ Suspended again (kind={s}) — resume from: {s}\n", .{ si.kind, dir });
     } else {
         suspend_state.clear(dir); // 恢复完成,挂起点作废
     }

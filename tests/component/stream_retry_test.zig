@@ -436,9 +436,9 @@ test "L2 #221: Windows request-setup Unexpected is a retried, named connect fail
     try std.testing.expectEqual(@as(u32, 96), injector.remaining); // retried up to the bound
     try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
     const summary = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
-    try std.testing.expect(std.mem.indexOf(u8, summary, "重试 3 次") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "gave up after 3 attempts") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "ConnectFailed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "连接被拒绝") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "connection refused") != null);
 }
 
 test "L2 #221: request-setup Unexpected elsewhere is not a connect failure" {
@@ -481,7 +481,7 @@ test "L2 #221: a refused connection is retried and the summary names the cause" 
     const expected: anyerror = if (@import("builtin").os.tag == .windows) error.ConnectFailed else error.ConnectionRefused;
     try std.testing.expectError(expected, result);
     const summary = cc.api_last_error.take(&buf) orelse return error.TestExpectedLastError;
-    try std.testing.expect(std.mem.indexOf(u8, summary, "重试 2 次") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "gave up after 2 attempts") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, @errorName(expected)) != null);
 }
 

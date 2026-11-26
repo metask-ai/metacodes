@@ -304,6 +304,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **API failure notices are in English.** The line under `API request
+  failed` mixed Chinese into an English screen, e.g. `HTTP 429(重试 4 次后放弃):
+  …`. It now reads `HTTP 429 (gave up after 4 attempts): …`, and the named
+  failures are `Connection setup failed`, `Connection failed`,
+  `Response head timeout`, `Response body timeout`, `Connection dead`,
+  `Endpoint redirect`, `API error frame` and `Incomplete stream`, with English
+  details. The number is the requests sent, the first one included. The
+  headless `--resume-response` errors are in English too.
+
 - Removed the Glob and Grep built-in tools from the CLI
   and AgentCore. Embedded hosts that explicitly select them must update
   their tool lists. Use Bash for filename and text searches. The CLI keeps

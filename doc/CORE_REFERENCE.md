@@ -1132,8 +1132,8 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   两者分开是因为网关在上游沉默期间照样每 15s 发 ping:2026-09-23 一条零产出的流靠 ping 活了
   55 分钟,监视线程从未开火。(旧法先是按语义事件续命——126s 的合法工具调用在字节每秒都到的情况
   下被判 stall;改成按字节续命后又把 ping 当活着。)正文 stall 经 `client.reportBodyStall` 写
-  last_error,TUI 打"正文空闲超时: N ms 内无任何字节(上限 M ms)"(连接死了)或"N ms 内无模型输出,
-  但网关 keepalive 仍在到达(最近字节 K ms 前)"(上游/网关卡住)而不是猜谜文案。用户 Ctrl+C/Esc
+  last_error,TUI 打"Response body timeout: no byte for N ms (limit M ms)"(连接死了)或"no model output for
+  N ms, but gateway keepalives kept arriving (last byte K ms ago"(上游/网关卡住)而不是猜谜文案。用户 Ctrl+C/Esc
   经 `provider.cancel` 关掉 socket 后,阻塞的读以 ReadFailed/干净 EOF 醒来——三个 provider client
   与 agent_loop 都先查 abort 标志,归为 Aborted(保留已流出的 partial 文本),绝不归 api_error;
   REPL 在每个 run 边界无条件复位 abort 标志。
@@ -1142,13 +1142,13 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   没有)。`RequestAbortRegistry` 每个 client 一份,`touchKeepalive` 记录端点在流中途(SSE 正文、本流
   已有进展之后)用一条保活行打破了多长的沉默(≥2 s 才算样本,同一次读只算一次);攒够 3 个样本后,
   SSE 正文在传输层(含保活)沉默超过 max(4 × 最长间隔, 2 min) 且小于进展上限时,判
-  `Stall.cause = .transport_dead`,TUI 打"连接已断: N ms 内无任何字节,连 keepalive 也没有…"。判死即
+  `Stall.cause = .transport_dead`,TUI 打"Connection dead: no byte for N ms, not even a keepalive…"。判死即
   清空已学证据,端点不再发保活时退回只按进展上限判;从未在流中途发过保活的端点行为不变。非流式整包
   正文与收头阶段不受此规则影响(`setIdleLimit(.., .whole)`)。
   **流中途错误的名字约定**(`api/stream.zig midStreamReadError`,三个 provider client 共用):
   `RequestFailed` 只表示连接在流中途断了;服务端在流里声明的失败一律 `ApiError`(Anthropic 错误帧、
   OpenAI chat 兼容端与 Gemini 的顶层 `error` 对象、Responses 的 `response.failed` / `error` 事件,
-  经 `client.reportServerError` 写"API 错误帧"现场);`StreamStalled` / `StreamIncomplete` /
+  经 `client.reportServerError` 写"API error frame"现场);`StreamStalled` / `StreamIncomplete` /
   `ContextWindowExceeded` / `Aborted` 各有专名;本地或解析类失败(`StreamTooLong`、`OutOfMemory`…)
   保留原名。
   **每个模型请求自带一次同轮重发**(#461):`agent_loop.STREAM_RETRIES_PER_REQUEST`(1)——失败是

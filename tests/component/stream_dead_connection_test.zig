@@ -6,7 +6,7 @@
 //! 客户端按 max_tokens 放大的正文上限盲等了 30 分钟,run 以 api_error 收口,用户手动 /retry,
 //! 同一请求 18.7 s 完成。修法两层,本文件用真 HTTP 链路 + 真 client + 真 agent loop 逐层证明:
 //!   ⑪ 三个 provider client(anthropic / openai chat / gemini)都学到保活节奏,随后的沉默连接在
-//!     学到的上限附近被判"连接已断",远早于正文进展上限,文案点名 keepalive 也没来(读于
+//!     学到的上限附近被判"Connection dead",远早于正文进展上限,文案点名 keepalive 也没来(读于
 //!     `retry_notice` 之时:请求自带的那次重发(#461)随后成功,会清掉现场);
 //!   ⑫ 反例:从未在流中途发过 keepalive 的端点,沉默连接仍只按正文进展上限判(旧行为不变);
 //!   ⑬ 反例:已学到节奏的端点,keepalive 一直在到的慢流(进展沉默 > 死连接上限)不被误杀;
@@ -181,7 +181,7 @@ fn withClient(
     }
 }
 
-/// The decimal number right after `label` in `text` (e.g. "上限 1000 ms" → 1000).
+/// The decimal number right after `label` in `text` (e.g. "limit 1000 ms" → 1000).
 fn numberAfter(text: []const u8, label: []const u8) !u64 {
     const start = (std.mem.indexOf(u8, text, label) orelse return error.TestExpectedLabel) + label.len;
     var end = start;
@@ -218,11 +218,11 @@ const ArmedThenDead = struct {
         try std.testing.expect(elapsed < BOUND_MS);
         try std.testing.expect(elapsed < @as(i64, @intCast(BODY_MS)));
         const detail = capture.detail orelse return error.TestExpectedLastError;
-        try std.testing.expect(std.mem.startsWith(u8, detail, "连接已断: "));
-        try std.testing.expect(std.mem.indexOf(u8, detail, "连 keepalive 也没有") != null);
+        try std.testing.expect(std.mem.startsWith(u8, detail, "Connection dead: "));
+        try std.testing.expect(std.mem.indexOf(u8, detail, "not even a keepalive") != null);
         // The printed limit is the learned one (floor 1 s, more only if the cadence drifted),
         // never the 20 s progress limit.
-        const limit = try numberAfter(detail, "上限 ");
+        const limit = try numberAfter(detail, "limit ");
         try std.testing.expect(limit >= TUNING.floor_ms);
         try std.testing.expect(limit < BODY_MS);
         // The verdict spent the evidence.
@@ -274,8 +274,8 @@ const NeverPinged = struct {
         try std.testing.expect(elapsed >= @as(i64, @intCast(SHORT_BODY_MS)));
         try std.testing.expect(elapsed < BOUND_MS);
         const detail = capture.detail orelse return error.TestExpectedLastError;
-        try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
-        try std.testing.expect(std.mem.indexOf(u8, detail, "内无任何字节(上限 2500 ms)") != null);
+        try std.testing.expect(std.mem.startsWith(u8, detail, "Response body timeout: "));
+        try std.testing.expect(std.mem.indexOf(u8, detail, " ms (limit 2500 ms)") != null);
     }
 };
 

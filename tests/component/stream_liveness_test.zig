@@ -17,7 +17,7 @@
 //!       20-40KB 的调用 = 120-200s 真实沉默,确定性被杀。
 //! 本文件继续用真 HTTP 链路证明修法:
 //!   ⑤ input_json_delta 帧滴流(帧间隔 < 上限,总时长 ≫ 上限)→ 按字节续命,完整 tool_use 收齐;
-//!   ⑥ 只有 ping 的保活**不算进展**:超过正文上限即 stall,文案点名"网关 keepalive 仍在到达";
+//!   ⑥ 只有 ping 的保活**不算进展**:超过正文上限即 stall,文案点名"gateway keepalives kept arriving";
 //!   ⑥b ping 之间夹着真实进展(上限内)→ 正常 end_turn;
 //!   ⑦ 收头阶段用严上限,正文阶段用另一个(更大的)上限:两者独立生效;
 //!   ⑧ 非流式(auto-compact 那条路)正文 stall 同样点名而不是塌缩成 RequestFailed。
@@ -208,15 +208,17 @@ test "L2 liveness ②: 正文阶段已流出可见文本后对端沉默 → Stre
     try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     try std.testing.expect(elapsed >= @as(i64, @intCast(2 * IDLE_MS)));
     try std.testing.expect(elapsed < BOUND_MS);
-    // TUI 打印的就是这行:必须点名"正文空闲超时"+ 空闲毫秒 + 生效的上限,而不是
+    // TUI 打印的就是这行:必须点名"Response body timeout"+ 空闲毫秒 + 生效的上限,而不是
     // "重试耗尽 / 后端错误 / 上下文超限"的猜谜文案。
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;
-    const prefix = "正文空闲超时: ";
+    const prefix = "Response body timeout: ";
     try std.testing.expect(std.mem.startsWith(u8, detail, prefix));
-    try std.testing.expect(std.mem.indexOf(u8, detail, " ms 内无任何字节(上限 400 ms)") != null);
-    const idle_end = std.mem.indexOfPos(u8, detail, prefix.len, " ms").?;
-    const idle_ms = try std.fmt.parseInt(u64, detail[prefix.len..idle_end], 10);
+    try std.testing.expect(std.mem.indexOf(u8, detail, " ms (limit 400 ms)") != null);
+    const lead = prefix ++ "no byte for ";
+    try std.testing.expect(std.mem.startsWith(u8, detail, lead));
+    const idle_end = std.mem.indexOfPos(u8, detail, lead.len, " ms").?;
+    const idle_ms = try std.fmt.parseInt(u64, detail[lead.len..idle_end], 10);
     try std.testing.expect(idle_ms >= IDLE_MS);
     try std.testing.expect(takeLastError(&buf) == null); // 读后清空
 }
@@ -456,9 +458,9 @@ test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限�
     // 文案必须区分"keepalive 撑着的死上游"和"连接死了":前者查网关/上游,后者查网络。
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;
-    try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
-    try std.testing.expect(std.mem.indexOf(u8, detail, "网关 keepalive 仍在到达") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "(上限 3000 ms)") != null);
+    try std.testing.expect(std.mem.startsWith(u8, detail, "Response body timeout: "));
+    try std.testing.expect(std.mem.indexOf(u8, detail, "gateway keepalives kept arriving") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "limit 3000 ms)") != null);
 }
 
 test "L2 liveness ⑥b: ping 之间夹着真实进展(进展间隔 < 上限)→ 正常 end_turn,ping 既不续命也不致命" {
@@ -510,8 +512,8 @@ test "L2 liveness ⑦: 收头/正文阶段各用各的上限——正文沉默�
     try std.testing.expect(elapsed < BOUND_MS);
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;
-    try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
-    try std.testing.expect(std.mem.indexOf(u8, detail, "(上限 1500 ms)") != null);
+    try std.testing.expect(std.mem.startsWith(u8, detail, "Response body timeout: "));
+    try std.testing.expect(std.mem.indexOf(u8, detail, "(limit 1500 ms)") != null);
 }
 
 test "L2 liveness ⑧: 非流式请求正文阶段沉默 → StreamStalled 并点名(auto-compact 走的就是这条路)" {
@@ -534,7 +536,7 @@ test "L2 liveness ⑧: 非流式请求正文阶段沉默 → StreamStalled 并�
     try std.testing.expect(elapsed < BOUND_MS);
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;
-    try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
+    try std.testing.expect(std.mem.startsWith(u8, detail, "Response body timeout: "));
 }
 
 test "L2 liveness ⑨: 短文本后零字节沉默超过收头上限,正文上限内突发完整 tool_use → 正常收齐不报 stall" {
