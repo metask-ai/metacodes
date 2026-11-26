@@ -395,6 +395,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Home and End work in tmux, GNU screen, the Linux console and rxvt.**
+  These send Home as `ESC [ 1 ~` and End as `ESC [ 4 ~` (rxvt `ESC [ 7 ~`
+  and `ESC [ 8 ~`), and the key parser knew Home and End only as
+  `ESC [ H` and `ESC [ F`, so in tmux both keys did nothing at the prompt
+  and in the `/model` list, whose footer offers them. The four forms are now
+  Home and End, also with only Caps Lock or Num Lock in the modifier; with
+  Shift, Alt or Ctrl they are still ignored, like the other cursor and
+  editing keys.
+
 - **`bench pull` also pulls verifier and sidecar images.** It took only the
   first `docker_image` of a task's `task.toml`, which in the FrontierHarness
   tasks is the separate verifier's, so their environment images and the

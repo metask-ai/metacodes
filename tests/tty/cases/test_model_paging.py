@@ -96,3 +96,11 @@ def test_models_menu_reaches_the_last_of_many_models(bin_path):
     assert f"Models for selected API key ({COUNT})" in text, text
     assert f"> m-{COUNT}" in text.replace(">  ", "> "), "/models 选不到最后一个模型:\n" + text
     assert "more from server" not in text, "/models 仍在第 8 项截断:\n" + text
+
+
+def test_picker_home_and_end_as_tmux_sends_them_reach_both_ends(bin_path):
+    text = _run(bin_path, OPEN_MODEL_STAGE + ["raw:\\x1b[4~", wait_for(f"[{COUNT}/{COUNT}]")])
+    assert f"> Model {COUNT}" in text.replace(">  ", "> "), "ESC[4~ did not reach the last model:\n" + text
+    text = _run(bin_path, OPEN_MODEL_STAGE + ["raw:\\x1b[4~", wait_for(f"[{COUNT}/{COUNT}]"),
+                                               "raw:\\x1b[1~", wait_for(f"[1/{COUNT}]")])
+    assert f"[1/{COUNT}]" in text and "> Model 001" in text.replace(">  ", "> "), "ESC[1~ did not go back to the first model:\n" + text

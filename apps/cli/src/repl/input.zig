@@ -103,9 +103,9 @@ pub fn pastedByte(key: Key) ?u8 {
 ///
 /// 支持的 CSI 序列：
 ///   ESC [ A/B/C/D     ↑↓→←
-///   ESC [ H / F       Home / End
+///   ESC [ H / F、ESC [ 1/7 ~ / 4/8 ~   Home / End
 ///   ESC [ 3 ~         Delete
-///   ESC [ 1;<mod> A–D/H/F、ESC [ 3/5/6;<mod> ~   <mod> 只带 Caps Lock(64)/Num Lock(128) 时同不带 <mod>
+///   ESC [ 1;<mod> A–D/H/F、ESC [ 1/3/4/5/6/7/8;<mod> ~   <mod> 只带 Caps Lock(64)/Num Lock(128) 时同不带 <mod>
 ///   ESC [ <num>;<mod> u   CSI u（kitty 键盘协议）
 ///   ESC [ 27;<mod>;<num> ~  xterm modifyOtherKeys,与 CSI u 同一张表(decodeModifiedKey)
 ///     - 9;2 = Shift+Tab
@@ -577,7 +577,9 @@ fn cursorKey(final: u8) Key {
 
 fn tildeKey(number: u32) Key {
     return switch (number) {
+        1, 7 => .home,
         3 => .delete,
+        4, 8 => .end,
         5 => .page_up,
         6 => .page_down,
         else => .unknown,
@@ -2018,7 +2020,7 @@ test "KeyParser: unknown modifyOtherKeys combos are one .unknown and leave no ch
 
 test "KeyParser: cursor and editing keys with only Caps Lock or Num Lock on are the plain keys" {
     const finals = [_]struct { u8, Key }{ .{ 'A', .up }, .{ 'B', .down }, .{ 'C', .right }, .{ 'D', .left }, .{ 'H', .home }, .{ 'F', .end } };
-    const tildes = [_]struct { u32, Key }{ .{ 3, .delete }, .{ 5, .page_up }, .{ 6, .page_down } };
+    const tildes = [_]struct { u32, Key }{ .{ 1, .home }, .{ 3, .delete }, .{ 4, .end }, .{ 5, .page_up }, .{ 6, .page_down }, .{ 7, .home }, .{ 8, .end } };
     var buf: [16]u8 = undefined;
     for ([_]u32{ 1, 65, 129, 193 }) |modifier| {
         for (finals) |f| try expectSequence(try std.fmt.bufPrint(&buf, "\x1b[1;{d}{c}", .{ modifier, f[0] }), f[1]);
@@ -2029,8 +2031,20 @@ test "KeyParser: cursor and editing keys with only Caps Lock or Num Lock on are 
     try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .left, .{ .char = 'b' }, .delete, .{ .char = 'c' } }, keys);
 }
 
+test "KeyParser: Home and End as tmux, GNU screen, the Linux console and rxvt send them" {
+    try expectSequence("\x1b[1~", .home);
+    try expectSequence("\x1b[7~", .home);
+    try expectSequence("\x1b[4~", .end);
+    try expectSequence("\x1b[8~", .end);
+    try expectSequence("\x1b[1;1~", .home);
+    try expectSequence("\x1b[4;1~", .end);
+    var buf: [16]Key = undefined;
+    const keys = parseAll("abc\x1b[1~X\x1b[4~Y\x1b[7~Z\x1b[8~", &buf);
+    try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .{ .char = 'b' }, .{ .char = 'c' }, .home, .{ .char = 'X' }, .end, .{ .char = 'Y' }, .home, .{ .char = 'Z' }, .end }, keys);
+}
+
 test "KeyParser: Shift, Alt or Ctrl next to a lock still keeps a cursor or editing key from being the plain key" {
-    for ([_][]const u8{ "\x1b[1;2A", "\x1b[1;66A", "\x1b[1;5D", "\x1b[1;133D", "\x1b[1;3H", "\x1b[1;67F", "\x1b[3;130~", "\x1b[5;69~", "\x1b[6;2~" }) |seq| {
+    for ([_][]const u8{ "\x1b[1;2A", "\x1b[1;66A", "\x1b[1;5D", "\x1b[1;133D", "\x1b[1;3H", "\x1b[1;67F", "\x1b[3;130~", "\x1b[5;69~", "\x1b[6;2~", "\x1b[1;2~", "\x1b[4;5~", "\x1b[7;66~", "\x1b[8;3~" }) |seq| {
         try expectSequence(seq, .unknown);
     }
 }
