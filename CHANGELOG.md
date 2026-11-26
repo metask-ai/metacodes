@@ -292,6 +292,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- Removed the Glob and Grep built-in tools from the CLI
+  and AgentCore. Embedded hosts that explicitly select them must update
+  their tool lists. Use Bash for filename and text searches. The CLI keeps
+  CodeMap for source outlines and FindSymbol for locating definitions; both
+  load their parameter schemas through ToolSearch when needed.
 - **The lower packages are separate Zig modules under `packages/`.** `base`,
   `ai`, `kernel`, `guard`, `coding`, `session` and `teamwork` moved from
   `src/` to `packages/<package>/src/` and are the named modules

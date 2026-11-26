@@ -21,9 +21,17 @@ function timeTitle(r) {
 }
 const REFRESH_S = 10;
 
+const PROFILE_COLORS = ['#6a9dd9', '#71b69e', '#d8af65', '#a99be0', '#eb7c8e', '#5cb8c8', '#c76f5e'];
+const profileColor = (index) => PROFILE_COLORS[index % PROFILE_COLORS.length];
+
 const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, overviewDirty: false, live: false,
+
   jobFilter: 'all', jobSearch: '', suite: null, comparisons: new Map(), sort: { key: 'task', dir: 1 }, selected: new Set(),
-  suitePick: null, profileSuite: 'all', taskFilter: 'all', taskSearch: '', boardModel: {}, boardExpanded: {} };
+  suitePick: null, profileSuite: 'all', profileModel: 'all', taskFilter: 'all', taskSearch: '', taskSort: 'default',
+  profileId: null, profileExpanded: false, selectedTaskKey: null, drawerClosed: false,
+  overviewFilter: 'all', overviewSearch: '', overviewSort: 'recent',
+  boardModel: {}, boardExpanded: {}, boardSelected: {}, boardPareto: {},
+  compareBaseline: null, compareFilter: 'all', compareSearch: '' };
 
 // ------------------------------------------------------------ DOM helpers
 function h(tag, props, ...children) {
@@ -341,7 +349,7 @@ function comparisonPicker(profiles, crossProfile) {
         if (!bySuite.has(item.suite)) bySuite.set(item.suite, []);
         bySuite.get(item.suite).push({ run: item.job.name, suite: item.suite_name || item.suite,
           owner: crossProfile ? profile.id : group.id,
-          label: [crossProfile ? profileName(profile) : null, group.label, item.model, item.run].filter(Boolean).join(' · ') });
+          label: [crossProfile ? profileName(profile) : null, group.label, item.model, item.tasks?.length ? `${item.tasks.length} 题` : null, item.run].filter(Boolean).join(' · ') });
       }
     }
   }
@@ -380,6 +388,113 @@ function comparisonPicker(profiles, crossProfile) {
     h('label', { class: 'field' }, '第二份结果', right), compare);
 }
 
+function profileSuiteEntries(chosen) {
+  const bySuite = new Map();
+  for (const p of chosen) {
+    for (const group of groupedItems(p)) {
+      for (const { item } of group.entries) {
+        if (!item.job) continue;
+        if (!bySuite.has(item.suite)) bySuite.set(item.suite, { suiteName: item.suite_name || item.suite, byProfile: new Map() });
+        const bucket = bySuite.get(item.suite).byProfile;
+        if (!bucket.has(p.id)) bucket.set(p.id, []);
+        const tasksCount = item.tasks?.length || item.job.planned || 0;
+        bucket.get(p.id).push({
+          run: item.job.name,
+          model: item.model || '',
+          tasks: tasksCount,
+          startedAt: item.job.started_at || item.started_at || '',
+          label: [group.label, item.model || '—', tasksCount ? `${tasksCount} 题` : null, item.job.name].filter(Boolean).join(' · '),
+        });
+      }
+    }
+  }
+  return [...bySuite.entries()].filter(([, v]) => chosen.every((p) => (v.byProfile.get(p.id) || []).length > 0));
+}
+
+function bestJobEntry(entries, model) {
+  const pool = model !== null ? entries.filter((e) => e.model === model) : entries;
+  return [...pool].sort((a, b) => b.tasks - a.tasks || String(b.startedAt).localeCompare(String(a.startedAt)))[0];
+}
+
+function pickDefaultProfileJobs(chosen, byProfile, saved) {
+  const sets = chosen.map((p) => new Set(byProfile.get(p.id).map((e) => e.model)));
+  const sharedModels = [...sets[0]].filter((m) => sets.every((s) => s.has(m)));
+  let preferredModel = null;
+  if (sharedModels.length) {
+    preferredModel = sharedModels.sort((a, b) => {
+      const score = (m) => chosen.reduce((sum, p) => sum + (bestJobEntry(byProfile.get(p.id), m)?.tasks || 0), 0);
+      return score(b) - score(a);
+    })[0];
+  }
+  const result = {};
+  for (const p of chosen) {
+    const entries = byProfile.get(p.id);
+    const kept = saved?.[p.id];
+    if (kept && entries.some((e) => e.run === kept)) result[p.id] = kept;
+    else result[p.id] = bestJobEntry(entries, preferredModel).run;
+  }
+  return result;
+}
+
+function multiProfileCompareDock(chosen) {
+  const shared = profileSuiteEntries(chosen);
+  const key = chosen.map((p) => p.id).join(',');
+  const picked = state.comparisons.get(key) || {};
+  const chips = chosen.map((p, i) => h('span', { class: 'mono', style: 'font-size:12px' },
+    h('span', { style: `color:${profileColor(i)};margin-right:4px`, text: '★' }), profileName(p)));
+  const clearBtn = h('button', { type: 'button', class: 'button sm', onclick: () => { state.selected.clear(); render(); } }, '清空');
+  if (!shared.length) {
+    return h('section', { class: 'compare-dock' },
+      h('div', { class: 'compare-dock-top' },
+        h('div', { class: 'compare-dock-left' }, h('span', { class: 'tag acc', text: `已勾选 ${chosen.length} 个 Profile` }), ...chips,
+          h('span', { class: 'muted', text: '暂无所有已选 Profile 共有的评测集结果' })),
+        h('div', { class: 'compare-dock-right' }, clearBtn)));
+  }
+  const bySuite = new Map(shared);
+  const currentSuite = bySuite.has(picked.suite) ? picked.suite : shared[0][0];
+  const suiteSelect = h('select', { 'aria-label': '共同评测集' }, shared.map(([sid, v]) =>
+    h('option', { value: sid, selected: sid === currentSuite, text: '共同评测集：' + v.suiteName })));
+  const go = h('a', { class: 'button primary sm', text: `打开 ${chosen.length} 版本对比台 →` });
+  const picksBox = h('div', { class: 'compare-dock-picks' });
+  const selects = new Map();
+
+  function syncHref() {
+    const sid = suiteSelect.value;
+    const saved = picked.jobsBySuite?.[sid] || {};
+    for (const [pid, sel] of selects) saved[pid] = sel.value;
+    picked.suite = sid;
+    picked.jobsBySuite = { ...(picked.jobsBySuite || {}), [sid]: saved };
+    state.comparisons.set(key, picked);
+    const jobs = chosen.map((p) => saved[p.id]).filter(Boolean);
+    go.href = '#/compare/' + jobs.map(encodeURIComponent).join(',');
+  }
+
+  function drawPicks() {
+    const sid = suiteSelect.value;
+    const { byProfile } = bySuite.get(sid);
+    const defaults = pickDefaultProfileJobs(chosen, byProfile, picked.jobsBySuite?.[sid]);
+    selects.clear();
+    picksBox.replaceChildren(...chosen.map((p, i) => {
+      const entries = byProfile.get(p.id);
+      const sel = h('select', { 'aria-label': `${profileName(p)} 参与对比的作业`, onchange: syncHref },
+        entries.map((e) => h('option', { value: e.run, selected: e.run === defaults[p.id], text: e.label })));
+      selects.set(p.id, sel);
+      return h('label', { class: 'compare-dock-pick' },
+        h('span', {}, h('b', { style: `color:${profileColor(i)}`, text: '★' }), h('span', { class: 'mono', text: profileName(p) })),
+        sel);
+    }));
+    syncHref();
+  }
+
+  suiteSelect.onchange = drawPicks;
+  drawPicks();
+  return h('section', { class: 'compare-dock' },
+    h('div', { class: 'compare-dock-top' },
+      h('div', { class: 'compare-dock-left' }, h('span', { class: 'tag acc', text: `已勾选 ${chosen.length} 个 Profile` }), ...chips),
+      h('div', { class: 'compare-dock-right' }, suiteSelect, go, clearBtn)),
+    picksBox);
+}
+
 async function renderOverview() {
   state.overviewDirty = false;
   navCurrent('overview');
@@ -388,60 +503,209 @@ async function renderOverview() {
   const { profiles, jobs, runs, can_run: canRun } = await api('/api/jobs');
   state.live = profiles.some(profileActive) || jobs.some((j) => j.running) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
   $('#create-run').hidden = !canRun;
+  const knownIds = new Set(profiles.map((p) => p.id));
+  for (const id of [...state.selected]) if (!knownIds.has(id)) state.selected.delete(id);
   const chosen = profiles.filter((p) => state.selected.has(p.id));
-  const rows = profiles.map((p) => h('tr', {},
-    h('td', {}, h('input', { type: 'checkbox', checked: state.selected.has(p.id), 'aria-label': '对比 ' + profileName(p),
-      onchange: (e) => { if (e.target.checked) state.selected.add(p.id); else state.selected.delete(p.id); render(); } })),
-    h('td', {}, link(profileHref(p), profileName(p)), h('small', { class: 'sub', text: p.models.join('、') })),
-    h('td', { class: 'mono', text: p.metacodes?.label || '—' }),
-    h('td', { text: groupedItems(p).length }), h('td', { text: PROFILE_STATUS[p.status] || p.status }),
-    h('td', { class: 'num', text: pct(p.summary.first_pass_rate) }),
-    h('td', { class: 'num', text: when(p.last_run_at) }),
-    canRun ? h('td', {}, profileActive(p) ? null : deleteProfileButton(p)) : null));
+  const colorOf = new Map(chosen.map((p, i) => [p.id, profileColor(i)]));
+  const allModels = [...new Set(profiles.flatMap((p) => p.models || []).filter(Boolean))];
+  const runningCount = profiles.filter(profileActive).length;
+  if (state.overviewFilter !== 'all' && state.overviewFilter !== 'running' && !allModels.includes(state.overviewFilter)) {
+    state.overviewFilter = 'all';
+  }
+  const filterButtons = [
+    ['all', '全部 Profile', profiles.length],
+    ...(runningCount ? [['running', '运行中', runningCount]] : []),
+    ...(allModels.length > 1 ? allModels.map((m) => [m, m, profiles.filter((p) => (p.models || []).includes(m)).length]) : []),
+  ];
+  const filterChips = h('div', { class: 'chips', role: 'group', 'aria-label': '筛选 Profile' },
+    filterButtons.map(([key, label, count]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String(state.overviewFilter === key),
+      onclick: () => { state.overviewFilter = key; render(); } }, label, ' ', h('span', { class: 'mono faint', text: String(count) }))));
+  const search = h('input', { type: 'search', placeholder: '搜索 Profile / 版本 / 模型', value: state.overviewSearch, 'aria-label': '搜索 Profile',
+    onfocus: () => { state.editing = true; }, onblur: () => { state.editing = false; },
+    oninput: (e) => { state.overviewSearch = e.target.value; drawCards(); } });
+  const sortSelect = h('select', { 'aria-label': '排序方式', onchange: (e) => { state.overviewSort = e.target.value; drawCards(); } },
+    [['recent', '排序：最近运行'], ['rate', '排序：首轮满分率'], ['cost', '排序：每题成本']].map(([val, label]) =>
+      h('option', { value: val, selected: state.overviewSort === val, text: label })));
+  const indexBar = profiles.length ? h('div', { class: 'index-bar' }, filterChips, h('div', { class: 'index-controls' }, search, sortSelect)) : null;
+  const dock = chosen.length >= 2 ? multiProfileCompareDock(chosen) : null;
+  const grid = h('section', { class: 'card-grid' });
+  function drawCards() {
+    const q = (state.overviewSearch || '').trim().toLowerCase();
+    const visible = profiles.filter((p) => {
+      if (state.overviewFilter === 'running' && !profileActive(p)) return false;
+      if (state.overviewFilter !== 'all' && state.overviewFilter !== 'running' && !(p.models || []).includes(state.overviewFilter)) return false;
+      if (!q) return true;
+      const hay = [profileName(p), p.metacodes?.label || '', (p.models || []).join(' '), (p.features || []).join(' ')].join(' ').toLowerCase();
+      return hay.includes(q);
+    }).sort((a, b) => {
+      if (state.overviewSort === 'rate') return (b.summary.first_pass_rate ?? -1) - (a.summary.first_pass_rate ?? -1);
+      if (state.overviewSort === 'cost') return (a.summary.cost_per_task ?? Infinity) - (b.summary.cost_per_task ?? Infinity);
+      return String(b.last_run_at || b.created_at || '').localeCompare(String(a.last_run_at || a.created_at || ''));
+    });
+    if (!visible.length) {
+      grid.replaceChildren(h('div', { class: 'panel', style: 'grid-column:1/-1' }, h('div', { class: 'empty' },
+        profiles.length ? '没有符合条件的 Profile。' : '还没有 Profile。',
+        !profiles.length && canRun ? h('button', { class: 'button', onclick: openRunDialog, style: 'margin-left:10px' }, '创建首个作业') : null)));
+      return;
+    }
+    grid.replaceChildren(...visible.map((p) => {
+      const checked = state.selected.has(p.id);
+      const col = colorOf.get(p.id);
+      const active = profileActive(p);
+      const s = p.summary;
+      const box = h('input', { type: 'checkbox', checked, 'aria-label': '对比 ' + profileName(p),
+        onclick: (e) => e.stopPropagation(),
+        onchange: (e) => { if (e.target.checked) state.selected.add(p.id); else state.selected.delete(p.id); render(); } });
+      if (col) box.style.accentColor = col;
+      const rateGood = (s.first_pass_rate ?? 0) >= 0.65;
+      const featList = p.features || [];
+      return h('article', { class: 'pcard' + (checked ? ' selected' : ''), style: col ? `border-top:2px solid ${col}` : null,
+        onclick: () => { location.hash = profileHref(p); } },
+        h('div', { class: 'pcard-head' },
+          h('div', { style: 'min-width:0' },
+            h('div', { class: 'pcard-title' }, col ? h('span', { style: `color:${col}`, text: '★' }) : null, h('a', { href: profileHref(p), text: profileName(p) })),
+            h('div', { class: 'muted', style: 'font-size:11.5px;margin-top:3px', text: (p.models || []).join(' · ') || '—' })),
+          h('div', { style: 'display:flex;align-items:center;gap:8px;flex:none' },
+            h('span', { class: active ? 'tag acc' : 'tag' }, active ? h('i', { class: 'live-dot' }) : null, PROFILE_STATUS[p.status] || p.status),
+            h('label', { class: 'pcard-check', onclick: (e) => e.stopPropagation() }, box))),
+        h('div', { class: 'pcard-tags' },
+          h('span', { class: 'tag mono', text: p.metacodes?.label || '—' }),
+          h('span', { class: 'tag mono', text: featList.length ? featList.join(', ') : '默认功能' })),
+        h('div', {},
+          h('div', { class: 'pcard-rate' },
+            h('div', {}, h('strong', { class: rateGood ? 'good' : null, text: pct(s.first_pass_rate) }), ' ', h('span', { class: 'muted', style: 'font-size:11.5px', text: '首轮满分' })),
+            h('span', { class: 'mono muted', style: 'font-size:11.5px', text: `${int(s.first_passed)} / ${int(s.first_valid)} 首次有效` })),
+          h('div', { style: 'margin-top:8px' }, outcomeBar(s.counts, s.trials))),
+        h('div', { class: 'pcard-stats' },
+          h('div', {}, h('span', { text: '每题成本' }), h('b', { text: usd(s.cost_per_task) })),
+          h('div', {}, h('span', { text: '初始 Token' }), h('b', { text: compact(s.initial_input_tokens_mean) })),
+          h('div', {}, h('span', { text: '作业数' }), h('b', { text: groupedItems(p).length + ' 作业' }))),
+        h('div', { class: 'pcard-foot' },
+          h('span', { class: active ? 'acc mono' : null, text: active ? progressText(p) : '最近：' + when(p.last_run_at) }),
+          h('span', { class: 'acc', text: '进入详情 →' }),
+          canRun && !active ? deleteProfileButton(p) : null));
+    }));
+  }
+  drawCards();
   const table = (heads, rows) => h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, heads.map((head) => h('th', { text: head })))), h('tbody', {}, rows)));
-  const listing = panel('Profile 列表', profiles.length + ' 个', profiles.length
-    ? table(['对比', 'Profile / 模型', 'MetaCodes 版本', '作业数', '状态', '首轮满分率', '最近运行', ...(canRun ? ['操作'] : [])], rows)
-    : h('div', { class: 'empty' }, '还没有 Profile。', canRun ? h('button', { class: 'button', onclick: openRunDialog }, '创建首个作业') : null));
-  const comparison = chosen.length < 2 ? null : panel('Profile 对比', '各 Profile 的最新结果', h('div', {},
-    table(['Profile', '一次性完成率', '首轮满分率', '至少通过一次', '初始 Token', '每题平均成本', '每次通过成本', '通过 trial', '缓存命中率'],
-      chosen.map((p) => h('tr', {}, [profileName(p), pct(p.summary.one_shot_pass_rate), pct(p.summary.first_pass_rate),
-        pct(p.summary.solved_rate), compact(p.summary.initial_input_tokens_mean), usd(p.summary.cost_per_task),
-        usd(p.summary.cost_per_pass), int(p.summary.counts.pass), pct(p.summary.cache_hit_rate)].map((v) => h('td', { text: v }))))),
-    h('div', { class: 'panel-body' }, comparisonPicker(chosen, true))));
+
   const owned = new Set(profiles.flatMap((p) => p.items.map((i) => i.run)));
   const localRuns = new Set(runs.map((r) => r.name));
   const loose = jobs.filter((j) => !owned.has(j.name));
   const receipts = runs.filter((r) => !owned.has(r.name) && !jobs.some((j) => j.name === r.name));
-  const legacy = loose.length || receipts.length ? panel('独立评测记录', null, table(['评测', '模型', '评测集', ''], [
-    ...loose.map((j) => h('tr', {}, h('td', {}, link((localRuns.has(j.name) ? '#/run/' : '#/job/') + encodeURIComponent(j.name), j.name)),
-      h('td', { text: j.model }), h('td', { text: j.suite_name || j.dataset }), h('td', {}, canRun && !j.running ?
-        h('button', { class: 'button', onclick: (e) => deleteJob(j, e.currentTarget) }, '删除') : null))),
-    ...receipts.map((r) => h('tr', {}, h('td', {}, link('#/run/' + encodeURIComponent(r.name), r.name)),
-      h('td', { text: r.model }), h('td', { text: r.suite_name }), h('td', { text: RUN_STATUS[r.status] || r.status }))),
-  ])) : null;
-  return h('div', {}, listing, comparison, legacy);
+  const legacyCount = loose.length + receipts.length;
+  const legacy = legacyCount ? h('details', { class: 'panel legacy-panel', open: true, 'data-key': 'overview-legacy' },
+    h('summary', {}, '独立评测记录', h('span', { class: 'muted', text: `${legacyCount} 条历史评测（未归属 Profile）` })),
+    table(['评测', '模型', '评测集', ''], [
+      ...loose.map((j) => h('tr', {}, h('td', {}, link((localRuns.has(j.name) ? '#/run/' : '#/job/') + encodeURIComponent(j.name), j.name)),
+        h('td', { text: j.model }), h('td', { text: j.suite_name || j.dataset }), h('td', {}, canRun && !j.running ?
+          h('button', { class: 'button sm', onclick: (e) => deleteJob(j, e.currentTarget) }, '删除') : null))),
+      ...receipts.map((r) => h('tr', {}, h('td', {}, link('#/run/' + encodeURIComponent(r.name), r.name)),
+        h('td', { text: r.model }), h('td', { text: r.suite_name }), h('td', { text: RUN_STATUS[r.status] || r.status }))),
+    ])) : null;
+  return h('div', {}, indexBar, dock, grid, legacy);
 }
 
 // ------------------------------------------------------------ profile
+function taskKey(t) { return `${t.suite}\0${t.model || ''}\0${t.task}`; }
+function attemptStrip(t, href) {
+  if (!t.attempts.length) return h('span', { class: 'muted', text: '等待运行' });
+  return h('span', { class: 'attempt-strip' }, t.attempts.map((a) => {
+    const title = `第 ${a.attempt_number} 次 · ${STATUS[a.status] || a.status}${a.cause ? ' · ' + a.cause : ''}`;
+    const sq = h('i', { class: 'attempt-sq s-' + a.status, title });
+    return href ? h('a', { href: href + '/' + encodeURIComponent(a.trial), onclick: (e) => e.stopPropagation(), title, 'aria-label': title }, sq) : sq;
+  }));
+}
+
 async function renderProfile(id) {
   navCurrent('overview');
   const b = await api('/api/profile?id=' + encodeURIComponent(id));
+  if (state.profileId !== b.id) {
+    state.profileId = b.id;
+    state.selectedTaskKey = null;
+    state.drawerClosed = false;
+  }
   state.live = profileActive(b);
   $('#title').textContent = profileName(b);
-  crumbs([{ text: 'Profiles', href: '#/' }, { text: 'MetaCodes ' + (b.metacodes?.label || '—') }]);
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: 'MetaCodes ' + (b.metacodes?.label || '—') + (b.features?.length ? ' · ' + b.features.join(', ') : '') }]);
   const s = b.summary;
-  const metrics = h('section', { class: 'profile-metrics', 'aria-label': '各题最新结果' },
-    metric('一次性完成率', pct(s.one_shot_pass_rate), int(s.counts.pass) + ' 通过 / ' + int(s.valid) + ' 有效', true),
-    metric('首轮满分率', pct(s.first_pass_rate), int(s.first_passed) + ' / ' + int(s.first_valid) + ' 道首次有效'),
-    metric('至少通过一次', pct(s.solved_rate), int(s.tasks_solved) + ' / ' + int(s.tasks_attempted) + ' 道'),
-    metric('通过 trial', int(s.counts.pass), int(s.trials) + ' 次尝试'),
-    metric('初始 Token（均值）', compact(s.initial_input_tokens_mean), int(s.initial_token_trials) + ' 次有记录'),
-    metric('每题平均成本', usd(s.cost_per_task), int(s.task_cost_tasks) + ' 道有价格'),
-    metric('每次通过成本', usd(s.cost_per_pass)), metric('缓存命中率', pct(s.cache_hit_rate)));
-  const diagnostics = h('details', { class: 'panel', 'data-key': 'profile-metrics' }, h('summary', { text: '完整指标' }),
-    h('div', { class: 'metrics' }, measurementCards(s), metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
-      metric('无效', int(s.counts.invalid)), s.budget_exhausted ? metric('预算用完', int(s.budget_exhausted)) : null));
+
+  const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
+  if (state.profileSuite && !suitesPresent.some(([sid]) => sid === state.profileSuite)) state.profileSuite = 'all';
+  const modelsPresent = [...new Set(b.tasks.map((t) => t.model).filter(Boolean))];
+  if (state.profileModel && !modelsPresent.includes(state.profileModel)) state.profileModel = 'all';
+
+  const scopedTasks = b.tasks
+    .filter((t) => (state.profileSuite || 'all') === 'all' || t.suite === state.profileSuite)
+    .filter((t) => (state.profileModel || 'all') === 'all' || t.model === state.profileModel);
+  const scopedCounts = Object.fromEntries(ORDER.map((k) => [k, 0]));
+  for (const t of scopedTasks) if (t.first_status && t.first_status in scopedCounts) scopedCounts[t.first_status] += 1;
+  const scopeLabel = [
+    state.profileSuite === 'all' ? '全部评测集' : (suitesPresent.find(([sid]) => sid === state.profileSuite)?.[1] || state.profileSuite),
+    state.profileModel === 'all' ? null : state.profileModel,
+  ].filter(Boolean).join(' · ');
+
+  const statusPills = h('div', { class: 'stat-pills', role: 'group', 'aria-label': '按首次结局筛选' },
+    h('button', { type: 'button', class: 'stat-pill' + ((state.taskFilter || 'all') === 'all' ? ' on' : ''),
+      onclick: () => { state.taskFilter = 'all'; render(); } }, '全部 ', h('b', { text: String(scopedTasks.length) })),
+    ...ORDER.filter((k) => scopedCounts[k] > 0 || state.taskFilter === k).map((k) =>
+      h('button', { type: 'button', class: 'stat-pill' + (state.taskFilter === k ? ' on' : ''),
+        onclick: () => { state.taskFilter = state.taskFilter === k ? 'all' : k; render(); } },
+        h('i', { class: 'dot s-' + k }), STATUS[k] + ' ', h('b', { text: String(scopedCounts[k]) }))));
+
+  const banner = h('section', { class: 'profile-banner', 'aria-label': '各题最新结果' },
+    h('div', { class: 'profile-banner-left' },
+      metric('一次性完成率', pct(s.one_shot_pass_rate), int(s.counts.pass) + ' 通过 / ' + int(s.valid) + ' 有效', true),
+      metric('首轮满分率', pct(s.first_pass_rate), int(s.first_passed) + ' / ' + int(s.first_valid) + ' 首次有效'),
+      metric('至少通过一次', pct(s.solved_rate), int(s.tasks_solved) + ' / ' + int(s.tasks_attempted) + ' 道')),
+    h('div', { class: 'profile-banner-right' },
+      h('div', {},
+        h('div', { style: 'display:flex;justify-content:space-between;gap:10px;font-size:11.5px;margin-bottom:6px;flex-wrap:wrap' },
+          h('span', { class: 'muted', text: `首次结局分布（${scopeLabel} · 点击状态筛选下方任务）` }),
+          h('span', { class: 'mono muted', text: `${scopedTasks.length} 道题` })),
+        outcomeBar(scopedCounts, scopedTasks.length, true),
+        statusPills),
+      h('div', { class: 'profile-banner-meta' },
+        h('div', {}, h('span', { text: '每题平均成本' }), h('strong', { text: usd(s.cost_per_task) })),
+        h('div', {}, h('span', { text: '每次通过成本' }), h('strong', { text: usd(s.cost_per_pass) })),
+        h('div', {}, h('span', { text: '初始 Token 均值' }), h('strong', { text: compact(s.initial_input_tokens_mean) })),
+        h('div', {}, h('span', { text: '缓存命中率' }), h('strong', { text: pct(s.cache_hit_rate) })))));
+
+  const groups = groupedItems(b);
+  const runningItem = b.items.find((i) => i.status === 'running');
+  const latestGroup = groups[0];
+  const pendingItems = b.items.filter((i) => i.status === 'pending').length;
+  const activeProg = runningItem ? (() => {
+    const js = runningItem.job?.summary;
+    const planned = runningItem.job?.planned || runningItem.tasks.length * (runningItem.attempts || 1);
+    const done = js ? js.trials - js.counts.running : 0;
+    const width = planned ? Math.min(100, 100 * done / planned) : 0;
+    return h('span', { class: 'prog-pill' },
+      h('strong', { text: runningItem.suite_name || runningItem.suite }),
+      h('span', { class: 'mono', text: `${done} / ${planned}` }),
+      h('span', { class: 'prog-bar' }, h('span', { width: width + '%' })),
+      js ? h('span', { class: 'pos mono', text: pct(js.first_pass_rate) }) : null);
+  })() : null;
+
+  const jobsStrip = h('section', { class: 'jobs-strip' },
+    h('div', { class: 'jobs-strip-left' },
+      h('span', { class: profileActive(b) ? 'tag acc' : 'tag' },
+        profileActive(b) ? h('i', { class: 'live-dot' }) : null,
+        latestGroup ? `${latestGroup.label} · ${PROFILE_STATUS[b.status] || b.status}` : `${groups.length} 个作业`),
+      activeProg,
+      h('span', { class: 'muted', style: 'font-size:12px', text: [
+        pendingItems ? `队列剩余 ${pendingItems} 项` : `共 ${groups.length} 个作业`,
+        `并发 ${b.concurrency}`,
+        `自动重跑：${b.auto_rerun_invalid ? '开' : '关'}`,
+      ].join(' · ') })),
+    h('div', { class: 'row-actions', style: 'flex-wrap:wrap' },
+      b.can_run && b.tasks.some((t) => t.model === runModel(b) && hasInvalid(t))
+        ? h('button', { type: 'button', class: 'button sm', onclick: () => runAgain(b, true) }, '重跑无效的题') : null,
+      b.can_run ? h('button', { type: 'button', class: 'button primary sm', onclick: () => runAgain(b, false) }, '创建作业') : null,
+      h('button', { type: 'button', class: 'button sm', 'aria-expanded': String(state.profileExpanded),
+        onclick: () => { state.profileExpanded = !state.profileExpanded; render(); } },
+        state.profileExpanded ? '收起作业 / 设置 / 诊断 ▴' : `展开作业 (${groups.length}) / 设置 / 诊断 ▾`)));
 
   const nameInput = h('input', { type: 'text', maxlength: 80, value: b.name || '', placeholder: b.default_name || b.id, 'aria-label': 'Profile名称' });
   const renameFeedback = h('span', { class: 'muted', role: 'status' });
@@ -453,28 +717,43 @@ async function renderProfile(id) {
   renameForm.addEventListener('submit', async (event) => {
     event.preventDefault();
     renameFeedback.textContent = '正在保存…';
-    try {
-      await api('/api/profile/rename', { id: b.id, name: nameInput.value });
-      render();
-    } catch (error) { renameFeedback.textContent = error.message; }
+    try { await api('/api/profile/rename', { id: b.id, name: nameInput.value }); render(); }
+    catch (error) { renameFeedback.textContent = error.message; }
   });
   const nameRow = h('span', { class: 'rename' }, h('span', { text: b.name || '未命名（按版本和高级功能命名）' }),
-    b.can_run ? h('button', { type: 'button', class: 'button', onclick: () => {
+    b.can_run ? h('button', { type: 'button', class: 'button sm', onclick: () => {
       state.editing = true; nameRow.hidden = true; renameForm.hidden = false; nameInput.focus(); nameInput.select();
     } }, '重命名') : null);
   const m = b.metacodes || {};
-  const info = h('div', { class: 'panel-body' }, h('dl', { class: 'kv' },
-    h('dt', { text: '名称' }), h('dd', {}, nameRow, renameForm),
-    h('dt', { text: '并发数' }), h('dd', {}, concurrencyControl(b)),
-    h('dt', { text: '自动重跑' }), h('dd', {}, autoRerunControl(b)),
-    h('dt', { text: '编号' }), h('dd', { class: 'mono', text: b.id }),
-    h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
-    h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
-    h('dt', { text: '二进制 SHA-256' }), h('dd', { class: 'mono', text: m.binary_sha256 || '—' }),
-    h('dt', { text: '冻结副本' }), h('dd', { class: 'mono', text: m.bundle || '—' }),
-    h('dt', { text: '高级功能' }), h('dd', { class: 'mono', text: featuresText(b) }),
-    h('dt', { text: '模型' }), h('dd', { text: b.models.join('、') || '—' }),
-    h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 最近运行 ${when(b.last_run_at)}` })));
+  const infoPanel = panel('Profile 设置与冻结信息', `并发 ${b.concurrency}`, h('div', { class: 'panel-body' },
+    h('dl', { class: 'kv' },
+      h('dt', { text: '名称' }), h('dd', {}, nameRow, renameForm),
+      h('dt', { text: '并发数' }), h('dd', {}, concurrencyControl(b)),
+      h('dt', { text: '自动重跑' }), h('dd', {}, autoRerunControl(b)),
+      h('dt', { text: '编号' }), h('dd', { class: 'mono', text: b.id }),
+      h('dt', { text: 'metacodes 版本' }), h('dd', {}, h('b', { class: 'mono', text: m.label || '—' }), m.release ? h('span', { class: 'muted', text: ' · 发行包 ' + m.release }) : null),
+      h('dt', { text: '冻结' }), h('dd', { class: 'mono', text: m.digest ? `内容摘要 ${m.digest}${m.commit ? ' · commit ' + m.commit : ''}` : '—' }),
+      h('dt', { text: '二进制 SHA-256' }), h('dd', { class: 'mono', text: m.binary_sha256 || '—' }),
+      h('dt', { text: '冻结副本' }), h('dd', { class: 'mono', text: m.bundle || '—' }),
+      h('dt', { text: '高级功能' }), h('dd', { class: 'mono', text: featuresText(b) }),
+      h('dt', { text: '模型' }), h('dd', { text: b.models.join('、') || '—' }),
+      h('dt', { text: '时间' }), h('dd', { text: `创建 ${when(b.created_at)} · 最近运行 ${when(b.last_run_at)}` })),
+    b.can_run ? h('div', { class: 'row-actions', style: 'margin-top:14px;padding-top:12px;border-top:1px solid var(--rule)' }, profileActions(b)) : null));
+
+  const diagBody = h('div', { class: 'panel-body', style: 'display:flex;flex-direction:column;gap:14px' },
+    s.initial_composition_mean ? h('div', {},
+      stackBar(compositionSegments(s.initial_composition_mean)),
+      h('div', { class: 'legend keys' }, PARTS.map(([k, l]) => h('span', { class: 'key' }, h('i', { class: 'c-' + k }),
+        `${l} ${compact(s.initial_composition_mean[k])} · ${pct((s.initial_composition_mean[k] || 0) / Math.max(1, partsTotal(s.initial_composition_mean)))}`)))) : null,
+    h('div', { class: 'kv-grid' },
+      h('div', { class: 'kv-box' }, h('span', { text: '生成 TPS' }), h('strong', { text: tps(s.tps) })),
+      h('div', { class: 'kv-box' }, h('span', { text: 'TTFT 均值 / P95' }), h('strong', { text: `${ttft(s.ttft_ms)} / ${ttft(s.ttft_p95_ms)}` })),
+      h('div', { class: 'kv-box' }, h('span', { text: '未通过成本占比' }), h('strong', { text: pct(s.non_pass_cost_share) }))),
+    h('details', { class: 'call', 'data-key': 'profile-metrics' }, h('summary', { text: '展开全部 15 项指标' }),
+      h('div', { class: 'metrics', style: 'padding:12px 14px;margin-bottom:0;border-bottom:0' }, measurementCards(s),
+        metric('队列', progressText(b), PROFILE_STATUS[b.status] || b.status),
+        metric('无效', int(s.counts.invalid)), s.budget_exhausted ? metric('预算用完', int(s.budget_exhausted)) : null)));
+  const diagPanel = panel('完整诊断与初始上下文组成', `初始均值 ${compact(s.initial_input_tokens_mean)}`, diagBody);
 
   const itemRow = (item, index) => {
     const j = item.job; const js = j?.summary;
@@ -492,24 +771,20 @@ async function renderProfile(id) {
       h('td', { class: 'num', text: js ? pct(js.first_pass_rate) : '—' }),
       h('td', { class: 'num', text: js ? compact(js.total_tokens) : '—' }),
       h('td', { class: 'num', text: j ? dur(j.wall_s) : '—' }),
-
       b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index), j && !j.running && item.status !== 'running' ? h('button', { class: 'button', onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除结果') : null)) : null);
   };
   const itemHeads = ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', ...(b.can_run ? ['操作'] : [])];
   const itemTable = (rows, empty) => h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, itemHeads.map((t, i) => h('th', { class: [3, 5, 6, 7].includes(i) ? 'num' : i === 8 ? 'pinned' : null, text: t })))),
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: itemHeads.length, class: 'empty', text: empty })))));
-  const groups = groupedItems(b);
-  const submissions = panel('作业', groups.length + ' 个', h('div', {}, groups.map((group) => {
+  const submissions = panel('作业队列', groups.length + ' 个', h('div', {}, groups.map((group) => {
     const active = group.entries.some(({ item }) => ['pending', 'running'].includes(item.status));
     const controlFor = (action, label, question) => h('button', { type: 'button', class: 'button', onclick: async (event) => {
       if (question && !confirm(question)) return;
       const control = event.currentTarget;
       control.disabled = true;
-      try {
-        await api('/api/profile/submission', { id: b.id, submission: group.id, action });
-        await render();
-      } catch (error) { control.disabled = false; setConnection(false, error.message); }
+      try { await api('/api/profile/submission', { id: b.id, submission: group.id, action }); await render(); }
+      catch (error) { control.disabled = false; setConnection(false, error.message); }
     } }, label);
     const controls = b.can_run ? h('div', { class: 'row-actions' }, active
       ? controlFor('cancel', '取消作业', '取消' + group.label + '里的所有等待中和运行中评测？')
@@ -518,55 +793,131 @@ async function renderProfile(id) {
     return h('article', { class: 'submission' }, h('div', { class: 'panel-heading' },
       h('h3', {}, group.label, h('small', { class: 'muted', text: [when(first.queued_at), first.executor, group.entries.length + ' 项评测'].filter(Boolean).join(' · ') })),
       controls), itemTable(group.entries.map(({ item, index }) => itemRow(item, index)), ''));
-  })), b.can_run ? h('button', { class: 'button primary', onclick: () => runAgain(b, false) }, '创建作业') : null);
-  // Per task: each (suite, model, task)'s latest attempts in order.
-  const suitesPresent = [...new Map(b.tasks.map((t) => [t.suite, t.suite_name || t.suite]))];
-  if (state.profileSuite && !suitesPresent.some(([id]) => id === state.profileSuite)) state.profileSuite = 'all';
+  })));
+  const expandedArea = state.profileExpanded ? h('div', { class: 'profile-expanded' },
+    submissions,
+    panel('作业对比', '同一评测集', h('div', { class: 'panel-body' }, comparisonPicker([b], false))),
+    modelsPanel(b),
+    h('div', { class: 'sec-grid' }, infoPanel, diagPanel)) : null;
+
+  const suiteCounts = new Map();
+  for (const t of b.tasks) suiteCounts.set(t.suite, (suiteCounts.get(t.suite) || 0) + 1);
   const chips = suitesPresent.length > 1 ? h('div', { class: 'chips', role: 'group', 'aria-label': '按评测集筛选' },
-    [['all', '全部评测集'], ...suitesPresent].map(([sid, name]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String((state.profileSuite || 'all') === sid),
-      onclick: () => { state.profileSuite = sid; render(); } }, name))) : null;
-  const modelsPresent = [...new Set(b.tasks.map((t) => t.model).filter(Boolean))];
-  if (state.profileModel && !modelsPresent.includes(state.profileModel)) state.profileModel = 'all';
+    [['all', '全部', b.tasks.length], ...suitesPresent.map(([sid, name]) => [sid, name, suiteCounts.get(sid) || 0])].map(([sid, name, cnt]) =>
+      h('button', { type: 'button', class: 'chip', 'aria-pressed': String((state.profileSuite || 'all') === sid),
+        onclick: () => { state.profileSuite = sid; render(); } }, name, ' ', h('span', { class: 'mono faint', text: String(cnt) })))) : null;
   const modelChips = modelsPresent.length > 1 ? h('div', { class: 'chips', role: 'group', 'aria-label': '按模型筛选' },
     [['all', '全部模型'], ...modelsPresent.map((x) => [x, x])].map(([mid, name]) => h('button', { type: 'button', class: 'chip', 'aria-pressed': String((state.profileModel || 'all') === mid),
       onclick: () => { state.profileModel = mid; render(); } }, name))) : null;
-  const firstFilter = h('div', { class: 'filters' }, ['all', ...ORDER].map((key) => h('button', {
-    type: 'button', class: (state.taskFilter || 'all') === key ? 'on' : null, onclick: () => { state.taskFilter = key; render(); },
-  }, key === 'all' ? '全部' : '首次' + STATUS[key])));
   const search = h('input', { type: 'search', placeholder: '搜索任务', value: state.taskSearch || '', 'aria-label': '搜索任务',
-    oninput: (e) => { state.taskSearch = e.target.value; drawTasks(); } });
+    onfocus: () => { state.editing = true; }, onblur: () => { state.editing = false; },
+    oninput: (e) => { state.taskSearch = e.target.value; drawWorkspace(); } });
+  const sortSelect = h('select', { class: 'task-sort', 'aria-label': '任务排序', onchange: (e) => { state.taskSort = e.target.value; drawWorkspace(); } },
+    [['default', '默认顺序'], ['rate-asc', '通过率升序'], ['tokens-desc', '总 Token 降序'], ['time-desc', '用时降序']].map(([v, label]) =>
+      h('option', { value: v, selected: state.taskSort === v, text: label })));
+
+  const showSuiteCol = suitesPresent.length > 1 && (state.profileSuite || 'all') === 'all';
+  const showModelCol = modelsPresent.length > 1 && (state.profileModel || 'all') === 'all';
+  const taskHeads = ['任务', ...(showSuiteCol ? ['评测集'] : []), ...(showModelCol ? ['模型'] : []), '各次结局', '通过 / 有效', '总 Token', '轮数', '用时'];
+  const numStart = 2 + (showSuiteCol ? 1 : 0) + (showModelCol ? 1 : 0);
   const tbody = h('tbody', {});
-  function drawTasks() {
+  const drawer = h('aside', { class: 'task-drawer', 'aria-label': '任务详情抽屉' });
+  const workspace = h('div', { class: 'task-workspace' });
+
+  function drawWorkspace() {
     const q = (state.taskSearch || '').trim().toLowerCase();
-    const shown = b.tasks.filter((t) => (state.profileSuite || 'all') === 'all' || t.suite === state.profileSuite)
-      .filter((t) => (state.profileModel || 'all') === 'all' || t.model === state.profileModel)
+    const shown = scopedTasks
       .filter((t) => (state.taskFilter || 'all') === 'all' || t.first_status === state.taskFilter)
       .filter((t) => !q || t.task.toLowerCase().includes(q));
-    tbody.replaceChildren(...(shown.length ? shown.map((t) => {
+    const ordered = [...shown];
+    if (state.taskSort === 'rate-asc') ordered.sort((a, c) => (a.valid ? a.passed / a.valid : -1) - (c.valid ? c.passed / c.valid : -1) || a.task.localeCompare(c.task));
+    else if (state.taskSort === 'tokens-desc') ordered.sort((a, c) => (c.mean_total_tokens ?? -1) - (a.mean_total_tokens ?? -1));
+    else if (state.taskSort === 'time-desc') ordered.sort((a, c) => (c.mean_elapsed_s ?? -1) - (a.mean_elapsed_s ?? -1));
+
+    let selIndex = ordered.findIndex((t) => taskKey(t) === state.selectedTaskKey);
+    if (selIndex < 0 && ordered.length && !state.drawerClosed) {
+      selIndex = 0;
+      state.selectedTaskKey = taskKey(ordered[0]);
+    }
+    const sel = !state.drawerClosed && selIndex >= 0 ? ordered[selIndex] : null;
+    workspace.classList.toggle('full', !sel);
+    drawer.hidden = !sel;
+
+    tbody.replaceChildren(...(ordered.length ? ordered.map((t) => {
+      const k = taskKey(t);
+      const isSel = sel && taskKey(sel) === k;
       const href = t.job ? `#/profile/${encodeURIComponent(b.id)}/task/${encodeURIComponent(t.job)}/${encodeURIComponent(t.task)}` : null;
-      return h('tr', { class: href ? 'link' : null, onclick: href ? () => { location.hash = href; } : null },
-        h('td', {}, h('span', { class: 'mono', text: t.task })),
-        h('td', { text: t.suite_name || t.suite }),
-        h('td', { text: t.model || '—' }),
-        h('td', {}, t.attempts.length ? h('span', { class: 'dots' }, t.attempts.map((a) => h('a', { href: href + '/' + encodeURIComponent(a.trial), onclick: (e) => e.stopPropagation(), title: `第 ${a.attempt_number} 次 · ${STATUS[a.status] || a.status}${a.cause ? ' · ' + a.cause : ''}` }, badge(a.status)))) : h('span', { class: 'muted', text: '等待运行' })),
+      return h('tr', { class: 'link' + (isSel ? ' selected' : ''), onclick: () => {
+        state.selectedTaskKey = k;
+        state.drawerClosed = false;
+        drawWorkspace();
+      } },
+        h('td', {}, h('span', { class: 'task-name-cell' }, h('i', { class: 'dot round s-' + (t.first_status || 'running') }), h('span', { class: 'mono', text: t.task }))),
+        showSuiteCol ? h('td', { text: t.suite_name || t.suite }) : null,
+        showModelCol ? h('td', { text: t.model || '—' }) : null,
+        h('td', {}, attemptStrip(t, href)),
         h('td', { class: 'num', text: t.attempts.length ? `${t.passed} / ${t.valid}` : '—' }),
-        h('td', { class: 'num', text: t.history.length ? `覆盖了 ${t.history.length} 次` : '—' }),
         h('td', { class: 'num', text: compact(t.mean_total_tokens) }),
-        h('td', { class: 'num', text: compact(t.mean_initial_input_tokens) }),
         h('td', { class: 'num', text: t.mean_turns === null || t.mean_turns === undefined ? '—' : t.mean_turns.toFixed(1) }),
-        h('td', { class: 'num', text: t.mean_tool_calls === null || t.mean_tool_calls === undefined ? '—' : t.mean_tool_calls.toFixed(1) }),
         h('td', { class: 'num', text: dur(t.mean_elapsed_s) }));
-    }) : [h('tr', {}, h('td', { colspan: 11, class: 'empty', text: '没有符合条件的任务' }))]));
+    }) : [h('tr', {}, h('td', { colspan: taskHeads.length, class: 'empty', text: '没有符合条件的任务' }))]));
+
+    if (!sel) return;
+    const href = sel.job ? `#/profile/${encodeURIComponent(b.id)}/task/${encodeURIComponent(sel.job)}/${encodeURIComponent(sel.task)}` : null;
+    const prev = selIndex > 0 ? ordered[selIndex - 1] : null;
+    const next = selIndex < ordered.length - 1 ? ordered[selIndex + 1] : null;
+    const attemptsList = sel.attempts.length ? h('div', { class: 'att-list' }, sel.attempts.map((a) => {
+      const trialHref = href ? href + '/' + encodeURIComponent(a.trial) : null;
+      const testText = a.tests ? `${a.tests.passed}/${a.tests.total} 测试` : (a.reward !== null && a.reward !== undefined ? `reward ${a.reward}` : '');
+      const card = h(trialHref ? 'a' : 'div', { class: 'att-card', href: trialHref },
+        h('div', { style: 'display:flex;align-items:center;gap:9px' },
+          h('span', { class: 'mono muted', text: '#' + a.attempt_number }),
+          badge(a.status, a.cause),
+          testText ? h('span', { class: 'mono muted', style: 'font-size:11.5px', text: testText }) : null),
+        h('div', { style: 'display:flex;align-items:center;gap:10px' },
+          h('span', { class: 'mono', style: 'font-size:11.5px', text: `${compact(a.total_tokens)} · ${dur(a.elapsed_s)}` }),
+          trialHref ? h('span', { class: 'acc', style: 'font-size:11.5px', text: '轨迹 ↗' }) : null));
+      return card;
+    })) : h('div', { class: 'muted', text: '等待运行' });
+    const historyNote = sel.history?.length ? h('span', { class: 'muted', style: 'font-size:11.5px' }, `历史覆盖 ${sel.history.length} 次 `,
+      ...sel.history.map((job) => h('a', { class: 'acc mono', style: 'margin-left:4px', href: `#/profile/${encodeURIComponent(b.id)}/task/${encodeURIComponent(job)}/${encodeURIComponent(sel.task)}`, text: job.slice(-8) }))) : null;
+    drawer.replaceChildren(
+      h('div', { class: 'drawer-head' },
+        h('div', { style: 'min-width:0' },
+          h('div', { class: 'muted', style: 'font-size:11.5px', text: [sel.suite_name || sel.suite, sel.model || '—', `${selIndex + 1} / ${ordered.length}`].join(' · ') }),
+          h('div', { class: 'drawer-title', text: sel.task })),
+        h('div', { style: 'display:flex;gap:5px;flex:none' },
+          h('button', { type: 'button', class: 'button sm', disabled: !prev, 'aria-label': '上一题',
+            onclick: () => { if (prev) { state.selectedTaskKey = taskKey(prev); drawWorkspace(); } } }, '←'),
+          h('button', { type: 'button', class: 'button sm', disabled: !next, 'aria-label': '下一题',
+            onclick: () => { if (next) { state.selectedTaskKey = taskKey(next); drawWorkspace(); } } }, '→'),
+          h('button', { type: 'button', class: 'button sm', 'aria-label': '关闭详情抽屉',
+            onclick: () => { state.drawerClosed = true; drawWorkspace(); } }, '×'))),
+      h('div', { class: 'drawer-body' },
+        h('div', { class: 'kv-grid' },
+          h('div', { class: 'kv-box' }, h('span', { text: '通过 / 有效' }), h('strong', { class: sel.valid && !sel.passed ? 'neg' : sel.valid && sel.passed === sel.valid ? 'pos' : null, text: sel.attempts.length ? `${sel.passed} / ${sel.valid}` : '—' })),
+          h('div', { class: 'kv-box' }, h('span', { text: '平均总 Token' }), h('strong', { text: compact(sel.mean_total_tokens) })),
+          h('div', { class: 'kv-box' }, h('span', { text: '平均初始 Token' }), h('strong', { text: compact(sel.mean_initial_input_tokens) })),
+          h('div', { class: 'kv-box' }, h('span', { text: '平均轮数' }), h('strong', { text: sel.mean_turns === null || sel.mean_turns === undefined ? '—' : sel.mean_turns.toFixed(1) })),
+          h('div', { class: 'kv-box' }, h('span', { text: '平均工具调用' }), h('strong', { text: sel.mean_tool_calls === null || sel.mean_tool_calls === undefined ? '—' : sel.mean_tool_calls.toFixed(1) })),
+          h('div', { class: 'kv-box' }, h('span', { text: '平均用时' }), h('strong', { text: dur(sel.mean_elapsed_s) }))),
+        h('div', {},
+          h('div', { style: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap' },
+            h('strong', { style: 'font-size:12.5px', text: `${sel.attempts.length} 次尝试记录` }),
+            historyNote),
+          attemptsList),
+        href ? h('div', { class: 'drawer-actions' }, h('a', { class: 'button accent sm', href, text: '打开完整任务页（轨迹 / 测试 / 上下文）↗' })) : null));
   }
-  drawTasks();
-  const tasks = panel('逐任务（最新结果）', `${b.tasks.length} 道`, h('div', {}, chips, modelChips,
-    h('div', { class: 'panel-body toolbar' }, firstFilter, search),
-    h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['任务', '评测集', '模型', '各次结局', '通过 / 有效', '历史', '平均总 Token', '平均初始 Token', '平均轮数', '平均工具调用', '平均用时'].map((t, i) => h('th', { class: i >= 4 ? 'num' : null, text: t })))), tbody))));
-  const settings = h('details', { class: 'panel', 'data-key': 'profile-settings-' + b.id },
-    h('summary', {}, 'Profile 设置', h('span', { class: 'muted', text: '并发 ' + b.concurrency })), info,
-    b.can_run ? h('div', { class: 'panel-body row-actions' }, profileActions(b)) : null);
-  return h('div', {}, metrics, settings, submissions, panel('作业对比', '同一评测集', h('div', { class: 'panel-body' }, comparisonPicker([b], false))),
-    modelsPanel(b), diagnostics, tasks, compositionPanel(s, '最新结果均值'));
+
+  const tasksPanel = panel('逐任务（最新结果）', `${scopedTasks.length} 道` + (!showSuiteCol && !showModelCol ? ' · 已隐去重复评测集/模型列' : ''),
+    h('div', {}, chips, modelChips,
+      h('div', { class: 'panel-body toolbar', style: 'justify-content:space-between' }, search, sortSelect),
+      h('div', { class: 'table-scroll' }, h('table', { class: 'task-table' },
+        h('thead', {}, h('tr', {}, taskHeads.map((t, i) => h('th', { class: i >= numStart ? 'num' : null, text: t })))), tbody))));
+  workspace.append(tasksPanel, drawer);
+  drawWorkspace();
+
+  return h('div', {}, banner, jobsStrip, expandedArea, workspace);
 }
 
 // The profile's concurrency, the only place it is set: every dataset
@@ -1483,44 +1834,241 @@ async function renderTrial(jobName, trialName) {
 }
 
 // ------------------------------------------------------------ compare
+const VALID_STATUSES = ['pass', 'partial', 'fail', 'timeout'];
+function jobTitle(j) { return j.profile_name || j.model || j.name; }
+function jobSub(j) {
+  return [j.profile_version ? 'v' + j.profile_version : null, j.profile_features?.length ? j.profile_features.join(', ') : null,
+    j.profile_name ? j.model : null, j.name].filter(Boolean).join(' · ');
+}
+function deltaPct(curr, base) {
+  if (curr === null || curr === undefined || base === null || base === undefined) return '';
+  const d = (curr - base) * 100;
+  return (d > 0 ? '+' : '') + d.toFixed(1) + '%';
+}
+function deltaRel(curr, base) {
+  if (curr === null || curr === undefined || base === null || base === undefined || base <= 0) return null;
+  const d = (curr - base) / base * 100;
+  return { value: d, text: (d > 0 ? '+' : '') + Math.round(d) + '%' };
+}
+function compareCsv(jobs, tasks, byJob) {
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const head = ['task', ...jobs.flatMap((j) => [`${jobTitle(j)} status`, `${jobTitle(j)} tokens`, `${jobTitle(j)} elapsed_s`])];
+  const lines = [head.map(esc).join(',')];
+  for (const task of tasks) {
+    lines.push([task, ...byJob.flatMap((m) => {
+      const r = m.get(task);
+      return r ? [r.status, r.total_tokens ?? '', r.elapsed_s ?? ''] : ['', '', ''];
+    })].map(esc).join(','));
+  }
+  return lines.join('\n') + '\n';
+}
+
 async function renderCompare(names, profileId) {
   navCurrent('overview');
-  $('#title').textContent = '对比';
-  crumbs([{ text: 'Profiles', href: '#/' }, ...(profileId ? [{ text: 'Profile 作业', href: profileHref({ id: profileId }) }] : []), { text: '逐题对比' }]);
-  if (names.length < 2) {
+  $('#title').textContent = '多版本对比台';
+  const uniqueNames = [...new Set(names.filter(Boolean))];
+  crumbs([{ text: 'Profiles', href: '#/' }, ...(profileId ? [{ text: 'Profile 作业', href: profileHref({ id: profileId }) }] : []), { text: '多版本对比' }]);
+  if (uniqueNames.length < 2) {
     state.live = false;
-    return panel('对比', null, h('div', { class: 'empty', text: '从 Profile 进入作业对比，或在首页勾选要对比的 Profile。' }));
+    return panel('对比', null, h('div', { class: 'empty', text: '从首页或榜单勾选 2 个以上 Profile，或从 Profile 详情进入作业对比。' }));
   }
-  const jobs = await Promise.all(names.map((n) => api('/api/job?name=' + encodeURIComponent(n))));
-  state.live = jobs.some((j) => j.running);
-  // Compare each task's first execution, consistently with the headline rate.
+  const loaded = await Promise.all(uniqueNames.map((n) => api('/api/job?name=' + encodeURIComponent(n))));
+  state.live = loaded.some((j) => j.running);
+  const baseName = uniqueNames.includes(state.compareBaseline) ? state.compareBaseline : uniqueNames[0];
+  state.compareBaseline = baseName;
+  const jobs = [loaded.find((j) => j.name === baseName), ...loaded.filter((j) => j.name !== baseName)];
+  const colors = jobs.map((_, i) => profileColor(i));
   const byJob = jobs.map((j) => {
     const m = new Map();
     for (const r of j.rows) if (r.first_attempt) m.set(r.task, r);
     return m;
   });
   const tasks = [...new Set(jobs.flatMap((j) => j.rows.map((r) => r.task)))].sort();
-  const common = tasks.filter((t) => byJob.every((m) => m.has(t) && ['pass', 'partial', 'fail', 'timeout'].includes(m.get(t).status)));
-  const metrics = h('section', { class: 'metrics' },
-    metric('共同首次有效题', String(common.length), null, true),
-    ...jobs.map((j, i) => metric(j.model || j.name, pct(common.length ? common.filter((t) => byJob[i].get(t).status === 'pass').length / common.length : null),
-      `${j.name} · 共同题首次满分率`)));
-  const rows = tasks.map((task) => {
-    const statuses = byJob.map((m) => m.get(task)?.status);
-    const differ = new Set(statuses.filter(Boolean)).size > 1;
-    return h('tr', { class: differ ? 'diff' : null }, h('td', { text: task }),
-      byJob.map((m, i) => {
-        const r = m.get(task);
-        if (!r) return h('td', { class: 'cell' }, dash());
-        return h('td', { class: 'cell' }, h('a', { href: `#/job/${encodeURIComponent(jobs[i].name)}/${encodeURIComponent(r.trial)}` }, badge(r.status, r.cause)),
-          h('span', { class: 'sub', text: `${r.tests ? r.tests.passed + '/' + r.tests.total + ' · ' : ''}${compact(r.total_tokens)} tok · ${dur(r.elapsed_s)}` }),
-          h('span', { class: 'sub', text: `${tps(r.tps)} · TTFT ${ttft(r.ttft_ms)}` }));
-      }));
+  const common = tasks.filter((t) => byJob.every((m) => m.has(t) && VALID_STATUSES.includes(m.get(t).status)));
+  const suiteName = [...new Set(jobs.map((j) => j.suite_name || j.dataset).filter(Boolean))].join(' / ');
+  const prefix = profileId ? profileHref({ id: profileId }) + '/compare/' : '#/compare/';
+
+  const chips = jobs.map((j, i) => {
+    const isBase = i === 0;
+    const removeBtn = jobs.length > 2 ? h('button', { type: 'button', title: '移出对比', 'aria-label': '移出 ' + jobTitle(j),
+      onclick: () => {
+        const rest = jobs.filter((x) => x.name !== j.name).map((x) => x.name);
+        location.hash = prefix + rest.map(encodeURIComponent).join(',');
+      } }, '×') : null;
+    const pinBtn = !isBase ? h('button', { type: 'button', title: '设为基准',
+      onclick: () => { state.compareBaseline = j.name; render(); } }, '设为基准') : null;
+    return h('span', { class: 'ver-chip', style: `border-color:${colors[i]}88` },
+      h('span', { style: `color:${colors[i]}`, text: '★' }),
+      h('strong', { class: 'mono', text: jobTitle(j) }),
+      isBase ? h('span', { class: 'tag warn', text: '基准' }) : pinBtn,
+      removeBtn);
   });
-  const table = h('div', { class: 'table-scroll' }, h('table', { class: 'matrix' },
-    h('thead', {}, h('tr', {}, h('th', { text: '任务' }), jobs.map((j) => h('th', { class: 'center' }, h('span', { text: j.model || j.name }), h('span', { class: 'sub', text: j.name }))))),
-    h('tbody', {}, rows)));
-  return h('div', {}, metrics, costPassPanel(jobs, common), panel('逐题对比', null, table));
+  const exportBtn = h('button', { type: 'button', class: 'button sm', onclick: () => {
+    const blob = new Blob([compareCsv(jobs, tasks, byJob)], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = h('a', { href: url, download: 'bench-compare.csv' });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } }, '导出对比 CSV');
+  const modelsAcrossJobs = new Set(jobs.map((j) => j.model).filter(Boolean));
+  const ctrlBar = h('div', { class: 'cmp-ctrl' },
+    h('div', { class: 'cmp-chips' }, h('span', { class: 'muted', style: 'font-size:12px', text: '对比对象：' }), ...chips),
+    h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' },
+      modelsAcrossJobs.size > 1 ? h('span', { class: 'tag warn', text: `含 ${modelsAcrossJobs.size} 个不同模型` }) : null,
+      suiteName ? h('span', { class: 'tag', text: '评测集：' + suiteName }) : null, exportBtn));
+
+  const points = jobs.map((j) => commonCostPass(j, common));
+  const commonRates = jobs.map((_, i) => common.length ? common.filter((t) => byJob[i].get(t).status === 'pass').length / common.length : null);
+  const baseRate = commonRates[0];
+  const baseCommonCost = points[0]?.cost;
+  const summaryRows = jobs.map((j, i) => {
+    const s = j.summary;
+    const isBase = i === 0;
+    const point = points[i];
+    const frontier = point && !points.some((other) => other && dominated(point, other));
+    let wins = 0; let losses = 0;
+    if (!isBase) {
+      for (const t of common) {
+        const bPass = byJob[0].get(t).status === 'pass';
+        const cPass = byJob[i].get(t).status === 'pass';
+        if (!bPass && cPass) wins += 1;
+        else if (bPass && !cPass) losses += 1;
+      }
+    }
+    const rDelta = !isBase ? deltaPct(commonRates[i], baseRate) : '';
+    const cDelta = !isBase ? deltaRel(point?.cost, baseCommonCost) : null;
+    const meanTok = s.token_trials ? s.total_tokens / s.token_trials : null;
+    const roleTag = isBase ? h('span', { class: 'tag warn', style: 'margin-right:6px', text: '基准' })
+      : h('button', { type: 'button', class: 'tag acc', style: 'margin-right:6px;cursor:pointer', title: '点击设为基准',
+        onclick: () => { state.compareBaseline = j.name; render(); } }, i === jobs.length - 1 ? '候选' : `版本 ${i + 1}`);
+    return h('tr', { class: !isBase && i === jobs.length - 1 ? 'ours' : null },
+      h('td', {}, roleTag, h('strong', { class: 'mono', text: jobTitle(j) }), h('span', { class: 'sub mono', text: jobSub(j) })),
+      h('td', { class: 'num mono' + (rDelta.startsWith('+') ? ' pos' : rDelta.startsWith('-') ? ' neg' : '') },
+        pct(commonRates[i], 1), rDelta ? ` (${rDelta})` : ''),
+      h('td', { class: 'num mono' }, isBase ? h('span', { class: 'faint', text: '基准' })
+        : common.length ? h('span', {}, h('span', { class: 'pos', text: '+' + wins }), ' / ', h('span', { class: 'neg', text: '-' + losses })) : dash()),
+      h('td', { class: 'num mono' + (cDelta ? (cDelta.value < 0 ? ' pos' : cDelta.value > 0 ? ' neg' : '') : '') },
+        point ? usd(point.cost) : dash(), cDelta ? ` (${cDelta.text})` : '',
+        point ? h('span', { class: 'sub mono', text: `均通过 ${pct(point.pass, 1)}` }) : null),
+      h('td', {}, frontier ? h('span', { class: 'tag pos', text: '★ 前沿' }) : point ? '' : dash()),
+      h('td', { class: 'num mono' }, usd(s.cost_per_task),
+        h('span', { class: 'sub mono', text: `通过 ${usd(s.cost_per_pass)}` })),
+      h('td', { class: 'num mono', text: `${s.tasks_solved || 0} / ${s.tasks_attempted || 0}` }),
+      h('td', { class: 'num mono', text: compact(meanTok) }),
+      h('td', { class: 'num mono', text: pct(s.cache_hit_rate) }));
+  });
+  const summaryHeads = ['Profile 版本', '共同题首次满分', '较基准胜负', '共同题成本 / 均通过', '前沿', '全量每题 / 通过成本', '至少通过一次', '平均总 Token', '缓存命中'];
+  const summaryPanel = panel('多版本总览矩阵', `共同首次有效 ${common.length} / ${tasks.length} 题 · 成本变化与前沿均按共同题计算 · 点击版本标签可切换基准`,
+    h('div', { class: 'table-scroll' }, h('table', {},
+      h('thead', {}, h('tr', {}, summaryHeads.map((t, i) => h('th', { class: i > 0 && i !== 4 ? 'num' : null, text: t })))),
+      h('tbody', {}, summaryRows))));
+
+  const candIdx = jobs.length - 1;
+  const classified = tasks.map((task) => {
+    const rows = byJob.map((m) => m.get(task) || null);
+    const b = rows[0]; const c = rows[candIdx];
+    const bValid = b && VALID_STATUSES.includes(b.status);
+    const cValid = c && VALID_STATUSES.includes(c.status);
+    const statuses = rows.map((r) => r?.status).filter(Boolean);
+    const changed = new Set(statuses).size > 1 || rows.some((r) => !r);
+    let kind = 'same_fail';
+    if (!bValid || !cValid) kind = c && c.status === 'pass' && b && b.status === 'invalid' ? 'fixed_invalid' : 'invalid';
+    else if (b.status !== 'pass' && c.status === 'pass') kind = 'gain';
+    else if (b.status === 'pass' && c.status !== 'pass') kind = 'regress';
+    else if (b.status === 'pass' && c.status === 'pass') kind = 'same_pass';
+    const tokDelta = deltaRel(c?.total_tokens, b?.total_tokens);
+    return { task, rows, kind, changed, tokDelta };
+  });
+  const flowCounts = {
+    gain: classified.filter((x) => x.kind === 'gain').length,
+    same_pass: classified.filter((x) => x.kind === 'same_pass').length,
+    regress: classified.filter((x) => x.kind === 'regress').length,
+    same_fail: classified.filter((x) => x.kind === 'same_fail').length,
+    invalid: classified.filter((x) => x.kind === 'invalid' || x.kind === 'fixed_invalid').length,
+  };
+  const flowBar = tasks.length ? h('section', { class: 'flow-strip' },
+    h('div', { class: 'flow-head' },
+      h('strong', { text: `${tasks.length} 道题演进分布（${jobTitle(jobs[candIdx])} vs ${jobTitle(jobs[0])}）` }),
+      h('span', { class: 'mono' },
+        h('span', { class: 'pos', text: `突破通过 ${flowCounts.gain}` }), ' · ',
+        h('span', { class: 'muted', text: `持续通过 ${flowCounts.same_pass}` }), ' · ',
+        h('span', { class: 'neg', text: `退步 ${flowCounts.regress}` }), ' · ',
+        h('span', { class: 'faint', text: `持续失败 ${flowCounts.same_fail}` }), ' · ',
+        h('span', { class: 'warn', text: `无效/单侧 ${flowCounts.invalid}` }))),
+    h('div', { class: 'outcome-bar big' },
+      flowCounts.gain ? h('span', { class: 'seg s-pass', width: (100 * flowCounts.gain / tasks.length) + '%' }) : null,
+      flowCounts.same_pass ? h('span', { class: 'seg', style: `width:${100 * flowCounts.same_pass / tasks.length}%;background:#3a5c52` }) : null,
+      flowCounts.regress ? h('span', { class: 'seg s-fail', width: (100 * flowCounts.regress / tasks.length) + '%' }) : null,
+      flowCounts.same_fail ? h('span', { class: 'seg', style: `width:${100 * flowCounts.same_fail / tasks.length}%;background:#393840` }) : null,
+      flowCounts.invalid ? h('span', { class: 'seg s-invalid', width: (100 * flowCounts.invalid / tasks.length) + '%' }) : null)) : null;
+
+  const filterMeta = [
+    ['all', '全部', classified.length],
+    ['diff', '仅看变化', classified.filter((x) => x.changed).length],
+    ['gain', '突破通过', flowCounts.gain],
+    ['regress', '退步', flowCounts.regress],
+    ['fail', '持续失败', flowCounts.same_fail],
+    ['invalid', '无效/单侧', flowCounts.invalid],
+  ];
+  const filterChips = h('div', { class: 'chips', style: 'padding:0' }, filterMeta.map(([key, label, cnt]) =>
+    h('button', { type: 'button', class: 'chip', 'aria-pressed': String(state.compareFilter === key),
+      onclick: () => { state.compareFilter = key; render(); } }, label, ' ', h('span', { class: 'mono faint', text: String(cnt) }))));
+  const search = h('input', { type: 'search', placeholder: '搜索任务', value: state.compareSearch, 'aria-label': '搜索对比任务',
+    onfocus: () => { state.editing = true; }, onblur: () => { state.editing = false; },
+    oninput: (e) => { state.compareSearch = e.target.value; drawMatrix(); } });
+  const tbody = h('tbody', {});
+
+  const TREND_INFO = {
+    gain: ['gain', '↗ 突破通过'],
+    regress: ['regress', '↘ 出现退步'],
+    same_pass: ['same', '→ 持续通过'],
+    same_fail: ['same', '→ 持续失败'],
+    fixed_invalid: ['warn', '↺ 修复无效'],
+    invalid: ['warn', '无效 / 单侧'],
+  };
+
+  function drawMatrix() {
+    const q = (state.compareSearch || '').trim().toLowerCase();
+    const visible = classified.filter((x) => {
+      if (state.compareFilter === 'diff' && !x.changed) return false;
+      if (state.compareFilter === 'gain' && x.kind !== 'gain') return false;
+      if (state.compareFilter === 'regress' && x.kind !== 'regress') return false;
+      if (state.compareFilter === 'fail' && x.kind !== 'same_fail') return false;
+      if (state.compareFilter === 'invalid' && x.kind !== 'invalid' && x.kind !== 'fixed_invalid') return false;
+      return !q || x.task.toLowerCase().includes(q);
+    });
+    tbody.replaceChildren(...(visible.length ? visible.map((x) => {
+      const [cls, label] = TREND_INFO[x.kind];
+      const rowCls = x.kind === 'gain' ? 'gain' : x.kind === 'regress' ? 'regress' : x.changed ? 'diff' : null;
+      return h('tr', { class: rowCls },
+        h('td', { class: 'mono', text: x.task }),
+        ...x.rows.map((r, i) => {
+          if (!r) return h('td', {}, dash());
+          const info = [r.tests ? `${r.tests.passed}/${r.tests.total}` : null, compact(r.total_tokens), dur(r.elapsed_s)].filter(Boolean).join(' · ');
+          return h('td', {}, h('div', { class: 'cmp3-cell' },
+            h('a', { href: `#/job/${encodeURIComponent(jobs[i].name)}/${encodeURIComponent(r.trial)}` }, badge(r.status, r.cause)),
+            h('span', { class: 'cmp3-sub', text: info })));
+        }),
+        h('td', {}, h('span', { class: 'trend-badge ' + cls, text: label })),
+        h('td', { class: 'num mono' + (x.tokDelta ? (x.tokDelta.value < 0 ? ' pos' : x.tokDelta.value > 0 ? ' neg' : '') : ' faint'),
+          text: x.tokDelta ? x.tokDelta.text : '—' }));
+    }) : [h('tr', {}, h('td', { colspan: jobs.length + 3, class: 'empty', text: '没有符合条件的对比任务' }))]));
+  }
+  drawMatrix();
+
+  const matrixTable = h('div', { class: 'table-scroll' }, h('table', { class: 'matrix' },
+    h('thead', {}, h('tr', {},
+      h('th', { text: '任务' }),
+      ...jobs.map((j, i) => h('th', {},
+        h('span', { style: `color:${colors[i]};margin-right:5px`, text: '★' }),
+        h('span', { text: jobTitle(j) }),
+        h('span', { class: 'sub mono', text: [j.profile_version ? `v${j.profile_version}` : null, modelsAcrossJobs.size > 1 ? j.model : null, i === 0 ? '基准' : i === candIdx ? '候选' : `版本 ${i + 1}`].filter(Boolean).join(' · ') }))),
+      h('th', { text: '演进趋势' }),
+      h('th', { class: 'num' }, 'Token 变化', h('span', { class: 'sub', text: '候选 vs 基准' })))),
+    tbody));
+  const matrixPanel = panel(`${jobs.length} 版本逐题演进矩阵`, '点击任意单元格直达 Trial 轨迹与判分详情',
+    h('div', {}, h('div', { class: 'panel-body toolbar', style: 'justify-content:space-between' }, filterChips, search), matrixTable));
+  return h('div', {}, ctrlBar, summaryPanel, flowBar, matrixPanel);
 }
 function commonCostPass(job, tasks) {
   if (!tasks.length) return null;
@@ -1536,29 +2084,6 @@ function commonCostPass(job, tasks) {
 function dominated(a, b) {
   return b.cost <= a.cost && b.pass >= a.pass && (b.cost < a.cost || b.pass > a.pass);
 }
-function costPassPanel(jobs, common) {
-  const points = jobs.map((j) => commonCostPass(j, common));
-  const rows = jobs.map((j, i) => {
-    const s = j.summary; const point = points[i];
-    const frontier = point && !points.some((other) => other && dominated(point, other));
-    return h('tr', {},
-      h('td', {}, h('span', { text: j.model || j.name }), h('span', { class: 'sub', text: j.name })),
-      h('td', { class: 'num', text: pct(s.pass_rate) }, h('span', { class: 'sub', text: ciText(s.pass_rate_ci95) })),
-      h('td', { class: 'num', text: `${s.tasks_solved || 0} / ${s.tasks_attempted || 0}` }),
-      h('td', { class: 'num', text: usd(s.cost_per_task) }),
-      h('td', { class: 'num', text: usd(s.cost_per_pass) }),
-      h('td', { class: 'num', text: pct(s.non_pass_cost_share) }),
-      h('td', { class: 'num', text: pct(s.cache_hit_rate) }),
-      h('td', { class: 'num', text: fixed(s.turns_per_pass) }),
-      h('td', { class: 'num', text: point ? pct(point.pass) : '—' }, h('span', { class: 'sub', text: point ? usd(point.cost) + ' / 题' : '' })),
-      h('td', { text: frontier ? '是' : point ? '' : '—' }));
-  });
-  const heads = ['评测', '通过率（95% 区间）', '至少通过一次', '每题平均成本', '每次通过成本', '未通过成本占比', '缓存命中率', '通过平均轮数', '共同题通过率 / 成本', '成本-通过率前沿'];
-  return panel('成本与通过率', `${common.length} 道共同题`,
-    h('div', { class: 'table-scroll' }, h('table', {},
-      h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === 0 || i === heads.length - 1 ? null : 'num', text: t })))),
-      h('tbody', {}, rows))));
-}
 
 // ------------------------------------------------------------ public leaderboards
 function score(x) { return x === null || x === undefined ? '—' : x.toFixed(1) + '%'; }
@@ -1566,12 +2091,14 @@ function modelKey(m) { return String(m || '').toLowerCase().replace(/^.*\//, '')
 function boardModels(board) {
   return board.model_filter ? [...new Set(board.entries.map((e) => e.model))] : [];
 }
+function ourEntryLabel(j) { return j.profile_name || `metacodes · ${j.model || j.name}`; }
+function ourEntryHref(j) { return j.profile ? profileHref({ id: j.profile }) : '#/job/' + encodeURIComponent(j.name); }
 function boardRows(board, model) {
   const pooled = model === board.default_model;
   const published = board.entries.filter((e) => !board.model_filter || e.model === model)
     .map((e, i) => ({ ...e, id: 'p' + i, ours: null }));
   const ours = board.jobs.filter((j) => j.ranked && (!board.model_filter || pooled || modelKey(j.model) === modelKey(model)))
-    .map((j) => ({ id: 'o-' + j.name, ours: j, harness: 'metacodes', model: j.model, score: j.score * 100,
+    .map((j) => ({ id: 'o-' + j.name, ours: j, harness: ourEntryLabel(j), model: j.model, score: j.score * 100,
       stderr: null, cost_per_task_usd: j.cost_per_task, date: (j.started_at || '').slice(0, 10) || null }));
   const rows = [...published, ...ours].sort((x, y) => y.score - x.score || Boolean(y.ours) - Boolean(x.ours));
   for (const r of rows) r.rank = 1 + published.filter((o) => o !== r && o.score > r.score).length;
@@ -1583,7 +2110,7 @@ function svg(tag, attrs, ...children) {
   for (const child of children) if (child) el.append(child instanceof Node ? child : document.createTextNode(String(child)));
   return el;
 }
-const rowName = (r) => (r.ours ? `metacodes · ${r.model || r.ours.name}` : r.harness);
+const rowName = (r) => (r.ours ? ourEntryLabel(r.ours) : r.harness);
 const beats = (a, b) => a.cost_per_task_usd <= b.cost_per_task_usd && a.score >= b.score && (a.cost_per_task_usd < b.cost_per_task_usd || a.score > b.score);
 const PALETTE = ['#d95926', '#199e70', '#c98500', '#d55181', '#4fa34f', '#9085e9', '#e66767'];
 const SHAPES = ['diamond', 'square', 'circle', 'triangle', 'hexagon'];
@@ -1595,12 +2122,20 @@ function soleHarness(board) {
   const names = new Set(board.entries.map((e) => e.harness));
   return names.size === 1 ? [...names][0] : null;
 }
-function rowLooks(rows, byModel) {
-  const groupOf = (r) => (r.ours ? 'metacodes' : byModel ? r.model || r.harness : r.harness);
+function rowLooks(rows, byModel, ourColorMap) {
+  const groupOf = (r) => (r.ours ? 'ours:' + r.ours.name : byModel ? r.model || r.harness : r.harness);
   const names = [...new Set(rows.filter((r) => !r.ours).map(groupOf))];
   const looks = new Map(names.map((name, i) => [name, { name,
     color: PALETTE[i] || `hsl(${spareHue(i)} 55% 62%)`, shape: SHAPES[i % SHAPES.length] }]));
-  looks.set('metacodes', { name: 'metacodes', color: 'var(--accent)', shape: 'star' });
+  let ourIdx = 0;
+  for (const r of rows) {
+    if (!r.ours) continue;
+    const key = groupOf(r);
+    if (!looks.has(key)) {
+      const col = ourColorMap?.get(r.ours.name) || profileColor(ourIdx++);
+      looks.set(key, { name: ourEntryLabel(r.ours), color: col, shape: 'star' });
+    }
+  }
   return (r) => looks.get(groupOf(r));
 }
 const glyph = (look) => h('i', { class: 'glyph', 'data-shape': look.shape, style: 'background:' + look.color });
@@ -1646,21 +2181,31 @@ function arrangeLabels(plot) {
     else label.hidden = true;
   }
 }
-function costScatter(rows, focus, lookOf) {
+function costScatter(rows, focus, lookOf, paretoOnly) {
   const points = rows.filter((r) => r.cost_per_task_usd > 0);
   if (points.length < 2 || !points.some((r) => !r.ours)) return null;
   const costs = points.map((r) => Math.log(r.cost_per_task_usd)); const scores = points.map((r) => r.score);
-  const range = (v) => { const lo = Math.min(...v); const hi = Math.max(...v); const pad = (hi - lo || 1) * 0.08; return [lo - pad, hi + pad]; };
+  const range = (v) => { const lo = Math.min(...v); const hi = Math.max(...v); const pad = (hi - lo || 1) * 0.1; return [lo - pad, hi + pad]; };
   const [x0, x1] = range(costs); const [y0, y1] = range(scores);
   const px = (r) => (Math.log(r.cost_per_task_usd) - x0) / (x1 - x0) * 100;
   const py = (r) => (r.score - y0) / (y1 - y0) * 100;
-  const frontier = points.filter((r) => !points.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
+  const pubPoints = points.filter((r) => !r.ours);
+  const frontier = pubPoints.filter((r) => !pubPoints.some((o) => o !== r && beats(o, r))).sort((p, q) => p.cost_per_task_usd - q.cost_per_task_usd);
+  const ourByModel = new Map();
+  for (const r of points.filter((x) => x.ours)) {
+    const mk = modelKey(r.model) || '_';
+    if (!ourByModel.has(mk)) ourByModel.set(mk, []);
+    ourByModel.get(mk).push(r);
+  }
+  const trajectories = [...ourByModel.values()].filter((g) => g.length >= 2)
+    .map((g) => [...g].sort((a, b) => String(a.ours.started_at || '').localeCompare(String(b.ours.started_at || '')) || a.score - b.score));
   const label = (r) => (r.ours ? rowName(r) : lookOf(r).name);
   const repeated = new Set(points.filter((r, i) => points.findIndex((o) => label(o) === label(r)) !== i).map(label));
   const name = (r) => (!r.ours && repeated.has(label(r)) ? `${r.harness} · ${r.model}` : label(r));
   const order = [...points].sort((p, q) => Boolean(q.ours) - Boolean(p.ours) || frontier.includes(q) - frontier.includes(p) || q.score - p.score);
   const layer = svg('svg', { class: 'scatter-layer', viewBox: '0 0 100 100', preserveAspectRatio: 'none', 'aria-hidden': 'true' },
-    svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }));
+    svg('polyline', { class: 'frontier', points: frontier.map((r) => `${px(r)},${100 - py(r)}`).join(' ') }),
+    ...trajectories.map((g) => svg('polyline', { class: 'trajectory', points: g.map((r) => `${px(r)},${100 - py(r)}`).join(' ') })));
   const yTicks = niceTicks(y0, y1);
   const grid = [
     ...yTicks.ticks.map((v) => h('div', { class: 'grid-y', style: `bottom:${(v - y0) / (y1 - y0) * 100}%` },
@@ -1670,15 +2215,17 @@ function costScatter(rows, focus, lookOf) {
   ];
   const tip = h('div', { class: 'scatter-tip', hidden: true });
   const dots = new Map(points.map((r) => [r, h('button', { type: 'button', class: 'scatter-point',
-    'data-ours': r.ours ? '1' : null, 'data-frontier': frontier.includes(r) ? '1' : null, 'data-order': order.indexOf(r),
+    'data-ours': r.ours ? '1' : null, 'data-frontier': frontier.includes(r) ? '1' : null,
+    'data-nonfrontier': !r.ours && !frontier.includes(r) ? '1' : null,
+    'data-order': order.indexOf(r),
     style: `left:${px(r)}%;bottom:${py(r)}%`,
     'aria-label': `${rowName(r)} · ${r.model || ''} · ${score(r.score)} · ${usd(r.cost_per_task_usd)}`,
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
-    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
+    onclick: r.ours ? () => { location.hash = ourEntryHref(r.ours); } : null },
   glyph(lookOf(r)),
   h('span', { class: 'scatter-label', style: 'color:' + lookOf(r).color },
     h('b', { text: name(r) }), h('small', { class: 'num', text: `${score(r.score)} · ${usd(r.cost_per_task_usd)}` })))]));
-  const plot = h('div', { class: 'scatter-plot' }, ...grid, layer, ...dots.values(), tip);
+  const plot = h('div', { class: 'scatter-plot', 'data-pareto': paretoOnly ? '1' : null }, ...grid, layer, ...dots.values(), tip);
   focus.on((active) => {
     const a = dots.has(active) ? active : null;
     plot.toggleAttribute('data-active', Boolean(a));
@@ -1688,7 +2235,8 @@ function costScatter(rows, focus, lookOf) {
     }
     tip.hidden = !a;
     if (!a) return;
-    tip.replaceChildren(h('b', { text: a.ours ? 'metacodes（我们）' : a.harness }), h('span', { text: a.model || '—' }),
+    tip.replaceChildren(h('b', { text: a.ours ? ourEntryLabel(a.ours) : a.harness }),
+      h('span', { text: [a.ours?.profile_version ? 'v' + a.ours.profile_version : null, a.model || '—'].filter(Boolean).join(' · ') }),
       h('span', { class: 'num', text: `${score(a.score)} · ${usd(a.cost_per_task_usd)}` }));
     tip.style.left = px(a) + '%';
     tip.style.bottom = py(a) + '%';
@@ -1725,10 +2273,10 @@ function scoreBars(rows, focus, lookOf) {
   if (shown.length < 2) return null;
   const err = (r) => r.stderr || 0;
   const { at, lines, axis } = scoreScale(shown.map((r) => r.score - err(r)), shown.map((r) => r.score + err(r)), shown.length);
-  const name = (r) => (r.ours ? ['metacodes', r.model || r.ours.name] : [r.model || r.harness, null]);
+  const name = (r) => (r.ours ? [ourEntryLabel(r.ours), r.model || r.ours.name] : [r.model || r.harness, null]);
   const items = new Map(shown.map((r, i) => [r, h('div', { class: 'bar-row', 'data-ours': r.ours ? '1' : null, style: `--row:${i + 1}`,
     onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
-    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
+    onclick: r.ours ? () => { location.hash = ourEntryHref(r.ours); } : null },
   h('span', { class: 'bar-name', title: name(r).filter(Boolean).join(' · ') }, glyph(lookOf(r)),
     h('span', {}, name(r)[0], name(r)[1] ? h('small', { text: ' · ' + name(r)[1] }) : null)),
   h('span', { class: 'bar-track' }, h('i', { class: 'bar-fill', style: `width:${at(r.score)}%;background:${lookOf(r).color}` }),
@@ -1751,7 +2299,7 @@ function modelDots(rows, focus, lookOf) {
   const entries = shown.flatMap((g) => g.rows);
   const err = (r) => r.stderr || 0;
   const { at, lines, axis } = scoreScale(entries.map((r) => r.score - err(r)), entries.map((r) => r.score + err(r)), shown.length);
-  const harnessOf = (r) => (r.ours ? 'metacodes' : r.harness);
+  const harnessOf = (r) => (r.ours ? ourEntryLabel(r.ours) : r.harness);
   const scoreText = (r) => score(r.score) + (err(r) ? ` ±${err(r).toFixed(1)}` : '');
   const ends = (r) => [scoreText(r), h('small', { text: ' ' + harnessOf(r) })];
   const dots = new Map();
@@ -1762,7 +2310,7 @@ function modelDots(rows, focus, lookOf) {
       const dot = h('button', { type: 'button', class: 'pair-dot', 'data-ours': r.ours ? '1' : null, style: `left:${at(r.score)}%`,
         title: `${harnessOf(r)} · ${scoreText(r)}`, 'aria-label': `${g.model} · ${harnessOf(r)} · ${scoreText(r)}`,
         onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null), onfocus: () => focus.set(r), onblur: () => focus.set(null),
-        onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null }, glyph(lookOf(r)));
+        onclick: r.ours ? () => { location.hash = ourEntryHref(r.ours); } : null }, glyph(lookOf(r)));
       dots.set(r, dot);
       return dot;
     });
@@ -1793,66 +2341,153 @@ function leaderCards(rows, published) {
   const priced = pub.filter((r) => r.cost_per_task_usd > 0);
   const best = pub[0];
   const cheapest = priced.length ? [...priced].sort((a, b) => a.cost_per_task_usd - b.cost_per_task_usd || b.score - a.score)[0] : null;
-  const ours = rows.find((r) => r.ours);
+  const oursList = rows.filter((r) => r.ours);
+  const ours = oursList[0];
+  const extra = oursList.length > 1 ? ` · 共 ${oursList.length} 个版本入榜` : '';
   return h('section', { class: 'metrics leaders' },
     best ? metric('最高分', score(best.score), `${best.harness} · ${best.model || '—'}`) : null,
     cheapest ? metric('最低成本', usd(cheapest.cost_per_task_usd), `${cheapest.harness} · ${score(cheapest.score)}`) : null,
-    metric('我们的名次', ours ? `${ours.rank} / ${published + 1}` : '—', ours ? `${score(ours.score)} · ${ours.model || ''}` : null, true));
+    metric('我的最佳 Profile', ours ? `${ours.rank} / ${published + oursList.length}` : '—',
+      ours ? `${score(ours.score)} · ${ourEntryLabel(ours.ours)}${extra}` : '暂无达到覆盖门槛的评测', true));
 }
 const BOARD_TOP = 10;
-function boardPanel(board) {
+function boardPanel(board, suiteId, selectedSet, ourColorMap) {
   const key = board.suites.join(',') + '|' + board.title;
   const models = boardModels(board);
   const model = models.includes(state.boardModel[key]) ? state.boardModel[key] : (board.default_model || models[0] || null);
   const { rows, published } = boardRows(board, model);
   const focus = focusHub();
   const harness = soleHarness(board);
-  const lookOf = rowLooks(rows, Boolean(harness));
-  const harnessNote = harness ? h('div', { class: 'board-harness muted', text: `Harness：${harness}（本榜公开条目都用它，图中标识按模型区分）` }) : null;
+  const lookOf = rowLooks(rows, Boolean(harness), ourColorMap);
+  const harnessNote = harness ? h('div', { class: 'board-harness muted', text: `Harness：${harness}（本榜公开条目都用它，图中标识按模型/Profile 区分）` }) : null;
   const priced = rows.some((r) => r.cost_per_task_usd > 0);
   const src = board.source;
-  const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board));
+  const paretoOnly = Boolean(state.boardPareto[key]);
+  const scatter = costScatter(rows, focus, lookOf, paretoOnly);
+  const redraw = (e) => e.target.closest('.panel').replaceWith(boardPanel(board, suiteId, selectedSet, ourColorMap));
+  const paretoToggle = scatter ? h('div', { class: 'board-pareto-toggle' },
+    h('button', { type: 'button', class: 'chip', 'aria-pressed': String(!paretoOnly),
+      onclick: (e) => { state.boardPareto[key] = false; redraw(e); } }, '全部公开 + 我的 Profile'),
+    h('button', { type: 'button', class: 'chip', 'aria-pressed': String(paretoOnly),
+      onclick: (e) => { state.boardPareto[key] = true; redraw(e); } }, '仅 Pareto 前沿 + 我的 Profile')) : null;
   const picker = models.length ? h('select', { class: 'board-model', 'aria-label': '模型', onchange: (e) => { state.boardModel[key] = e.target.value; redraw(e); } },
     models.map((m) => h('option', { value: m, selected: m === model, text: m === board.default_model ? '全部模型' : m }))) : null;
   const sourceLink = h('a', { class: 'board-link', href: src.url, target: '_blank', rel: 'noopener noreferrer', title: `${src.name} · ${src.retrieved}`, text: '来源 ↗' });
   const expanded = Boolean(state.boardExpanded[key]);
   const shown = expanded ? rows : rows.filter((r, i) => i < BOARD_TOP || r.ours);
   const top = Math.max(...rows.map((r) => r.score), 1);
-  const rowNodes = new Map(shown.map((r) => [r, h('tr', { class: r.ours ? 'ours link' : null, title: r.ours ? r.ours.name : null,
-    onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
-    onclick: r.ours ? () => { location.hash = '#/job/' + encodeURIComponent(r.ours.name); } : null },
-  h('td', { class: 'num rank', text: String(r.rank) }),
-  h('td', {}, h('span', { class: 'harness' }, harness && !r.ours ? null : glyph(lookOf(r)), r.ours ? 'metacodes' : r.harness)),
-  h('td', { class: 'muted' }, h('span', { class: 'harness' }, harness && !r.ours ? glyph(lookOf(r)) : null, r.model || '—')),
-  h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%` })),
-    h('span', { class: 'num', text: score(r.score) }))),
-  priced ? h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }) : null)]));
+  const ourRows = rows.filter((r) => r.ours);
+  const showDelta = ourRows.length >= 2;
+  const baselineScore = showDelta ? Math.min(...ourRows.map((r) => r.score)) : null;
+
+  const rowNodes = new Map(shown.map((r) => {
+    const col = r.ours ? lookOf(r).color : null;
+    const checked = r.ours && selectedSet.has(r.ours.name);
+    const chk = r.ours ? h('input', { type: 'checkbox', checked, 'aria-label': '对比 ' + ourEntryLabel(r.ours),
+      style: `accent-color:${col};margin:0;cursor:pointer`,
+      onclick: (e) => e.stopPropagation(),
+      onchange: (e) => { if (e.target.checked) selectedSet.add(r.ours.name); else selectedSet.delete(r.ours.name); render(); } }) : null;
+    const deltaText = !showDelta ? null : !r.ours ? dash() : (() => {
+      const diff = r.score - baselineScore;
+      return diff <= 0.05 ? h('span', { class: 'faint', text: '基线' })
+        : h('span', { class: 'pos', text: `+${diff.toFixed(1)}%` });
+    })();
+    return [r, h('tr', { class: r.ours ? 'ours link' : null, title: r.ours ? r.ours.name : null,
+      onmouseenter: () => focus.set(r), onmouseleave: () => focus.set(null),
+      onclick: r.ours ? () => { location.hash = ourEntryHref(r.ours); } : null },
+    h('td', { class: 'num rank', text: String(r.rank) }),
+    h('td', {}, h('span', { class: 'harness' }, chk, harness && !r.ours ? null : glyph(lookOf(r)),
+      r.ours ? h('span', {}, h('strong', { text: ourEntryLabel(r.ours) }),
+        r.ours.profile_version ? h('span', { class: 'tag mono', style: `margin-left:6px;border-color:${col}66;color:${col}`, text: 'v' + r.ours.profile_version }) : null,
+        r.ours.profile_features?.length ? h('span', { class: 'sub mono', text: r.ours.profile_features.join(', ') }) : null)
+        : r.harness)),
+    h('td', { class: 'muted' }, h('span', { class: 'harness' }, harness && !r.ours ? glyph(lookOf(r)) : null, r.model || '—')),
+    h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%;background:${col || 'var(--control)'}` })),
+      h('span', { class: 'num', text: score(r.score) }))),
+    priced ? h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }) : null,
+    showDelta ? h('td', { class: 'num mono' }, deltaText) : null)];
+  }));
   focus.on((active) => { for (const [r, tr] of rowNodes) tr.classList.toggle('active', r === active); });
   const more = rows.length > shown.length || expanded ? h('button', { type: 'button', class: 'board-more',
     onclick: (e) => { state.boardExpanded[key] = !expanded; redraw(e); } }, expanded ? '收起' : `全部 ${rows.length} 条`) : null;
+  const heads = ['#', 'Profile / Harness', '模型', '分数', priced ? '每题成本' : null, showDelta ? '较基线' : null].filter(Boolean);
   const table = h('div', { class: 'table-scroll' }, h('table', { class: 'board' },
-    h('thead', {}, h('tr', {}, ['#', 'Harness', '模型', '分数', priced ? '每题成本' : null].filter(Boolean).map((t, i) => h('th', { class: [0, 4].includes(i) ? 'num' : null, text: t })))),
+    h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: [0, 4, 5].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
-  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), harnessNote, costScatter(rows, focus, lookOf) || (harness ? scoreBars : modelDots)(rows, focus, lookOf), table),
-    h('div', { class: 'board-actions' }, picker, sourceLink));
+  return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), harnessNote, scatter || (harness ? scoreBars : modelDots)(rows, focus, lookOf), table),
+    h('div', { class: 'board-actions' }, paretoToggle, picker, sourceLink));
 }
+
 async function renderLeaderboard(suiteId) {
   state.live = false;
   navCurrent('leaderboard');
   $('#title').textContent = '公开榜单';
   const d = await api('/api/leaderboard' + (suiteId ? '?suite=' + encodeURIComponent(suiteId) : ''));
-  crumbs([{ text: 'Profiles', href: '#/' }, { text: '公开榜单' }]);
-  const suitePicker = h('label', { class: 'scope' }, '评测集',
+  crumbs([{ text: 'Profiles', href: '#/' }, { text: '公开榜单' }, { text: d.suite_name }]);
+  const suitePicker = h('label', { class: 'scope', style: 'padding:0' }, '评测集',
     h('select', { onchange: (e) => { location.hash = '#/leaderboard/' + encodeURIComponent(e.target.value); } },
       d.suites.map((s) => h('option', { value: s.suite, selected: s.suite === d.suite, text: s.suite_name }))));
+
+  const rankedByJob = new Map();
+  for (const board of d.boards) {
+    for (const j of board.jobs) if (j.ranked && !rankedByJob.has(j.name)) rankedByJob.set(j.name, j);
+  }
+  const ourRanked = [...rankedByJob.values()].sort((a, b) => b.score - a.score);
+  const ourColorMap = new Map(ourRanked.map((j, i) => [j.name, profileColor(i)]));
+  if (!state.boardSelected[d.suite]) {
+    const byModel = new Map();
+    for (const j of ourRanked) {
+      const mk = modelKey(j.model);
+      if (!byModel.has(mk)) byModel.set(mk, []);
+      byModel.get(mk).push(j);
+    }
+    const multi = [...byModel.values()].filter((g) => g.length >= 2).sort((a, b) => b.length - a.length)[0];
+    state.boardSelected[d.suite] = new Set((multi || ourRanked).slice(0, 4).map((j) => j.name));
+  }
+  const selectedSet = state.boardSelected[d.suite];
+  for (const name of [...selectedSet]) if (!rankedByJob.has(name)) selectedSet.delete(name);
+
+  const baselineScore = ourRanked.length >= 2 ? Math.min(...ourRanked.map((j) => j.score * 100)) : null;
+  const pickedJobs = ourRanked.filter((j) => selectedSet.has(j.name));
+  const myProfilesStrip = ourRanked.length ? h('section', { class: 'my-profiles-strip' },
+    ...ourRanked.map((j) => {
+      const col = ourColorMap.get(j.name);
+      const checked = selectedSet.has(j.name);
+      const sc = j.score * 100;
+      const diff = baselineScore !== null ? sc - baselineScore : null;
+      const diffNode = diff === null ? null : diff <= 0.05 ? h('span', { class: 'faint', text: '基线' })
+        : h('span', { class: 'pos', text: `+${diff.toFixed(1)}%` });
+      return h('div', { class: 'mp-card', style: `border-top:2px solid ${col}` },
+        h('div', { class: 'mp-top' },
+          h('label', { class: 'mp-name', style: 'cursor:pointer' },
+            h('input', { type: 'checkbox', checked, style: `accent-color:${col};margin:0;cursor:pointer`,
+              onchange: (e) => { if (e.target.checked) selectedSet.add(j.name); else selectedSet.delete(j.name); render(); } }),
+            h('span', { style: `color:${col}`, text: '★' }),
+            h('span', { text: ourEntryLabel(j), title: ourEntryLabel(j) })),
+          j.profile_version ? h('span', { class: 'tag mono', text: 'v' + j.profile_version }) : null),
+        h('div', { class: 'muted', style: 'font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', text: j.model || j.name }),
+        h('div', { class: 'mp-nums' },
+          h('strong', { style: `color:${col}`, text: score(sc) }),
+          h('span', { class: 'mono muted', style: 'font-size:11.5px' },
+            j.cost_per_task !== null && j.cost_per_task !== undefined ? usd(j.cost_per_task) + (diffNode ? ' · ' : '') : '', diffNode)));
+    }),
+    ourRanked.length >= 2 ? h('div', { class: 'mp-cta' },
+      h('strong', { class: 'acc', style: 'font-size:13px', text: `对比已选 ${pickedJobs.length} 个 Profile` }),
+      h('span', { class: 'muted', style: 'font-size:11px', text: `${d.suite_name} · ${d.task_count} 题` }),
+      pickedJobs.length >= 2
+        ? h('a', { class: 'button primary sm', href: '#/compare/' + pickedJobs.map((j) => encodeURIComponent(j.name)).join(','), text: `进入 ${pickedJobs.length} 版本对比台 →` })
+        : h('span', { class: 'muted', style: 'font-size:11px', text: '请至少勾选 2 个版本' })) : null) : null;
+
   const partial = d.unranked;
-  const rest = partial.length ? panel('未参与排名的评测', null, h('div', { class: 'table-scroll' }, h('table', {},
-    h('thead', {}, h('tr', {}, ['评测', '模型', '题数', '分数'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
-    h('tbody', {}, partial.map((j) => h('tr', { class: 'link', onclick: () => { location.hash = '#/job/' + encodeURIComponent(j.name); } },
-      h('td', { text: j.name }), h('td', { text: j.model || '—' }),
+  const rest = partial.length ? panel('未参与排名的评测', `覆盖率低于 ${Math.round((d.ranked_coverage || 0.8) * 100)}%`, h('div', { class: 'table-scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, ['Profile / 评测', '模型', '题数', '分数'].map((t, i) => h('th', { class: i > 1 ? 'num' : null, text: t })))),
+    h('tbody', {}, partial.map((j) => h('tr', { class: 'link', onclick: () => { location.hash = ourEntryHref(j); } },
+      h('td', {}, h('span', { text: j.profile_name || j.name }), j.profile_name ? h('span', { class: 'sub mono', text: j.name }) : null),
+      h('td', { text: j.model || '—' }),
       h('td', { class: 'num', text: `${j.tasks} / ${d.task_count}` }), h('td', { class: 'num', text: pct(j.score, 1) }))))))) : null;
-  const about = d.description ? h('p', { class: 'muted', text: d.description }) : null;
-  return h('div', {}, h('div', { class: 'board-bar' }, suitePicker), about, d.boards.map((b) => boardPanel(b)), rest);
+  const about = d.description ? h('p', { class: 'muted', style: 'font-size:12.5px', text: d.description }) : null;
+  const topBar = h('div', { class: 'board-top-bar' }, about || h('span', {}), suitePicker);
+  return h('div', {}, topBar, myProfilesStrip, d.boards.map((b) => boardPanel(b, d.suite, selectedSet, ourColorMap)), rest);
 }
 
 // ------------------------------------------------------------ settings (database)

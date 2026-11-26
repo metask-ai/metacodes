@@ -4,7 +4,7 @@
 //! 仅断言"配置 X → 输出 Y",不依赖网络/mock server——直接调组装函数检结果。
 //!
 //! 覆盖两个注入点:
-//!   ① TOOL_DESC_CODEMAP → cc.tools.toToolDefinitionsFull 里 CodeMap 的 description
+//!   ① TOOL_DESC_BASH → cc.tools.toToolDefinitionsFull 里 Bash 的 description
 //!   ② USING_TOOLS       → cc.system_prompt.buildFull 里 # Using your tools 段
 //! 并验证"不设 env → 走默认"(零回归)。
 
@@ -46,30 +46,30 @@ fn findDesc(defs: []cc.json_mod.ToolDefinition, name: []const u8) ?[]const u8 {
 
 test "TOOL_DESC_<NAME> env overrides tool description" {
     const a = std.testing.allocator;
-    const slot_z = PREFIX ++ "TOOL_DESC_CODEMAP";
-    const sentinel = "OVERRIDDEN CODEMAP DESC — ab-test marker\nwith newline";
+    const slot_z = PREFIX ++ "TOOL_DESC_BASH";
+    const sentinel = "OVERRIDDEN BASH DESC — ab-test marker\nwith newline";
 
-    // ① 不设 env:CodeMap 走默认描述(含 "structural outline"),不含 sentinel。
+    // ① 不设 env:Bash 走默认描述(含 "rg --files"),不含 sentinel。
     {
         _ = unsetenv(slot_z);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        var pc = cc.tools.PromptContext{ .enabled_tool_names = &.{"CodeMap"} };
+        var pc = cc.tools.PromptContext{ .enabled_tool_names = &.{"Bash"} };
         const defs = try cc.tools.toToolDefinitionsFull(arena.allocator(), null, &pc);
-        const desc = findDesc(defs, "CodeMap") orelse return error.NoCodeMap;
+        const desc = findDesc(defs, "Bash") orelse return error.NoBash;
         try std.testing.expect(std.mem.indexOf(u8, desc, sentinel) == null);
-        try std.testing.expect(std.mem.indexOf(u8, desc, "structural outline") != null);
+        try std.testing.expect(std.mem.indexOf(u8, desc, "rg --files") != null);
     }
 
-    // ② 设 env:CodeMap 描述变成 sentinel。
+    // ② 设 env:Bash 描述变成 sentinel。
     {
         setOverride(slot_z, sentinel);
         defer _ = unsetenv(slot_z);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        var pc = cc.tools.PromptContext{ .enabled_tool_names = &.{"CodeMap"} };
+        var pc = cc.tools.PromptContext{ .enabled_tool_names = &.{"Bash"} };
         const defs = try cc.tools.toToolDefinitionsFull(arena.allocator(), null, &pc);
-        const desc = findDesc(defs, "CodeMap") orelse return error.NoCodeMap;
+        const desc = findDesc(defs, "Bash") orelse return error.NoBash;
         try std.testing.expectEqualStrings(sentinel, desc);
     }
 }
@@ -82,7 +82,7 @@ test "USING_TOOLS env overrides # Using your tools section in buildFull" {
     // ① 不设:默认段含稳定的运行期工具面声明,不含 sentinel。
     {
         _ = unsetenv(slot_z);
-        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" }, "", false, "/tmp");
+        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "Bash" }, "", false, "/tmp");
         defer a.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, sentinel) == null);
         try std.testing.expect(std.mem.indexOf(u8, s, "Use only tools present in the current API tool list") != null);
@@ -92,7 +92,7 @@ test "USING_TOOLS env overrides # Using your tools section in buildFull" {
     {
         setOverride(slot_z, sentinel);
         defer _ = unsetenv(slot_z);
-        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" }, "", false, "/tmp");
+        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "Bash" }, "", false, "/tmp");
         defer a.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, sentinel) != null);
         try std.testing.expect(std.mem.indexOf(u8, s, "Use only tools present in the current API tool list") == null);

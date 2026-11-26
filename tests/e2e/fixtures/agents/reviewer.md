@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: 只读代码审查 subagent。读取文件并给出审查意见,不修改任何文件。
-tools: Read, Grep, Glob, Bash
+tools: Read, Bash
 model: inherit
 ---
 

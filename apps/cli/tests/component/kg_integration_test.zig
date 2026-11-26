@@ -510,7 +510,7 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
 
-    const names = [_][]const u8{ "KgRemember", "KgRecall", "KgContext", "TaskList", "TaskGet", "TaskUpdate" };
+    const names = [_][]const u8{ "KgRemember", "KgRecall", "KgContext", "TaskCreate", "TaskList", "TaskGet", "TaskUpdate" };
     const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &names, "", true, "/tmp");
     defer a.free(system_prompt);
     // 生产 App 用 session arena 承载 defs + describe_fn 动态描述；测试保持同一生命周期，
@@ -519,10 +519,9 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     defer defs_arena.deinit();
     var pc = cc.tools.PromptContext{ .enabled_tool_names = &names };
     const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &pc);
-    // Production always supplies the session activation set. Keep it empty here so the request
-    // proves the real deferred-tool boundary: ToolSearch is visible, FormalAuditTask is not yet.
     var activated_tools = std.StringHashMap(void).init(a);
     defer activated_tools.deinit();
+    for ([_][]const u8{ "TaskCreate", "TaskList", "TaskGet", "TaskUpdate" }) |name| try activated_tools.put(name, {});
 
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();

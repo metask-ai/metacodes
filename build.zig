@@ -1730,32 +1730,34 @@ pub fn build(b: *std.Build) void {
         .protocol_mod = agentcore_protocol_mod,
     });
 
+    const agentcore_package_test_step = b.step("test:agentcore", "Run the agentcore package's unit, header and symbol tests");
     const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
-    agentcore_test_step.dependOn(http_status_gate_step);
+    agentcore_test_step.dependOn(agentcore_package_test_step);
+    agentcore_package_test_step.dependOn(http_status_gate_step);
     const agentcore_abi_test = addRecordedTest(b, .{
         .name = "agentcore-abi-unit",
         .root_module = agentcore_abi_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test).step);
     const agentcore_types_test = addRecordedTest(b, .{
         .name = "agentcore-types-unit",
         .root_module = agentcore_types_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test).step);
     const agentcore_protocol_test = addRecordedTest(b, .{
         .name = "agentcore-protocol-unit",
         .root_module = agentcore_protocol_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test).step);
     const agentcore_sdk_test = addRecordedTest(b, .{
         .name = "agentcore-sdk-unit",
         .root_module = agentcore_sdk_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test).step);
     const agentcore_zig_package_build_test_mod = b.createModule(.{
         .root_source_file = b.path("sdk/zig/build.zig"),
         .target = b.graph.host,
@@ -1766,7 +1768,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_zig_package_build_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_zig_package_build_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_zig_package_build_test).step);
     const agentcore_manifest_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/agentcore_artifact_consumer/manifest_contract.zig"),
         .target = target,
@@ -1777,7 +1779,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_manifest_contract_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test).step);
     const agentcore_manifest_tool_mod = b.createModule(.{
         .root_source_file = b.path("scripts/agentcore_manifest.zig"),
         .target = b.graph.host,
@@ -1798,7 +1800,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_manifest_tool_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test).step);
 
     // ── release:manifest / release:check / release:verify (#80, #47 stage 5) ──
     // The CLI release unit is the staged prefix sealed with manifest.json
@@ -1968,7 +1970,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agentcore_symbol_gate_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_symbol_gate_test).step);
+    agentcore_package_test_step.dependOn(&addTestRunArtifact(b, agentcore_symbol_gate_test).step);
     // header 可编译性检查:走 zig 构建系统原生 C 对象(不 install,只编译)。
     // 不用系统 cc(Windows 没有),也不用 `zig cc -fsyntax-only`(zig 0.16 Windows 实测
     // 对任何输入报 FileNotFound;`-c` 正常)。对象编译 = 语法+类型检查,跨平台等价。
@@ -1983,7 +1985,7 @@ pub fn build(b: *std.Build) void {
     });
     agentcore_header_mod.addIncludePath(b.path("sdk"));
     const agentcore_header_obj = b.addObject(.{ .name = "agentcore-header-compile", .root_module = agentcore_header_mod });
-    agentcore_test_step.dependOn(&agentcore_header_obj.step);
+    agentcore_package_test_step.dependOn(&agentcore_header_obj.step);
     const agentcore_cpp_header_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -1995,7 +1997,7 @@ pub fn build(b: *std.Build) void {
     });
     agentcore_cpp_header_mod.addIncludePath(b.path("sdk"));
     const agentcore_cpp_header_obj = b.addObject(.{ .name = "agentcore-cpp-header-compile", .root_module = agentcore_cpp_header_mod });
-    agentcore_test_step.dependOn(&agentcore_cpp_header_obj.step);
+    agentcore_package_test_step.dependOn(&agentcore_cpp_header_obj.step);
     const agentcore_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/component/agentcore_abi_test.zig"),
         .target = target,
@@ -2023,7 +2025,7 @@ pub fn build(b: *std.Build) void {
     agentcore_lib.bundle_compiler_rt = true;
     const agentcore_symbol_gate_cmd = b.addRunArtifact(agentcore_symbol_gate_tool);
     agentcore_symbol_gate_cmd.addFileArg(agentcore_lib.getEmittedBin());
-    agentcore_test_step.dependOn(&agentcore_symbol_gate_cmd.step);
+    agentcore_package_test_step.dependOn(&agentcore_symbol_gate_cmd.step);
     // The same module as a shared library for Hosts that can only load one
     // (ctypes, Node FFI, JNA, P/Invoke; #182). It exports only the discovery
     // entry point: ELF through a version script, Mach-O and PE because only
@@ -2046,7 +2048,7 @@ pub fn build(b: *std.Build) void {
     agentcore_shared_gate_cmd.addFileArg(agentcore_shared_lib.getEmittedBin());
     if (target.result.os.tag == .windows and target.result.abi == .msvc)
         agentcore_shared_gate_cmd.addArg("--msvc-runtime");
-    agentcore_test_step.dependOn(&agentcore_shared_gate_cmd.step);
+    agentcore_package_test_step.dependOn(&agentcore_shared_gate_cmd.step);
     const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
     const agentcore_architecture = @tagName(target.result.cpu.arch);
     const agentcore_os = @tagName(target.result.os.tag);
@@ -2792,6 +2794,8 @@ pub fn build(b: *std.Build) void {
     // the picker root, apps/cli/tests in its shards and the termios spike. It is
     // part of `test:units`, and what CI runs for a change scripts/ci_scope.py
     // confines to the cli package.
+    const facade_test_step = b.step("test:facade", "Run the facade package's tests: src/lib.zig and src/internal.zig (part of `test:units`)");
+    units_test_step.dependOn(facade_test_step);
     const cli_test_step = b.step("test:cli", "Run the cli package's tests: apps/cli/src inline tests, the picker root and apps/cli/tests (part of `test:units`)");
     units_test_step.dependOn(cli_test_step);
     const package_test_steps = [lower_packages.len]*std.Build.Step{
@@ -2824,7 +2828,7 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
     if (@import("builtin").os.tag == .macos) eval_test_step.dependOn(&project_rule_mac_pilot_run.step);
-    units_test_step.dependOn(release_test_step);
+    package_test_steps[packageIndex("base")].dependOn(release_test_step);
     units_test_step.dependOn(http_status_gate_step);
     units_test_step.dependOn(subsystem_boundary_step);
     package_test_steps[packageIndex("ai")].dependOn(provider_test_step);
@@ -3123,7 +3127,7 @@ pub fn build(b: *std.Build) void {
     });
     const rule_control_test_step = b.step("test:rule-control", "Test the rule-control sensors on fixtures and on the checked-in tree");
     rule_control_test_step.dependOn(&rule_control_test_cmd.step);
-    units_test_step.dependOn(&rule_control_test_cmd.step);
+    cli_test_step.dependOn(&rule_control_test_cmd.step);
     const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "apps", "packages", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
@@ -3315,7 +3319,8 @@ pub fn build(b: *std.Build) void {
         .root_module = test_cc_mod.import_table.get("metacodes-internal").?,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    units_test_step.dependOn(&addTestRunArtifact(b, internal_test).step);
+    facade_test_step.dependOn(&core_suites[lower_packages.len].compile.step);
+    facade_test_step.dependOn(&addTestRunArtifact(b, internal_test).step);
     for (lower_packages, package_test_steps, 0..) |name, package_test_step, index| {
         const package_test = addRecordedTest(b, .{
             .name = b.fmt("{s}-test", .{name}),
@@ -3707,6 +3712,7 @@ pub fn build(b: *std.Build) void {
     const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test);
     const dispatcher_metadata_step = b.step("test:dispatcher-metadata", "Run the ToolDispatcher metadata acceptance suite");
     dispatcher_metadata_step.dependOn(&dispatcher_metadata_run.step);
+    agentcore_package_test_step.dependOn(&dispatcher_metadata_run.step);
     units_test_step.dependOn(&dispatcher_metadata_run.step);
 
     // Focused Skill Runtime gate. Keep this work independently

@@ -226,7 +226,7 @@ pub fn main(init: std.process.Init) !void {
             .path = ripgrep_rel,
             .upstream = ripgrep_pin.source_repository,
             .license = ripgrep_pin.license,
-            .role = "Glob/Grep execution dependency",
+            .role = "bundled workspace search executable",
         }},
         .files = &files,
     };
@@ -336,10 +336,7 @@ fn renderReadme(
         \\
         \\`{s}` is the manifest-pinned ripgrep {s} runtime asset (upstream official release
         \\binary, MIT OR Unlicense; MIT text at `bin/ripgrep-LICENSE-MIT`, declaration in
-        \\`runtime_assets` in `manifest.json`). The built-in `Glob`/`Grep` tools execute
-        \\through it, and Runtime creation refuses to advertise them when no ripgrep
-        \\resolves. Deploy it next to your Host executable — that location is probed
-        \\automatically — or point the `RG_BIN` environment variable at it; installations
+        \\`runtime_assets` in `manifest.json`). Hosts can invoke the bundled executable directly; installations
         \\on `PATH` also resolve.
         \\
         \\`bin/metacodes-fs-helper` (`.exe` on Windows) is the trusted native filesystem

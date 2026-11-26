@@ -34,7 +34,7 @@ fn deferredProbe(_: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyo
 // ① 核心工具长描述进 defs(对比:无 context 时是短描述)。
 test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     const a = std.testing.allocator;
-    const names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "Task" };
+    const names = [_][]const u8{ "Read", "Write", "Edit", "Bash", "Task" };
     var pc = cc.tools.PromptContext{ .enabled_tool_names = &names, .include_git = true };
 
     const defs = try cc.tools.toToolDefinitionsFull(a, null, &pc);
@@ -52,8 +52,19 @@ test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     try std.testing.expect(std.mem.indexOf(u8, read.description, "cat -n format") != null);
     const edit = findDef(defs, "Edit").?;
     try std.testing.expect(std.mem.indexOf(u8, edit.description, "exact string replacements") != null);
-    const grep = findDef(defs, "Grep").?;
-    try std.testing.expect(std.mem.indexOf(u8, grep.description, "ALWAYS use Grep") != null);
+    try std.testing.expect(findDef(defs, "CodeMap").?.deferred);
+    try std.testing.expect(findDef(defs, "FindSymbol").?.deferred);
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.request_tools = .{ .advertised = defs, .catalog = defs };
+    for ([_][]const u8{ "Glob", "Grep" }) |name| {
+        try std.testing.expect(findDef(defs, name) == null);
+        try std.testing.expectError(error.UnknownTool, cc.tools.dispatch(&ctx, name, "{}"));
+        var buffer: [80]u8 = undefined;
+        const args = try std.fmt.bufPrint(&buffer, "{{\"query\":\"select:{s}\"}}", .{name});
+        try std.testing.expectError(error.NoToolMatch, cc.tools.dispatch(&ctx, "ToolSearch", args));
+    }
+    const bash = findDef(defs, "Bash").?;
+    try std.testing.expect(std.mem.indexOf(u8, bash.description, "rg --files") != null);
     const write = findDef(defs, "Write").?;
     try std.testing.expect(std.mem.indexOf(u8, write.description, "MUST use the Read tool first") != null);
 }
@@ -151,21 +162,18 @@ test "L2: ToolSearch enters the API tool set only when a deferred tool exists" {
     const definitions_allocator = definitions_arena.allocator();
     var no_tinykg = cc.tools.PromptContext{ .tinykg_enabled = false };
 
-    // TinyKG 治理核未启用、无动态工具：ToolSearch 没有工作可做，必须不广告。
     const core_only = try cc.tools.toToolDefinitionsFull(definitions_allocator, null, &no_tinykg);
     try std.testing.expect(findDef(core_only, "KgRecall") == null);
     try std.testing.expect(findDef(core_only, "Write") != null);
-    try std.testing.expect(findDef(core_only, "ToolSearch") == null);
+    try std.testing.expect(findDef(core_only, "ToolSearch") != null);
 
     var dyn = cc.tools_dynamic.DynRegistry.init(a);
     defer dyn.deinit();
-    // 常驻 Skill 类动态工具不需要激活，仍不应引入 ToolSearch。
     try dyn.register("always_visible", "always visible helper", &.{}, deferredProbe, null, false);
     const visible_dyn = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
     try std.testing.expect(findDef(visible_dyn, "always_visible") != null);
-    try std.testing.expect(findDef(visible_dyn, "ToolSearch") == null);
+    try std.testing.expect(findDef(visible_dyn, "ToolSearch") != null);
 
-    // MCP 工具 deferred=true：此时 ToolSearch 才是必要能力并随工具表进入请求。
     try dyn.registerMcp("demo__lookup", "deferred MCP lookup", &.{}, deferredProbe, null, "demo");
     const with_deferred = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
     try std.testing.expect(findDef(with_deferred, "ToolSearch") != null);
@@ -203,7 +211,7 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     try std.testing.expect(findDef(baseline_defs, "KgRecall") == null);
     try std.testing.expect(findDef(baseline_defs, "KgContext") == null);
     try std.testing.expect(findDef(baseline_defs, "FormalAuditTask") == null);
-    try std.testing.expect(findDef(baseline_defs, "ToolSearch") == null);
+    try std.testing.expect(findDef(baseline_defs, "ToolSearch") != null);
     const baseline_create = findDef(baseline_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "in-session task list") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "TinyKG") == null);
@@ -272,20 +280,16 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
 test "L2: buildUsingTools 段按工具集裁剪" {
     const a = std.testing.allocator;
 
-    // 全量:含 Grep/Glob/TaskCreate 子条
-    const full_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "TaskCreate" };
+    const full_names = [_][]const u8{ "Read", "Write", "Edit", "Bash", "TaskCreate" };
     const sp_full = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &full_names, "", false, "/tmp");
     defer a.free(sp_full);
-    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Grep instead of grep") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_full, "use Glob instead of find") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_full, "Bash for workspace searches") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_full, "TaskCreate tool") != null);
 
-    // 裁剪:无 Grep / 无 TaskCreate
-    const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Bash" };
+    const slim_names = [_][]const u8{ "Read", "Write", "Edit", "Bash" };
     const sp_slim = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &slim_names, "", false, "/tmp");
     defer a.free(sp_slim);
-    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Grep instead of grep") == null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "use Glob instead of find") != null); // Glob 仍在
+    try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Bash for workspace searches") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_slim, "Break down and manage your work") == null);
 
     // 极简/文本 profile 不得残留不存在的基础工具指导。
@@ -295,7 +299,7 @@ test "L2: buildUsingTools 段按工具集裁剪" {
     try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To read files use Read") != null);
     try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To edit files use Edit") == null);
     try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "To create files use Write") == null);
-    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "Reserve Bash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sp_read_only, "Bash for workspace searches") == null);
 
     const sp_text_only = try cc.system_prompt.buildFull(a, "model", null, null, &.{}, "", false, "/tmp");
     defer a.free(sp_text_only);
@@ -319,7 +323,7 @@ test "L2: per-turn policy projection removes hidden ordinary tool guidance" {
     defer a.free(projected);
     try std.testing.expect(std.mem.indexOf(u8, projected, "To read files use Read") != null);
     try std.testing.expect(std.mem.indexOf(u8, projected, "To create files use Write") == null);
-    try std.testing.expect(std.mem.indexOf(u8, projected, "Reserve Bash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "Bash for workspace searches") == null);
 
     // 同一个有效工具面再次投影不分配、不改变字节，保护 provider prefix cache。
     try std.testing.expect((try cc.system_prompt.projectUsingToolsForExecution(a, projected, &visible)) == null);
@@ -346,7 +350,7 @@ test "L2: redescribeForContext 给只读 agent 的 Bash 加只读提醒" {
     const a = std.testing.allocator;
 
     // 先建一份主对话 defs(Bash 含 Git 段)
-    const names = [_][]const u8{ "Read", "Grep", "Glob", "Bash" };
+    const names = [_][]const u8{ "Read", "Bash" };
     var main_pc = cc.tools.PromptContext{ .enabled_tool_names = &names, .include_git = true };
     const defs = try cc.tools.toToolDefinitionsFull(a, null, &main_pc);
     defer a.free(defs);
@@ -372,6 +376,7 @@ test "L2: redescribeForContext 给只读 agent 的 Bash 加只读提醒" {
 
     const bash_after = findDef(defs, "Bash").?;
     try std.testing.expect(std.mem.indexOf(u8, bash_after.description, "Committing changes with git") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_after.description, "Creating pull requests") == null);
     try std.testing.expect(std.mem.indexOf(u8, bash_after.description, "read-only agent") != null);
 }
 
@@ -391,7 +396,7 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
 
-    const names = [_][]const u8{ "Read", "Edit", "Grep", "Bash" };
+    const names = [_][]const u8{ "Read", "Edit", "Bash" };
     var pc = cc.tools.PromptContext{ .enabled_tool_names = &names, .include_git = true };
     const defs = try cc.tools.toToolDefinitionsFull(a, null, &pc);
 
@@ -412,7 +417,18 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "cat -n format") != null); // Read 长描述
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "exact string replacements") != null); // Edit 长描述
-    try std.testing.expect(std.mem.indexOf(u8, tools_field, "ALWAYS use Grep") != null); // Grep 长描述
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "rg --files") != null);
+    var tool_list = try std.json.parseFromSlice(std.json.Value, a, tools_field, .{});
+    defer tool_list.deinit();
+    for (tool_list.value.array.items) |tool| {
+        if (!std.mem.eql(u8, tool.object.get("name").?.string, "Bash")) continue;
+        const desc = tool.object.get("description").?.string;
+        for ([_][]const u8{ "fresh process", "Choosing a tool", "Running commands", "Long-running commands and results", "Committing changes with git", "Creating pull requests", "git diff <base>...HEAD" }) |rule|
+            try std.testing.expect(std.mem.indexOf(u8, desc, rule) != null);
+        const timeout = tool.object.get("input_schema").?.object.get("properties").?.object.get("timeout").?;
+        try std.testing.expectEqualStrings("Foreground timeout in milliseconds (default 120000, maximum 86400000)", timeout.object.get("description").?.string);
+        break;
+    } else return error.BashToolMissing;
 }
 
 test "L2 e2e: execution policy hides deferred tools from schema and system prompt" {
@@ -470,15 +486,6 @@ test "L2 e2e: execution policy hides deferred tools from schema and system promp
 
 // ── 动态(MCP)deferred 工具的可发现性:提示词列名 → ToolSearch select → 下一请求进 tools ──
 
-fn toolSearchSse(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
-        "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_search\",\"name\":\"ToolSearch\",\"input\":{{}}}}}}\n\n" ++
-        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"query\\\":\\\"{s}\\\"}}\"}}}}\n\n" ++
-        "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
-        "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
-        "data: {{\"type\":\"message_stop\"}}\n\n", .{query});
-}
-
 /// 生产 App.activateTool 的最小镜像:dupe 名字记入激活集(ToolSearch 传进来的 name 借用
 /// 工具参数内存,工具返回后就失效)。
 const Activation = struct {
@@ -510,7 +517,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
 
     var defs_arena = std.heap.ArenaAllocator.init(a);
     defer defs_arena.deinit();
-    var pc = cc.tools.PromptContext{};
+    var pc = cc.tools.PromptContext{ .tinykg_enabled = false };
     const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), &dyn, &pc);
     const names = try defs_arena.allocator().alloc([]const u8, defs.len);
     for (defs, 0..) |d, i| names[i] = d.name;
@@ -522,7 +529,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__search — Search a KnowForge knowledge base by keyword. Returns fragments") != null);
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__overview — Knowledge base overview.") != null);
 
-    const search_sse = try toolSearchSse(a, "select:knowforge__search");
+    const search_sse = try harness.toolSearchSse(a, "select:knowforge__search,CodeMap,FindSymbol,TaskCreate,TaskUpdate,TaskOutput,CronList,BashOutput");
     defer a.free(search_sse);
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
     defer srv.stop();
@@ -564,6 +571,17 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__search") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__overview") != null);
 
+    const deferred_names = [_][]const u8{ "CodeMap", "FindSymbol", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop", "BashOutput", "Monitor", "KillShell", "CronCreate", "CronList", "CronDelete" };
+    try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"ScheduleWakeup\"") != null);
+    for (deferred_names) |name| {
+        const field = try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name});
+        defer a.free(field);
+        try std.testing.expect(std.mem.indexOf(u8, first_tools, field) == null);
+        const catalog_entry = try std.fmt.allocPrint(a, "- {s} —", .{name});
+        defer a.free(catalog_entry);
+        try std.testing.expect(std.mem.indexOf(u8, first_system, catalog_entry) != null);
+    }
+
     // ToolSearch 的结果把 schema 给了模型,激活集记下了名字。
     try std.testing.expect(activated.contains("knowforge__search"));
     try std.testing.expect(!activated.contains("knowforge__overview"));
@@ -571,12 +589,22 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(tool_result_msg.blocks[0] == .tool_result);
     try std.testing.expect(std.mem.indexOf(u8, tool_result_msg.blocks[0].tool_result.content, "\"name\":\"knowforge__search\"") != null);
 
+    try std.testing.expect(std.mem.indexOf(u8, tool_result_msg.blocks[0].tool_result.content, "acts_on") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_system, "- TaskUpdate — Update an in-session task") != null);
+
     // 第二请求:被激活的 MCP 工具进 tools 数组;未激活的同伴仍只在 Deferred 段。
     const second = srv.requestAt(1) orelse return error.NoRequestCaptured;
     const second_tools = second.jsonField("tools") orelse return error.ToolsFieldMissing;
     const second_system = second.jsonField("system") orelse return error.SystemFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, second_tools, "\"name\":\"knowforge__search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, second_tools, "knowforge__overview") == null);
+    for (deferred_names) |name| {
+        const selected = activated.contains(name);
+        const field = try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name});
+        defer a.free(field);
+        try std.testing.expectEqual(selected, std.mem.indexOf(u8, second_tools, field) != null);
+    }
+    for ([_][]const u8{ "CodeMap", "FindSymbol", "TaskCreate", "TaskUpdate", "TaskOutput", "CronList", "BashOutput" }) |name| try std.testing.expect(activated.contains(name));
     try std.testing.expect(std.mem.indexOf(u8, second_system, "- knowforge__overview") != null);
 }
 
@@ -609,7 +637,7 @@ test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
     var sw = cc.swarm_context.SwarmContext{ .allocator = a, .state_root = home };
     defer sw.deinit();
 
-    const search_sse = try toolSearchSse(a, "send team message read bash");
+    const search_sse = try harness.toolSearchSse(a, "send team message read bash");
     defer a.free(search_sse);
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
     defer srv.stop();

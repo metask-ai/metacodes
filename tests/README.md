@@ -22,7 +22,7 @@ L2 必要条件:一条组件测试要跨 ≥3 个真实模块接线(声明=接�
 ```bash
 zig build test                   # 完整离线门:core + 聚合 L2/L3 + eval + TinyKG 合约 + 规则传感器 + 隔离根(platform/lsp/provider/picker)
 zig build test:lib               # core 全图:每个包一个分片二进制加 lib.zig 的一个;coding 默认 4 个确定性、fail-closed 分片
-zig build test:coding            # 只跑一个包的内联测试(base、ai、kernel、guard、coding、session、teamwork)
+zig build test:coding            # 只跑一个包的内联测试(base、ai、kernel、guard、coding、session、teamwork、facade、agentcore、cli)
 zig build test:lib -Dlib-test-shards=2   # 资源紧张机器可降低并发,不减覆盖
 zig build test:lib-monolithic    # 单进程诊断/与分片基线对照
 zig build test:lib-times         # 逐测试耗时、slow buckets 与 top-N

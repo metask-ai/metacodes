@@ -79,6 +79,49 @@ def latest_results(record, views):
     return latest, history
 
 
+def _profile_lookup(records):
+    by_id, by_job = {}, {}
+    for record in records:
+        pub = public_profile(record)
+        meta = {
+            "profile": pub["id"],
+            "profile_name": pub.get("name") or pub.get("default_name") or pub["id"],
+            "profile_version": (pub.get("metacodes") or {}).get("label"),
+            "profile_features": list(pub.get("features") or []),
+        }
+        by_id[pub["id"]] = meta
+        for item in pub.get("items") or []:
+            if item.get("run"):
+                by_job[item["run"]] = meta
+    return by_id, by_job
+
+
+def _attach_profile(entry, by_id, by_job):
+    meta = by_job.get(entry.get("name")) or by_id.get(entry.get("profile"))
+    if meta:
+        entry.update(meta)
+    return entry
+
+
+def _latest_ranked_per_profile(jobs):
+    ranked_by_key = {}
+    standalone_ranked = []
+    unranked = []
+    for job in jobs:
+        if not job.get("ranked"):
+            unranked.append(job)
+            continue
+        if not job.get("profile"):
+            standalone_ranked.append(job)
+            continue
+        key = (job["profile"], job.get("model") or "")
+        prev = ranked_by_key.get(key)
+        if prev is None or (job.get("started_at") or "", job["name"]) > (prev.get("started_at") or "", prev["name"]):
+            ranked_by_key[key] = job
+    return sorted([*ranked_by_key.values(), *standalone_ranked, *unranked],
+                  key=lambda job: (job["score"], job.get("started_at") or ""), reverse=True)
+
+
 def board_job(view, tasks):
     """A finished job on a published board's tasks (None: all of them): the
     mean reward of its finished trials, an invalid trial counting 0, and the
@@ -384,24 +427,39 @@ class Workbench:
         names = set(self.library.job_names()).union(n for n, r in runs.items() if r.get("worker_summary"))
         views = [view for view in (self.job_view(name, True, runs, aggregate=True) for name in sorted(names))
                  if view and view.get("suite") == suite_id and not view["running"]]
-        boards, ranked_anywhere = [], set()
+        by_id, by_job = _profile_lookup(self.profile_records())
+        boards, ranked_anywhere, ranked_profiles = [], set(), set()
         for board in (b for b in published if suite_id in b["suites"]):
             tasks = set(board["tasks"]) if board.get("tasks") else None
             needed = RANKED_COVERAGE * (len(tasks) if tasks else task_count)
-            jobs = [job for job in (board_job(view, tasks) for view in views) if job]
+            jobs = [_attach_profile(job, by_id, by_job) for job in (board_job(view, tasks) for view in views) if job]
             for job in jobs:
                 job["ranked"] = job["tasks"] >= needed
                 if job["ranked"]:
                     ranked_anywhere.add(job["name"])
-            boards.append({**board, "jobs": sorted(jobs, key=lambda job: job["score"], reverse=True)})
-        unranked = [job for job in (board_job(view, None) for view in views) if job and job["name"] not in ranked_anywhere]
+                    if job.get("profile"):
+                        ranked_profiles.add((job["profile"], job.get("model") or ""))
+            boards.append({**board, "jobs": _latest_ranked_per_profile(jobs)})
+        unranked = []
+        for view in views:
+            job = board_job(view, None)
+            if not job or job["name"] in ranked_anywhere:
+                continue
+            _attach_profile(job, by_id, by_job)
+            if job.get("profile") and (job["profile"], job.get("model") or "") in ranked_profiles:
+                continue
+            unranked.append(job)
         return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "description": suite.description,
                 "task_count": task_count,
                 "ranked_coverage": RANKED_COVERAGE, "boards": boards, "unranked": unranked}
 
     def job(self, name) -> Optional[Dict[str, Any]]:
         self.library.maybe_sync()
-        return self.job_view(name)
+        view = self.job_view(name)
+        if view is None:
+            return None
+        by_id, by_job = _profile_lookup(self.profile_records())
+        return _attach_profile(view, by_id, by_job)
 
     def trial(self, job, trial) -> Optional[Dict[str, Any]]:
         self.library.maybe_sync()

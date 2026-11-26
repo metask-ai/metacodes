@@ -45,8 +45,6 @@ pub const CODING_TOOLS = [_][]const u8{
     "Read",
     "Write",
     "Edit",
-    "Glob",
-    "Grep",
     "Bash",
     "BashOutput",
     "KillShell",
@@ -56,16 +54,12 @@ pub const CODING_TOOLS = [_][]const u8{
 
 pub const MINIMAL_TOOLS = [_][]const u8{
     "Read",
-    "Glob",
-    "Grep",
 };
 
 pub const OFFLINE_CODING_TOOLS = [_][]const u8{
     "Read",
     "Write",
     "Edit",
-    "Glob",
-    "Grep",
     "Bash",
     "BashOutput",
     "KillShell",

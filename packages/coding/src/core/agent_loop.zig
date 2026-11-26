@@ -24,8 +24,9 @@ const tools_common = @import("metacodes-guard").tools.common;
 const permission_mod = @import("metacodes-guard").permission_root;
 const message_repair_mod = @import("message_repair.zig");
 const hooks_mod = @import("metacodes-guard").permission.hooks;
-const msg = @import("metacodes-kernel").message;
-const conversation_mod = @import("metacodes-kernel").conversation;
+const kernel = @import("metacodes-kernel");
+const msg = kernel.message;
+const conversation_mod = kernel.conversation;
 const Conversation = conversation_mod.Conversation;
 const AbortSignal = @import("metacodes-base").util.abort.AbortSignal;
 const ReadState = @import("read_state.zig").ReadState;
@@ -1431,7 +1432,7 @@ const ToolAdmission = struct {
                 .input = tu.input,
                 .content = try tool_error.errorToJson(
                     "VerifierLeadsToolUnavailable",
-                    "tool '{s}' does not run in a verifier leads round: only Read, Grep and Glob do, and files cannot change",
+                    "tool '{s}' does not run in a verifier leads round: only Read does, and files cannot change",
                     .{tu.name},
                     allocator,
                 ),
@@ -1453,7 +1454,7 @@ const ToolAdmission = struct {
             var lslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
             lslot.content = try tool_error.errorToJson(
                 "LearningTurnToolUnavailable",
-                "tool '{s}' does not run in a learning turn: only Read, Grep, Glob, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
+                "tool '{s}' does not run in a learning turn: only Read, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
                 .{tu.name},
                 allocator,
             );
@@ -2276,16 +2277,6 @@ noinline fn freeOwnedSlice(comptime T: type, allocator: std.mem.Allocator, owned
     if (owned) |slice| allocator.free(slice);
 }
 
-noinline fn freeBlockList(allocator: std.mem.Allocator, blocks: *std.ArrayList(msg.Block)) void {
-    for (blocks.items) |b| b.deinit(allocator);
-    blocks.deinit(allocator);
-}
-
-noinline fn freeItemList(allocator: std.mem.Allocator, items: *std.ArrayList([]u8)) void {
-    for (items.items) |item| allocator.free(item);
-    items.deinit(allocator);
-}
-
 fn runCounted(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -2349,7 +2340,6 @@ fn runCounted(
     // 据 trace_id+depth 重建 span 树。depth = agent 嵌套深度(父 0 子 1)。
     const trace_id = log.genRequestId().bytes;
     const depth = opts.agent_depth;
-    var turns: u32 = 0;
     var job_wakeups: u32 = 0;
     var verification_progress = verification_progress_mod.State{};
     var total_tool_calls: u32 = 0;
@@ -2432,9 +2422,6 @@ fn runCounted(
     var host_injection_meter = @import("host_injection_meter.zig").Meter{};
     defer if (opts.requirement_ledger or opts.requirement_ledger_observe) recordRequirementLedger(&opts, &requirement_ledger_state, &verification_progress);
     defer if (opts.verification_final_gate or opts.verification_final_observe) recordVerificationFinalGate(&opts, &verification_progress, verification_nudges);
-    // At most this many max_tokens continuations in a row; the streak resets
-    // whenever a turn ends without the cut or carries a tool call.
-    const MAX_CONTINUATIONS: u32 = 3;
 
     // Governed lexical recall is run-scoped: the model proposes aliases and
     // variants, while this bounded host ledger remembers only node ids that
@@ -2474,17 +2461,248 @@ fn runCounted(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns +| learning_borrowed_turns +| verifier_borrowed_turns) : (turns += 1) {
-        // 开头检查 abort
-        if (opts.abort) |a| if (a.isAborted()) {
-            log.warn("agent", "aborted before turn {d}", .{turns + 1});
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
-        };
+    var turn_driver = TurnDriver{
+        .conversation = conversation,
+        .provider = provider,
+        .tool_defs = &tool_defs,
+        .permission_ctx = permission_ctx,
+        .opts = &opts,
+        .backend = backend,
+        .span_sink = span_sink,
+        .allocator = allocator,
+        .counters = counters,
+        .tool_changes_hook = tool_changes_hook,
+        .harnessmm_enabled = harnessmm_enabled,
+        .run_prompt = run_prompt,
+        .harnessmm = &harnessmm,
+        .harnessmm_journal = &harnessmm_journal,
+        .sess = sess,
+        .trace_id = trace_id,
+        .depth = depth,
+        .job_wakeups = &job_wakeups,
+        .verification_progress = &verification_progress,
+        .total_tool_calls = &total_tool_calls,
+        .environment_faults = &environment_faults,
+        .continuations = continuations,
+        .continuation_streak = &continuation_streak,
+        .continuation_pending = &continuation_pending,
+        .output_channel = &output_channel,
+        .verification_nudges = &verification_nudges,
+        .required_first_repairs = &required_first_repairs,
+        .stream_turn_retries = &stream_turn_retries,
+        .requirement_ledger_state = &requirement_ledger_state,
+        .delivery_cadence_state = &delivery_cadence_state,
+        .progress_state = &progress_state,
+        .stall_state = stall_state,
+        .check_gate_state = &check_gate_state,
+        .learning_state = &learning_state,
+        .learning_borrowed_turns = &learning_borrowed_turns,
+        .test_integrity_state = &test_integrity_state,
+        .stop_hook_active = &stop_hook_active,
+        .verifier_armed = verifier_armed,
+        .verifier_gate = &verifier_gate,
+        .verifier_borrowed_turns = &verifier_borrowed_turns,
+        .host_injection_meter = &host_injection_meter,
+        .kg_lexical_ledger = &kg_lexical_ledger,
+        .kg_enumeration_query_hint = kg_enumeration_query_hint,
+        .kg_enumeration_text = kg_enumeration_text,
+        .kg_enumeration_judged = &kg_enumeration_judged,
+        .kg_enumeration_soft_hint = &kg_enumeration_soft_hint,
+        .kg_coverage_reminder_emitted = &kg_coverage_reminder_emitted,
+        .kg_context_reminder_emitted = &kg_context_reminder_emitted,
+        .kg_coverage_repair_attempts = &kg_coverage_repair_attempts,
+        .kg_context_repair_attempts = &kg_context_repair_attempts,
+        .kg_coverage_borrowed_turns = &kg_coverage_borrowed_turns,
+        .cost_rates = cost_rates,
+        .run_cost_usd = &run_cost_usd,
+        .cache_detector = &cache_detector,
+        .context_warning_emitted = &context_warning_emitted,
+        .compact_summary_reserve_tokens = &compact_summary_reserve_tokens,
+    };
+    return kernel.drive(
+        RunResult,
+        &turn_driver,
+        TurnDriver.turnLimit,
+        TurnDriver.isAborted,
+        TurnDriver.step,
+        TurnDriver.onAborted,
+        TurnDriver.onLimit,
+        false,
+    );
+}
+
+const TurnDriver = struct {
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: *[]const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    opts: *Options,
+    backend: *const UiBackend,
+    span_sink: ?*const UiBackend,
+    allocator: std.mem.Allocator,
+    counters: *RunCounters,
+    tool_changes_hook: ?@import("tool_changes.zig").Hook,
+    harnessmm_enabled: bool,
+    run_prompt: ?[]const u8,
+    harnessmm: *harnessmm_mod.State,
+    harnessmm_journal: *?harnessmm_mod.Journal,
+    sess: @import("metacodes-kernel").session_id.SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    job_wakeups: *u32,
+    verification_progress: *verification_progress_mod.State,
+    total_tool_calls: *u32,
+    environment_faults: *u32,
+    continuations: *u32,
+    continuation_streak: *u32,
+    continuation_pending: *bool,
+    output_channel: *OutputChannel,
+    verification_nudges: *u8,
+    required_first_repairs: *u8,
+    stream_turn_retries: *u8,
+    requirement_ledger_state: *requirement_ledger_mod.State,
+    delivery_cadence_state: *delivery_cadence_mod.State,
+    progress_state: *progress_updates_mod.State,
+    stall_state: ?*stall_gate_mod.State,
+    check_gate_state: *check_gate_mod.State,
+    learning_state: *learning_turn_mod.State,
+    learning_borrowed_turns: *u32,
+    test_integrity_state: *test_integrity_mod.State,
+    stop_hook_active: *bool,
+    verifier_armed: bool,
+    verifier_gate: *isolated_verifier_mod.Gate,
+    verifier_borrowed_turns: *u32,
+    host_injection_meter: *@import("host_injection_meter.zig").Meter,
+    kg_lexical_ledger: *@import("../kg/lexical_query_plan.zig").Ledger,
+    kg_enumeration_query_hint: bool,
+    kg_enumeration_text: ?[]u8,
+    kg_enumeration_judged: *bool,
+    kg_enumeration_soft_hint: *bool,
+    kg_coverage_reminder_emitted: *bool,
+    kg_context_reminder_emitted: *bool,
+    kg_coverage_repair_attempts: *u8,
+    kg_context_repair_attempts: *u8,
+    kg_coverage_borrowed_turns: *u32,
+    cost_rates: @import("metacodes-base").util.pricing.Rates,
+    run_cost_usd: *f64,
+    cache_detector: *@import("cache_break.zig").CacheBreakDetector,
+    context_warning_emitted: *bool,
+    compact_summary_reserve_tokens: *usize,
+
+    fn turnLimit(driver: *@This()) u32 {
+        return driver.opts.max_turns +| driver.kg_coverage_borrowed_turns.* +| driver.learning_borrowed_turns.* +| driver.verifier_borrowed_turns.*;
+    }
+
+    fn isAborted(driver: *@This()) bool {
+        return if (driver.opts.abort) |a| a.isAborted() else false;
+    }
+
+    fn onAborted(driver: *@This(), turns: u32) RunResult {
+        log.warn("agent", "aborted before turn {d}", .{turns + 1});
+        return finishRun(driver.backend, driver.sess, driver.trace_id, driver.depth, .{
+            .stop_reason = stopReasonForAbort(driver.opts.abort),
+            .turns = turns,
+            .tool_calls = driver.total_tool_calls.*,
+        });
+    }
+
+    fn onLimit(driver: *@This(), turns: u32) RunResult {
+        return finishRun(driver.backend, driver.sess, driver.trace_id, driver.depth, .{
+            .stop_reason = .max_turns,
+            .turns = turns,
+            .tool_calls = driver.total_tool_calls.*,
+        });
+    }
+
+    fn step(driver: *@This(), turns: u32) !kernel.StepOutcome(RunResult) {
+        const conversation = driver.conversation;
+        const provider = driver.provider;
+        const permission_ctx = driver.permission_ctx;
+        const backend = driver.backend;
+        const span_sink = driver.span_sink;
+        const allocator = driver.allocator;
+        const counters = driver.counters;
+        const tool_changes_hook = driver.tool_changes_hook;
+        const harnessmm_enabled = driver.harnessmm_enabled;
+        const run_prompt = driver.run_prompt;
+        const harnessmm = driver.harnessmm;
+        const sess = driver.sess;
+        const trace_id = driver.trace_id;
+        const depth = driver.depth;
+        const verification_progress = driver.verification_progress;
+        const continuations = driver.continuations;
+        const output_channel = driver.output_channel;
+        const requirement_ledger_state = driver.requirement_ledger_state;
+        const delivery_cadence_state = driver.delivery_cadence_state;
+        const progress_state = driver.progress_state;
+        const stall_state = driver.stall_state;
+        const check_gate_state = driver.check_gate_state;
+        const learning_state = driver.learning_state;
+        const test_integrity_state = driver.test_integrity_state;
+        const verifier_armed = driver.verifier_armed;
+        const verifier_gate = driver.verifier_gate;
+        const host_injection_meter = driver.host_injection_meter;
+        const kg_lexical_ledger = driver.kg_lexical_ledger;
+        const kg_retrieval_protocol = @import("../kg/retrieval_protocol.zig");
+        const kg_enumeration_query_hint = driver.kg_enumeration_query_hint;
+        const kg_enumeration_text = driver.kg_enumeration_text;
+        const cost_rates = driver.cost_rates;
+        const cache_detector = driver.cache_detector;
+        const MAX_CONTINUATIONS: u32 = 3;
+
+        var tool_defs = driver.tool_defs.*;
+        var opts = driver.opts.*;
+        var job_wakeups = driver.job_wakeups.*;
+        var total_tool_calls = driver.total_tool_calls.*;
+        var environment_faults = driver.environment_faults.*;
+        var continuation_streak = driver.continuation_streak.*;
+        var continuation_pending = driver.continuation_pending.*;
+        var verification_nudges = driver.verification_nudges.*;
+        var required_first_repairs = driver.required_first_repairs.*;
+        var stream_turn_retries = driver.stream_turn_retries.*;
+        var learning_borrowed_turns = driver.learning_borrowed_turns.*;
+        var stop_hook_active = driver.stop_hook_active.*;
+        var verifier_borrowed_turns = driver.verifier_borrowed_turns.*;
+        var kg_enumeration_judged = driver.kg_enumeration_judged.*;
+        var kg_enumeration_soft_hint = driver.kg_enumeration_soft_hint.*;
+        var kg_coverage_reminder_emitted = driver.kg_coverage_reminder_emitted.*;
+        var kg_context_reminder_emitted = driver.kg_context_reminder_emitted.*;
+        var kg_coverage_repair_attempts = driver.kg_coverage_repair_attempts.*;
+        var kg_context_repair_attempts = driver.kg_context_repair_attempts.*;
+        var kg_coverage_borrowed_turns = driver.kg_coverage_borrowed_turns.*;
+        var run_cost_usd = driver.run_cost_usd.*;
+        var context_warning_emitted = driver.context_warning_emitted.*;
+        var compact_summary_reserve_tokens = driver.compact_summary_reserve_tokens.*;
+        defer {
+            driver.tool_defs.* = tool_defs;
+            driver.opts.* = opts;
+            driver.job_wakeups.* = job_wakeups;
+            driver.total_tool_calls.* = total_tool_calls;
+            driver.environment_faults.* = environment_faults;
+            driver.continuation_streak.* = continuation_streak;
+            driver.continuation_pending.* = continuation_pending;
+            driver.verification_nudges.* = verification_nudges;
+            driver.required_first_repairs.* = required_first_repairs;
+            driver.stream_turn_retries.* = stream_turn_retries;
+            driver.learning_borrowed_turns.* = learning_borrowed_turns;
+            driver.stop_hook_active.* = stop_hook_active;
+            driver.verifier_borrowed_turns.* = verifier_borrowed_turns;
+            driver.kg_enumeration_judged.* = kg_enumeration_judged;
+            driver.kg_enumeration_soft_hint.* = kg_enumeration_soft_hint;
+            driver.kg_coverage_reminder_emitted.* = kg_coverage_reminder_emitted;
+            driver.kg_context_reminder_emitted.* = kg_context_reminder_emitted;
+            driver.kg_coverage_repair_attempts.* = kg_coverage_repair_attempts;
+            driver.kg_context_repair_attempts.* = kg_context_repair_attempts;
+            driver.kg_coverage_borrowed_turns.* = kg_coverage_borrowed_turns;
+            driver.run_cost_usd.* = run_cost_usd;
+            driver.context_warning_emitted.* = context_warning_emitted;
+            driver.compact_summary_reserve_tokens.* = compact_summary_reserve_tokens;
+        }
         // 成本次闸:本 run 累计成本达预算 → 停,交互层询问是否继续(不自动续)。
         if (opts.cost_budget_usd) |budget| {
             if (run_cost_usd >= budget) {
                 log.warn("agent", "cost budget reached: ${d:.4} >= ${d:.4}", .{ run_cost_usd, budget });
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls }) };
             }
         }
         // Learning pass turn cap: a pass that keeps calling tools ends here;
@@ -2492,7 +2710,7 @@ fn runCounted(
         if (learning_state.active() and !learning_state.beginPassTurn()) {
             learning_state.truncated = true;
             log.info("agent", "learning turn {s} pass cut at {d} turns", .{ @tagName(learning_state.phase), learning_turn_mod.PASS_MAX_TURNS });
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls });
+            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls }) };
         }
         // The one predicate for "this round is a learning pass, not the
         // attempt". A pass is the tail of a finished attempt: queued input,
@@ -2510,14 +2728,14 @@ fn runCounted(
                 // leads, and the boundary's verdict is final either way.
                 log.info("agent", "verifier leads round cut at {d} turns", .{isolated_verifier_mod.LEADS_MAX_TURNS});
                 verifier_gate.leads = .idle;
-                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, "")) {
+                switch (try verifierAfterLeads(allocator, &opts, verifier_gate, provider, tool_defs, permission_ctx, sess, check_gate_state, "")) {
                     .continue_run => |text| {
                         defer allocator.free(text);
                         output_channel.final_sealed = false;
                         try conversation.appendHostText(text);
-                        continue :outer_turn;
+                        return .continue_run;
                     },
-                    .stand, .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls }),
+                    .stand, .exhausted => return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls }) },
                 }
             }
         }
@@ -2528,7 +2746,7 @@ fn runCounted(
         // 暂停点;唯一安全转后台点是 turn 边界)。与 abort 分开:这不是中断,是把完整对话搬去后台。
         if (!in_learning_pass) if (opts.background_request) |bg| if (bg.load(.acquire)) {
             log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
+            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls }) };
         };
 
         // UI → core 输入(#115):生成期入队的用户消息在这里进对话,本 Run 的下一次请求就带上它;
@@ -2539,11 +2757,11 @@ fn runCounted(
         } else if (!in_learning_pass) {
             if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
                 log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
-                return finishRun(backend, sess, trace_id, depth, .{
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{
                     .stop_reason = stopReasonForReason(reason),
                     .turns = turns,
                     .tool_calls = total_tool_calls,
-                });
+                }) };
             }
             // Host input submitted through the Session (#270): same boundary, same skip.
             if (opts.run_inputs) |queue| {
@@ -2552,7 +2770,7 @@ fn runCounted(
                 // rather than build and send another request.
                 if (opts.abort) |a| if (a.isAborted()) {
                     log.warn("agent", "aborted while adopting host input before turn {d}", .{turns + 1});
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                    return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls }) };
                 };
             }
             // Issue #277: the goal's budget ran out during the last turn.
@@ -2861,7 +3079,7 @@ fn runCounted(
                     false,
                 );
                 if (compactStopReason(previous_model_compact_outcome, opts.abort)) |stop_reason| {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
+                    return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls }) };
                 }
             }
         };
@@ -2896,7 +3114,7 @@ fn runCounted(
                 false,
             );
             if (compactStopReason(pre_sampling_compact, opts.abort)) |stop_reason| {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls }) };
             }
         }
 
@@ -3052,29 +3270,10 @@ fn runCounted(
             .{ .discarded = .run_error },
         );
 
-        // 3. 收集响应 blocks。声明在 request_recovery 外层，使 SSE context
-        // recovery 可以清空临时状态后重试同一 turn。
-        var assistant_blocks = std.ArrayList(msg.Block).empty;
-        errdefer freeBlockList(allocator, &assistant_blocks);
-        var assistant_text = std.ArrayList(u8).empty;
-        defer assistant_text.deinit(allocator);
-        // 进度更新传感器(#114)的输入:本轮用户看到的模型文本里非空白的字节数(host 渲染的
-        // web_search 装饰、thinking 都不算)。
+        var draft = kernel.AssistantDraft.init(allocator);
+        defer draft.deinit();
+        const assistant_text = &draft.text;
         var visible_model_text_bytes: usize = 0;
-
-        // 思考过程累加器:本轮所有 thinking_delta/reasoning_content 拼成一个 thinking block,
-        // 存入 assistant message(preserved thinking)。下轮请求 serializeContent 回传。
-        var thinking_text = std.ArrayList(u8).empty;
-        defer thinking_text.deinit(allocator);
-
-        // provider 私有的推理续传项(issue #23,当前唯一生产者是 OpenAI Responses):
-        // 按到达顺序收集 owned item JSON,turn 末转成 reasoning_item block 存进
-        // assistant message,下轮同模型请求逐字节回传。丢弃残缺回合时随之释放。
-        var reasoning_items = std.ArrayList([]u8).empty;
-        defer freeItemList(allocator, &reasoning_items);
-
-        var tool_uses = std.ArrayList(msg.ToolUse).empty;
-        defer tool_uses.deinit(allocator);
 
         // P0.4 流式预取:纯只读工具(Read/Grep/Glob)在其 tool_use_start 到达时就开线程执行,流末
         // executeSlots 直接用结果。仅当无 PreToolUse hook(避免 ModifyInput 让预取输入过时)时启用。
@@ -3102,7 +3301,7 @@ fn runCounted(
             .permission_ctx = &pc_prefetch, // hooks 已剥离
             .tasks = opts.tasks,
             .kg = opts.kg,
-            .kg_lexical_ledger = &kg_lexical_ledger,
+            .kg_lexical_ledger = kg_lexical_ledger,
             .jev = opts.jev,
             .jev_request = kg_enumeration_text orelse "",
             .lesson_binding = if (learning_state.active()) &learning_state.binding else null,
@@ -3164,8 +3363,7 @@ fn runCounted(
                 // is fabricated. The exact action enters the common native
                 // slot/permission/sandbox/formal/budget dispatch below.
                 const block = try (msg.Block{ .tool_use = action }).dupe(allocator);
-                errdefer block.deinit(allocator);
-                try assistant_blocks.append(allocator, block);
+                try draft.appendBlockOwned(block);
                 rid_for_turn = .{ .bytes = action.id[4..16].* };
                 turn_stop_reason = .tool_use;
                 break :request_recovery;
@@ -3174,7 +3372,7 @@ fn runCounted(
             // respect the same dollar cap as the next logical turn.
             if (opts.cost_budget_usd) |budget| {
                 if (run_cost_usd >= budget)
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+                    return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls }) };
             }
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
@@ -3213,7 +3411,7 @@ fn runCounted(
                     // admits or refuses a child request on the wrong number.
                     .max_output_tokens = provider.maxTokensFor(opts.model_override),
                 }))
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+                    return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls }) };
             }
 
             // 击穿检测必须跟真实 provider 前缀走：swarm addendum 会改变 effective
@@ -3244,11 +3442,11 @@ fn runCounted(
                     effective_system_prompt,
                     provider_tool_defs,
                     opts.model_override,
-                ) catch return finishRun(backend, sess, trace_id, depth, .{
+                ) catch return .{ .stop = finishRun(backend, sess, trace_id, depth, .{
                     .stop_reason = .api_error,
                     .turns = turns,
                     .tool_calls = total_tool_calls,
-                })
+                }) }
             else
                 [_]u8{'0'} ** 64;
             // The provider attempt id must be unique within a Run. A mid-stream
@@ -3271,11 +3469,11 @@ fn runCounted(
                 @intCast(@min(attempt_generation, std.math.maxInt(u32))),
                 max_provider_attempts,
                 request_attempts_spent + 1,
-            )) return finishRun(backend, sess, trace_id, depth, .{
+            )) return .{ .stop = finishRun(backend, sess, trace_id, depth, .{
                 .stop_reason = .api_error,
                 .turns = turns,
                 .tool_calls = total_tool_calls,
-            });
+            }) };
 
             stream = provider.sendStreamRetry(
                 api_messages.items,
@@ -3312,7 +3510,7 @@ fn runCounted(
                 };
                 if (retry_ui.hasActiveAttempt() and
                     !retry_ui.finishAttempt(attempt_outcome, .unknown))
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                    return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }) };
                 backend.emitEvent(sess, .{ .diag_model_request = .{
                     .trace_id = trace_id,
                     .depth = depth,
@@ -3356,11 +3554,11 @@ fn runCounted(
                         .control = opts.compaction_control,
                     })) {
                         .retry => continue :request_recovery,
-                        .aborted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls }),
+                        .aborted => return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls }) },
                         // The owner recorded its terminal (a refused
                         // replacement, or the deferred request abandoned):
                         // its outcome, not a model failure, explains the stop.
-                        .owner_terminal => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }),
+                        .owner_terminal => return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }) },
                     },
                     error.ContextWindowExceeded => {
                         if (!recoverContextWindowExceeded(.{
@@ -3389,18 +3587,18 @@ fn runCounted(
                             .goal_meter = opts.goal_meter,
                             .control = opts.compaction_control,
                         })) {
-                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }) };
                         }
                         continue :request_recovery;
                     },
                     error.Aborted => {
                         log.warn("agent", "sendMessageStream aborted turn={d}", .{turns + 1});
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                        return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls }) };
                     },
                     else => |e| {
                         log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
                         model_error.noteRequestError(e);
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                        return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }) };
                     },
                 }
             };
@@ -3506,7 +3704,7 @@ fn runCounted(
                     .text => |text| {
                         backend.emitEvent(sess, .{ .text_chunk = text });
                         output_channel.note(text.len);
-                        try assistant_text.appendSlice(allocator, text);
+                        try draft.appendText(text);
                         visible_model_text_bytes += progress_updates_mod.visibleLen(text);
                         log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                         const admission = observeCandidate(
@@ -3526,7 +3724,7 @@ fn runCounted(
                         // preserved thinking:累加进 thinking_text,turn 末存入 thinking block,
                         // 下轮请求 serializeContent 回传给模型。
                         backend.emitEvent(sess, .{ .thinking_chunk = text });
-                        try thinking_text.appendSlice(allocator, text);
+                        try draft.appendThinking(text);
                         log.debugId("agent", rid, "thinking chunk bytes={d}", .{text.len});
                         const admission = observeCandidate(
                             opts.response_observer,
@@ -3554,8 +3752,7 @@ fn runCounted(
                         // verbose 的 `[Tool: name]` 行移到 backend(在 tool_start 渲染时打,
                         // 见 TuiBackend/WriterBackend);此处只入队 tool_use。
                         log.infoId("agent", rid, "tool_use queued id={s} name={s} input_bytes={d}", .{ tu.id, tu.name, tu.input_json.len });
-                        // stream 里 id/name/input_json 都是 owned；转移所有权给 tool_uses（不 dupe）
-                        try tool_uses.append(allocator, .{
+                        try draft.appendToolUseOwned(.{
                             .id = tu.id,
                             .name = tu.name,
                             .input = tu.input_json,
@@ -3583,7 +3780,7 @@ fn runCounted(
                                 true;
                         // A call after EnterWorktree / ExitWorktree waits for it: started
                         // now it would run in the directory being left.
-                        const after_root_move = for (tool_uses.items[0 .. tool_uses.items.len - 1]) |previous| {
+                        const after_root_move = for (draft.tool_uses.items[0 .. draft.tool_uses.items.len - 1]) |previous| {
                             if (tools_mod.movesWorkingRoot(previous.name)) break true;
                         } else false;
                         // A call the confirm gate marks must wait for its prompt;
@@ -3601,7 +3798,7 @@ fn runCounted(
                             if (!tools_mod.isConcurrencySafeInput(tu.name, canonical) or
                                 permission_mod.checkPermission(&pc_prefetch, tu.name, canonical) != .allow)
                                 break :prefetch;
-                            const last = &tool_uses.items[tool_uses.items.len - 1];
+                            const last = &draft.tool_uses.items[draft.tool_uses.items.len - 1];
                             canonical_owned = false;
                             prefetch.startOwned(&prefetch_ctx, last.id, last.name, canonical, rid);
                         }
@@ -3612,7 +3809,7 @@ fn runCounted(
                         // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
                         backend.emitEvent(sess, .{ .text_chunk = w.ui_text });
                         output_channel.note(w.ui_text.len);
-                        try assistant_text.appendSlice(allocator, w.ui_text);
+                        try draft.appendText(w.ui_text);
                         allocator.free(w.ui_text);
                         allocator.free(w.content_json);
                     },
@@ -3629,7 +3826,7 @@ fn runCounted(
                             candidate,
                             .{ .reasoning_item = item_json },
                         );
-                        reasoning_items.append(allocator, item_json) catch allocator.free(item_json);
+                        draft.appendReasoningOwned(item_json) catch {};
                         if (admission == .reject) {
                             candidate_rejected = true;
                             break;
@@ -3673,7 +3870,7 @@ fn runCounted(
             }
             ledger_outcome = if (aborted_during_stream) "client_disconnect" else if (stream_error) "failed" else "completed";
             if (!retry_ui.finishAttempt(provider_outcome, provider_metering))
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls }) };
 
             // message_start/message_delta usage 是同一个 provider response 的片段，而不是
             // 两个请求。只在成功收完整条响应后更新 token anchor 和 cache detector；否则
@@ -3721,7 +3918,7 @@ fn runCounted(
 
             log.infoId("agent", rid, "stream finished text_bytes={d} tool_uses={d} aborted={} err={}", .{
                 assistant_text.items.len,
-                tool_uses.items.len,
+                draft.tool_uses.items.len,
                 aborted_during_stream,
                 stream_error,
             });
@@ -3737,22 +3934,9 @@ fn runCounted(
                 // Join before freeing: a prefetch thread borrows the tool_use
                 // bytes about to be released.
                 prefetch.joinAll();
-                for (tool_uses.items) |tu| {
-                    allocator.free(tu.id);
-                    allocator.free(tu.name);
-                    allocator.free(tu.input);
-                }
-                tool_uses.clearRetainingCapacity();
-                // This path always returns, so the list is released outright
-                // rather than cleared for a re-issue that will not happen.
-                for (assistant_blocks.items) |b| b.deinit(allocator);
-                assistant_blocks.deinit(allocator);
-                assistant_text.clearRetainingCapacity();
+                draft.clear();
                 visible_model_text_bytes = 0;
-                thinking_text.clearRetainingCapacity();
-                for (reasoning_items.items) |item| allocator.free(item);
-                reasoning_items.clearRetainingCapacity();
-                return rejectedCandidateRun(
+                return .{ .stop = rejectedCandidateRun(
                     backend,
                     sess,
                     trace_id,
@@ -3762,7 +3946,7 @@ fn runCounted(
                     opts.response_observer,
                     &candidate_open,
                     candidate,
-                );
+                ) };
             }
 
             if (aborted_during_stream) {
@@ -3779,28 +3963,16 @@ fn runCounted(
                 // **先 join 预取线程**:它们 borrow tool_uses 的 id/name/input 字节,必须在下面 free
                 // 之前 join,否则在飞 Read/Grep 读已释放内存(Linus HIGH-1 UAF)。
                 prefetch.joinAll();
-                // tool_uses 累了一半但没收齐 content_block_stop 时可能残缺——弃掉（不 commit）。
-                for (tool_uses.items) |tu| {
-                    allocator.free(tu.id);
-                    allocator.free(tu.name);
-                    allocator.free(tu.input);
-                }
-                tool_uses.clearRetainingCapacity();
-
-                for (reasoning_items.items) |item| allocator.free(item);
-                reasoning_items.clearRetainingCapacity();
-                if (assistant_text.items.len > 0) {
-                    const text_owned = try allocator.dupe(u8, assistant_text.items);
-                    errdefer allocator.free(text_owned);
-                    try assistant_blocks.append(allocator, .{ .text = text_owned });
-                }
-                if (assistant_blocks.items.len > 0) {
-                    const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
+                if (try draft.finishPartialText()) |blocks_slice| {
+                    var blocks_owned = true;
+                    errdefer if (blocks_owned) {
+                        for (blocks_slice) |b| b.deinit(allocator);
+                        allocator.free(blocks_slice);
+                    };
                     try conversation.append(.{ .role = .assistant, .blocks = blocks_slice });
-                } else {
-                    assistant_blocks.deinit(allocator);
+                    blocks_owned = false;
                 }
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
             }
 
             // Stream error：不把残缺的 assistant_text / tool_uses commit 到 conversation
@@ -3819,43 +3991,23 @@ fn runCounted(
                 output_channel.close(.discarded, assistant_text.items);
                 // The segment this attempt's text and thinking belonged to.
                 const discarded_segment = output_channel.last_closed;
-                const can_recover_context_error = stream_context_window_exceeded and
-                    assistant_text.items.len == 0 and
-                    tool_uses.items.len == 0 and
-                    assistant_blocks.items.len == 0;
-                // Something the user could have watched: text, thinking or a
-                // tool call reached the backend in this attempt (usage and
-                // reasoning items are not shown).
-                const showed_output = assistant_text.items.len != 0 or
-                    thinking_text.items.len != 0 or
-                    tool_uses.items.len != 0 or
-                    assistant_blocks.items.len != 0;
+                const can_recover_context_error = stream_context_window_exceeded and !draft.hasSubstantiveOutput();
+                const showed_output = draft.hasVisibleOutput();
                 // The connection gave no answer at all (isSilentRetryFailure).
                 const connection_failure = isSilentRetryFailure(stream_failure);
                 // The response began a tool call: one the loop received, or
                 // one the parser saw open whose arguments never finished.
-                const tool_call_started = tool_uses.items.len != 0 or stream.toolCallStarted();
+                const tool_call_started = draft.tool_uses.items.len != 0 or stream.toolCallStarted();
                 // See STREAM_RETRIES_PER_REQUEST.
                 const request_retry_eligible = connection_failure and !tool_call_started;
                 const overloaded = if (stream_failure) |failure| failure == error.ServiceUnavailable else false;
                 const overload_attempts = providerAttemptLimit(opts.request_gate != null);
                 const attempts_used = stream_attempts;
-                const thinking_bytes: u64 = thinking_text.items.len;
+                const thinking_bytes: u64 = draft.thinking.items.len;
                 // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
                 prefetch.joinAll();
-                for (tool_uses.items) |tu| {
-                    allocator.free(tu.id);
-                    allocator.free(tu.name);
-                    allocator.free(tu.input);
-                }
-                tool_uses.clearRetainingCapacity();
-                for (assistant_blocks.items) |b| b.deinit(allocator);
-                assistant_blocks.clearRetainingCapacity();
-                assistant_text.clearRetainingCapacity();
+                draft.clear();
                 visible_model_text_bytes = 0;
-                thinking_text.clearRetainingCapacity();
-                for (reasoning_items.items) |item| allocator.free(item);
-                reasoning_items.clearRetainingCapacity();
                 if (can_recover_context_error) {
                     if (!recoverContextWindowExceeded(.{
                         .conversation = conversation,
@@ -3886,7 +4038,7 @@ fn runCounted(
                         .goal_meter = opts.goal_meter,
                         .control = opts.compaction_control,
                     })) {
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+                        return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls }) };
                     }
                     continue :request_recovery;
                 }
@@ -3927,7 +4079,7 @@ fn runCounted(
                         announceRetractedAttempt(backend, sess, discarded_segment, thinking_bytes, attempts_used, overload_attempts, @intCast(delay_ms));
                         if (!client_mod.interruptibleSleepMs(delay_ms, opts.abort)) {
                             log.warnId("agent", rid_for_turn, "aborted during stream retry backoff", .{});
-                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
                         }
                         continue :request_recovery;
                     }
@@ -3960,7 +4112,7 @@ fn runCounted(
                         );
                         if (!waitStreamRetryBackoff(opts.abort, opts.stream_retry_backoff_ms)) {
                             log.warnId("agent", rid_for_turn, "aborted during stream retry backoff", .{});
-                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
                         }
                     }
                     continue :request_recovery;
@@ -3969,91 +4121,47 @@ fn runCounted(
                     log.errId("agent", rid_for_turn, "stream failed after {d} attempt(s): {s}", .{ attempts_used, @errorName(error.ServiceUnavailable) });
                     last_error.noteAttempts(attempts_used);
                 }
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls }) };
             }
 
             break :request_recovery;
         }
         const rid = rid_for_turn;
 
-        // 4. 把 reasoning items + thinking + assistant text + tool_uses 组装成 Message
-        // 追加到 conversation。顺序:thinking block 先于 text(对齐 Anthropic content[] 规范;
-        // OpenAI-compatible 的 reasoning_content 平级字段由 request.zig 序列化时处理,
-        // block 顺序无害)。
-        // reasoning_item 排在最前:OpenAI Responses 的 `output` 就是 reasoning 在前,
-        // 回传 `input` 亦然(reasoning → message/function_call)。
-        // **不产出只有 reasoning 的 assistant 消息**:那种消息 buildApiMessages 会整条
-        // 跳过(Anthropic 的 content 数组会空),于是它永远不上 wire,却仍被
-        // estimateMessageTokens 按 REASONING_ITEM_TOKEN_ESTIMATE 计入——"发给模型的
-        // 投影"与"token 估算"就此分叉,估算单调虚高、误触发 auto-compact。何况一个
-        // 什么都没产出的回合,它的推理状态也没有可续的下文。这条不变式让
-        // buildApiMessages 的 n_substantive 守卫在本进程内不可能被触发。
-        const turn_has_content = assistant_text.items.len > 0 or tool_uses.items.len > 0 or assistant_blocks.items.len > 0;
-        if (!turn_has_content) {
-            for (reasoning_items.items) |item| allocator.free(item);
-            reasoning_items.clearRetainingCapacity();
-        }
-        // 逐项**先摘表再转移**:append/dupe 在 OOM 下失败时,已转移项不再留在
-        // reasoning_items 里,顶部 defer 与 assistant_blocks 的 errdefer 不会双释放。
-        while (reasoning_items.items.len > 0) {
-            const item_json = reasoning_items.orderedRemove(0);
-            errdefer allocator.free(item_json);
-            const model_owned = try allocator.dupe(u8, opts.model_override orelse provider.model());
-            errdefer allocator.free(model_owned);
-            try assistant_blocks.append(allocator, .{ .reasoning_item = .{
-                .model = model_owned,
-                .json = item_json,
-            } });
-        }
-        if (thinking_text.items.len > 0) {
-            const th_owned = try allocator.dupe(u8, thinking_text.items);
-            errdefer allocator.free(th_owned);
-            try assistant_blocks.append(allocator, .{ .thinking = th_owned });
-        }
-        if (assistant_text.items.len > 0) {
-            const text_owned = try allocator.dupe(u8, assistant_text.items);
-            errdefer allocator.free(text_owned);
-            try assistant_blocks.append(allocator, .{ .text = text_owned });
-        }
-        for (tool_uses.items) |tu| {
-            try assistant_blocks.append(allocator, .{ .tool_use = tu });
-        }
-        // 清空 tool_uses 的所有权转移表示：此后 tool_uses.items 内的字节归 assistant_blocks 所有
-        tool_uses.clearRetainingCapacity();
-
-        // The last question before the assembled message becomes Conversation
-        // state. A policy that can only decide once the response is complete
-        // answers here; one that already refused mid-stream never reaches it.
-        // `candidate_open` is only ever set from a non-null observer, which is
-        // what makes the unwrap below total.
-        if (candidate_open and assistant_blocks.items.len > 0 and
-            opts.response_observer.?.admit(candidate) == .reject)
-        {
-            log.warnId("agent", rid, "assembled candidate refused at commit, turn {d}", .{turns + 1});
-            output_channel.close(.discarded, assistant_text.items);
-            prefetch.joinAll();
-            for (assistant_blocks.items) |b| b.deinit(allocator);
-            assistant_blocks.deinit(allocator);
-            return rejectedCandidateRun(
-                backend,
-                sess,
-                trace_id,
-                depth,
-                turns + 1,
-                total_tool_calls,
-                opts.response_observer,
-                &candidate_open,
-                candidate,
-            );
-        }
-
-        if (assistant_blocks.items.len > 0) {
-            const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
+        const assembled_blocks = try draft.finishBlocks(
+            opts.model_override orelse provider.model(),
+            .{ .drop_reasoning_without_content = true },
+        );
+        if (assembled_blocks) |blocks_slice| {
+            var blocks_owned = true;
+            errdefer if (blocks_owned) {
+                prefetch.joinAll();
+                for (blocks_slice) |b| b.deinit(allocator);
+                allocator.free(blocks_slice);
+            };
+            if (candidate_open and opts.response_observer.?.admit(candidate) == .reject) {
+                log.warnId("agent", rid, "assembled candidate refused at commit, turn {d}", .{turns + 1});
+                output_channel.close(.discarded, assistant_text.items);
+                prefetch.joinAll();
+                for (blocks_slice) |b| b.deinit(allocator);
+                allocator.free(blocks_slice);
+                blocks_owned = false;
+                return .{ .stop = rejectedCandidateRun(
+                    backend,
+                    sess,
+                    trace_id,
+                    depth,
+                    turns + 1,
+                    total_tool_calls,
+                    opts.response_observer,
+                    &candidate_open,
+                    candidate,
+                ) };
+            }
             try conversation.append(.{ .role = .assistant, .blocks = blocks_slice, .origin = if (fast_action != null) .host else .participant });
+            blocks_owned = false;
             settleCandidate(opts.response_observer, &candidate_open, candidate, .committed);
         } else {
-            // 空响应，避免 deinit 释放已归还的 slice
-            assistant_blocks.deinit(allocator);
             settleCandidate(
                 opts.response_observer,
                 &candidate_open,
@@ -4088,14 +4196,14 @@ fn runCounted(
                 output_channel.close(.commentary, assistant_text.items);
                 verifier_gate.leads = .idle;
                 leads_just_ended = true;
-                switch (try verifierAfterLeads(allocator, &opts, &verifier_gate, provider, tool_defs, permission_ctx, sess, &check_gate_state, assistant_text.items)) {
+                switch (try verifierAfterLeads(allocator, &opts, verifier_gate, provider, tool_defs, permission_ctx, sess, check_gate_state, assistant_text.items)) {
                     .continue_run => |text| {
                         defer allocator.free(text);
                         output_channel.final_sealed = false;
                         try conversation.appendHostText(text);
-                        continue :outer_turn;
+                        return .continue_run;
                     },
-                    .exhausted => return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls }),
+                    .exhausted => return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls }) },
                     .stand => {},
                 }
             }
@@ -4109,19 +4217,19 @@ fn runCounted(
                 if (learning_state.phase == .distill) {
                     learning_state.distill_accepted = learning_state.binding.acceptedCount();
                     if (learning_turn_mod.afterDistill(learning_state.distill_accepted, learning_state.existing) == .reconcile) {
-                        const text = try learning_turn_mod.renderReconcile(allocator, &learning_state);
+                        const text = try learning_turn_mod.renderReconcile(allocator, learning_state);
                         defer allocator.free(text);
                         learning_state.startPass(.reconcile);
                         learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
                         log.infoId("agent", rid, "learning turn reconcile accepted={d} existing={d}", .{ learning_state.distill_accepted, learning_state.existing });
                         try conversation.appendHostText(text);
-                        continue;
+                        return .continue_run;
                     }
                 }
                 const report = learning_state.report(opts.learning_turn.?.mode);
                 learning_state.phase = .idle;
                 log.infoId("agent", rid, "learning turn done passes={d} lessons={d} refused={d}", .{ report.passes, report.lessons_accepted, report.lessons_refused });
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls }) };
             }
             if (turn_stop_reason == .max_tokens and continuation_streak >= MAX_CONTINUATIONS) {
                 // The provider cut this turn at its output-token limit again
@@ -4135,7 +4243,7 @@ fn runCounted(
                 // common tail and was reported as a completed answer.
                 output_channel.close(.partial, assistant_text.items);
                 log.warnId("agent", rid, "max_tokens continuation budget exhausted; last turn still truncated ({d} visible bytes)", .{assistant_text.items.len});
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_tokens_exhausted, .turns = turns + 1, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_tokens_exhausted, .turns = turns + 1, .tool_calls = total_tool_calls }) };
             }
             // Some Anthropic-compatible gateways accept but ignore a forced
             // tool_choice. `required_first` is stronger than a prompt hint:
@@ -4152,7 +4260,7 @@ fn runCounted(
                     // 会丢这段 partial 正文。
                     output_channel.close(.partial, assistant_text.items);
                     backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+                    return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls }) };
                 }
                 required_first_repairs += 1;
                 // 主机拒绝过早的"最终答案"并注入 required-first 修复 → 本段是过程
@@ -4170,7 +4278,7 @@ fn runCounted(
                 );
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                 try conversation.appendHostText(repair);
-                continue;
+                return .continue_run;
             }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
             // 注入 continue 提示让它接着写,而不是当作完成。最多连续 MAX_CONTINUATIONS 次。
@@ -4185,10 +4293,10 @@ fn runCounted(
                 backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuation_streak, .max = MAX_CONTINUATIONS } });
                 try conversation.appendHostText(if (assistant_text.items.len == 0) RESPOND_AFTER_SILENT_TRUNCATION else CONTINUE_AFTER_TRUNCATION);
                 continuation_pending = true;
-                continue;
+                return .continue_run;
             }
             const kg_pending = kgEnumerationPending(
-                &kg_lexical_ledger,
+                kg_lexical_ledger,
                 gated_tool_defs,
                 kg_enumeration_query_hint,
             );
@@ -4216,7 +4324,7 @@ fn runCounted(
                         .context => kg_retrieval_protocol.ENUMERATION_CONTEXT_REPAIR,
                         .none => unreachable,
                     });
-                    continue;
+                    return .continue_run;
                 }
                 // A second premature final is not accepted as a valid answer.
                 // Preserve the trace for audit and fail closed as a controlled
@@ -4224,7 +4332,7 @@ fn runCounted(
                 // 第二次未覆盖的"结论"不被接受为有效答案 → 已产出文本是 partial,不是 final。
                 output_channel.close(.partial, assistant_text.items);
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls }) };
             }
             // Verification obligation (task-agnostic process rule): a final
             // answer after an unverified mutation gets a bounded nudge with a
@@ -4244,7 +4352,7 @@ fn runCounted(
                     verification_progress_mod.FINAL_GATE_KNOWN_FAILING_TEXT
                 else
                     verification_progress_mod.FINAL_GATE_TEXT);
-                continue;
+                return .continue_run;
             }
             // Requirement-ledger closure obligation: a final answer with open
             // ledger items (or with mutations but no ledger despite the
@@ -4275,7 +4383,7 @@ fn runCounted(
                         );
                         defer allocator.free(nudge);
                         try conversation.appendHostText(nudge);
-                        continue;
+                        return .continue_run;
                     },
                     .coverage => {
                         _ = host_injection_meter.tryConsume();
@@ -4285,7 +4393,7 @@ fn runCounted(
                         log.infoId("agent", rid, "requirement ledger coverage nudge {d}/{d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                         try conversation.appendHostText(requirement_ledger_mod.COVERAGE_NUDGE_TEXT);
-                        continue;
+                        return .continue_run;
                     },
                     .shallow => {
                         _ = host_injection_meter.tryConsume();
@@ -4295,7 +4403,7 @@ fn runCounted(
                         log.infoId("agent", rid, "requirement ledger shallow nudge {d}/{d} total={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.total });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                         try conversation.appendHostText(requirement_ledger_mod.SHALLOW_NUDGE_TEXT);
-                        continue;
+                        return .continue_run;
                     },
                 }
             }
@@ -4320,7 +4428,7 @@ fn runCounted(
                     );
                     defer allocator.free(nudge);
                     try conversation.appendHostText(nudge);
-                    continue;
+                    return .continue_run;
                 }
             }
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
@@ -4357,7 +4465,7 @@ fn runCounted(
                     // so it stays the final segment.
                     if (opts.abort) |a| if (a.isAborted()) {
                         output_channel.close(.final, assistant_text.items);
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
                     };
                     // Escape hatch 2: queued user input wins; the exit stays unannounced and
                     // rides with that message through the next run's boundary drain.
@@ -4396,7 +4504,7 @@ fn runCounted(
                         output_channel.close(.commentary, assistant_text.items);
                         job_wakeups += 1;
                         log.info("agent", "job notification delivered after wait id={s} turn={d} wakeups={d}", .{ events[0].id[0..], turns + 1, job_wakeups });
-                        continue :outer_turn;
+                        return .continue_run;
                     }
                     @import("job_registry.zig").freeJobExitEvents(allocator, events);
                     if (opts.preview.monitor_events) {
@@ -4413,7 +4521,7 @@ fn runCounted(
                             output_channel.close(.commentary, assistant_text.items);
                             job_wakeups += 1;
                             log.info("agent", "monitor notification delivered after wait turn={d} wakeups={d}", .{ turns + 1, job_wakeups });
-                            continue :outer_turn;
+                            return .continue_run;
                         }
                     }
                     // Jobs ended but were already observed via BashOutput/KillShell: nothing to say.
@@ -4429,7 +4537,7 @@ fn runCounted(
                 test_integrity_state.rescan(allocator, opts.abort) catch |err| switch (err) {
                     error.Aborted => {
                         output_channel.close(.final, assistant_text.items);
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
                     },
                     error.OutOfMemory => return error.OutOfMemory,
                 };
@@ -4444,7 +4552,7 @@ fn runCounted(
                         // The host found weakened tests: this answer is not final.
                         output_channel.close(.commentary, assistant_text.items);
                         try conversation.appendHostText(text);
-                        continue :outer_turn;
+                        return .continue_run;
                     }
                 }
             }
@@ -4458,13 +4566,13 @@ fn runCounted(
                 // Where the work is now: a Run may have moved into a worktree.
                 const root = if (opts.host_services) |hs| hs.workingRoot() orelse opts.cwd_abs else opts.cwd_abs;
                 const cwd: ?[]const u8 = if (root.len > 0) root else null;
-                var outcome = check_gate_mod.runCheck(allocator, gate, cwd, opts.abort, &check_gate_state) catch |err| {
+                var outcome = check_gate_mod.runCheck(allocator, gate, cwd, opts.abort, check_gate_state) catch |err| {
                     backend.emitEvent(sess, .clear_current_tool);
                     switch (err) {
                         // Ctrl+C while the check ran: the answer before it stays final.
                         error.Aborted => {
                             output_channel.close(.final, assistant_text.items);
-                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
                         },
                         error.OutOfMemory => return error.OutOfMemory,
                     }
@@ -4486,14 +4594,14 @@ fn runCounted(
                     const verifier = opts.isolated_verifier.?;
                     verifier_gate.boundaries += 1;
                     backend.emitEvent(sess, .{ .set_current_tool = .{ .name = "running the isolated verifier" } });
-                    var vresult = try verifierSpawn(allocator, &verifier_gate, verifier, verifierDeps(&opts, provider, tool_defs, permission_ctx, sess), root, .{ .command = gate.command, .passed = outcome.passed, .total = outcome.total }, null);
+                    var vresult = try verifierSpawn(allocator, verifier_gate, verifier, verifierDeps(&opts, provider, tool_defs, permission_ctx, sess), root, .{ .command = gate.command, .passed = outcome.passed, .total = outcome.total }, null);
                     defer vresult.deinit();
                     backend.emitEvent(sess, .clear_current_tool);
                     log.infoId("agent", rid, "isolated verifier boundary={d} result={s}", .{ verifier_gate.boundaries, @tagName(vresult.outcome) });
                     if (opts.abort) |a| if (a.isAborted()) {
                         verifier_gate.dropSnapshot();
                         output_channel.close(.final, assistant_text.items);
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                        return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
                     };
                     const leads_round = verifier.mode == .enforce and vresult.outcome == .unverified and
                         check_gate_state.continuations < gate.max_continuations;
@@ -4512,25 +4620,25 @@ fn runCounted(
                         output_channel.close(.final, assistant_text.items);
                         output_channel.final_sealed = true;
                         try conversation.appendHostText(text);
-                        continue :outer_turn;
+                        return .continue_run;
                     }
-                    switch (try verifierConclude(allocator, &verifier_gate, verifier, gate, &check_gate_state, &vresult)) {
+                    switch (try verifierConclude(allocator, verifier_gate, verifier, gate, check_gate_state, &vresult)) {
                         .continue_run => |text| {
                             defer allocator.free(text);
                             output_channel.close(.commentary, assistant_text.items);
                             try conversation.appendHostText(text);
-                            continue :outer_turn;
+                            return .continue_run;
                         },
                         .stand, .exhausted => {},
                     }
                 }
                 if (decision == .continue_run) {
-                    const text = try check_gate_mod.renderContinuation(allocator, gate, &outcome, &check_gate_state);
+                    const text = try check_gate_mod.renderContinuation(allocator, gate, &outcome, check_gate_state);
                     defer allocator.free(text);
                     // 主机裁决没过 → 这段"结论"是过程信息,不是最终答案。
                     output_channel.close(.commentary, assistant_text.items);
                     try conversation.appendHostText(text);
-                    continue :outer_turn;
+                    return .continue_run;
                 }
             };
             // Stop hook (Claude Code semantics): every configured hook runs here
@@ -4543,7 +4651,7 @@ fn runCounted(
                 defer stop.deinit(allocator);
                 if (opts.abort) |a| if (a.isAborted()) {
                     output_channel.close(.final, assistant_text.items);
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
+                    return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls }) };
                 };
                 if (check_gate_mod.stopContinues(stop.blocked, check_gate_state.stop_hook_blocks)) {
                     check_gate_state.stop_hook_blocks += 1;
@@ -4553,7 +4661,7 @@ fn runCounted(
                     defer allocator.free(text);
                     output_channel.close(.commentary, assistant_text.items);
                     try conversation.appendHostText(text);
-                    continue :outer_turn;
+                    return .continue_run;
                 }
                 if (stop.blocked) log.warnId("agent", rid, "Stop hook asked to continue again; block budget {d} spent, finishing", .{check_gate_mod.MAX_STOP_HOOK_BLOCKS});
             };
@@ -4577,16 +4685,16 @@ fn runCounted(
                     const existing = try lesson_mod.collectForTask(allocator, store.?, learning_state.binding.task, learning_turn_mod.MAX_EXISTING_SHOWN);
                     defer lesson_mod.freeStored(allocator, existing);
                     learning_state.existing = existing.len;
-                    const text = try learning_turn_mod.renderDistill(allocator, &learning_state, existing);
+                    const text = try learning_turn_mod.renderDistill(allocator, learning_state, existing);
                     defer allocator.free(text);
                     output_channel.final_sealed = true;
                     learning_state.startPass(.distill);
                     learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
                     try conversation.appendHostText(text);
-                    continue :outer_turn;
+                    return .continue_run;
                 }
             };
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
+            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls }) };
         }
 
         // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加。
@@ -4724,7 +4832,7 @@ fn runCounted(
             .permission_ctx = @constCast(permission_ctx),
             .tasks = opts.tasks,
             .kg = opts.kg,
-            .kg_lexical_ledger = &kg_lexical_ledger,
+            .kg_lexical_ledger = kg_lexical_ledger,
             .jev = opts.jev,
             .jev_request = kg_enumeration_text orelse "",
             .lesson_binding = if (learning_state.active()) &learning_state.binding else null,
@@ -5092,7 +5200,7 @@ fn runCounted(
             s.pending_kind = null;
             s.pending_payload = null;
             log.infoId("agent", rid, "run SUSPENDED tool_use_id={s} kind={s} completed_siblings={d}", .{ s.id, kind, si.completed_results.len });
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si });
+            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si }) };
         }
 
         const observe_verification = opts.verification_checkpoint or
@@ -5196,7 +5304,7 @@ fn runCounted(
 
         if (result_blocks.items.len == 0) {
             result_blocks.deinit(allocator);
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls }) };
         }
 
         // Hooks and UI above observe the exact execution result. Only now do
@@ -5272,15 +5380,15 @@ fn runCounted(
         }
         if (opts.jev) |advisor| {
             if (advisor.advises(.enumeration_intent) and !kg_enumeration_judged and !kg_enumeration_query_hint and
-                kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, false) == .none and
-                kgEnumerationPending(&kg_lexical_ledger, gated_tool_defs, true) == .batch)
+                kgEnumerationPending(kg_lexical_ledger, gated_tool_defs, false) == .none and
+                kgEnumerationPending(kg_lexical_ledger, gated_tool_defs, true) == .batch)
             {
                 kg_enumeration_judged = true;
                 kg_enumeration_soft_hint = try judgeEnumerationIntent(advisor, allocator, opts, kg_enumeration_text.?);
             }
         }
         const kg_pending = kgEnumerationPending(
-            &kg_lexical_ledger,
+            kg_lexical_ledger,
             gated_tool_defs,
             kg_enumeration_query_hint or kg_enumeration_soft_hint,
         );
@@ -5299,7 +5407,7 @@ fn runCounted(
         if (harnessmm_enabled) {
             var certificate = try harnessmm.observe(conversation.messages.items[conversation.messages.items.len - 1], turns + 1);
             defer if (certificate) |*value| value.deinit();
-            if (certificate) |*value| try harnessmm_journal.?.append(allocator, value);
+            if (certificate) |*value| try driver.harnessmm_journal.*.?.append(allocator, value);
         }
         // The round's results are now the last message, one block per slot:
         // the stall gate anchors each key to the block the model will see.
@@ -5312,7 +5420,7 @@ fn runCounted(
             backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = environment_faults } });
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
             fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls }) };
         }
 
         // Stall gate (StallGate.lean): decided after the results are committed,
@@ -5325,7 +5433,7 @@ fn runCounted(
             if (mode == .enforce) {
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
                 fireStopHook(permission_ctx.hooks, allocator, conversation, "stalled", depth);
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .stalled, .turns = turns + 1, .tool_calls = total_tool_calls, .stall = report });
+                return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .stalled, .turns = turns + 1, .tool_calls = total_tool_calls, .stall = report }) };
             }
         };
 
@@ -5364,17 +5472,13 @@ fn runCounted(
             false,
         );
         if (compactStopReason(post_tool_compact, opts.abort)) |stop_reason| {
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns + 1, .tool_calls = total_tool_calls });
+            return .{ .stop = finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns + 1, .tool_calls = total_tool_calls }) };
         }
 
-        // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
-        // end_turn 路径在上方提前 return + diag_run_end 收口,故不重复发)。
         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+        return .continue_run;
     }
-
-    // 循环正常退出 = turns >= max_turns
-    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls });
-}
+};
 
 const KgEnumerationPending = enum { none, batch, context };
 
@@ -5608,7 +5712,7 @@ fn buildApiMessagesWithFeatures(
             if ((!notes.harnessmm and std.mem.startsWith(u8, text, harnessmm_mod.AUTHOR_MARKER)) or
                 (!notes.rsi and std.mem.startsWith(u8, text, @import("../skills/rsi.zig").PREFIX))) continue;
         }
-        try @import("metacodes-kernel").appendHistoryMessage(&out, allocator, m);
+        try kernel.appendHistoryMessage(&out, allocator, m);
     }
     if (synthetic_user_input) |synthetic_text| {
         if (synthetic_text.len > 0) {

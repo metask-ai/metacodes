@@ -213,7 +213,7 @@ def hygiene_check(binary: Path) -> List[str]:
         ("Write", {"file_path": "smoke/a.txt", "content": "alpha\nbeta\n"}),
         ("Read", {"file_path": "smoke/a.txt"}),
         ("Edit", {"file_path": "smoke/a.txt", "old_string": "beta", "new_string": "gamma"}),
-        ("Grep", {"pattern": "gamma", "path": "smoke"}),
+        ("ToolSearch", {"query": "select:TaskCreate,TaskList"}),
         ("TaskCreate", {"subject": "first", "description": "d"}),
         ("TaskList", {}),
     ]

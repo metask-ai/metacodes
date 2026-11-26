@@ -231,18 +231,21 @@ def _workbuddy_tool_policy_smoke(binary: Path, tinykg_binary: Path) -> None:
             json.loads(line)
             for line in request_log.read_text(encoding="utf-8").splitlines()
         ]
-        _require(len(rows) == 4, "WorkBuddy tool-policy request count drifted")
+        _require(len(rows) == 6, "WorkBuddy tool-policy request count drifted")
         hidden = set(WORKBUDDY_DISABLED_TOOLS.split(","))
-        required = {"KgRecall", "KgContext", "KgRemember", "TaskCreate", "TaskList", "TaskUpdate"}
-        for row in rows:
+        required = {"KgRecall", "KgContext", "KgRemember", "ToolSearch"}
+        task_tools = {"TaskCreate", "TaskList", "TaskUpdate"}
+        for index, row in enumerate(rows):
             exposed = set(row.get("tool_names", []))
             _require(exposed.isdisjoint(hidden), "WorkBuddy exposed a disabled interactive/swarm tool")
-            _require(required <= exposed, "WorkBuddy tool policy disabled TinyKG task/memory tools")
-        schema_hashes = {row.get("tool_schema_sha256") for row in rows}
-        _require(
-            len(schema_hashes) == 1,
-            "WorkBuddy tool schema drifted within or across identical fresh runs",
-        )
+            _require(required <= exposed, "WorkBuddy is missing memory tools or ToolSearch")
+            if index % 3 == 2:
+                _require(task_tools <= exposed, "WorkBuddy omitted the selected task tools")
+            else:
+                _require(task_tools.isdisjoint(exposed), "WorkBuddy advertised task tools before discovery")
+        hashes = [row["tool_schema_sha256"] for row in rows]
+        _require(hashes[0] == hashes[1], "WorkBuddy tool schema drifted before discovery")
+        _require(hashes[:3] == hashes[3:], "WorkBuddy tool schema drifted across identical fresh runs")
 
 
 def _base_env() -> Dict[str, str]:

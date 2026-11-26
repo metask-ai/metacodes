@@ -49,7 +49,7 @@
       "test_name": "L2 AgentDef.tools/disallowed_tools: 白名单与黑名单共同裁剪真实子请求",
       "feedback_step": "test:agentdef-fields",
       "assertion_markers": [
-        "tools: Read, Write, Grep",
+        "tools: Read, Write, ReadArtifact",
         "\\\"name\\\":\\\"Bash\\\""
       ]
     },

@@ -331,7 +331,8 @@ test "preview: monitor_events alone switches the Monitor tool to push events" {
         defer case.deinit();
         const arena = case.arena();
         if (scenario.saved) |saved| try case.write("state/config.json", saved);
-        var server = try harness.MockServer.start(ANTHROPIC_SSE, 0);
+        const search = try harness.toolSearchSse(arena, "select:Monitor");
+        var server = try harness.MockServer.startCassette(&.{ search, ANTHROPIC_SSE }, 0);
         defer server.stop();
         const url = try server.urlOwned(arena);
         var args: std.ArrayList([]const u8) = .empty;
@@ -340,7 +341,11 @@ test "preview: monitor_events alone switches the Monitor tool to push events" {
         const result = try case.run(&.{}, args.items);
         errdefer std.debug.print("monitor_events CLI exit {d}: {s}\n", .{ result.exit_code, result.stderr });
         try testing.expectEqual(@as(i32, 0), result.exit_code);
-        try testing.expectEqual(@as(usize, 1), server.requestCount());
+        try testing.expectEqual(@as(usize, 2), server.requestCount());
+        const first = try std.json.parseFromSlice(std.json.Value, arena, server.requestAt(0).?.body(), .{});
+        for (first.value.object.get("tools").?.array.items) |tool| {
+            try testing.expect(!std.mem.eql(u8, tool.object.get("name").?.string, "Monitor"));
+        }
         const parsed = try std.json.parseFromSlice(std.json.Value, arena, server.lastRequest().?.body(), .{});
         var monitor: ?std.json.Value = null;
         for (parsed.value.object.get("tools").?.array.items) |tool| {

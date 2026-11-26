@@ -28,8 +28,8 @@ metacodes 的 agent loop、形式化+本体论和基于证据自我迭代三条�
 | Profile | 插件 | 原生工具 |
 |---|---|---|
 | `none` | 无 | 无 |
-| `minimal` | `metacodes.core.minimal@1.0.0` | Read, Glob, Grep |
-| `offline-coding` | `metacodes.core.offline-coding@1.0.0` | ExecuteCode, Read, Write, Edit, Glob, Grep, Bash, BashOutput, KillShell |
+| `minimal` | `metacodes.core.minimal@1.0.0` | Read |
+| `offline-coding` | `metacodes.core.offline-coding@1.0.0` | ExecuteCode, Read, Write, Edit, Bash, BashOutput, KillShell |
 | `coding` | `metacodes.core.coding@1.0.0` | 在 offline-coding 上增加 WebSearch、WebFetch |
 | `coding-interactive` | coding + `metacodes.core.interaction@1.0.0` | coding 再增加 AskUserQuestion |
 
@@ -78,7 +78,7 @@ Runtime。热替换是 immutable generation replacement，不是修改活跃对�
 ### 3.1 System prompt 与缓存不变量
 
 Session 每次 Run 从同一份有效 `ToolCatalog` 同时生成 provider tool schema 和
-`# Using your tools`。Read/Edit/Write/Bash/Glob/Grep/CodeMap/Task 与 deferred catalog
+`# Using your tools`。Read/Edit/Write/Bash/Task 与 deferred catalog
 都按实际工具面投影；execution policy 或 provider capability 在 turn 边界继续缩窄工具时，
 普通工具指导、deferred catalog、Skill/子 Agent 章节及 TinyKG 的 recall/context/remember/task
 协议也一起缩窄。文本模式不会残留不存在的工具名。

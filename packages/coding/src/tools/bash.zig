@@ -1446,7 +1446,7 @@ test "BashTool embedding without JobRegistry still spools from byte zero" {
     try std.testing.expect(std.mem.indexOf(u8, tail.bytes, "EMBED_TAIL") != null);
 
     // No staging path reaches the model here either; the artifact id above is
-    // the whole recovery surface, and `Grep(artifact_id)` searches it in place.
+    // the recovery surface for the saved output.
     try std.testing.expect(parsed.value.object.get("stdout_path") == null);
 }
 

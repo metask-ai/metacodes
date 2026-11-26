@@ -10,6 +10,7 @@ only on the machine executing trials. No repository checkout is required.
 from __future__ import annotations
 
 import argparse
+import http.client
 import ipaddress
 import json
 import os
@@ -142,7 +143,7 @@ def stop_service(client):
         while time.monotonic() < deadline:
             client.request("api/workbench")
             time.sleep(0.1)
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         pass
 
 

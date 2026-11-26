@@ -1,24 +1,5 @@
 //! L2 regression for #494: the permission check and the executor read one
 //! spelling of a tool call's arguments.
-//!
-//! Defect 1: arguments naming a key twice (`"-i"` twice in a Grep call,
-//! `file_path` twice in a Read call) failed the permission layer's strict
-//! parse, and that failure became a deny. The model got `permission_denied`
-//! (category safety, not recoverable) for an argument mistake it could fix.
-//! Defect 2: Grep found its `path` by the substring `"path":`, so
-//! `"path" : "target.ts"` fell back to the working directory while the
-//! permission layer, parsing the JSON, judged `target.ts`.
-//!
-//! Fix: the agent loop admits a call's arguments before the hook, the
-//! permission check and the dispatch see them (`tools/common.canonicalizeArgs`):
-//! one JSON object with no duplicate key, in one canonical spelling, or a
-//! recoverable `invalid_args`. Executors read top-level members structurally
-//! (`extractJsonArg` / `util/json.topLevel*Field`).
-//!
-//! Crosses agent_loop → argument admission → permission decision → tools
-//! dispatch → Grep → the repository-pinned ripgrep. Y is the tool result the
-//! provider receives on the next request: an `invalid_args` error, or the
-//! lines a search of exactly `target.ts` returns.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -99,35 +80,6 @@ fn expectInvalidArgs(a: std.mem.Allocator, result_text: []const u8) !void {
     try std.testing.expect(err.get("recoverable").?.bool);
 }
 
-/// The repository-pinned ripgrep (#460 wiring), digest-checked.
-fn usePinnedRipgrep(path_buf: *[std.fs.max_path_bytes:0]u8) !bool {
-    const raw = std.c.getenv("METACODES_TEST_PINNED_RG") orelse return error.PinnedRipgrepNotWired;
-    const path = std.mem.span(raw);
-    if (std.mem.eql(u8, path, "unavailable")) return false;
-    const want = std.mem.span(std.c.getenv("METACODES_TEST_PINNED_RG_SHA256") orelse return error.PinnedRipgrepNotWired);
-    if (path.len >= path_buf.len) return error.NameTooLong;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const path_z = path_buf[0..path.len :0];
-    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
-    if (fd < 0) return error.PinnedRipgrepMissing;
-    defer pfs.close(fd);
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var chunk: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = pfs.read(fd, &chunk);
-        if (n < 0) return error.ReadFailed;
-        if (n == 0) break;
-        hasher.update(chunk[0..@intCast(n)]);
-    }
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    const got = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings(want, &got);
-    cc.util_toolchain.test_ripgrep_path_override = path_z;
-    return true;
-}
-
 /// Runs one tool turn through the CLI agent loop with `mode`, the workspace
 /// `root` as the tools' working directory, and returns the follow-up request
 /// body (owned) that carries the tool results.
@@ -146,17 +98,22 @@ fn runTurn(a: std.mem.Allocator, mode: cc.types_mod.PermissionMode, root: []cons
     defer client.deinit();
     var conversation = cc.conversation.Conversation.init(a);
     defer conversation.deinit();
-    try conversation.appendText(.user, "search the target");
+    try conversation.appendText(.user, "read the target");
     var permission = cc.permission.createContext(mode, a);
     permission.no_interactive_prompt = true;
     var null_backend = NullBackend{};
     const backend = null_backend.backend();
+    const names = [_][]const u8{"Read"};
+    var catalog = try cc.tool_catalog.Catalog.initBuiltins(a, &names);
+    defer catalog.deinit();
+    var selection = try cc.tool_catalog.Selection.init(a, &catalog, &names);
+    defer selection.deinit();
     const result = try cc.agent_loop.run(
         &conversation,
         client.provider(),
-        &.{},
+        selection.definitions,
         &permission,
-        .{ .max_turns = 2, .cwd_abs = root, .resolve_relative_paths = true },
+        .{ .max_turns = 2, .cwd_abs = root, .resolve_relative_paths = true, .tool_dispatcher = selection.dispatcher() },
         &backend,
         a,
     );
@@ -175,9 +132,8 @@ test "L2 #494: duplicate argument keys are a recoverable invalid_args in every p
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "decoy.ts", .data = "const decoy_needle = 2;\n" });
 
     const calls = [_]Call{
-        .{ .id = "tu_grep", .name = "Grep", .args = "{\"output_mode\":\"content\",\"path\":\"target.ts\",\"pattern\":\"needle\",\"-i\":true,\"-n\":true,\"glob\":\"*.ts\",\"-i\":true,\"-n\":true}" },
         .{ .id = "tu_read", .name = "Read", .args = "{\"file_path\":\"target.ts\",\"file_path\":\"decoy.ts\"}" },
-        .{ .id = "tu_nested", .name = "Grep", .args = "{\"pattern\":\"needle\",\"o\":{\"k\":1,\"k\":2}}" },
+        .{ .id = "tu_nested", .name = "Read", .args = "{\"file_path\":\"target.ts\",\"o\":{\"k\":1,\"k\":2}}" },
     };
     for ([_]cc.types_mod.PermissionMode{ .default, .bypass_permissions, .dont_ask }) |mode| {
         errdefer std.debug.print("mode={s}\n", .{@tagName(mode)});
@@ -191,38 +147,5 @@ test "L2 #494: duplicate argument keys are a recoverable invalid_args in every p
             try expectInvalidArgs(a, text);
         }
         try std.testing.expect(std.mem.indexOf(u8, body, "decoy_needle") == null);
-    }
-}
-
-test "L2 #494: whitespace before the colon names the same Grep path the permission check judged" {
-    var rg_buf: [std.fs.max_path_bytes:0]u8 = undefined;
-    if (!try usePinnedRipgrep(&rg_buf)) return error.SkipZigTest;
-    defer cc.util_toolchain.test_ripgrep_path_override = null;
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target.ts", .data = "const needle_in_target = 1;\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "decoy.ts", .data = "const needle_in_decoy = 2;\n" });
-
-    const body = try runTurn(a, .default, root, &.{
-        .{ .id = "tu_compact", .name = "Grep", .args = "{\"pattern\":\"needle\",\"path\":\"target.ts\",\"output_mode\":\"content\"}" },
-        .{ .id = "tu_spaced", .name = "Grep", .args = "{\"pattern\":\"needle\",\"path\" : \"target.ts\",\"output_mode\":\"content\"}" },
-        .{ .id = "tu_pretty", .name = "Grep", .args = "{\n  \"pattern\" :\t\"needle\",\n  \"path\"\n :  \"target.ts\" ,\n  \"output_mode\" : \"content\"\n}" },
-    });
-    defer a.free(body);
-    const compact = try toolResult(a, body, "tu_compact");
-    defer a.free(compact);
-    errdefer std.debug.print("compact: {s}\n", .{compact});
-    try std.testing.expect(std.mem.indexOf(u8, compact, "needle_in_target") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "needle_in_decoy") == null);
-    // Before #494 the spaced spellings searched the whole working directory
-    // and returned the decoy line too.
-    for ([_][]const u8{ "tu_spaced", "tu_pretty" }) |id| {
-        const text = try toolResult(a, body, id);
-        defer a.free(text);
-        errdefer std.debug.print("{s}: {s}\n", .{ id, text });
-        try std.testing.expectEqualStrings(compact, text);
     }
 }

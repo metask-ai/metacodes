@@ -34,7 +34,7 @@ pub const PASS_MAX_TURNS: u32 = 6;
 pub const MAX_EXISTING_SHOWN: usize = 6;
 /// Tools that run during a learning pass; every other call is refused with a
 /// tool error, so the workspace the check judged is the one the run returns.
-pub const ALLOWED_TOOLS = [_][]const u8{ "Read", "Grep", "Glob", "KgRecall", "KgContext", "KgRemember" };
+pub const ALLOWED_TOOLS = [_][]const u8{ "Read", "KgRecall", "KgContext", "KgRemember" };
 
 const MAX_EXISTING_BYTES: usize = 600;
 
@@ -308,7 +308,7 @@ pub fn renderDistill(allocator: std.mem.Allocator, state: *const State, existing
     try w.writeAll("Rules: copy the first line exactly; the host rejects any other header. ");
     try w.writeAll(verdictRule(state.binding.verdict));
     try w.writeAll("Make a causal claim only where your own trajectory supports it; put the rest under uncertain. " ++
-        "Write nothing if this attempt taught nothing reusable. Only Read, Grep, Glob, KgRecall, KgContext and KgRemember run in this turn; " ++
+        "Write nothing if this attempt taught nothing reusable. Only Read, KgRecall, KgContext and KgRemember run in this turn; " ++
         "do not change any file. End with one line saying what you recorded.");
     return out.toOwnedSlice();
 }

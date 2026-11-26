@@ -16,6 +16,35 @@ pub const Options = struct {
     hooks: []const types.Hook = &.{},
 };
 
+pub fn StepOutcome(comptime Result: type) type {
+    return union(enum) {
+        continue_run,
+        stop: Result,
+    };
+}
+
+pub fn drive(
+    comptime Result: type,
+    context: anytype,
+    comptime limit: fn (@TypeOf(context)) u32,
+    comptime isAborted: fn (@TypeOf(context)) bool,
+    comptime step: anytype,
+    comptime onAborted: fn (@TypeOf(context), u32) Result,
+    comptime onLimit: fn (@TypeOf(context), u32) Result,
+    comptime abort_precedes_limit: bool,
+) !Result {
+    var turns: u32 = 0;
+    while (true) {
+        if (abort_precedes_limit and isAborted(context)) return onAborted(context, turns);
+        if (turns >= limit(context)) return onLimit(context, turns);
+        if (!abort_precedes_limit and isAborted(context)) return onAborted(context, turns);
+        switch (try step(context, turns)) {
+            .continue_run => turns += 1,
+            .stop => |result| return result,
+        }
+    }
+}
+
 pub fn run(options: Options) types.Outcome {
     var events: types.Dispatcher = .{ .hooks = options.hooks };
     events.emit(.agent_start);
@@ -24,29 +53,59 @@ pub fn run(options: Options) types.Outcome {
     return outcome;
 }
 
-fn runTurns(options: Options, events: *types.Dispatcher) types.Outcome {
-    var outcome: types.Outcome = .{ .stop = .completed, .turns = 0 };
-    while (true) {
-        if (options.abort.isAborted()) {
-            outcome.stop = .aborted;
-            return outcome;
-        }
-        if (outcome.turns == options.max_turns) {
-            outcome.stop = .max_turns;
-            return outcome;
-        }
-        outcome.turns += 1;
-        events.emit(.{ .turn_start = outcome.turns });
-        const step = runTurn(options, events, outcome.turns);
-        events.emit(.{ .turn_end = outcome.turns });
-        const next = step catch |err| {
-            outcome.stop = if (options.abort.isAborted()) .aborted else .{ .failed = err };
-            return outcome;
-        };
-        outcome.stop_reason = next.stop_reason;
-        outcome.stop = next.stop orelse continue;
-        return outcome;
+const RunTurnsContext = struct {
+    options: Options,
+    events: *types.Dispatcher,
+    stop_reason: ai.StopReason = .unknown,
+
+    fn limit(ctx: *RunTurnsContext) u32 {
+        return ctx.options.max_turns;
     }
+
+    fn isAborted(ctx: *RunTurnsContext) bool {
+        return ctx.options.abort.isAborted();
+    }
+
+    fn onAborted(ctx: *RunTurnsContext, turns: u32) types.Outcome {
+        return .{ .stop = .aborted, .turns = turns, .stop_reason = ctx.stop_reason };
+    }
+
+    fn onLimit(ctx: *RunTurnsContext, turns: u32) types.Outcome {
+        return .{ .stop = .max_turns, .turns = turns, .stop_reason = ctx.stop_reason };
+    }
+
+    fn step(ctx: *RunTurnsContext, completed_turns: u32) error{}!StepOutcome(types.Outcome) {
+        const turn = completed_turns + 1;
+        ctx.events.emit(.{ .turn_start = turn });
+        const next_step = runTurn(ctx.options, ctx.events, turn);
+        ctx.events.emit(.{ .turn_end = turn });
+        const next = next_step catch |err| {
+            return .{ .stop = .{
+                .stop = if (ctx.options.abort.isAborted()) .aborted else .{ .failed = err },
+                .turns = turn,
+                .stop_reason = ctx.stop_reason,
+            } };
+        };
+        ctx.stop_reason = next.stop_reason;
+        if (next.stop) |stop| {
+            return .{ .stop = .{ .stop = stop, .turns = turn, .stop_reason = next.stop_reason } };
+        }
+        return .continue_run;
+    }
+};
+
+fn runTurns(options: Options, events: *types.Dispatcher) types.Outcome {
+    var ctx: RunTurnsContext = .{ .options = options, .events = events };
+    return drive(
+        types.Outcome,
+        &ctx,
+        RunTurnsContext.limit,
+        RunTurnsContext.isAborted,
+        RunTurnsContext.step,
+        RunTurnsContext.onAborted,
+        RunTurnsContext.onLimit,
+        true,
+    ) catch unreachable;
 }
 
 const Step = struct {
@@ -100,38 +159,47 @@ fn runTools(options: Options, events: *types.Dispatcher, calls: []const types.To
     defer for (tasks) |*task| task.deinit();
     var turn_arena: std.heap.ArenaAllocator = .init(gpa);
     defer turn_arena.deinit();
-    const arena = turn_arena.allocator();
-    var hook_failure: ?anyerror = null;
-    var start: usize = 0;
-    while (start < tasks.len) {
-        const end = executor.batchEnd(tasks, start);
-        const batch = tasks[start..end];
+    var ctx = ToolBatchContext{ .options = options, .events = events, .arena = turn_arena.allocator() };
+    try executor.dispatchBatches(tasks, &ctx, ToolBatchContext.mode, ToolBatchContext.execute, false);
+    try appendResults(options.conversation, events, tasks);
+    if (ctx.hook_failure) |err| return err;
+}
+
+const ToolBatchContext = struct {
+    options: Options,
+    events: *types.Dispatcher,
+    arena: std.mem.Allocator,
+    hook_failure: ?anyerror = null,
+
+    fn mode(_: *ToolBatchContext, task: executor.Task) ?types.ExecutionMode {
+        return task.executionMode();
+    }
+
+    fn execute(ctx: *ToolBatchContext, batch: []executor.Task, _: ?types.ExecutionMode) !void {
+        const options = ctx.options;
         for (batch) |*task| {
-            events.emit(.{ .tool_start = task.call });
+            ctx.events.emit(.{ .tool_start = task.call });
             if (options.abort.isAborted()) {
                 task.result = executor.aborted_result;
                 continue;
             }
-            gate(options.hooks, arena, task) catch |err| {
-                hook_failure = hook_failure orelse err;
+            gate(options.hooks, ctx.arena, task) catch |err| {
+                ctx.hook_failure = ctx.hook_failure orelse err;
                 task.result = .{ .content = @errorName(err), .is_error = true };
             };
         }
-        executor.runBatch(gpa, batch, options.abort, events);
+        executor.runBatch(options.stream_gpa, batch, options.abort, ctx.events);
         for (batch) |*task| {
             for (options.hooks) |hook| {
                 const after = hook.after_tool orelse continue;
-                after(hook.context, arena, task.call, &task.result.?) catch |err| {
-                    hook_failure = hook_failure orelse err;
+                after(hook.context, ctx.arena, task.call, &task.result.?) catch |err| {
+                    ctx.hook_failure = ctx.hook_failure orelse err;
                 };
             }
-            events.emit(.{ .tool_end = .{ .call = task.call, .result = task.result.? } });
+            ctx.events.emit(.{ .tool_end = .{ .call = task.call, .result = task.result.? } });
         }
-        start = end;
     }
-    try appendResults(options.conversation, events, tasks);
-    if (hook_failure) |err| return err;
-}
+};
 
 fn gate(hooks: []const types.Hook, arena: std.mem.Allocator, task: *executor.Task) !void {
     if (task.tool == null) {
@@ -210,7 +278,7 @@ fn streamReply(options: Options, events: *types.Dispatcher) !Reply {
     const tools = if (request.tools.items.len == 0) null else request.tools.items;
     const handle = try options.provider.sendStream(request.messages.items, request.system, tools, options.abort, request.model_override, request.tool_choice, "");
     defer handle.deinit();
-    var draft: Draft = .{ .gpa = options.conversation.allocator, .stream_gpa = options.stream_gpa };
+    var draft: StreamDraft = .init(options.conversation.allocator, options.stream_gpa);
     defer draft.deinit();
     errdefer if (draft.started) events.emit(.{ .message_discarded = .assistant });
     while (try handle.next()) |event| try draft.take(events, event);
@@ -256,42 +324,174 @@ fn carriesContent(item: message.Message) bool {
     return false;
 }
 
-const Draft = struct {
+pub const AssistantDraft = struct {
     gpa: std.mem.Allocator,
-    stream_gpa: std.mem.Allocator,
     text: std.ArrayList(u8) = .empty,
     thinking: std.ArrayList(u8) = .empty,
     reasoning: std.ArrayList([]u8) = .empty,
     tool_uses: std.ArrayList(message.ToolUse) = .empty,
+    blocks: std.ArrayList(message.Block) = .empty,
+
+    pub const FinishOptions = struct {
+        drop_reasoning_without_content: bool = false,
+    };
+
+    pub fn init(gpa: std.mem.Allocator) AssistantDraft {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(draft: *AssistantDraft) void {
+        draft.clear();
+        draft.text.deinit(draft.gpa);
+        draft.thinking.deinit(draft.gpa);
+        draft.reasoning.deinit(draft.gpa);
+        draft.tool_uses.deinit(draft.gpa);
+        draft.blocks.deinit(draft.gpa);
+    }
+
+    pub fn clear(draft: *AssistantDraft) void {
+        for (draft.blocks.items) |block| block.deinit(draft.gpa);
+        draft.blocks.clearRetainingCapacity();
+        draft.text.clearRetainingCapacity();
+        draft.thinking.clearRetainingCapacity();
+        for (draft.reasoning.items) |json| draft.gpa.free(json);
+        draft.reasoning.clearRetainingCapacity();
+        for (draft.tool_uses.items) |tool_use| freeToolUse(draft.gpa, tool_use);
+        draft.tool_uses.clearRetainingCapacity();
+    }
+
+    pub fn hasVisibleOutput(draft: *const AssistantDraft) bool {
+        return draft.text.items.len != 0 or
+            draft.thinking.items.len != 0 or
+            draft.tool_uses.items.len != 0 or
+            draft.blocks.items.len != 0;
+    }
+
+    pub fn hasSubstantiveOutput(draft: *const AssistantDraft) bool {
+        return draft.text.items.len != 0 or
+            draft.tool_uses.items.len != 0 or
+            draft.blocks.items.len != 0;
+    }
+
+    pub fn appendText(draft: *AssistantDraft, bytes: []const u8) !void {
+        try draft.text.appendSlice(draft.gpa, bytes);
+    }
+
+    pub fn appendThinking(draft: *AssistantDraft, bytes: []const u8) !void {
+        try draft.thinking.appendSlice(draft.gpa, bytes);
+    }
+
+    pub fn appendReasoningOwned(draft: *AssistantDraft, json: []u8) !void {
+        draft.reasoning.append(draft.gpa, json) catch |err| {
+            draft.gpa.free(json);
+            return err;
+        };
+    }
+
+    pub fn appendToolUseOwned(draft: *AssistantDraft, tool_use: message.ToolUse) !void {
+        draft.tool_uses.append(draft.gpa, tool_use) catch |err| {
+            freeToolUse(draft.gpa, tool_use);
+            return err;
+        };
+    }
+
+    pub fn appendBlockOwned(draft: *AssistantDraft, block: message.Block) !void {
+        draft.blocks.append(draft.gpa, block) catch |err| {
+            block.deinit(draft.gpa);
+            return err;
+        };
+    }
+
+    pub fn finishPartialText(draft: *AssistantDraft) !?[]message.Block {
+        for (draft.tool_uses.items) |tool_use| freeToolUse(draft.gpa, tool_use);
+        draft.tool_uses.clearRetainingCapacity();
+        for (draft.reasoning.items) |json| draft.gpa.free(json);
+        draft.reasoning.clearRetainingCapacity();
+        draft.thinking.clearRetainingCapacity();
+        if (draft.text.items.len > 0) {
+            const owned = try draft.gpa.dupe(u8, draft.text.items);
+            errdefer draft.gpa.free(owned);
+            try draft.blocks.append(draft.gpa, .{ .text = owned });
+        }
+        if (draft.blocks.items.len == 0) return null;
+        return try draft.blocks.toOwnedSlice(draft.gpa);
+    }
+
+    pub fn finishBlocks(draft: *AssistantDraft, model: []const u8, options: FinishOptions) !?[]message.Block {
+        if (options.drop_reasoning_without_content and !draft.hasSubstantiveOutput()) {
+            for (draft.reasoning.items) |json| draft.gpa.free(json);
+            draft.reasoning.clearRetainingCapacity();
+        }
+        const extra = draft.reasoning.items.len +
+            @as(usize, @intFromBool(draft.thinking.items.len > 0)) +
+            @as(usize, @intFromBool(draft.text.items.len > 0)) +
+            draft.tool_uses.items.len;
+        try draft.blocks.ensureUnusedCapacity(draft.gpa, extra);
+        if (draft.reasoning.items.len > 0) {
+            const models = try draft.gpa.alloc([]u8, draft.reasoning.items.len);
+            var duped: usize = 0;
+            errdefer {
+                for (models[0..duped]) |owned_model| draft.gpa.free(owned_model);
+                draft.gpa.free(models);
+            }
+            for (models) |*slot| {
+                slot.* = try draft.gpa.dupe(u8, model);
+                duped += 1;
+            }
+            defer draft.gpa.free(models);
+            for (draft.reasoning.items, models) |json, owned_model| {
+                draft.blocks.appendAssumeCapacity(.{ .reasoning_item = .{ .model = owned_model, .json = json } });
+            }
+            draft.reasoning.clearRetainingCapacity();
+        }
+        if (draft.thinking.items.len > 0) {
+            const owned = try draft.gpa.dupe(u8, draft.thinking.items);
+            draft.blocks.appendAssumeCapacity(.{ .thinking = owned });
+        }
+        if (draft.text.items.len > 0) {
+            const owned = try draft.gpa.dupe(u8, draft.text.items);
+            draft.blocks.appendAssumeCapacity(.{ .text = owned });
+        }
+        for (draft.tool_uses.items) |tool_use| {
+            draft.blocks.appendAssumeCapacity(.{ .tool_use = tool_use });
+        }
+        draft.tool_uses.clearRetainingCapacity();
+        if (draft.blocks.items.len == 0) return null;
+        return try draft.blocks.toOwnedSlice(draft.gpa);
+    }
+};
+
+const StreamDraft = struct {
+    assistant: AssistantDraft,
+    stream_gpa: std.mem.Allocator,
     started: bool = false,
 
-    fn start(draft: *Draft, events: *types.Dispatcher) void {
+    fn init(gpa: std.mem.Allocator, stream_gpa: std.mem.Allocator) StreamDraft {
+        return .{ .assistant = .init(gpa), .stream_gpa = stream_gpa };
+    }
+
+    fn start(draft: *StreamDraft, events: *types.Dispatcher) void {
         if (draft.started) return;
         draft.started = true;
         events.emit(.{ .message_start = .assistant });
     }
 
-    fn deinit(draft: *Draft) void {
-        draft.text.deinit(draft.gpa);
-        draft.thinking.deinit(draft.gpa);
-        for (draft.reasoning.items) |json| draft.gpa.free(json);
-        draft.reasoning.deinit(draft.gpa);
-        for (draft.tool_uses.items) |tool_use| freeToolUse(draft.gpa, tool_use);
-        draft.tool_uses.deinit(draft.gpa);
+    fn deinit(draft: *StreamDraft) void {
+        draft.assistant.deinit();
     }
 
-    fn take(draft: *Draft, events: *types.Dispatcher, event: ai.StreamEvent) !void {
+    fn take(draft: *StreamDraft, events: *types.Dispatcher, event: ai.StreamEvent) !void {
         switch (event) {
             .text => |text| {
                 defer draft.stream_gpa.free(text);
                 draft.start(events);
-                try draft.text.appendSlice(draft.gpa, text);
+                try draft.assistant.appendText(text);
                 events.emit(.{ .message_update = .{ .text = text } });
             },
             .thinking => |text| {
                 defer draft.stream_gpa.free(text);
                 draft.start(events);
-                try draft.thinking.appendSlice(draft.gpa, text);
+                try draft.assistant.appendThinking(text);
                 events.emit(.{ .message_update = .{ .thinking = text } });
             },
             .tool_use_start => |tool_use| {
@@ -301,20 +501,14 @@ const Draft = struct {
                     draft.stream_gpa.free(tool_use.input_json);
                 }
                 draft.start(events);
-                const owned = try dupeToolUse(draft.gpa, .{ .id = tool_use.id, .name = tool_use.name, .input = tool_use.input_json });
-                draft.tool_uses.append(draft.gpa, owned) catch |err| {
-                    freeToolUse(draft.gpa, owned);
-                    return err;
-                };
+                const owned = try dupeToolUse(draft.assistant.gpa, .{ .id = tool_use.id, .name = tool_use.name, .input = tool_use.input_json });
+                try draft.assistant.appendToolUseOwned(owned);
             },
             .reasoning_item => |json| {
                 defer draft.stream_gpa.free(json);
                 draft.start(events);
-                const owned = try draft.gpa.dupe(u8, json);
-                draft.reasoning.append(draft.gpa, owned) catch |err| {
-                    draft.gpa.free(owned);
-                    return err;
-                };
+                const owned = try draft.assistant.gpa.dupe(u8, json);
+                try draft.assistant.appendReasoningOwned(owned);
             },
             .web_search_result => |result| {
                 draft.stream_gpa.free(result.ui_text);
@@ -325,36 +519,8 @@ const Draft = struct {
         }
     }
 
-    fn finish(draft: *Draft, model: []const u8) !?message.Message {
-        const gpa = draft.gpa;
-        const count = draft.reasoning.items.len + draft.tool_uses.items.len +
-            @intFromBool(draft.thinking.items.len != 0) + @intFromBool(draft.text.items.len != 0);
-        if (count == 0) return null;
-        const blocks = try gpa.alloc(message.Block, count);
-        errdefer gpa.free(blocks);
-        var filled: usize = 0;
-        errdefer for (blocks[0..filled]) |block| gpa.free(block.reasoning_item.model);
-        for (draft.reasoning.items) |json| {
-            blocks[filled] = .{ .reasoning_item = .{ .model = try gpa.dupe(u8, model), .json = json } };
-            filled += 1;
-        }
-        const thinking: ?[]u8 = if (draft.thinking.items.len != 0) try draft.thinking.toOwnedSlice(gpa) else null;
-        errdefer if (thinking) |owned| gpa.free(owned);
-        const text: ?[]u8 = if (draft.text.items.len != 0) try draft.text.toOwnedSlice(gpa) else null;
-        if (thinking) |owned| {
-            blocks[filled] = .{ .thinking = owned };
-            filled += 1;
-        }
-        if (text) |owned| {
-            blocks[filled] = .{ .text = owned };
-            filled += 1;
-        }
-        for (draft.tool_uses.items) |tool_use| {
-            blocks[filled] = .{ .tool_use = tool_use };
-            filled += 1;
-        }
-        draft.reasoning.clearRetainingCapacity();
-        draft.tool_uses.clearRetainingCapacity();
+    fn finish(draft: *StreamDraft, model: []const u8) !?message.Message {
+        const blocks = try draft.assistant.finishBlocks(model, .{}) orelse return null;
         return .{ .role = .assistant, .blocks = blocks };
     }
 };

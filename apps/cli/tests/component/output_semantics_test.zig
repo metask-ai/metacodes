@@ -245,9 +245,10 @@ test "L2 输出语义:工具调用前的文本是 commentary,end_turn 的文本�
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(&tmp, &root_buf);
 
-    const glob_input = try std.fmt.allocPrint(a, "{{\"pattern\":\"*.none\",\"path\":\"{s}\"}}", .{root});
-    defer a.free(glob_input);
-    const turn1 = try textThenToolSse(a, "m1", "Let me look around.", "Glob", glob_input);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fixture.txt", .data = "task evidence" });
+    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/fixture.txt\"}}", .{root});
+    defer a.free(read_input);
+    const turn1 = try textThenToolSse(a, "m1", "Let me look around.", "Read", read_input);
     defer a.free(turn1);
     const turn2 = try textSseAlloc(a, "m2", "Nothing there.", "end_turn");
     defer a.free(turn2);
@@ -469,18 +470,19 @@ test "L2 输出语义:required_first 修复轮的文本是 commentary,段协议�
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(&tmp, &root_buf);
 
-    // turn1:路由未满足就交"答案"(违约,触发 repair);turn2:补上 Glob 调用
+    // turn1:路由未满足就交"答案"(违约,触发 repair);turn2:补上 Read 调用
     // (满足路由);turn3:真正的最终答案。
     const premature = try textSseAlloc(a, "m1", "I am done now.", "end_turn");
     defer a.free(premature);
-    const glob_input = try std.fmt.allocPrint(a, "{{\"pattern\":\"*.none\",\"path\":\"{s}\"}}", .{root});
-    defer a.free(glob_input);
-    const comply = try textThenToolSse(a, "m2", "Let me comply.", "Glob", glob_input);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fixture.txt", .data = "task evidence" });
+    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/fixture.txt\"}}", .{root});
+    defer a.free(read_input);
+    const comply = try textThenToolSse(a, "m2", "Let me comply.", "Read", read_input);
     defer a.free(comply);
     const answer = try textSseAlloc(a, "m3", "All set.", "end_turn");
     defer a.free(answer);
 
-    var scenario = try runCassetteRouted(a, &.{ premature, comply, answer }, root, null, 2, "Glob");
+    var scenario = try runCassetteRouted(a, &.{ premature, comply, answer }, root, null, 2, "Read");
     defer scenario.deinit();
 
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, scenario.result.stop_reason);
@@ -519,7 +521,7 @@ test "L2 输出语义:required_first 修复额度耗尽 fail-closed,partial 正�
     const try3 = try textSseAlloc(a, "m3", "try three", "end_turn");
     defer a.free(try3);
 
-    var scenario = try runCassetteRouted(a, &.{ try1, try2, try3 }, root, null, 2, "Glob");
+    var scenario = try runCassetteRouted(a, &.{ try1, try2, try3 }, root, null, 2, "Read");
     defer scenario.deinit();
 
     // MAX_REQUIRED_FIRST_REPAIRS=2:两次修复后第三次违约 fail-closed。

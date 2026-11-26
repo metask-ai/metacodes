@@ -92,7 +92,7 @@ AgentLoop 构造 effective tool set
 
 | 动作族 | 第一阶段用途 | 终止事实 |
 |---|---|---|
-| `Read` / `Grep` / `Glob` / `CodeMap` / `FindSymbol` | 查证需求、定位定义、收集证据 | tool observation |
+| `Read` / `Bash` | 查证需求、定位定义、收集证据 | tool observation |
 | `RunTests` / `ReviewDiff` / `ProjectRuleCheck` | 验证变更与收尾 | 测试、project/Lean verdict |
 | `KgRecall` / `KgContext` | 只读地补充已准入记忆 | TinyKG read receipt |
 | `Write` / `Edit` / `ApplyPatch` / `Bash` | 第二阶段只做风险排序或建议 | 真实 effect + re-observation |

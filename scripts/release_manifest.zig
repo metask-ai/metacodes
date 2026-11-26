@@ -259,7 +259,7 @@ pub fn main(init: std.process.Init) !void {
             .upstream = ripgrep_pin.source_repository,
             .license = ripgrep_pin.license,
             .license_path = "share/licenses/ripgrep-LICENSE-MIT",
-            .purpose = "Glob/Grep execution dependency",
+            .purpose = "bundled workspace search executable",
         },
         .{
             .role = "runtime_asset",
@@ -340,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
                 .storage_format_version = tinykg_contract.storage_format_version,
                 .store_schema_version = tinykg_contract.store_schema_version,
             }},
-            .fails_without = &.{.{ .component = "ripgrep", .effect = "Grep / Glob unavailable" }},
+            .fails_without = &.{.{ .component = "ripgrep", .effect = "bundled rg unavailable" }},
             .degraded_without = &.{
                 .{ .component = "tinykg", .effect = "KG memory/task degrade; agent loop unaffected" },
                 .{ .component = "tinykgd", .effect = "no shared KG service; sessions use the exclusive TinyKG CLI store" },

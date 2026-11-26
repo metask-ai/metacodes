@@ -2,14 +2,14 @@ const std = @import("std");
 const json = @import("metacodes-ai").json;
 const util_json = @import("metacodes-base").util.json;
 
+const code_map_tool = @import("tools/code_map.zig");
+const find_symbol_tool = @import("tools/find_symbol.zig");
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
 const apply_patch_tool = @import("tools/apply_patch.zig");
 const task_batch_tool = @import("tools/task_batch.zig");
-const glob_tool = @import("tools/glob.zig");
 const bash_tool = @import("tools/bash.zig");
-const grep_tool = @import("tools/grep.zig");
 const bash_output_tool = @import("tools/bash_output.zig");
 const read_artifact_tool = @import("tools/read_artifact.zig");
 const task_output_tool = @import("tools/task_output.zig");
@@ -31,8 +31,6 @@ const formal_task_audit = @import("formal/task_audit.zig");
 const agent_tool = @import("tools/agent.zig");
 const tool_search_tool = @import("tools/tool_search.zig");
 const web_search_tool = @import("tools/web_search.zig");
-const code_map_tool = @import("tools/code_map.zig");
-const find_symbol_tool = @import("tools/find_symbol.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const ToolDispatcher = @import("tools/context.zig").ToolDispatcher;
@@ -208,40 +206,8 @@ pub const registry: []const ToolEntry = &.{
         .result_production = .input_derived,
     },
     .{
-        .name = "Glob",
-        .description = "Find files matching a glob pattern",
-        .describe_fn = descriptions.describeGlob,
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "pattern", .type = "string", .description = "The glob pattern to match files against (e.g. **/*.zig)" },
-            .{ .name = "path", .type = "string", .description = "The directory to search in (defaults to cwd)" },
-        }, .required = &.{"pattern"} },
-        .execute = .{ .result_body = glob_tool.executeBody },
-        .replay = .read_only,
-        .result_production = .byte_zero_spool,
-        .runtime_dependency = .ripgrep,
-    },
-    .{
-        .name = "Grep",
-        .description = "Search for patterns in files, or inside a recovered tool-result artifact, using ripgrep",
-        .describe_fn = descriptions.describeGrep,
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "pattern", .type = "string", .description = "The regular expression pattern to search for in file contents" },
-            .{ .name = "path", .type = "string", .description = "File or directory to search in (defaults to cwd)" },
-            .{ .name = "artifact_id", .type = "string", .description = "Search a recovered tool-result artifact instead of a path. Use the sha256 artifact_id from a truncated result to find the part you need in one call, rather than paging it with ReadArtifact. Mutually exclusive with path; output_mode must be content or count" },
-            .{ .name = "glob", .type = "string", .description = "Glob pattern to filter files (e.g. *.zig)" },
-            .{ .name = "output_mode", .type = "string", .description = "Output mode", .enum_values = &.{ "content", "files_with_matches", "count" } },
-            .{ .name = "-i", .type = "boolean", .description = "Case insensitive search" },
-            .{ .name = "-n", .type = "boolean", .description = "Show line numbers (content mode)" },
-        }, .required = &.{"pattern"} },
-        .execute = .{ .result_body = grep_tool.executeBody },
-        .replay = .read_only,
-        .result_production = .byte_zero_spool,
-        .runtime_dependency = .ripgrep,
-    },
-    // CodeMap:代码结构大纲(LSP documentSymbol,Y2 砍 tree-sitter 后)。排在搜索工具之后、Bash
-    // 之前——和 Grep/Glob 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。
-    .{
         .name = "CodeMap",
+        .deferred = true,
         .description = "Produce a structural outline of source code: functions, types, classes, " ++
             "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
             "plain-text, config, JSON, or docs). Pass a file path for one file, or a glob (e.g. " ++
@@ -257,13 +223,11 @@ pub const registry: []const ToolEntry = &.{
         .replay = .read_only,
         .result_production = .byte_zero_spool,
     },
-    // FindSymbol:跨文件找符号*定义*(LSP documentSymbol)。常驻默认工具菜单——A/B 实验(2026-06-08,
-    // 192 次真模型)证明 deferred(藏 ToolSearch 后)致"找定义题"压不动(命中率仅 17%,
-    // p=0.156 不显著),模型大量退回 Grep/ToolSearch。提为默认后无需激活即可直接调。
     .{
         .name = "FindSymbol",
+        .deferred = true,
         .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
-            "Unlike Grep (which returns all occurrences), this returns only definitions, with " ++
+            "Returns definitions with " ++
             "file:line and signature. Use this to jump to a function/type/class definition by " ++
             "name when you don't know which file it lives in. Requires an installed language " ++
             "server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); an " ++
@@ -277,18 +241,14 @@ pub const registry: []const ToolEntry = &.{
         .replay = .read_only,
         .result_production = .byte_zero_spool,
     },
-    // Bash 排在所有文件/搜索专用工具(Read/Write/Edit/Glob/Grep)之后,对齐 mecode 的
-    // 工具顺序(default.md 工具清单:…Glob, Grep, NotebookEdit, Bash…)。MiniMax 类模型
-    // 对工具顺序敏感:Bash(万能工具)若排在 Grep 前,模型易"先看到 Bash 就用",
-    // 即便提示词写了"用 Grep 别用 Bash grep"。把 Bash 后置降低这种误选。
     .{
         .name = "Bash",
-        .description = "Execute a bash command",
+        .description = "Run shell commands for workspace searches, builds, tests, and Git.",
         .describe_fn = descriptions.describeBash,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "command", .type = "string", .description = "The command to execute" },
             .{ .name = "description", .type = "string", .description = "Clear, concise description of what this command does in 5-10 words" },
-            .{ .name = "timeout", .type = "integer", .description = "Optional timeout in milliseconds (max 600000)" },
+            .{ .name = "timeout", .type = "integer", .description = std.fmt.comptimePrint("Foreground timeout in milliseconds (default {d}, maximum {d})", .{ bash_tool.DEFAULT_TIMEOUT_MS, bash_tool.MAX_TIMEOUT_MS }) },
             .{ .name = "run_in_background", .type = "boolean", .description = "Set to true to run this command in the background" },
         }, .required = &.{"command"} },
         .execute = .{ .result_body = bash_tool.executeBody },
@@ -296,6 +256,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "BashOutput",
+        .deferred = true,
         .description = "A backgrounded job's exit is announced to you automatically; you do not need to call this in a loop. Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks plus status (running|exited|killed). On a running job the call waits (default 30 seconds, maximum 600 seconds) until the job exits, or returns at once when unread output already fills the result (returned_on \"backlog\": page on with the cursors). until=\"output\" returns on the first unread byte instead (to stream a Monitor), until=\"quiet\" once output pauses for quiet_ms, until=\"pattern\" once output past the cursor contains pattern (pattern_match gives the channel and byte offset; pass it as *_since_byte to read from there; if the search could not reach the end in time, pattern_searched_to says where to resume it). Set wait_ms to 0 for a snapshot. returned_on names what ended the call. Back-to-back waiting polls that keep returning only a few bytes of a still-running job (a progress ticker) engage poll_guard: later waits ignore progress output and may run up to poll_guard.min_wait_ms even when wait_ms is shorter, and a page smaller than 256 bytes (a tiny max_bytes) no longer counts as full; page through a backlog with wait_ms 0. A pattern match ends any wait, guarded or not, and clears the guard's count. Omit stdout_since_byte/stderr_since_byte to continue from the last read, or pass an explicit offset to override it. Do not re-poll in a loop or sleep between polls: one BashOutput call waits for it. max_bytes caps a single read; omit it to get as much as the context budget allows (maximum 262144, and a large explicit value may still be reduced to fit that budget). To follow a long job, pass the previous stdout_next_offset/stderr_next_offset as the next stdout_since_byte/stderr_since_byte — those are the resume cursors. stdout_total_bytes/stderr_total_bytes report the file's current size, NOT a cursor: using them as one skips everything between what was shown and the end of the file. NOTE: if the command used shell redirection (>/>>/2>), the redirected output went to the file you named and BashOutput will not show it — Read that file directly.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to read" },
@@ -325,6 +286,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KillShell",
+        .deferred = true,
         .description = "Terminate a running backgrounded Bash job by job_id",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "job_id", .type = "string", .description = "The id of the backgrounded Bash job to terminate" },
@@ -333,6 +295,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Monitor",
+        .deferred = true,
         .description = "Start a background monitor that runs a command and streams stdout line-by-line. Its exit is announced to you automatically. Use to watch logs, poll status, or react to file changes mid-conversation. Each stdout line is collected into a ring buffer readable via BashOutput(job_id, until=\"output\") as lines arrive; a plain BashOutput waits up to wait_ms for the monitor to exit. Stop with KillShell(job_id). Args: command (required), description (required, e.g. 'errors in /var/log/app.log'). Optional: persistent (default false; if true, no timeout).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "command", .type = "string", .description = "Shell command to run; each stdout line becomes an event" },
@@ -401,7 +364,20 @@ pub const registry: []const ToolEntry = &.{
         .execute = .{ .legacy_inline = push_notification_tool.execute },
     },
     .{
+        .name = "ScheduleWakeup",
+        .description = "Schedule the next one-shot check-in for a requested task in this live session. Choose a delay from 60 to 3600 seconds, explain it, and pass the prompt to resume. A new call replaces the pending wakeup. Set stop to cancel it. Fixed schedules are managed separately with CronCreate, CronList and CronDelete via ToolSearch.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "delaySeconds", .type = "integer", .description = "Delay in seconds, clamped to 60..3600. Required unless stopping." },
+            .{ .name = "prompt", .type = "string", .description = "Instructions for the next check-in. Required unless stopping." },
+            .{ .name = "reason", .type = "string", .description = "Short reason for the chosen delay. Required unless stopping." },
+            .{ .name = "noop", .type = "boolean", .description = "Whether this iteration found no change. Required unless stopping." },
+            .{ .name = "stop", .type = "boolean", .description = "Cancel the pending dynamic wakeup in this session." },
+        } },
+        .execute = .{ .legacy_inline = cron_tool.wakeupExecute },
+    },
+    .{
         .name = "CronCreate",
+        .deferred = true,
         .description = "Schedule a prompt to fire at a future time. Recurring (cron) or one-shot (delaySeconds). Args: cron (5-field 'M H DoM Mon DoW') OR delaySeconds; prompt (required); recurring (default true). Session-scoped, fires when you return to the prompt. Returns job id.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "prompt", .type = "string", .description = "The prompt to enqueue at each fire time" },
@@ -413,6 +389,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CronDelete",
+        .deferred = true,
         .description = "Cancel a scheduled cron job by id.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "id", .type = "string", .description = "The id of the cron job to cancel" },
@@ -421,6 +398,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CronList",
+        .deferred = true,
         .description = "List all scheduled cron jobs in this session.",
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
         .execute = .{ .legacy_inline = cron_tool.listExecute },
@@ -534,6 +512,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskCreate",
+        .deferred = true,
         .description = "Create a task in the in-session task list. Returns the new task id. Use for multi-step work you want to track across turns.",
         .describe_fn = descriptions.describeTaskCreate,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -545,6 +524,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskGet",
+        .deferred = true,
         .description = "Fetch a task by id. For persistent kg-* tasks this also returns a bounded TinyKG task_packet with parent objective, dependencies, evidence, truncation diagnostics and continuations. Call it after restart/compaction or whenever claim could not return a packet; do not work from the title alone.",
         .describe_fn = descriptions.describeTaskGet,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -554,6 +534,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskList",
+        .deferred = true,
         .description = "List the live task frontier. For kg-* tasks select only an open, ready, unclaimed leaf; then claim it with TaskUpdate status=in_progress before work. This is a summary/projection, so use TaskGet/task_packet for full recovery context.",
         .describe_fn = descriptions.describeTaskList,
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
@@ -561,6 +542,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskUpdate",
+        .deferred = true,
         .description = "Update a task's status (pending/in_progress/completed/failed/deleted) and/or fields. For persistent kg-* tasks: claim with in_progress before work (the successful response contains the bounded task_packet); completed/failed are terminal while preserving the stable id; deleted is only a compatibility alias for failed. Close every claimed task with a verified conclusion and actual acts_on/uses/produces when known, then inspect the returned frontier.",
         .describe_fn = descriptions.describeTaskUpdate,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -581,6 +563,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskStop",
+        .deferred = true,
         .description = "Stop a task by id. For a backgrounded agent job (agent_* id, or agent_job_id arg), requests termination of the running subagent. For a todo task id, marks it completed (shortcut for TaskUpdate status=completed).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The task id (todo id or agent_* job id) to stop" },
@@ -590,6 +573,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskOutput",
+        .deferred = true,
         .description = "Read a backgrounded Task subagent by agent_job_id. Omit since_byte to start at offset 0 and wait up to 30 seconds for the first output or terminal status; pass since_byte = previous output_next_offset to wait for incremental output. output_total_bytes is retained as the next cursor for compatibility; output_size_bytes reports the current total. When done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "agent_job_id", .type = "string", .description = "The backgrounded agent job id to read" },
@@ -811,8 +795,6 @@ pub fn toToolDefinitionsFull(
     const tinykg_on = if (prompt_ctx) |pc| pc.tinykg_enabled else true;
     // ToolSearch 是 deferred 工具的发现/激活入口。没有任何 deferred 工具时仍广告它，
     // 会诱导模型对已经带完整 schema 的常驻工具做 select:Write/KgRecall，徒增一轮。
-    // 静态内置当前全常驻；MCP 动态工具 deferred=true。未来若静态工具重新 deferred，
-    // 此门会自动把 ToolSearch 放回。
     var has_deferred = false;
     for (registry) |tool| {
         if (tool.swarm_gated and !teams_on) continue;
@@ -992,14 +974,6 @@ fn fieldSpecs(name: []const u8) []const FieldSpec {
         .{ .name = "command", .ty = .string },
         .{ .name = "timeout", .ty = .integer },
         .{ .name = "run_in_background", .ty = .boolean },
-    };
-    if (std.mem.eql(u8, name, "Grep")) return &.{
-        .{ .name = "pattern", .ty = .string },
-        .{ .name = "path", .ty = .string },
-    };
-    if (std.mem.eql(u8, name, "Glob")) return &.{
-        .{ .name = "pattern", .ty = .string },
-        .{ .name = "path", .ty = .string },
     };
     return &.{};
 }
@@ -1314,13 +1288,13 @@ fn similarity(a: []const u8, b: []const u8) f32 {
 
 /// 工具是否可与同批工具并发执行(对齐 cc isConcurrencySafe)。
 /// 安全 = 只读 + 不写任何共享态(或写的共享态已线程安全)。
-///   Read(read_state 已加锁)/Glob/Grep/WebFetch/BashOutput → safe。
+///   Read(read_state 已加锁)/ReadArtifact/WebFetch/BashOutput → safe。
 ///   WebSearch 的静态分类仍保守为 unsafe；tool_exec 只有在 ToolContext 提供 per-call
 ///   provider factory 时才动态升级为 safe，并由专用 admission gate 限制并发为 2。
 ///   Write/Edit/Bash/Task*/NotebookEdit/MCP/Skill 等有副作用或写共享态 → unsafe。
 /// 一期按工具名判定(cc 是 per-input;cc-zig 工具名足够,Bash 即便 readonly 也保守串行)。
 pub fn isConcurrencySafe(name: []const u8) bool {
-    const safe = [_][]const u8{ "Read", "ReadArtifact", "Glob", "Grep", "WebFetch", "BashOutput" };
+    const safe = [_][]const u8{ "Read", "ReadArtifact", "WebFetch", "BashOutput" };
     for (safe) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }
@@ -1386,7 +1360,7 @@ test "isConcurrencySafeInput: wrapper 剥离后判 readonly" {
 
 test "isConcurrencySafeInput: 非 Bash 工具沿用名单" {
     try std.testing.expect(isConcurrencySafeInput("Read", "{\"file_path\":\"/x\"}"));
-    try std.testing.expect(isConcurrencySafeInput("Grep", "{\"pattern\":\"x\"}"));
+    try std.testing.expect(isConcurrencySafeInput("ReadArtifact", "{}"));
     try std.testing.expect(!isConcurrencySafeInput("Write", "{\"file_path\":\"/x\",\"content\":\"y\"}"));
     try std.testing.expect(!isConcurrencySafeInput("Edit", "{\"file_path\":\"/x\"}"));
 }
@@ -1395,9 +1369,7 @@ test "getTool by name" {
     try std.testing.expect(getTool("Read") != null);
     try std.testing.expect(getTool("Write") != null);
     try std.testing.expect(getTool("Edit") != null);
-    try std.testing.expect(getTool("Glob") != null);
     try std.testing.expect(getTool("Bash") != null);
-    try std.testing.expect(getTool("Grep") != null);
     try std.testing.expect(getTool("BashOutput") != null);
     try std.testing.expect(getTool("KillShell") != null);
     try std.testing.expect(getTool("WebFetch") != null);
@@ -1586,8 +1558,6 @@ test "ToolExecutor result_body preserves a native byte-zero artifact receipt" {
 
 test "native byte-zero roster is declared and wired through typed executors" {
     const expected = [_][]const u8{
-        "Glob",
-        "Grep",
         "CodeMap",
         "FindSymbol",
         "Bash",
@@ -1615,12 +1585,20 @@ test "dispatch returns UnknownTool when missing everywhere" {
     try std.testing.expectError(error.UnknownTool, dispatch(&ctx, "NoSuchTool", "{}"));
 }
 
+test "removed workspace builtins have no executor or normalized alias" {
+    var ctx = ToolContext.simple(std.testing.allocator);
+    for ([_][]const u8{ "Glob", "Grep", "glob_tool", "grep" }) |name| {
+        try std.testing.expect(getTool(name) == null);
+        try std.testing.expect(resolveToolNameExact(&ctx, name) == null);
+        try std.testing.expectError(error.UnknownTool, dispatch(&ctx, name, "{}"));
+    }
+}
+
 test "resolveToolNameExact: 大小写/分隔归一化命中真工具" {
     var ctx = ToolContext.simple(std.testing.allocator);
     // 小写、全大写、连字符/空格 → 归一化命中(无损等价变换)。
     try std.testing.expectEqualStrings("Read", resolveToolNameExact(&ctx, "read").?);
     try std.testing.expectEqualStrings("Read", resolveToolNameExact(&ctx, "READ").?);
-    try std.testing.expectEqualStrings("Grep", resolveToolNameExact(&ctx, "grep").?);
     try std.testing.expectEqualStrings("Bash", resolveToolNameExact(&ctx, "bash").?);
 }
 
@@ -1648,11 +1626,9 @@ test "suggestToolName: 模糊近似作建议(≥0.7),差太远返 null" {
 }
 
 test "dispatch: 确定性归一化幻觉名改派到真工具(端到端)" {
-    // "grep"(大小写幻觉,归一化无损)→ resolveToolNameExact → "Grep" → 真执行。Grep 缺 pattern
-    // 会返错,但**不是 UnknownTool**——证明改派发生了(名字被归一化,进了 Grep 的执行/校验)。
     var ctx = ToolContext.simple(std.testing.allocator);
     ctx.cwd_abs = ".";
-    const err = dispatch(&ctx, "grep", "{}");
+    const err = dispatch(&ctx, "read", "{}");
     if (err) |r| {
         var outcome = r;
         outcome.deinit(std.testing.allocator);
@@ -1672,9 +1648,7 @@ test {
     _ = &write_tool;
     _ = &edit_tool;
     _ = &@import("tools/file_target.zig");
-    _ = &glob_tool;
     _ = &bash_tool;
-    _ = &grep_tool;
     _ = &bash_output_tool;
     _ = &kill_shell_tool;
     _ = &monitor_tool;

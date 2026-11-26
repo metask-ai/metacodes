@@ -104,8 +104,8 @@ const SKILL_THEN_GLOB_SSE =
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_serial_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\\\"root-policy\\\"}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
-    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_serial_glob\",\"name\":\"Glob\",\"input\":{}}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"**/*\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_serial_fetch\",\"name\":\"WebFetch\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"url\\\":\\\"https://example.invalid/\\\",\\\"prompt\\\":\\\"Summarize\\\"}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
@@ -7716,7 +7716,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     const builtins = [_]wire.BytesViewV1{
         sdk.bytesView("Read"),
         sdk.bytesView("Write"),
-        sdk.bytesView("Glob"),
+        sdk.bytesView("WebFetch"),
     };
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
@@ -7775,7 +7775,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     const allowed = [_]wire.BytesViewV1{
         sdk.bytesView("Read"),
         sdk.bytesView("Write"),
-        sdk.bytesView("Glob"),
+        sdk.bytesView("WebFetch"),
     };
     var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
     host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
@@ -7874,7 +7874,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         api.session().runText(
             session,
             2,
-            sdk.bytesView("Activate root-policy, then Glob in the same response."),
+            sdk.bytesView("Activate root-policy, then WebFetch in the same response."),
             &options,
             &result,
             &diagnostic,
@@ -7883,7 +7883,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     try std.testing.expectEqual(@as(u32, 2), result.tool_calls);
     const serial_body = (server.lastRequest() orelse
         return error.NoRequestCaptured).body();
-    const serial_result = std.mem.indexOf(u8, serial_body, "tu_serial_glob") orelse
+    const serial_result = std.mem.indexOf(u8, serial_body, "tu_serial_fetch") orelse
         return error.MissingSerializedToolResult;
     try std.testing.expect(
         std.mem.indexOfPos(
@@ -16400,7 +16400,6 @@ test "L2 issue #494: duplicate argument keys are a recoverable invalid_args, and
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "decoy.txt", .data = "ISSUE494_DECOY_LINE\n" });
 
         const tool_sse = try issue494ToolTurnSse(a, &.{
-            .{ .id = "tu_grep_dup", .name = "Grep", .args = "{\"output_mode\":\"content\",\"path\":\"target.txt\",\"pattern\":\"ISSUE494\",\"-i\":true,\"-n\":true,\"glob\":\"*.txt\",\"-i\":true,\"-n\":true}" },
             .{ .id = "tu_read_dup", .name = "Read", .args = "{\"file_path\":\"target.txt\",\"file_path\":\"decoy.txt\"}" },
             .{ .id = "tu_read_compact", .name = "Read", .args = "{\"file_path\":\"target.txt\"}" },
             .{ .id = "tu_read_space", .name = "Read", .args = "{\"file_path\" : \"target.txt\"}" },
@@ -16417,7 +16416,7 @@ test "L2 issue #494: duplicate argument keys are a recoverable invalid_args, and
         const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
         var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
         defer api.bufferRelease()(&diagnostic);
-        const builtins = [_]wire.BytesViewV1{ sdk.bytesView("Grep"), sdk.bytesView("Read") };
+        const builtins = [_]wire.BytesViewV1{sdk.bytesView("Read")};
         var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
         runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
         runtime_config.builtin_tools = &builtins;
@@ -16467,12 +16466,10 @@ test "L2 issue #494: duplicate argument keys are a recoverable invalid_args, and
         // Before #494 both duplicate-key calls came back as a non-recoverable
         // permission_denied: the permission digest refused the arguments and
         // its caller turned that into a deny, in every permission mode.
-        for ([_][]const u8{ "tu_grep_dup", "tu_read_dup" }) |id| {
-            const text = try issue494ToolResult(a, follow_up, id);
-            defer a.free(text);
-            try std.testing.expect(std.mem.indexOf(u8, text, "permission_denied") == null);
-            try expectIssue494InvalidArgs(a, text);
-        }
+        const duplicate_result = try issue494ToolResult(a, follow_up, "tu_read_dup");
+        defer a.free(duplicate_result);
+        try std.testing.expect(std.mem.indexOf(u8, duplicate_result, "permission_denied") == null);
+        try expectIssue494InvalidArgs(a, duplicate_result);
         // Neither spelling of the duplicate was read: the decoy never reached the model.
         try std.testing.expect(std.mem.indexOf(u8, follow_up, "ISSUE494_DECOY_LINE") == null);
         // `"file_path" : "target.txt"` is the same argument as the compact
@@ -16735,6 +16732,29 @@ const win_cost = struct {
     extern "kernel32" fn K32GetProcessMemoryInfo(process: HANDLE, counters: *ProcessMemoryCountersEx, cb: u32) callconv(.winapi) i32;
 };
 
+fn openIdleStreamingSession(
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle,
+    config: *const wire.SessionCreateConfigV1,
+    callbacks: *const wire.SessionCallbacksV1,
+    diagnostic: *wire.OwnedBytesV1,
+) !*wire.SessionHandle {
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, config, callbacks, &session, diagnostic));
+    const handle = session orelse return error.MissingSession;
+    errdefer _ = api.session().destroy()(handle, diagnostic);
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(handle, 1, sdk.bytesView("stream once, then idle"), &options, &result, diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    return handle;
+}
+
 test "L2 #503 Sessions idling after a streaming Run keep at most their provider's two Io workers, and on Windows no 16 MiB commit each" {
     const idle_sessions = 4;
     const a = std.testing.allocator;
@@ -16772,28 +16792,26 @@ test "L2 #503 Sessions idling after a streaming Run keep at most their provider'
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
 
-    const baseline = ProcessCost.now();
+    var baseline = ProcessCost.now();
+    if (@import("builtin").os.tag == .windows) {
+        const warmup = try openIdleStreamingSession(api, runtime, &session_config, &callbacks, &diagnostic);
+        try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(warmup, &diagnostic));
+        baseline.threads = ProcessCost.processThreadCount() orelse return error.ThreadCountUnavailable;
+    }
+    errdefer std.debug.print("#503 process cost: baseline {any}, after Session teardown {any}\n", .{ baseline, ProcessCost.now() });
     var sessions = [_]?*wire.SessionHandle{null} ** idle_sessions;
     defer for (sessions) |session| if (session) |handle| {
         _ = api.session().destroy()(handle, &diagnostic);
     };
     for (&sessions) |*session| {
-        try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &session_config, &callbacks, session, &diagnostic));
-        var options = std.mem.zeroes(wire.RunOptionsV1);
-        options.struct_size = @sizeOf(wire.RunOptionsV1);
-        options.max_turns = 1;
-        var result = std.mem.zeroes(wire.RunResultV1);
-        try std.testing.expectEqual(
-            wire.STATUS_OK,
-            api.session().runText(session.*, 1, sdk.bytesView("stream once, then idle"), &options, &result, &diagnostic),
-        );
-        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+        session.* = try openIdleStreamingSession(api, runtime, &session_config, &callbacks, &diagnostic);
     }
 
     // Idle: the stream liveness monitor leaves within a tick of the last
     // request. What stays per Session is its provider's Io pool, at most the
     // two workers std's connect used.
     var idle = ProcessCost.now();
+    errdefer std.debug.print("#503 idle process cost: {any}\n", .{idle});
     var waited_ms: u64 = 0;
     if (baseline.threads) |before| {
         while (idle.threads.? > before + 2 * idle_sessions and waited_ms < 5_000) : (waited_ms += 50) {

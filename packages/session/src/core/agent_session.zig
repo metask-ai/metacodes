@@ -61,7 +61,7 @@ pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_part
 /// Process-level tools (Task, Cron, KG, MCP, worktree, notifications, etc.) are
 /// deliberately rejected at Runtime creation instead of being advertised with
 /// null Host state. Membership here is a name-level claim only: built-ins that
-/// additionally need an external executable (Glob/Grep → ripgrep) are verified
+/// declare an external executable dependency are verified
 /// at catalog admission and fail Runtime creation with
 /// `error.ToolDependencyUnavailable` when the executable cannot be resolved.
 /// WebSearch is a Session-owned network capability backed by the configured
@@ -83,7 +83,7 @@ pub const TEAM_BUILTIN_TOOLS = [_][]const u8{ "TeamCreate", "TeamDelete", "SendM
 /// (as the CLI's `App` keeps it). The tools only schedule: a prompt fires when
 /// the Session's Host takes it with `takeDueCronPrompts` while the Session is
 /// idle, as `SessionHost` does, so the C ABI does not offer them.
-pub const CRON_BUILTIN_TOOLS = [_][]const u8{ "CronCreate", "CronDelete", "CronList" };
+pub const CRON_BUILTIN_TOOLS = [_][]const u8{ "CronCreate", "CronDelete", "CronList", "ScheduleWakeup" };
 
 pub fn isCronBuiltin(name: []const u8) bool {
     return containsToolName(&CRON_BUILTIN_TOOLS, name);
@@ -210,49 +210,23 @@ test "default AgentRuntime preserves the coding tool surface through first-party
     const inventory = try runtime.describePlugins(std.testing.allocator);
     defer std.testing.allocator.free(inventory);
     try std.testing.expect(std.mem.indexOf(u8, inventory, "metacodes.core.coding") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inventory, "\"contribution_count\":8") != null);
 }
 
-test "Runtime creation refuses Glob/Grep when their ripgrep dependency is unresolvable" {
-    const toolchain = @import("metacodes-base").util.toolchain;
-    toolchain.test_ripgrep_override = false;
-    defer toolchain.test_ripgrep_override = null;
-
-    // 默认 coding profile 含 Glob/Grep:依赖缺失必须在创建期报类型化配置错误,
-    // 而不是把工具广告给 Provider 后在首次调用时失败(issue 报告的桌面端形态)。
-    try std.testing.expectError(
-        error.ToolDependencyUnavailable,
-        AgentRuntime.create(std.testing.allocator, .{}),
-    );
-    // 显式选择同样被拒:消费者按名索取了一个无法执行的工具。
-    try std.testing.expectError(
-        error.ToolDependencyUnavailable,
-        AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Grep"} }),
-    );
-    // 不含 Glob/Grep 的显式选择在同一环境下仍可创建:门只跟随真实依赖。
-    const degraded = try AgentRuntime.create(std.testing.allocator, .{
-        .builtin_tools = &.{ "Read", "Write", "Bash" },
-    });
-    defer degraded.destroy() catch unreachable;
-    try std.testing.expect(degraded.catalog.find("Read") != null);
-    try std.testing.expect(degraded.catalog.find("Grep") == null);
-}
-
-test "Runtime creation admits Glob/Grep when ripgrep resolves" {
-    const toolchain = @import("metacodes-base").util.toolchain;
-    toolchain.test_ripgrep_override = true;
-    defer toolchain.test_ripgrep_override = null;
+test "standalone navigation and retired search tools are outside the embedded tool catalog" {
     const runtime = try AgentRuntime.create(std.testing.allocator, .{});
     defer runtime.destroy() catch unreachable;
-    try std.testing.expect(runtime.catalog.find("Glob") != null);
-    try std.testing.expect(runtime.catalog.find("Grep") != null);
+    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol" }) |name| {
+        try std.testing.expect(runtime.catalog.find(name) == null);
+        try std.testing.expectError(error.UnsupportedBuiltinTool, AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{name} }));
+    }
 }
 
 test "minimal and none core profiles retain the mandatory artifact recovery kernel" {
     const minimal = try AgentRuntime.create(std.testing.allocator, .{ .core_profile = .minimal });
     defer minimal.destroy() catch unreachable;
     try std.testing.expect(minimal.catalog.find("Read") != null);
-    try std.testing.expect(minimal.catalog.find("Grep") != null);
+    try std.testing.expect(minimal.catalog.find("Grep") == null);
     try std.testing.expect(minimal.catalog.find("Write") == null);
     try std.testing.expect(minimal.catalog.find("WebFetch") == null);
 
@@ -1767,6 +1741,14 @@ pub const AgentSession = struct {
     last_terminal_compact_id: u64 = 0,
     callback_failed: bool = false,
 
+    fn limitSingleAddressWorkers(provider: *const provider_factory.OwnedProvider, base_url: ?[]const u8) void {
+        const uri = std.Uri.parse(base_url orelse return) catch return;
+        var buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = uri.getHost(&buffer) catch return;
+        _ = @import("platform").net.parseIpLiteral(host.bytes, 0) catch return;
+        provider.io.setAsyncLimit(provider.io.async_limit.min(.limited(2)));
+    }
+
     fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
         return provider_factory.makeProviderWithOptions(
@@ -1890,6 +1872,7 @@ pub const AgentSession = struct {
             .{ .auth_scheme = auth_scheme, .dialect = config.dialect, .limits = null, .capability_declarations = model_capabilities },
         );
         errdefer owned_provider.deinit();
+        limitSingleAddressWorkers(&owned_provider, base_url);
         if (config.reasoning_effort) |effort| try owned_provider.provider().setReasoningEffort(effort);
 
         // collision detection:锁下原子注册,冲突则重新生成;重试超限 = 生成器故障,
@@ -2194,6 +2177,7 @@ pub const AgentSession = struct {
             return err;
         };
         errdefer replacement_provider.deinit();
+        limitSingleAddressWorkers(&replacement_provider, self.base_url);
         // A fresh client starts at the provider default; carry the Session's
         // effort over. The replacement has the same provider kind, whose
         // client accepted this effort when it was set, so it has the setter.
@@ -2987,6 +2971,7 @@ pub const AgentSession = struct {
             .{ .auth_scheme = auth_scheme, .dialect = route.dialect, .limits = null, .capability_declarations = self.model_capabilities },
         );
         errdefer provider.deinit();
+        limitSingleAddressWorkers(&provider, base_url);
         if (effort) |value| provider.provider().setReasoningEffort(value) catch
             return error.AgentEffortUnsupportedProvider;
 
@@ -3889,6 +3874,91 @@ fn createTestSession(runtime: *AgentRuntime, mode: types.PermissionMode, root: [
         .workspace = .{ .root = root },
         .allowed_tools = &.{"Read"},
     });
+}
+
+test "a session's named endpoint can connect to IPv4 while IPv6 is still pending" {
+    const Io = std.Io;
+    const net = Io.net;
+    const a = std.testing.allocator;
+    if ((std.Thread.getCpuCount() catch 0) < 4) return error.SkipZigTest;
+    const runtime = try createTestRuntime(a);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer a.free(cwd);
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = "https://provider.example/v1/messages",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer session.destroy() catch unreachable;
+
+    const Routes = struct {
+        var first_started: Io.Event = .unset;
+        var second_connected: Io.Event = .unset;
+        var first_finished: Io.Event = .unset;
+        const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(3) } };
+
+        fn waitForFirst(io: Io) !void {
+            first_started.waitTimeout(io, timeout) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return error.Unexpected,
+            };
+        }
+
+        fn resolve(ctx: ?*anyopaque, _: net.HostName, results: *Io.Queue(net.HostName.LookupResult), options: net.HostName.LookupOptions) net.HostName.LookupError!void {
+            const pool: *Io.Threaded = @ptrCast(@alignCast(ctx.?));
+            const io = pool.io();
+            defer results.close(io);
+            results.putAll(io, &.{
+                .{ .address = .{ .ip6 = .loopback(options.port) } },
+                .{ .address = .{ .ip4 = .loopback(options.port) } },
+            }) catch |err| switch (err) {
+                error.Closed => unreachable,
+                error.Canceled => return error.Canceled,
+            };
+            try waitForFirst(io);
+        }
+
+        fn connect(ctx: ?*anyopaque, address: *const net.IpAddress, options: net.IpAddress.ConnectOptions) net.IpAddress.ConnectError!net.Socket {
+            const pool: *Io.Threaded = @ptrCast(@alignCast(ctx.?));
+            const io = pool.io();
+            if (address.* == .ip6) {
+                first_started.set(io);
+                defer first_finished.set(io);
+                const deadline = timeout.toDeadline(io).deadline;
+                while (!second_connected.isSet() and Io.Clock.Timestamp.now(io, .awake).compare(.lt, deadline)) {
+                    try Io.sleep(io, .fromMilliseconds(2), .awake);
+                }
+                return error.ConnectionRefused;
+            }
+            try waitForFirst(io);
+            const socket = try io.vtable.netConnectIp(ctx, address, options);
+            if (first_finished.isSet()) {
+                socket.close(io);
+                return error.ConnectionRefused;
+            }
+            second_connected.set(io);
+            return socket;
+        }
+    };
+    Routes.first_started = .unset;
+    Routes.second_connected = .unset;
+    Routes.first_finished = .unset;
+    var io = session.provider.io.io();
+    var table = io.vtable.*;
+    table.netLookup = Routes.resolve;
+    table.netConnectIp = Routes.connect;
+    io.vtable = &table;
+    const loopback: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try loopback.listen(io, .{});
+    defer server.deinit(io);
+    const host: net.HostName = .{ .bytes = "provider.example" };
+    const stream = try host.connect(io, server.socket.address.getPort(), .{ .mode = .stream });
+    defer stream.close(io);
+    try std.testing.expect(Routes.second_connected.isSet());
 }
 
 test "secureClear uses optimizer-resistant zeroing" {
@@ -5977,7 +6047,7 @@ test "Workspace shell policy is an authority ceiling for Session tools" {
 }
 
 test "Sessions sharing one Runtime keep independent tool selections" {
-    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Grep" } });
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Edit" } });
     defer runtime.destroy() catch unreachable;
     const cwd = try testCwd();
     defer std.testing.allocator.free(cwd);
@@ -5989,20 +6059,20 @@ test "Sessions sharing one Runtime keep independent tool selections" {
         .allowed_tools = &.{"Read"},
     });
     defer read_session.destroy() catch unreachable;
-    const grep_session = try runtime.createSession(.{
+    const edit_session = try runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = "grep-key",
         .model = "test-model",
         .workspace = .{ .root = cwd },
-        .allowed_tools = &.{"Grep"},
+        .allowed_tools = &.{"Edit"},
     });
-    defer grep_session.destroy() catch unreachable;
+    defer edit_session.destroy() catch unreachable;
 
     try std.testing.expect(read_session.tools.contains("Read"));
-    try std.testing.expect(!read_session.tools.contains("Grep"));
-    try std.testing.expect(grep_session.tools.contains("Grep"));
-    try std.testing.expect(!grep_session.tools.contains("Read"));
-    try std.testing.expect(!std.mem.eql(u8, read_session.session_id.asSlice(), grep_session.session_id.asSlice()));
+    try std.testing.expect(!read_session.tools.contains("Edit"));
+    try std.testing.expect(edit_session.tools.contains("Edit"));
+    try std.testing.expect(!edit_session.tools.contains("Read"));
+    try std.testing.expect(!std.mem.eql(u8, read_session.session_id.asSlice(), edit_session.session_id.asSlice()));
 }
 
 // —— T1 矩阵测试:session_id registry 生命周期(31/36)与 host identity 校验 ——

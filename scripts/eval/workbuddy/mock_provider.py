@@ -478,9 +478,9 @@ def _scenario_sse(scenario: str, request_number: int, request: Mapping[str, Any]
     if scenario == "leaderboard-protocol-v1":
         return _leaderboard_sse(request_number, request)
     if scenario == "guessed-disabled-tool-v1":
-        pair = (request_number + 1) // 2
-        call_id = f"guessed-disabled-task-{pair}"
-        if request_number % 2 == 1:
+        step = (request_number - 1) % 3
+        call_id = f"guessed-disabled-task-{(request_number - 1) // 3 + 1}"
+        if step == 0:
             if "Task" in _tool_names(request):
                 raise ScenarioError("disabled Task tool remained provider-visible")
             # Deliberately violate the advertised schema with a tool the binary
@@ -488,9 +488,14 @@ def _scenario_sse(scenario: str, request_number: int, request: Mapping[str, Any]
             # dispatch rather than trusting the provider to call only declared
             # tools.
             return _tool_sse(request_number, call_id, "Task", {})
-        content, is_error = _result_text(request, call_id)
-        if not is_error or '"code":"permission_denied"' not in content:
-            raise ScenarioError("guessed disabled tool escaped dispatch policy")
+        if step == 1:
+            content, is_error = _result_text(request, call_id)
+            if not is_error or '"code":"permission_denied"' not in content:
+                raise ScenarioError("guessed disabled tool escaped dispatch policy")
+            return _tool_sse(request_number, "select-task-tools", "ToolSearch", {"query": "select:TaskCreate,TaskList,TaskUpdate"})
+        _, is_error = _result_text(request, "select-task-tools")
+        if is_error:
+            raise ScenarioError("task tool discovery failed")
         return _final_sse(request_number, "guessed disabled tool was denied safely")
     raise ScenarioError(f"unsupported scenario: {scenario}")
 

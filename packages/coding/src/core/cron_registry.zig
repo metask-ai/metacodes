@@ -98,6 +98,7 @@ pub fn dupeViews(allocator: std.mem.Allocator, views: []const JobView) error{Out
 
 pub const CronJob = struct {
     id: JobId,
+    dynamic_wakeup: bool = false,
     /// cron 5-field 表达式;one-shot 时为空(用 fire_at_unix)
     cron_expr: []const u8, // owned
     /// 要注入的 prompt
@@ -146,16 +147,38 @@ pub const CronRegistry = struct {
         const next_fire = if (delay_seconds) |d| now + d else by_expr.?;
 
         const id = try genId();
+        const expression_copy = try self.allocator.dupe(u8, cron_expr);
+        errdefer self.allocator.free(expression_copy);
+        const prompt_copy = try self.allocator.dupe(u8, prompt);
+        errdefer self.allocator.free(prompt_copy);
         const job = CronJob{
             .id = id,
-            .cron_expr = try self.allocator.dupe(u8, cron_expr),
-            .prompt = try self.allocator.dupe(u8, prompt),
+            .cron_expr = expression_copy,
+            .prompt = prompt_copy,
             .recurring = recurring,
             .next_fire_unix = next_fire,
             .created_unix = now,
         };
         try self.jobs.append(self.allocator, job);
         return id;
+    }
+
+    pub fn pendingWakeup(self: *const CronRegistry) ?CronJob {
+        for (self.jobs.items) |job| if (job.dynamic_wakeup) return job;
+        return null;
+    }
+
+    pub fn stopWakeup(self: *CronRegistry) bool {
+        const job = self.pendingWakeup() orelse return false;
+        return self.remove(job.id);
+    }
+
+    pub fn scheduleWakeup(self: *CronRegistry, delay_seconds: i64, prompt: []const u8) !i64 {
+        _ = try self.create("", delay_seconds, prompt, false);
+        _ = self.stopWakeup();
+        const job = &self.jobs.items[self.jobs.items.len - 1];
+        job.dynamic_wakeup = true;
+        return job.next_fire_unix * 1000;
     }
 
     /// 删除指定 id(as the model wrote it)。返回是否找到。

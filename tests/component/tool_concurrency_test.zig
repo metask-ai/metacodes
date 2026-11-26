@@ -13,8 +13,6 @@ const tools = cc.tools;
 
 test "L2 并发: isConcurrencySafe 分类" {
     try std.testing.expect(tools.isConcurrencySafe("Read"));
-    try std.testing.expect(tools.isConcurrencySafe("Glob"));
-    try std.testing.expect(tools.isConcurrencySafe("Grep"));
     try std.testing.expect(tools.isConcurrencySafe("WebFetch"));
     // 静态 API 保守为 false；tool_exec 只在有 provider factory 时动态升级。
     try std.testing.expect(!tools.isConcurrencySafe("WebSearch"));
@@ -162,50 +160,23 @@ test "L2 WebSearch 独立 provider 让混合批并发且 Read 不被隔离" {
     try std.testing.expect(probe.web_overlap.load(.acquire));
 }
 
-fn mkdir(p: [*:0]const u8) void {
-    _ = pfs.mkdir(p, 0o755);
-}
-fn touch(p: [*:0]const u8) void {
-    const fd = pfs.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    if (fd >= 0) pfs.close(fd);
-}
-/// `<dir>/<name>`,NUL 结尾写进 buf。
-fn sub(buf: []u8, dir: []const u8, name: []const u8) [:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name }) catch unreachable;
-}
-
-test "L2 并发: 3 个 Glob safe 批并发执行,结果按原顺序回填" {
+test "L2 并发: 3 个 Read safe 批并发执行,结果按原顺序回填" {
     const a = std.testing.allocator;
-    // 准备 3 个目录各含一个独特文件(每进程唯一根目录,结束整棵删)
-    var base_buf: [512]u8 = undefined;
-    const base = cc.util_fs.testing.perPidDir(&base_buf, "cc-zig-conc");
-    defer cc.util_fs.testing.rmrfBestEffort(base);
-    mkdir(base.ptr);
-    var d0_buf: [512]u8 = undefined;
-    var d1_buf: [512]u8 = undefined;
-    var d2_buf: [512]u8 = undefined;
-    const d0 = sub(&d0_buf, base, "d0");
-    const d1 = sub(&d1_buf, base, "d1");
-    const d2 = sub(&d2_buf, base, "d2");
-    mkdir(d0.ptr);
-    mkdir(d1.ptr);
-    mkdir(d2.ptr);
-    var f_buf: [512]u8 = undefined;
-    touch(sub(&f_buf, d0, "aaa.txt").ptr);
-    touch(sub(&f_buf, d1, "bbb.txt").ptr);
-    touch(sub(&f_buf, d2, "ccc.txt").ptr);
-
-    var in0: [640]u8 = undefined;
-    var in1: [640]u8 = undefined;
-    var in2: [640]u8 = undefined;
-    var slots = [_]tool_exec.Slot{
-        .{ .decision = .run, .name = "Glob", .id = "t0", .input = try std.fmt.bufPrint(&in0, "{{\"pattern\":\"*.txt\",\"path\":\"{s}\"}}", .{d0}) },
-        .{ .decision = .run, .name = "Glob", .id = "t1", .input = try std.fmt.bufPrint(&in1, "{{\"pattern\":\"*.txt\",\"path\":\"{s}\"}}", .{d1}) },
-        .{ .decision = .run, .name = "Glob", .id = "t2", .input = try std.fmt.bufPrint(&in2, "{{\"pattern\":\"*.txt\",\"path\":\"{s}\"}}", .{d2}) },
-    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const names = [_][]const u8{ "aaa.txt", "bbb.txt", "ccc.txt" };
+    var slots: [names.len]tool_exec.Slot = undefined;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (names, 0..) |name, i| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = name });
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = buf[0..try tmp.dir.realPathFile(std.testing.io, name, &buf)];
+        slots[i] = .{ .decision = .run, .name = "Read", .id = name, .input = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .file_path = path }, .{}) };
+    }
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
-    defer for (&slots) |*s| if (s.content) |c| a.free(c);
+    defer for (&slots) |*s| s.deinit(a);
 
     // 每个 slot 拿到自己目录的结果(顺序未乱:t0→aaa,t1→bbb,t2→ccc)
     try std.testing.expect(slots[0].content != null and std.mem.indexOf(u8, slots[0].content.?, "aaa.txt") != null);
@@ -219,9 +190,9 @@ test "L2 并发: 3 个 Glob safe 批并发执行,结果按原顺序回填" {
 test "L2 并发: denied slot 不执行,content 保留" {
     const a = std.testing.allocator;
     var slots = [_]tool_exec.Slot{
-        .{ .decision = .denied, .name = "Glob", .id = "x", .input = "{}", .content = try a.dupe(u8, "{\"error\":\"denied\"}"), .is_error = true },
+        .{ .decision = .denied, .name = "Read", .id = "x", .input = "{}", .content = try a.dupe(u8, "{\"error\":\"denied\"}"), .is_error = true },
     };
-    defer for (&slots) |*s| if (s.content) |c| a.free(c);
+    defer for (&slots) |*s| s.deinit(a);
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     // denied 的 content 没被覆盖
@@ -234,7 +205,7 @@ test "L2 并发: unsafe 工具串行单跑(未知工具→错误,不崩)" {
     var slots = [_]tool_exec.Slot{
         .{ .decision = .run, .name = "__unknown__", .id = "u", .input = "{}" },
     };
-    defer for (&slots) |*s| if (s.content) |c| a.free(c);
+    defer for (&slots) |*s| s.deinit(a);
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     try std.testing.expect(slots[0].is_error);
@@ -258,11 +229,11 @@ test "L2 并发: executeSlots 保留聚合大结果给 hook/UI 后置投影" {
     defer a.free(big);
     @memset(big, 'Z');
     var slots = [_]tool_exec.Slot{
-        .{ .decision = .denied, .name = "Grep", .id = "a", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
-        .{ .decision = .denied, .name = "Grep", .id = "b", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
-        .{ .decision = .denied, .name = "Grep", .id = "c", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "ReadArtifact", .id = "a", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "ReadArtifact", .id = "b", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "ReadArtifact", .id = "c", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
     };
-    defer for (&slots) |*s| if (s.content) |c| a.free(c);
+    defer for (&slots) |*s| s.deinit(a);
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = home };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 
@@ -289,7 +260,7 @@ test "L2 并发: per-input 分类(Bash readonly safe / 写 unsafe)" {
     try std.testing.expect(!tools.isConcurrencySafeInput("Write", "{\"file_path\":\"/x\",\"content\":\"y\"}"));
 }
 
-test "L2 并发: executeSlots 对 Read/Grep 都不提前投影" {
+test "L2 并发: executeSlots 对 Read/ReadArtifact 都不提前投影" {
     const a = std.testing.allocator;
     var home_buf: [512]u8 = undefined;
     const home = cc.util_fs.testing.perPidDir(&home_buf, "cc-zig-cc-budget-home2");
@@ -302,10 +273,10 @@ test "L2 并发: executeSlots 对 Read/Grep 都不提前投影" {
     @memset(big, 'R');
     var slots = [_]tool_exec.Slot{
         .{ .decision = .denied, .name = "Read", .id = "r", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
-        .{ .decision = .denied, .name = "Grep", .id = "g1", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
-        .{ .decision = .denied, .name = "Grep", .id = "g2", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "ReadArtifact", .id = "g1", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "ReadArtifact", .id = "g2", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
     };
-    defer for (&slots) |*s| if (s.content) |c| a.free(c);
+    defer for (&slots) |*s| s.deinit(a);
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = home };
     try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 

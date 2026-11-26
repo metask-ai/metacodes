@@ -235,12 +235,12 @@ fn expectIsolatedRequest(run: *const Run, index: usize) !void {
     try std.testing.expect(run.has(index, "TOTAL=42 and NOTE=done"));
     try std.testing.expect(run.has(index, "passed 1/1"));
     try std.testing.expect(!run.has(index, HANDOFF));
-    for ([_][]const u8{ "Bash", "Read", "Grep", "Glob" }) |name| {
+    for ([_][]const u8{ "Bash", "Read" }) |name| {
         const needle = try std.fmt.allocPrint(std.testing.allocator, "\"name\":\"{s}\"", .{name});
         defer std.testing.allocator.free(needle);
         try std.testing.expect(run.has(index, needle));
     }
-    for ([_][]const u8{ "Write", "Edit", "Agent", "Task", "KgRecall", "KgContext", "KgRemember", "Skill", "WebFetch" }) |name| {
+    for ([_][]const u8{ "Glob", "Grep", "CodeMap", "FindSymbol", "Write", "Edit", "Agent", "Task", "KgRecall", "KgContext", "KgRemember", "Skill", "WebFetch" }) |name| {
         const needle = try std.fmt.allocPrint(std.testing.allocator, "\"name\":\"{s}\"", .{name});
         defer std.testing.allocator.free(needle);
         try std.testing.expect(!run.has(index, needle));

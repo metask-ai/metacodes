@@ -2,7 +2,7 @@
 
     import metacodes
 
-    with metacodes.Runtime(tools=["Read", "Glob", "Grep"]) as runtime:
+    with metacodes.Runtime(tools=["Read"]) as runtime:
         session = runtime.session("claude-sonnet-4-5", workspace=".")
         result = session.run("Summarize this repository in three lines.")
         print(result.text)

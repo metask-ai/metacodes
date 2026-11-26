@@ -224,8 +224,7 @@ This is the research frontier of the project and an open invitation.
 - **Reads Claude Code and Codex configuration.** Skills, agents and MCP server
   configs are picked up as they are. MCP 2026-07-28 is supported along with the
   earlier handshakes.
-- **Language-server aware.** It has LSP diagnostics after edits, plus CodeMap
-  and FindSymbol.
+- **Language-server aware.** CodeMap outlines source files, FindSymbol locates definitions, and edits trigger LSP diagnostics.
 
 ### Safety and observability
 

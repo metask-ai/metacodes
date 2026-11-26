@@ -16,9 +16,8 @@ pub const Task = struct {
         task.arena.deinit();
     }
 
-    fn mode(task: Task) types.ExecutionMode {
-        const tool = task.tool orelse return .parallel;
-        return tool.mode;
+    pub fn executionMode(task: Task) types.ExecutionMode {
+        return if (task.tool) |tool| tool.mode else .parallel;
     }
 
     fn run(task: *Task, abort: *const types.AbortSignal, events: *types.Dispatcher) void {
@@ -35,10 +34,42 @@ pub const Task = struct {
 pub const aborted_result: types.ToolResult = .{ .content = "aborted before the tool ran", .is_error = true };
 
 pub fn batchEnd(tasks: []const Task, start: usize) usize {
-    var end = start + 1;
-    if (tasks[start].mode() == .sequential) return end;
-    while (end < tasks.len and tasks[end].mode() == .parallel) end += 1;
+    return start + batchLength(tasks[start..], taskMode({}, tasks[start]), {}, taskMode, false);
+}
+
+fn taskMode(_: void, task: Task) ?types.ExecutionMode {
+    return task.executionMode();
+}
+
+fn batchLength(items: anytype, mode: ?types.ExecutionMode, context: anytype, comptime classify: anytype, comptime group_sequential: bool) usize {
+    if (mode == null or (!group_sequential and mode == .sequential)) return 1;
+    var end: usize = 1;
+    while (end < items.len and classify(context, items[end]) == mode) end += 1;
     return end;
+}
+
+pub fn dispatchBatches(items: anytype, context: anytype, comptime classify: anytype, comptime execute: anytype, comptime group_sequential: bool) !void {
+    var remaining = items;
+    while (remaining.len != 0) {
+        const mode = classify(context, remaining[0]);
+        const len = batchLength(remaining, mode, context, classify, group_sequential);
+        try execute(context, remaining[0..len], mode);
+        remaining = remaining[len..];
+    }
+}
+
+pub fn runWindow(jobs: anytype, threads: []?std.Thread, spawn: anytype, comptime run: anytype, comptime should_stop: anytype) usize {
+    var launched: usize = 0;
+    for (jobs, threads) |*job, *thread| {
+        thread.* = spawn(job) catch null;
+        launched += 1;
+        if (thread.* == null) {
+            run(job);
+            if (should_stop(job)) break;
+        }
+    }
+    for (threads[0..launched]) |thread| if (thread) |worker| worker.join();
+    return launched;
 }
 
 pub fn runBatch(gpa: std.mem.Allocator, batch: []Task, abort: *const types.AbortSignal, events: *types.Dispatcher) void {

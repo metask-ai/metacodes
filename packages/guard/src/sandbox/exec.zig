@@ -22,6 +22,7 @@ const bwrap_mod = @import("bwrap.zig");
 const seccomp = @import("seccomp.zig");
 const config_mod = @import("config.zig");
 const util_json = @import("metacodes-base").util.json;
+const log = @import("metacodes-base").util.log;
 
 /// The sandbox implementation a host uses.
 pub const Backend = enum {
@@ -349,7 +350,11 @@ fn writeTempProfile(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
     const path = path_z[0 .. path_z.len - 1];
 
     const fd = pfs.open(@ptrCast(path_z.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.WriteProfileFailed;
+    if (fd < 0) {
+        const e = pfs.lastErrno();
+        log.err("sandbox", "open Seatbelt temporary profile failed errno={s}({d})", .{ pfs.errnoName(e), e });
+        return error.WriteProfileFailed;
+    }
     errdefer pfs.unlinkPath(@ptrCast(path_z.ptr)) catch {};
     defer _ = pfs.close(fd);
 

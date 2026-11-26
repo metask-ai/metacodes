@@ -123,17 +123,16 @@ const ACTIONS_SECTION =
 ;
 
 /// getUsingYourToolsSection 的非 REPL / 非 embedded 分支。
-/// TS 用 ${FILE_READ_TOOL_NAME} 等变量，cc-zig 里的实际工具名是 Read/Write/Edit/Glob/Grep/Bash/TaskCreate。
+/// TS 用 ${FILE_READ_TOOL_NAME} 等变量，cc-zig 里的实际工具名是 Read/Write/Edit/Bash/TaskCreate。
 const USING_TOOLS_SECTION =
     \\# Using your tools
     \\ - Do NOT use the Bash to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:
     \\  - To read files use Read instead of cat, head, tail, or sed
     \\  - To edit files use Edit instead of sed or awk
     \\  - To create files use Write instead of cat with heredoc or echo redirection
-    \\  - To search for files use Glob instead of find or ls
-    \\  - To search the content of files, use Grep instead of grep or rg
-    \\  - To locate where functions/types/classes are DEFINED, use CodeMap (a structural outline) instead of reading whole files; reach for FindSymbol to jump to a single named definition
-    \\  - Reserve using the Bash exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the Bash tool for these if it is absolutely necessary.
+    \\  - Use CodeMap to outline definitions in a source file or a group of files.
+    \\  - Use FindSymbol to locate named definitions across files.
+    \\  - Use Bash for workspace searches, builds, tests and Git commands.
     \\ - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.
     \\ - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead.
 ;
@@ -858,7 +857,6 @@ fn kernelSection(which: KernelSection, text: []const u8) prompt_sections.Section
 /// 列出 deferred 工具(name + 短描述),说明调 ToolSearch 取 schema 才能用(对齐 cc
 /// <available-deferred-tools>)。只列当前 runtime treatment 实际启用的 deferred 工具；
 /// 否则 TinyKG-only schema 名会泄漏到 codex/claude 对照臂并破坏实验隔离。
-/// MCP 动态工具在 DynRegistry(此函数看不到),其 prompt 列名待 MCP 启动接线后补。
 fn buildDeferredToolsSection(
     allocator: std.mem.Allocator,
     enabled_tool_names: ?[]const []const u8,
@@ -869,22 +867,20 @@ fn buildDeferredToolsSection(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var any = false;
-    for (tools.registry) |*t| {
-        if (!t.deferred) continue;
-        if (t.tinykg_gated and !kg_ready) continue;
-        if (!toolNameEnabled(enabled_tool_names, t.name)) continue;
-        try appendDeferredLine(allocator, &buf, &any, t.name, t.description);
-    }
-    // 动态 deferred 工具(MCP/插件):不在静态注册表里,按运行时定义列名。描述压成单行
-    // 并截短——MCP server 的描述常常是整段文档,提示词只需要"这是什么"够模型选。
     if (tool_defs) |defs| {
         for (defs) |def| {
-            if (!def.deferred or def.retired) continue;
-            if (tools.getTool(def.name) != null) continue; // 静态条目上面已列
-            if (!toolNameEnabled(enabled_tool_names, def.name)) continue;
+            if (!def.deferred or def.retired or !toolNameEnabled(enabled_tool_names, def.name)) continue;
+            if (tools.getTool(def.name)) |tool| if (tool.tinykg_gated and !kg_ready) continue;
             const summary = try deferredDescriptionSummary(allocator, def.description);
             defer allocator.free(summary);
             try appendDeferredLine(allocator, &buf, &any, def.name, summary);
+        }
+    } else {
+        for (tools.registry) |tool| {
+            if (!tool.deferred or (tool.tinykg_gated and !kg_ready) or !toolNameEnabled(enabled_tool_names, tool.name)) continue;
+            const summary = try deferredDescriptionSummary(allocator, tool.description);
+            defer allocator.free(summary);
+            try appendDeferredLine(allocator, &buf, &any, tool.name, summary);
         }
     }
     if (!any) return try allocator.dupe(u8, "");
@@ -1233,24 +1229,11 @@ fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u
         try buf.appendSlice(allocator, "\n  - To edit files use Edit instead of sed or awk");
     if (has(names, "Write"))
         try buf.appendSlice(allocator, "\n  - To create files use Write instead of cat with heredoc or echo redirection");
-    if (has(names, "Glob")) {
-        try buf.appendSlice(allocator, "\n  - To search for files use Glob instead of find or ls");
+    if (has(names, "CodeMap")) try buf.appendSlice(allocator, "\n  - Use CodeMap to outline definitions in a source file or a group of files.");
+    if (has(names, "FindSymbol")) try buf.appendSlice(allocator, "\n  - Use FindSymbol to locate named definitions across files.");
+    if (has(names, "Bash")) {
+        try buf.appendSlice(allocator, "\n  - Use Bash for workspace searches, builds, tests and Git commands.");
     }
-    if (has(names, "Grep")) {
-        try buf.appendSlice(allocator, "\n  - To search the content of files, use Grep instead of grep or rg");
-    }
-    if (has(names, "CodeMap")) {
-        // FindSymbol 一句仅当它也在工具集时附加(它是 deferred,通常不在默认 names,
-        // 但 ToolSearch 激活后会进 names → 描述自然升级)。
-        const find_sym = if (has(names, "FindSymbol"))
-            "; reach for FindSymbol to jump to a single named definition"
-        else
-            "";
-        try buf.appendSlice(allocator, "\n  - To locate where functions/types/classes are DEFINED, use CodeMap (a structural outline) instead of reading whole files");
-        try buf.appendSlice(allocator, find_sym);
-    }
-    if (has(names, "Bash"))
-        try buf.appendSlice(allocator, "\n  - Reserve Bash for system commands and terminal operations that do not have a relevant dedicated tool.");
     if (has(names, "TaskCreate")) {
         try buf.appendSlice(allocator, "\n - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.");
     } else if (has(names, "TodoWrite")) {
@@ -1406,7 +1389,7 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     try testing.expect(std.mem.indexOf(u8, without_kg, "ALIAS BRANCH HAS PRIORITY") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "KgContext") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "Persistent task control-plane algorithm") == null);
-    try testing.expect(std.mem.indexOf(u8, without_kg, "# Deferred tools") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "- TaskList") != null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "FormalAuditTask") == null);
 }
 
@@ -1586,30 +1569,14 @@ test "partial TinyKG prompt never names unavailable operations" {
     try testing.expect(std.mem.indexOf(u8, prompt, "TaskGet") == null);
 }
 
-test "buildUsingToolsSection gates CodeMap + FindSymbol guidance on tool presence" {
+test "workspace search guidance follows access to Bash" {
     const a = testing.allocator;
-
-    // 无 CodeMap → 无引导行
-    {
-        const s = try buildUsingToolsSection(a, &.{ "Read", "Grep", "Glob" });
-        defer a.free(s);
-        try testing.expect(std.mem.indexOf(u8, s, "use CodeMap") == null);
-        try testing.expect(std.mem.indexOf(u8, s, "FindSymbol") == null);
-    }
-    // 有 CodeMap、无 FindSymbol → CodeMap 行有,FindSymbol 子句无
-    {
-        const s = try buildUsingToolsSection(a, &.{ "Read", "Grep", "CodeMap" });
-        defer a.free(s);
-        try testing.expect(std.mem.indexOf(u8, s, "use CodeMap") != null);
-        try testing.expect(std.mem.indexOf(u8, s, "FindSymbol") == null);
-    }
-    // CodeMap + FindSymbol(ToolSearch 激活后)→ 两者都在
-    {
-        const s = try buildUsingToolsSection(a, &.{ "Read", "Grep", "CodeMap", "FindSymbol" });
-        defer a.free(s);
-        try testing.expect(std.mem.indexOf(u8, s, "use CodeMap") != null);
-        try testing.expect(std.mem.indexOf(u8, s, "FindSymbol") != null);
-    }
+    const with_shell = try buildUsingToolsSection(a, &.{ "Read", "Bash" });
+    defer a.free(with_shell);
+    try testing.expect(std.mem.indexOf(u8, with_shell, "Bash for workspace searches") != null);
+    const read_only = try buildUsingToolsSection(a, &.{"Read"});
+    defer a.free(read_only);
+    try testing.expect(std.mem.indexOf(u8, read_only, "Bash for workspace searches") == null);
 }
 
 test "deferred section lists dynamic (MCP) deferred tools with a single-line summary; static entries are not duplicated" {
@@ -1618,8 +1585,6 @@ test "deferred section lists dynamic (MCP) deferred tools with a single-line sum
         .{ .name = "knowforge__search", .description = "Search the knowledge base.\n\nSecond paragraph that goes on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on and on.", .input_schema = .{}, .deferred = true, .mcp_server = "knowforge" },
         .{ .name = "knowforge__overview", .description = "  库概览——中文描述也要在 UTF-8 边界上截断,不能切出半个字。这里放足够长的文字保证超过一百二十字节的上限以触发截断逻辑。", .input_schema = .{}, .deferred = true, .mcp_server = "knowforge" },
         .{ .name = "skill__helper", .description = "resident skill tool", .input_schema = .{}, .deferred = false },
-        // 与静态注册表同名的动态定义(唯一的静态 deferred 是 TinyKG 门控的 FormalAuditTask):
-        // 静态循环已列,动态循环必须跳过,否则重复。
         .{ .name = "FormalAuditTask", .description = "static deferred already listed by the registry", .input_schema = .{}, .deferred = true },
     };
     const names = [_][]const u8{ "Read", "ToolSearch", "FormalAuditTask", "knowforge__search", "knowforge__overview", "skill__helper" };
@@ -2062,7 +2027,7 @@ test "per-turn projections leave Host sections joined after a projected section 
     const guidance = (try projectUsingToolsForExecution(a, rendered.text, &visible)) orelse
         return error.TestExpectedProjection;
     defer a.free(guidance);
-    try testing.expect(std.mem.indexOf(u8, guidance, "Reserve Bash") == null);
+    try testing.expect(std.mem.indexOf(u8, guidance, "Bash for workspace searches") == null);
     try testing.expect(std.mem.indexOf(u8, guidance, "\n\n" ++ after_tools ++ "\n\n") != null);
 
     const deferred = (try projectDeferredToolsForExecution(a, guidance, &visible, &visible)) orelse

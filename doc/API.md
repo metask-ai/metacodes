@@ -14,6 +14,17 @@ The Zig `sandbox_exec` namespace exposes platform discovery; no C ABI fields
 or wire layouts change. See [sandbox execution](SANDBOX_DESIGN.md) for the
 helper contract and the current network-policy limits.
 
+The CLI uses Bash for workspace file discovery and text search. Use `rg --files`
+to list matching paths and `rg -n -F` to locate literal text, then Read the
+matching lines. Supply the resulting paths when delegating to the read-only
+Explore or Plan agent. Use Edit and Write for file changes. CodeMap outlines a source file or glob,
+and FindSymbol locates named definitions across files. Both use the project's
+language server and are deferred: the initial request lists their names and
+purposes; use `ToolSearch` to load their schemas before calling them. Read also
+accepts `outline=true` for one file. For captured output, page with ReadArtifact
+using the returned artifact ID and next offset. Embedded hosts can opt in to
+Bash for workspace searches. The minimal profile provides Read.
+
 ## Compatibility matrix
 
 | Interface | Entry point | Status | Compatibility rule |
@@ -1037,13 +1048,7 @@ too large is recoverable; an unparseable result is not. The microcompact
 clear pass already refuses to erase a result's only recovery capability for
 the same reason.
 
-Recovery has two primitives rather than one. `ReadArtifact` returns byte
-ranges, which costs one round trip per `MAX_READ_BYTES` and cannot answer a
-question about the content; `Grep` therefore accepts `artifact_id` in place of
-`path` and searches the stored blob directly. The store path is never exposed:
-filename output is suppressed, `files_with_matches` — whose entire output would
-be that path — is rejected for artifact searches, and the child's stderr is
-scrubbed of it before it can reach a tool error.
+`ReadArtifact` returns bounded byte ranges from a stored result. The model receives the artifact ID and offset.
 
 `ReadArtifact` remains exempt from result projection, but its recovery cost is
 bounded per turn. Before the batch executes, the agent loop walks the turn's
@@ -1259,13 +1264,7 @@ requests, and destroys sessions before their owning runtime generation.
 sessions. Existing sessions remain pinned to their old generation. Failed staging
 does not consume a generation or mutate the active runtime.
 
-Runtime creation validates tool availability, not only tool names: built-ins
-that execute through an external binary (`Glob`/`Grep` → ripgrep) fail
-creation with `error.ToolDependencyUnavailable` when that executable cannot be
-resolved, instead of entering the catalog and failing on their first
-invocation. A host can probe the dependency up front with
-`mc.util_toolchain.ripgrepPath()` and select a tool set without `Glob`/`Grep`
-when it is absent.
+Runtime creation rejects unrecognized built-in names. The minimal profile provides read-only workspace access with `Read`.
 
 The recommended high-level lifecycle is:
 
@@ -1719,7 +1718,7 @@ leaving every Host to rebuild them:
   Run, queued behind any work already there and journaled like a submission
   without a `trace_id`. The bundled daemon does the same for its `App` lead.
 - A Session that selected the cron tools (`CronCreate`, `CronDelete`,
-  `CronList`; admitted only with `RuntimeConfig.enable_cron`) has its
+  `CronList`, or `ScheduleWakeup`, admitted with `RuntimeConfig.enable_cron`) has its
   scheduled prompts fired by its driver, as the CLI fires them once it is
   back at the prompt: while its queue is empty and it has cron jobs, the
   driver calls `AgentSession.takeDueCronPrompts` at most every

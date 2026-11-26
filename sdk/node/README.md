@@ -8,7 +8,7 @@ never blocks. No npm dependencies; Node 18 or newer on macOS or Linux.
 ```js
 const metacodes = require('metacodes');
 
-const runtime = new metacodes.Runtime({ tools: ['Read', 'Glob', 'Grep'] });
+const runtime = new metacodes.Runtime({ tools: ['Read'] });
 const session = runtime.session('claude-sonnet-4-5', { provider: 'anthropic', workspace: '.' });
 const result = await session.run('Summarize this repository in three lines.');
 console.log(result.text, result.stopReason, result.usage);
