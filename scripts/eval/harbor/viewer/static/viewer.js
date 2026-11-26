@@ -262,6 +262,13 @@ async function deleteProfile(b, button) {
   state.selected.delete(b.id);
   return true;
 }
+function deleteProfileButton(b) {
+  return h('button', { type: 'button', class: 'button', onclick: async (event) => {
+    event.stopPropagation();
+    if (!await deleteProfile(b, event.currentTarget)) return;
+    if (route().view === 'overview') render(); else location.hash = '#/';
+  } }, '删除 Profile');
+}
 async function deleteJob(j, button) {
   const impact = j.result_owner ? `工作台会删除运行记录和汇总，作业详情保留在 ${j.result_owner}。` : '工作台会删除运行记录、日志和评测结果，不能恢复。';
   if (!confirm(`删除评测结果 ${j.name}？${impact}`)) return;
@@ -304,10 +311,7 @@ function profileActions(b) {
       ? h('button', { type: 'button', class: 'button', title: '只选最新结果里有无效尝试的题（网络波动、环境故障等导致）', onclick: keep(() => runAgain(b, true)) }, '重跑无效的题') : null,
     profileActive(b)
       ? h('button', { type: 'button', class: 'button', onclick: keep((button) => stopProfile(b, button)) }, '停止队列')
-      : h('button', { type: 'button', class: 'button', onclick: keep(async (button) => {
-        if (!await deleteProfile(b, button)) return;
-        if (route().view === 'overview') render(); else location.hash = '#/';
-      }) }, '删除 Profile'),
+      : deleteProfileButton(b),
   ];
 }
 function progressText(b) {
@@ -386,11 +390,12 @@ async function renderOverview() {
     h('td', { class: 'mono', text: p.metacodes?.label || '—' }),
     h('td', { text: groupedItems(p).length }), h('td', { text: PROFILE_STATUS[p.status] || p.status }),
     h('td', { class: 'num', text: pct(p.summary.first_pass_rate) }),
-    h('td', { class: 'num', text: when(p.last_run_at) })));
+    h('td', { class: 'num', text: when(p.last_run_at) }),
+    canRun ? h('td', {}, profileActive(p) ? null : deleteProfileButton(p)) : null));
   const table = (heads, rows) => h('div', { class: 'table-scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, heads.map((head) => h('th', { text: head })))), h('tbody', {}, rows)));
   const listing = panel('Profile 列表', profiles.length + ' 个', profiles.length
-    ? table(['对比', 'Profile / 模型', 'MetaCodes 版本', '作业数', '状态', '首轮满分率', '最近运行'], rows)
+    ? table(['对比', 'Profile / 模型', 'MetaCodes 版本', '作业数', '状态', '首轮满分率', '最近运行', ...(canRun ? ['操作'] : [])], rows)
     : h('div', { class: 'empty' }, '还没有 Profile。', canRun ? link('#/new', '创建首个作业') : null));
   const comparison = chosen.length < 2 ? null : panel('Profile 对比', '各 Profile 的最新结果', h('div', {},
     table(['Profile', '一次性完成率', '首轮满分率', '至少通过一次', '初始 Token', '每题平均成本', '每次通过成本', '通过 trial', '缓存命中率'],
