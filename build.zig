@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// 包清单是版本声明的仓库层权威;代码侧唯一拷贝在 src/version.zig。两者一致性由
+// 包清单是版本声明的仓库层权威;代码侧唯一拷贝在 packages/base/src/version.zig。两者一致性由
 // runtime_arm_smoke 的 --expected-version 在 `zig build test` 中用真实二进制强制。
 const manifest = @import("build.zig.zon");
 
@@ -18,6 +18,51 @@ fn addHl(b: *std.Build, mod: *std.Build.Module) void {
     addHlWithProjectHarnessActuation(b, mod, false);
 }
 
+fn hlModule(b: *std.Build) *std.Build.Module {
+    if (g_hl_mod == null) {
+        g_hl_mod = b.createModule(.{ .root_source_file = b.path("lib/highlight-zig/src/lib.zig") });
+    }
+    return g_hl_mod.?;
+}
+
+fn codeModule(b: *std.Build) *std.Build.Module {
+    if (g_code_mod == null) {
+        const code = b.createModule(.{ .root_source_file = b.path("packages/base/src/code/runtime.zig"), .link_libc = true });
+        // vendor/quickjs holds upstream bytes plus patches/*.patch; the engine
+        // is compiled from the verified, patched tree the stage script writes.
+        const quickjs = stageQuickJsSources(b);
+        code.addIncludePath(quickjs);
+        code.addIncludePath(b.path("packages/base/src/code"));
+        // Searched after the libc headers: only fills <sys/time.h> where the
+        // C runtime lacks it (Windows MSVC).
+        code.addAfterIncludePath(b.path("packages/base/src/code/compat"));
+        // The embedded engine and bridge are private implementation details;
+        // AgentCore shared libraries export only their declared public ABI.
+        const code_flags: []const []const u8 = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv", "-fvisibility=hidden", "-include", b.pathFromRoot("packages/base/src/code/quickjs_port.h") };
+        code.addCSourceFiles(.{
+            .root = quickjs,
+            .files = &.{ "quickjs.c", "cutils.c", "dtoa.c", "libregexp.c", "libunicode.c" },
+            .flags = code_flags,
+        });
+        code.addCSourceFile(.{ .file = b.path("packages/base/src/code/bridge.c"), .flags = code_flags });
+        g_code_mod = code;
+    }
+    return g_code_mod.?;
+}
+
+var g_project_harness_mods: [2]?*std.Build.Module = .{ null, null };
+fn addProjectHarnessOptions(b: *std.Build, mod: *std.Build.Module, evaluation_shadow: bool) void {
+    const slot = &g_project_harness_mods[@intFromBool(evaluation_shadow)];
+    if (slot.* == null) {
+        const project_harness_options = b.addOptions();
+        project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
+        project_harness_options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
+        project_harness_options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
+        slot.* = project_harness_options.createModule();
+    }
+    mod.addImport("project_harness_build_options", slot.*.?);
+}
+
 /// Project-Harness actuation is an artifact property, never a runtime switch.
 /// Every ordinary product/test/library root is compiled enforced.  The sole
 /// shadow artifact is wired explicitly below and is not part of `install`.
@@ -26,67 +71,98 @@ fn addHlWithProjectHarnessActuation(
     mod: *std.Build.Module,
     evaluation_shadow: bool,
 ) void {
-    if (g_hl_mod == null) {
-        g_hl_mod = b.createModule(.{ .root_source_file = b.path("lib/highlight-zig/src/lib.zig") });
-    }
-    mod.addImport("hl", g_hl_mod.?);
-    if (g_code_mod == null) {
-        const code = b.createModule(.{ .root_source_file = b.path("src/code/runtime.zig"), .link_libc = true });
-        // vendor/quickjs holds upstream bytes plus patches/*.patch; the engine
-        // is compiled from the verified, patched tree the stage script writes.
-        const quickjs = stageQuickJsSources(b);
-        code.addIncludePath(quickjs);
-        code.addIncludePath(b.path("src/code"));
-        // Searched after the libc headers: only fills <sys/time.h> where the
-        // C runtime lacks it (Windows MSVC).
-        code.addAfterIncludePath(b.path("src/code/compat"));
-        // The embedded engine and bridge are private implementation details;
-        // AgentCore shared libraries export only their declared public ABI.
-        const code_flags: []const []const u8 = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"2025-09-13\"", "-DMETACODES_NO_ATOMICS", "-fwrapv", "-fvisibility=hidden", "-include", b.pathFromRoot("src/code/quickjs_port.h") };
-        code.addCSourceFiles(.{
-            .root = quickjs,
-            .files = &.{ "quickjs.c", "cutils.c", "dtoa.c", "libregexp.c", "libunicode.c" },
-            .flags = code_flags,
-        });
-        code.addCSourceFile(.{ .file = b.path("src/code/bridge.c"), .flags = code_flags });
-        g_code_mod = code;
-    }
-    mod.addImport("code_runtime", g_code_mod.?);
+    mod.addImport("hl", hlModule(b));
+    mod.addImport("code_runtime", codeModule(b));
     mod.addImport("bench_assets", b.createModule(.{ .root_source_file = b.path("scripts/bench_assets.zig") }));
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
-    const project_harness_options = b.addOptions();
-    project_harness_options.addOption(bool, "evaluation_shadow", evaluation_shadow);
-    project_harness_options.addOption(?[]const u8, "formal_kernel_expected_sha256", g_formal_kernel_sha256);
-    project_harness_options.addOption(?[]const u8, "project_kernel_expected_sha256", g_project_kernel_sha256);
-    mod.addOptions("project_harness_build_options", project_harness_options);
+    addProjectHarnessOptions(b, mod, evaluation_shadow);
 }
 
 // platform —— 可移植系统抽象层(sync/process/fs/signal/rng/paths)。作为命名模块暴露,
-// 让 test:lsp 隔离模块(根在 src/lsp/,无法相对 import 上层 ../platform/)也能用。
+// 让 test:lsp 隔离模块(根在 packages/coding/src/lsp/,无法相对 import 上层 ../platform/)也能用。
 var g_platform_mod: ?*std.Build.Module = null;
 fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
     if (g_platform_mod == null) {
-        g_platform_mod = b.createModule(.{ .root_source_file = b.path("src/platform/platform.zig") });
+        g_platform_mod = b.createModule(.{ .root_source_file = b.path("packages/base/src/platform/platform.zig") });
     }
     mod.addImport("platform", g_platform_mod.?);
+}
+
+const lower_packages = [_][]const u8{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" };
+const PackageModules = [lower_packages.len]*std.Build.Module;
+var g_package_modules: [2]?PackageModules = .{ null, null };
+
+fn packageIndex(name: []const u8) usize {
+    for (lower_packages, 0..) |package, index| {
+        if (std.mem.eql(u8, package, name)) return index;
+    }
+    @panic("unknown package");
+}
+
+fn packageRoot(b: *std.Build, index: usize) std.Build.LazyPath {
+    return b.path(b.fmt("packages/{s}/src/root.zig", .{lower_packages[index]}));
+}
+
+fn packageModules(b: *std.Build, evaluation_shadow: bool) PackageModules {
+    const slot = &g_package_modules[@intFromBool(evaluation_shadow)];
+    if (slot.*) |modules| return modules;
+    var modules: PackageModules = undefined;
+    for (&modules, 0..) |*module, index| {
+        module.* = b.createModule(.{ .root_source_file = packageRoot(b, index) });
+        wirePackageFile(b, module.*, index, modules[0..index], evaluation_shadow);
+    }
+    slot.* = modules;
+    return modules;
+}
+
+fn wirePackageFile(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    index: usize,
+    lower: []const *std.Build.Module,
+    evaluation_shadow: bool,
+) void {
+    for (lower, lower_packages[0..lower.len]) |dependency, name| {
+        mod.addImport(b.fmt("metacodes-{s}", .{name}), dependency);
+    }
+    addPlatform(b, mod);
+    const name = lower_packages[index];
+    const coding = std.mem.eql(u8, name, "coding");
+    if (coding or std.mem.eql(u8, name, "base")) mod.addImport("hl", hlModule(b));
+    if (coding or std.mem.eql(u8, name, "kernel")) mod.addImport("code_runtime", codeModule(b));
+    if (coding or std.mem.eql(u8, name, "guard")) addProjectHarnessOptions(b, mod, evaluation_shadow);
+}
+
+fn addPackageFileImports(b: *std.Build, mod: *std.Build.Module, package: []const u8) void {
+    const index = packageIndex(package);
+    const modules = packageModules(b, false);
+    wirePackageFile(b, mod, index, modules[0..index], false);
+}
+
+fn addPackages(b: *std.Build, mod: *std.Build.Module, evaluation_shadow: bool) void {
+    const modules = packageModules(b, evaluation_shadow);
+    for (modules, lower_packages) |dependency, name| {
+        mod.addImport(b.fmt("metacodes-{s}", .{name}), dependency);
+    }
 }
 
 /// Every Zig test executable that can run on Windows shares the same legacy
 /// `/tmp` compatibility prerequisite. Keep that policy at test-run creation so
 /// new isolated suites cannot silently forget it.
-fn addInternal(b: *std.Build, mod: *std.Build.Module) *std.Build.Module {
+fn addInternal(b: *std.Build, mod: *std.Build.Module, evaluation_shadow: bool) *std.Build.Module {
     const internal = b.createModule(.{
         .root_source_file = b.path("src/internal.zig"),
         .target = mod.resolved_target,
         .optimize = mod.optimize,
         .link_libc = mod.link_libc,
     });
+    addPackages(b, internal, evaluation_shadow);
     mod.addImport("metacodes-internal", internal);
     return internal;
 }
 
 fn addAppInternal(b: *std.Build, mod: *std.Build.Module, evaluation_shadow: bool) void {
-    const internal = addInternal(b, mod);
+    const internal = addInternal(b, mod, evaluation_shadow);
     addHlWithProjectHarnessActuation(b, internal, evaluation_shadow);
     mod.addImport("bench_assets", internal.import_table.get("bench_assets").?);
 }
@@ -436,7 +512,7 @@ const StagedLeanKernel = struct {
     installed_path: []const u8,
     /// The test-only variable that hands the kernel to the test process; the
     /// digest comes from the provenance sidecar installed beside it
-    /// (src/formal/test_kernel.zig).
+    /// (packages/guard/src/formal/test_kernel.zig).
     path_variable: []const u8,
 };
 
@@ -613,7 +689,7 @@ fn stageLeanKernels(
     const bash = findBash(b).?;
     const dir: std.Build.InstallDir = .{ .custom = "libexec/metacodes" };
     // The executable resolves `<prefix>/libexec/metacodes/<kernel>[.exe]`
-    // (src/util/toolchain.zig); the scripts run under Git Bash on Windows.
+    // (packages/base/src/util/toolchain.zig); the scripts run under Git Bash on Windows.
     const exe_suffix = if (target.result.os.tag == .windows) ".exe" else "";
     const formal_name = b.fmt("metacodes-formal-kernel{s}", .{exe_suffix});
     const project_name = b.fmt("metacodes-project-kernel{s}", .{exe_suffix});
@@ -829,6 +905,7 @@ fn createCoreModule(
         .link_libc = true,
     });
     addHl(b, mod);
+    addPackages(b, mod, false);
     return mod;
 }
 
@@ -838,11 +915,12 @@ fn createCoreModule(
 /// come from here, so at equal optimize they are one compilation.
 fn addCoreSuite(
     b: *std.Build,
+    name: []const u8,
     root_module: *std.Build.Module,
     tfilter: ?[]const u8,
 ) *std.Build.Step.Compile {
     return b.addTest(.{
-        .name = "metacodes-core-test",
+        .name = name,
         .root_module = root_module,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         .test_runner = .{
@@ -850,6 +928,63 @@ fn addCoreSuite(
             .mode = .simple,
         },
     });
+}
+
+fn packageTestModule(
+    b: *std.Build,
+    index: usize,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = packageRoot(b, index),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const modules = packageModules(b, false);
+    wirePackageFile(b, mod, index, modules[0..index], false);
+    return mod;
+}
+
+const CoreSuite = struct {
+    compile: *std.Build.Step.Compile,
+    shards: u8,
+};
+
+/// The core suite is one test executable per lower package, rooted at the
+/// package's own module, plus `src/lib.zig`: a test only runs in the module
+/// that owns its file. `coding` holds most of the tests and takes the shards.
+fn addCoreSuites(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    facade: *std.Build.Module,
+    tfilter: ?[]const u8,
+    shards: u8,
+) [lower_packages.len + 1]CoreSuite {
+    var suites: [lower_packages.len + 1]CoreSuite = undefined;
+    for (lower_packages, 0..) |name, index| {
+        suites[index] = .{
+            .compile = addCoreSuite(b, b.fmt("metacodes-{s}-test", .{name}), packageTestModule(b, index, target, optimize), tfilter),
+            .shards = if (std.mem.eql(u8, name, "coding")) shards else 1,
+        };
+    }
+    suites[lower_packages.len] = .{ .compile = addCoreSuite(b, "metacodes-core-test", facade, tfilter), .shards = 1 };
+    return suites;
+}
+
+fn addCoreSuitesRun(
+    b: *std.Build,
+    name: []const u8,
+    suites: []const CoreSuite,
+    reporter: *std.Build.Step.Compile,
+    lean_kernels: StagedLeanKernels,
+) *std.Build.Step {
+    const step = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    step.* = .init(.{ .id = .custom, .name = name, .owner = b });
+    for (suites) |suite| step.dependOn(addCoreSuiteRun(b, suite.compile, suite.shards, reporter, lean_kernels));
+    return step;
 }
 
 /// Runs `suite` as `shards` processes that each execute only their own
@@ -1060,12 +1195,12 @@ pub fn build(b: *std.Build) void {
     // sandbox and passes the resulting fd back. Library hosts receive the
     // same helper in their bundle; neither path depends on Python or PATH.
     const sandbox_helper_mod = b.createModule(.{
-        .root_source_file = b.path("src/sandbox_helper_root.zig"),
+        .root_source_file = b.path("packages/guard/src/sandbox_helper_root.zig"),
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
     });
-    addPlatform(b, sandbox_helper_mod);
+    addPackageFileImports(b, sandbox_helper_mod, "guard");
     const sandbox_helper_exe = b.addExecutable(.{
         .name = "metacodes-fs-helper",
         .root_module = sandbox_helper_mod,
@@ -1400,7 +1535,7 @@ pub fn build(b: *std.Build) void {
     // selfexe_probe 二进制:相邻产物解析的进程级探针(adjacent_symlink_test 把它复制成
     // <prefix>/bin/metacodes 后经 symlink 启动)。只链 platform + toolchain,不拖整个 app 图。
     const toolchain_probe_mod = b.createModule(.{
-        .root_source_file = b.path("src/util/toolchain.zig"),
+        .root_source_file = b.path("packages/base/src/util/toolchain.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1429,7 +1564,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    addPlatform(b, addInternal(b, install_probe_root_mod));
+    addPlatform(b, addInternal(b, install_probe_root_mod, false));
     const update_unit_probe_mod = b.createModule(.{
         .root_source_file = b.path("tests/_harness/update_unit_probe.zig"),
         .target = target,
@@ -1484,9 +1619,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, core_mod);
+    addPackages(b, core_mod, false);
 
     // HTTP status is an open wire value. This host-native syntax gate keeps the
-    // std.http.Status interpretation authority in src/api/http_status.zig.
+    // std.http.Status interpretation authority in packages/ai/src/api/http_status.zig.
     const http_status_gate_mod = b.createModule(.{
         .root_source_file = b.path("scripts/http_status_boundary_gate.zig"),
         .target = b.graph.host,
@@ -1671,7 +1807,7 @@ pub fn build(b: *std.Build) void {
     // scripts/verify_release_bundle.py runs the fail-closed checks, the
     // executable-running ones only on the native target.
     const release_contract_mod = b.createModule(.{
-        .root_source_file = b.path("src/release_contract.zig"),
+        .root_source_file = b.path("packages/base/src/release_contract.zig"),
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });
@@ -2387,7 +2523,7 @@ pub fn build(b: *std.Build) void {
         "Run the zero-provider journal-to-receipt-to-Lean RuleImpact L2",
     );
     rule_impact_driver_l2_step.dependOn(&rule_impact_driver_l2_cmd.step);
-    const core_test = addCoreSuite(b, core_test_mod, tfilter);
+    const core_suites = addCoreSuites(b, target, optimize, core_test_mod, tfilter, lib_test_shards);
     const core_shard_reporter = b.addExecutable(.{
         .name = "metacodes-core-shard-reporter",
         .root_module = b.createModule(.{
@@ -2397,14 +2533,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
-    core_test_step.dependOn(addCoreSuiteRun(b, core_test, lib_test_shards, core_shard_reporter, staged_lean_kernels));
+    core_test_step.dependOn(addCoreSuitesRun(b, "core suites", &core_suites, core_shard_reporter, staged_lean_kernels));
 
-    const core_monolithic_run = addTestRunArtifact(b, core_test);
-    core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
-    core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
-    wireLeanKernelTestInputs(core_monolithic_run, staged_lean_kernels);
-    const core_test_monolithic_step = b.step("test:lib-monolithic", "Run the complete metacodes-core suite in one diagnostic process");
-    core_test_monolithic_step.dependOn(&core_monolithic_run.step);
+    const core_test_monolithic_step = b.step("test:lib-monolithic", "Run the complete metacodes-core suite with one diagnostic process per package");
+    for (core_suites) |suite| {
+        const core_monolithic_run = addTestRunArtifact(b, suite.compile);
+        core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
+        core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
+        wireLeanKernelTestInputs(core_monolithic_run, staged_lean_kernels);
+        core_test_monolithic_step.dependOn(&core_monolithic_run.step);
+    }
 
     const shard_runner_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -2427,32 +2565,34 @@ pub fn build(b: *std.Build) void {
     // Diagnostic companion to test:lib. It runs the identical test graph and
     // semantics, but emits per-test timings plus slow-test buckets/top-N so
     // performance work is driven by evidence instead of guessed timeouts.
-    const core_timed_test = b.addTest(.{
-        .name = "metacodes-core-test-times",
-        .root_module = core_test_mod,
-        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
-        .test_runner = .{
-            .path = b.path("scripts/time_test_runner.zig"),
-            .mode = .simple,
-        },
-    });
     const core_test_times_step = b.step("test:lib-times", "Run metacodes-core tests with per-test timing diagnostics");
-    const core_timed_run = addTestRunArtifact(b, core_timed_test);
-    wireLeanKernelTestInputs(core_timed_run, staged_lean_kernels);
-    core_test_times_step.dependOn(&core_timed_run.step);
+    for (core_suites) |suite| {
+        const core_timed_test = b.addTest(.{
+            .name = b.fmt("{s}-times", .{suite.compile.name}),
+            .root_module = suite.compile.root_module,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+            .test_runner = .{
+                .path = b.path("scripts/time_test_runner.zig"),
+                .mode = .simple,
+            },
+        });
+        const core_timed_run = addTestRunArtifact(b, core_timed_test);
+        wireLeanKernelTestInputs(core_timed_run, staged_lean_kernels);
+        core_test_times_step.dependOn(&core_timed_run.step);
+    }
     core_test_step.dependOn(http_status_gate_step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
-    // 根在 src/ 层(而非 src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
-    // 根在 src/lsp/ 会越出 module path(见 src/lsp_test_root.zig 顶部说明)。
+    // 根在 src/ 层(而非 packages/coding/src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
+    // 根在 packages/coding/src/lsp/ 会越出 module path(见 packages/coding/src/lsp_test_root.zig 顶部说明)。
     // 测试本身也在主套件里跑;`test` 依赖它是为了这份独立编译证明,与 test:provider 同理。
     const lsp_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/lsp_test_root.zig"),
+        .root_source_file = b.path("packages/coding/src/lsp_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    addPlatform(b, lsp_test_mod); // lsp/ 依赖 platform（sync/process），隔离测试也需
+    addPackageFileImports(b, lsp_test_mod, "coding");
     const lsp_test = addRecordedTest(b, .{ .name = "lsp-test", .root_module = lsp_test_mod });
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
     lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test).step);
@@ -2461,12 +2601,12 @@ pub fn build(b: *std.Build) void {
     // AgentLoop in its graph. Same shape and reason as test:provider below; its
     // tests also run in the main suites, this is the proof of independence.
     const mcp_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/mcp_test_root.zig"),
+        .root_source_file = b.path("packages/coding/src/mcp_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    addPlatform(b, mcp_test_mod);
+    addPackageFileImports(b, mcp_test_mod, "coding");
     const mcp_test = addRecordedTest(b, .{
         .name = "mcp-test",
         .root_module = mcp_test_mod,
@@ -2484,12 +2624,12 @@ pub fn build(b: *std.Build) void {
     // stopped compiling, and nothing noticed. It is also the only root that
     // reaches `provider/capability_matrix_test.zig`.
     const provider_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/provider_test_root.zig"),
+        .root_source_file = b.path("packages/ai/src/provider_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    addPlatform(b, provider_test_mod); // control_plane guards its state with platform/sync
+    addPackageFileImports(b, provider_test_mod, "ai");
     const provider_test = addRecordedTest(b, .{ .name = "provider-test", .root_module = provider_test_mod });
     const provider_test_step = b.step("test:provider", "Test the provider offer kernel in isolation (issue #16)");
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
@@ -2538,7 +2678,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    addPlatform(b, addInternal(b, picker_test_mod));
+    addPlatform(b, addInternal(b, picker_test_mod, false));
     const picker_test = addRecordedTest(b, .{ .name = "picker-test", .root_module = picker_test_mod });
     const picker_test_step = b.step("test:picker", "Test the cross-UI model picker in isolation (issue #16)");
     picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
@@ -2548,7 +2688,7 @@ pub fn build(b: *std.Build) void {
     // METACODES_PROC_TEST=1,`test` 里不设 —— 并行的 build runner 下 fork 会崩(见 process.zig
     // `procSpawnTestsEnabled`);它们由 CI 的 "Native platform modules" 用独立 `zig test` 跑。
     const platform_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/platform/platform.zig"),
+        .root_source_file = b.path("packages/base/src/platform/platform.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -2654,6 +2794,16 @@ pub fn build(b: *std.Build) void {
     // confines to the cli package.
     const cli_test_step = b.step("test:cli", "Run the cli package's tests: apps/cli/src inline tests, the picker root and apps/cli/tests (part of `test:units`)");
     units_test_step.dependOn(cli_test_step);
+    const package_test_steps = [lower_packages.len]*std.Build.Step{
+        b.step("test:base", "Run the base package's inline tests and the platform and release-contract roots (part of `test:units`)"),
+        b.step("test:ai", "Run the ai package's inline tests and the provider root (part of `test:units`)"),
+        b.step("test:kernel", "Run the kernel package's tests, fake provider and fake tools only (part of `test:units`)"),
+        b.step("test:guard", "Run the guard package's inline tests (part of `test:units`)"),
+        b.step("test:coding", "Run the coding package's inline tests and the MCP and LSP roots (part of `test:units`)"),
+        b.step("test:session", "Run the session package's inline tests (part of `test:units`)"),
+        b.step("test:teamwork", "Run the teamwork package's inline tests (part of `test:units`)"),
+    };
+    for (package_test_steps) |package_test_step| units_test_step.dependOn(package_test_step);
     // Built by nothing else in the suite; compiling it here keeps it in step
     // with the runtime API it calls.
     eval_test_step.dependOn(&jev_recall_eval_driver.step);
@@ -2677,11 +2827,11 @@ pub fn build(b: *std.Build) void {
     units_test_step.dependOn(release_test_step);
     units_test_step.dependOn(http_status_gate_step);
     units_test_step.dependOn(subsystem_boundary_step);
-    units_test_step.dependOn(provider_test_step);
-    units_test_step.dependOn(mcp_test_step);
+    package_test_steps[packageIndex("ai")].dependOn(provider_test_step);
+    package_test_steps[packageIndex("coding")].dependOn(mcp_test_step);
     cli_test_step.dependOn(picker_test_step);
-    units_test_step.dependOn(lsp_test_step);
-    units_test_step.dependOn(platform_test_step);
+    package_test_steps[packageIndex("coding")].dependOn(lsp_test_step);
+    package_test_steps[packageIndex("base")].dependOn(platform_test_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2795,7 +2945,7 @@ pub fn build(b: *std.Build) void {
     doc_facts_test_step.dependOn(&doc_facts_test_cmd.step);
     units_test_step.dependOn(&doc_facts_test_cmd.step);
     // Every std.Io.Threaded goes through platform.signal.threadedIo (SIGPIPE
-    // must stay ignored; see src/platform/signal.zig).
+    // must stay ignored; see packages/base/src/platform/signal.zig).
     const io_threaded_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2876,6 +3026,20 @@ pub fn build(b: *std.Build) void {
     const keep_server_open_test_step = b.step("test:keep-server-open", "Test that every request in src that closes its own connection asks the server to keep it open");
     keep_server_open_test_step.dependOn(&keep_server_open_test_cmd.step);
     units_test_step.dependOn(&keep_server_open_test_cmd.step);
+    const model_name_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/model_name_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    model_name_test_mod.addImport("metacodes-base", packageModules(b, false)[packageIndex("base")]);
+    const model_name_test_cmd = addTestRunArtifact(b, addRecordedTest(b, .{
+        .name = "model-name-sources",
+        .root_module = model_name_test_mod,
+    }));
+    model_name_test_cmd.setCwd(b.path("."));
+    const model_name_test_step = b.step("test:model-name", "Test that model routing sources match model names through api/model_name");
+    model_name_test_step.dependOn(&model_name_test_cmd.step);
+    units_test_step.dependOn(&model_name_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2924,18 +3088,16 @@ pub fn build(b: *std.Build) void {
     test_ids_test_step.dependOn(&test_ids_test_cmd.step);
     test_ids_test_step.dependOn(&test_id_fixture_check.step);
     units_test_step.dependOn(&test_ids_test_cmd.step);
-    const pr_loop_test_cmd = b.addSystemCommand(&.{
+    const ci_evidence_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
         "unittest",
-        "scripts.tests.test_pr_loop",
-        "scripts.tests.test_pr_policy",
         "scripts.tests.test_ci_evidence",
         "-v",
     });
-    const pr_loop_test_step = b.step("test:pr-loop", "Test PR review, repair, exact-head merging and CI evidence");
-    pr_loop_test_step.dependOn(&pr_loop_test_cmd.step);
-    units_test_step.dependOn(&pr_loop_test_cmd.step);
+    const ci_evidence_test_step = b.step("test:ci-evidence", "Test CI evidence");
+    ci_evidence_test_step.dependOn(&ci_evidence_test_cmd.step);
+    units_test_step.dependOn(&ci_evidence_test_cmd.step);
     const release_cut_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2976,10 +3138,10 @@ pub fn build(b: *std.Build) void {
     // a ReleaseSafe build of the core suite: the same compilation as that
     // checklist command, so either warms the cache for the other, and none extra
     // when the invocation already is ReleaseSafe.
-    const gate_core_suite = if (optimize == .ReleaseSafe) core_test_step else addCoreSuiteRun(
+    const gate_core_suite = if (optimize == .ReleaseSafe) core_test_step else addCoreSuitesRun(
         b,
-        addCoreSuite(b, createCoreModule(b, target, .ReleaseSafe), tfilter),
-        lib_test_shards,
+        "ReleaseSafe core suites",
+        &addCoreSuites(b, target, .ReleaseSafe, createCoreModule(b, target, .ReleaseSafe), tfilter, lib_test_shards),
         core_shard_reporter,
         staged_lean_kernels,
     );
@@ -3002,6 +3164,7 @@ pub fn build(b: *std.Build) void {
     gate_static_step.dependOn(&builtin_egress_test_cmd.step);
     gate_static_step.dependOn(&http_answer_test_cmd.step);
     gate_static_step.dependOn(&keep_server_open_test_cmd.step);
+    gate_static_step.dependOn(&model_name_test_cmd.step);
     gate_static_step.dependOn(&test_ids_check_cmd.step);
     gate_static_step.dependOn(&gate_diff_check.step);
     const gate_lint = b.addSystemCommand(&.{
@@ -3011,12 +3174,17 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint", "Lint Python, shell scripts and GitHub Actions workflows");
     lint_step.dependOn(&gate_lint.step);
     const gate_pr_step = b.step("gate:pr", "Run the AGENTS.md pre-submit checklist");
-    gate_pr_step.dependOn(gate_static_step);
-    gate_pr_step.dependOn(&gate_lint.step);
-    gate_pr_step.dependOn(test_step);
-    gate_pr_step.dependOn(gate_core_suite);
-    gate_pr_step.dependOn(&gate_coverage.step);
-    gate_pr_step.dependOn(doc_check_step);
+    const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    if (evalPythonFailure(b, eval_python_exe)) |message| {
+        gate_pr_step.dependOn(&b.addFail(message).step);
+    } else {
+        gate_pr_step.dependOn(gate_static_step);
+        gate_pr_step.dependOn(&gate_lint.step);
+        gate_pr_step.dependOn(test_step);
+        gate_pr_step.dependOn(gate_core_suite);
+        gate_pr_step.dependOn(&gate_coverage.step);
+        gate_pr_step.dependOn(doc_check_step);
+    }
     const affected_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "scripts/ci_scope.py",
@@ -3147,11 +3315,19 @@ pub fn build(b: *std.Build) void {
         .root_module = test_cc_mod.import_table.get("metacodes-internal").?,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const internal_test_run = addTestRunArtifact(b, internal_test);
-    wireTinyKgTestInput(internal_test_run, staged_tinykg);
-    wireTinyKgdTestInput(internal_test_run, staged_tinykgd);
-    wireLeanKernelTestInputs(internal_test_run, staged_lean_kernels);
-    units_test_step.dependOn(&internal_test_run.step);
+    units_test_step.dependOn(&addTestRunArtifact(b, internal_test).step);
+    for (lower_packages, package_test_steps, 0..) |name, package_test_step, index| {
+        const package_test = addRecordedTest(b, .{
+            .name = b.fmt("{s}-test", .{name}),
+            .root_module = packageTestModule(b, index, target, optimize),
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
+        const package_test_run = addTestRunArtifact(b, package_test);
+        wireTinyKgTestInput(package_test_run, staged_tinykg);
+        wireTinyKgdTestInput(package_test_run, staged_tinykgd);
+        wireLeanKernelTestInputs(package_test_run, staged_lean_kernels);
+        package_test_step.dependOn(&package_test_run.step);
+    }
 
     // Two independent Metacodes processes share one authenticated StoreActor.
     // This is the runtime actuator for the daemon transport control plane.
@@ -3180,7 +3356,6 @@ pub fn build(b: *std.Build) void {
     // test:eval —— harness 评估控制面（suite/readiness/rollout/judgement/
     // compare/gate）。Python 合同测试 + 同宿主原生零付费 smoke；不访问真实模型，
     // 默认 test 也执行，避免评估器或 native 接线漂移后继续给出看似可信的分数。
-    const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
     // The suite runs as shards (scripts/eval/tests/run_shard.py: every N-th
     // module), each with its output captured. As one process inheriting the
     // terminal it ran after every smoke, since the build runner runs such
@@ -3563,29 +3738,19 @@ pub fn build(b: *std.Build) void {
         const run_t = addTestRunArtifact(b, t);
         skill_runtime_step.dependOn(&run_t.step);
     }
-    const skill_runtime_unit_mod = b.createModule(.{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addHl(b, skill_runtime_unit_mod);
-    const skill_runtime_unit = addRecordedTest(b, .{
-        .name = "skill-runtime-unit",
-        .root_module = skill_runtime_unit_mod,
-        .filters = &.{
-            "skills.runtime",
-            "skills.active",
-            "skills.skill",
-            "skills.tool_pool_filter",
-        },
-    });
-    skill_runtime_step.dependOn(
-        &addTestRunArtifact(
-            b,
-            skill_runtime_unit,
-        ).step,
-    );
+    for ([_][]const u8{ "coding", "guard" }) |package| {
+        const skill_runtime_unit = addRecordedTest(b, .{
+            .name = b.fmt("skill-runtime-unit-{s}", .{package}),
+            .root_module = packageTestModule(b, packageIndex(package), target, optimize),
+            .filters = &.{
+                "skills.runtime",
+                "skills.active",
+                "skills.skill",
+                "skills.tool_pool_filter",
+            },
+        });
+        skill_runtime_step.dependOn(&addTestRunArtifact(b, skill_runtime_unit).step);
+    }
 
     integration_test_step.dependOn(spike_step);
 
@@ -3881,6 +4046,16 @@ pub fn build(b: *std.Build) void {
     });
 
     addLayerCheck(b, gate_static_step, units_test_step);
+}
+
+fn evalPythonFailure(b: *std.Build, python: []const u8) ?[]const u8 {
+    if (b.dep_prefix.len != 0) return null;
+    const result = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ python, b.pathFromRoot("scripts/check_eval_python.py") },
+        .environ_map = &b.graph.environ_map,
+    }) catch |err| return b.fmt("Cannot run Eval interpreter {s} ({s}). Put Python >= 3.9 on PATH and run {s} -m pip install -r requirements-dev.txt", .{ python, @errorName(err), python });
+    if (result.term == .exited and result.term.exited == 0) return null;
+    return b.fmt("Eval preflight failed ({s}): {s}", .{ python, std.mem.trim(u8, result.stderr, " \t\r\n") });
 }
 
 fn addLayerCheck(b: *std.Build, gate_static_step: *std.Build.Step, units_test_step: *std.Build.Step) void {

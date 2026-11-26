@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "sources": {
-    "agentdef": "src/agents/def.zig",
-    "task_registry": "src/tools.zig",
+    "agentdef": "packages/coding/src/agents/def.zig",
+    "task_registry": "packages/coding/src/tools.zig",
     "build_graph": "build.zig"
   },
   "exclusions": [

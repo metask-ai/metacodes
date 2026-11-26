@@ -21,7 +21,7 @@ metacodes 的 agent loop、形式化+本体论和基于证据自我迭代三条�
 
 ## 2. 首方核心能力包
 
-`src/plugin/first_party.zig` 把原先硬编码在 `AgentRuntime` 默认配置中的工具面整理为
+`packages/coding/src/plugin/first_party.zig` 把原先硬编码在 `AgentRuntime` 默认配置中的工具面整理为
 普通的 immutable `static_trusted` 插件。它们声明
 `builtin_tool_bundle`，由 `plugin/runtime.zig` 投影到原生 `ToolCatalog`：
 

@@ -1383,7 +1383,7 @@ the other features' flags, and only on an SSH executor whose entry sets
   `agent_timeout_multiplier`. The cap is in metacodes' price estimate,
   not a provider bill; without the run's OpenRouter price (below) a model
   missing from metacodes' table is charged at the Sonnet fallback rates
-  (`src/util/pricing.zig`), and the cap, and the isolated verifier's own
+  (`packages/base/src/util/pricing.zig`), and the cap, and the isolated verifier's own
   $0.20, stop far earlier than real spend would. The first real-model runs
   without it ran out of budget or ended with no audit verdict.
 
@@ -1431,7 +1431,9 @@ tasks all of them ran (`common_tasks` and each model's `common_summary` in
 Each submission creates one job (作业). All suite/model pairs in the request
 carry the same `submission` ID. The profile page can cancel one job or rerun
 its original evaluations together (`POST /api/profile/submission` with `id`,
-`submission` and `action` of `cancel` or `run`). Rerunning a whole job
+`submission` and `action` of `cancel`, `run` or `delete`). Deleting an ended submission removes
+its evaluations and retries from the profile and preserves stored run results.
+Item controls use the evaluation’s returned `index` across deletions. Rerunning a whole job
 creates a new job on its recorded executor. A single evaluation retry and an
 automatic retry stay in the original job. For older records, the workbench
 groups evaluations by their original queue timestamp and assigns automatic

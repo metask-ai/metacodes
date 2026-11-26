@@ -1,7 +1,7 @@
 //! L2 component test: the System-One (Jev) memory plane against a real TinyKG
 //! store and a mock judge.
 //!
-//! Declaration = wiring = evidence for every consumer of `src/jev/advisor.zig`:
+//! Declaration = wiring = evidence for every consumer of `packages/coding/src/jev/advisor.zig`:
 //! - scoped recall: shadow leaves the injected bytes and the v1 receipt exactly
 //!   as without an advisor while recording the judgment; advisory reranks the
 //!   pool by the judge, keeps the most probable candidate when none clears the

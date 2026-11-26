@@ -180,6 +180,9 @@ pub const Walker = struct {
                 if (tree.nodeTag(arg) != .string_literal) return .opaque_expr;
                 const literal = tree.tokenSlice(tree.nodeMainToken(arg));
                 const target = literal[1 .. literal.len - 1];
+                if (packageName(target)) |package| {
+                    return .{ .file = try walker.loadPackageRoot(package) orelse return .opaque_expr };
+                }
                 if (!std.mem.endsWith(u8, target, ".zig")) return .opaque_expr;
                 const dir = std.fs.path.dirname(file.path) orelse ".";
                 const joined = try std.fs.path.resolvePosix(walker.arena, &.{ dir, target });
@@ -208,6 +211,69 @@ pub const Walker = struct {
             },
             else => return .opaque_expr,
         }
+    }
+
+    fn loadPackageRoot(walker: *Walker, package: []const u8) !?*File {
+        const path = try std.fmt.allocPrint(walker.arena, "packages/{s}/src/root.zig", .{package});
+        return walker.load(path) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => err,
+        };
+    }
+
+    fn packageImportsAsFiles(walker: *Walker, text: []const u8) ![]const u8 {
+        const needle = "@import(\"" ++ package_module_prefix;
+        var out: std.ArrayList(u8) = .empty;
+        var rest = text;
+        while (std.mem.indexOf(u8, rest, needle)) |at| {
+            const name_start = at + needle.len;
+            const quote = std.mem.indexOfScalarPos(u8, rest, name_start, '"') orelse break;
+            const package = rest[name_start..quote];
+            const root = (if (quote + 1 < rest.len and rest[quote + 1] == ')') try walker.loadPackageRoot(package) else null) orelse {
+                try out.appendSlice(walker.arena, rest[0..quote]);
+                rest = rest[quote..];
+                continue;
+            };
+            const named = try walker.fileNamedBy(root, rest[quote + 2 ..]);
+            try out.appendSlice(walker.arena, rest[0..at]);
+            if (named.file) |file| {
+                try out.print(walker.arena, "@import(\"{s}\")", .{std.fs.path.basenamePosix(file.path)});
+            } else {
+                try out.print(walker.arena, "@import(\"{s}.zig\")", .{package});
+            }
+            rest = rest[quote + 2 + named.consumed ..];
+        }
+        try out.appendSlice(walker.arena, rest);
+        return out.items;
+    }
+
+    const Named = struct { file: ?*File, consumed: usize };
+
+    fn fileNamedBy(walker: *Walker, root: *File, chain: []const u8) !Named {
+        var scope: Located = .{ .file = root, .node = .root };
+        var cursor: usize = 0;
+        while (true) {
+            var next = cursor;
+            while (next < chain.len and chain[next] == ' ') next += 1;
+            if (next >= chain.len or chain[next] != '.') break;
+            next += 1;
+            while (next < chain.len and chain[next] == ' ') next += 1;
+            const start = next;
+            while (next < chain.len and (std.ascii.isAlphanumeric(chain[next]) or chain[next] == '_')) next += 1;
+            if (next == start) break;
+            const members = if (scope.node == .root) scope.file.tree.rootDecls() else blk: {
+                var buf: [2]Ast.Node.Index = undefined;
+                break :blk scope.file.tree.fullContainerDecl(&buf, scope.node).?.ast.members;
+            };
+            const found = findDecl(&scope.file.tree, members, chain[start..next]) orelse break;
+            switch (try walker.resolveMember(scope.file, found, 0)) {
+                .file => |file| return .{ .file = file, .consumed = next },
+                .container => |container| scope = container,
+                else => break,
+            }
+            cursor = next;
+        }
+        return .{ .file = null, .consumed = 0 };
     }
 
     fn findDecl(tree: *const Ast, members: []const Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
@@ -252,9 +318,16 @@ pub const Walker = struct {
             try out.appendSlice(walker.arena, slice);
             previous_end = start + slice.len;
         }
-        return stripImportDirs(walker.arena, out.items);
+        return stripImportDirs(walker.arena, try walker.packageImportsAsFiles(out.items));
     }
 };
+
+const package_module_prefix = "metacodes-";
+
+fn packageName(module: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, module, package_module_prefix)) return null;
+    return module[package_module_prefix.len..];
+}
 
 fn stripImportDirs(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     const needle = "@import(\"";
@@ -430,6 +503,45 @@ test "imports are followed, a second path to the same file or container is an al
         \\lib.Thing = lib.core.Thing
         \\lib.Other = lib.core.Thing
         \\lib.std_alias: const = @import("std")
+        \\
+    );
+}
+
+test "an import of a package module reads as the file its root re-exports, so splitting a package keeps the snapshot" {
+    try expectSnapshot(&.{
+        .{
+            "src/lib.zig",
+            \\pub const log = @import("metacodes-base").util.log;
+            \\pub const Level = @import("metacodes-base").util.log.Level;
+            \\pub const RequestId = @import("metacodes-base").RequestId;
+            \\pub fn write(level: @import("metacodes-base").util.log.Level, id: @import("metacodes-base").RequestId) void {}
+            \\pub const tools = @import("metacodes-base").tools_root;
+            \\pub const outside = @import("metacodes-absent").x;
+            \\
+        },
+        .{
+            "packages/base/src/root.zig",
+            \\pub const util = struct {
+            \\    pub const log = @import("util/log.zig");
+            \\};
+            \\pub const tools_root = @import("tools.zig");
+            \\pub const RequestId = util.log.RequestId;
+            \\
+        },
+        .{ "packages/base/src/util/log.zig", "pub const Level = enum { info };\npub const RequestId = u64;\n" },
+        .{ "packages/base/src/tools.zig", "pub const count = 2;\n" },
+    },
+        \\lib: file
+        \\lib.log: file
+        \\lib.log.Level: enum
+        \\lib.log.Level.info
+        \\lib.log.RequestId: const = u64
+        \\lib.Level = lib.log.Level
+        \\lib.RequestId: const = u64
+        \\lib.write: fn write(level: @import("log.zig").Level, id: @import("base.zig").RequestId) void
+        \\lib.tools: file
+        \\lib.tools.count: const = 2
+        \\lib.outside: const = @import("metacodes-absent").x
         \\
     );
 }

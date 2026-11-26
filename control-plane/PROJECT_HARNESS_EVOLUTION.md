@@ -6,7 +6,7 @@ promoted by a fixed Lean kernel into a hash-pinned active bundle; real tool
 dispatch is gated before and after execution. Automatic candidate discovery
 exists only in the experimental in-run self-evolution path
 (`METACODES_SELF_EVOLUTION`, headless only, off by default;
-`src/core/self_evolution.zig`): after a Run that shows a process signal
+`packages/coding/src/core/self_evolution.zig`): after a Run that shows a process signal
 (weakened tests, a false closure, a failed final check) or, failing that,
 repeated typed failures, an isolated rule-author call writes provisional rules
 that the next Run enforces without going through promotion. Nothing feeds discovered candidates into the

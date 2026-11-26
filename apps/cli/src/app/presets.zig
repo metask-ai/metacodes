@@ -2,7 +2,7 @@
 //! sets in the start's configuration.
 //!
 //! config.json holds them (`presets`, and `directory_presets` for the
-//! directories that remember one; `src/provider/config_doc.zig`);
+//! directories that remember one; `packages/ai/src/provider/config_doc.zig`);
 //! `startup_order.zig` decides whether one applies. This file reads the
 //! facts that decision needs and lowers the preset that wins into the fields
 //! `--provider`, `--channel`, `--model` (or `--offer`) and

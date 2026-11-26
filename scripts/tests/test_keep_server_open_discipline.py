@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HELPER = Path("src/api/http_connection.zig")
+HELPER = Path("packages/ai/src/api/http_connection.zig")
 CLOSES_ITSELF = re.compile(r"\.keep_alive\s*=\s*false\b")
 ASKS_TO_KEEP_OPEN = re.compile(r"\bhttp_connection\s*\.\s*keepServerOpen\s*\(")
 SENDS = re.compile(r"\bhttp_connection\s*\.\s*(sendBodiless|sendBodyComplete)\s*\(")
@@ -79,7 +79,8 @@ class KeepServerOpenDisciplineTest(unittest.TestCase):
     def test_scanner_pairs_each_request_with_a_call_before_its_send_and_skips_comments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "src" / "api").mkdir(parents=True)
+            (root / "src").mkdir()
+            (root / HELPER).parent.mkdir(parents=True)
             (root / "src" / "missing.zig").write_text(
                 "fn post(client: *Client) !void {\n"
                 "    var request = try client.request(.POST, uri, .{\n"
@@ -114,7 +115,7 @@ class KeepServerOpenDisciplineTest(unittest.TestCase):
                 "}\n",
                 encoding="utf-8",
             )
-            (root / "src" / "api" / "http_connection.zig").write_text(
+            (root / HELPER).write_text(
                 "test {\n"
                 "    var request = try client.request(.GET, uri, .{ .keep_alive = false });\n"
                 "}\n",

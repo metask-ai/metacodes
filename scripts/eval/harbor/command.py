@@ -49,7 +49,7 @@ DEFAULT_DISALLOWED_TOOLS = (
     "EnterPlanMode,ExitPlanMode"
 )
 
-# `metacodes --reasoning-effort` accepts exactly these (src/core/types.zig).
+# `metacodes --reasoning-effort` accepts exactly these (packages/coding/src/core/types.zig).
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 ADVANCED_FEATURES = {

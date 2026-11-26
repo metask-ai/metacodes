@@ -19,7 +19,7 @@ helper contract and the current network-policy limits.
 | Interface | Entry point | Status | Compatibility rule |
 |---|---|---|---|
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
-| Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
+| Provider control plane | `packages/ai/src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
 | AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 29 | exact root/child layouts and bundle manifest |
 | Python package | `import metacodes` ([sdk/python](../sdk/python/README.md)) | experimental, unpublished | speaks exactly the AgentCore ABI revision it was built for and refuses any other |
@@ -224,7 +224,7 @@ normative model; the entry points are:
 | `metacodes providers remove <id>` | remove a defined provider whole: `custom_providers.<id>`, `providers.<id>` and a `global_selection` that resolved to it in one write, then `keys/<id>.json` and `oauth/<id>.json` (not revoked); a built-in id exits 2. `/providers remove <id>` does the same for a defined provider |
 | `~/.metacodes/config.json` | `schema_version`, `config_revision`, `providers` (with per-provider `credentials` by environment-variable reference), `custom_providers`, `provider_catalogs`, `aliases`, `global_selection`, `presets`, `directory_presets` and `global_default` (#489), `recent_operation_ids`; written atomically, other keys preserved. The same file declares MCP servers under `"mcpServers"` (Claude Code's schema; the legacy `"mcp_servers":[{"name":"<id>","command":[...]}]` array still works), and Claude Code's `~/.claude.json` / `.mcp.json` and Codex's `config.toml` servers are read too — see [Skills and MCP servers](SKILLS_AND_MCP.md). Each connected server's tools register as deferred `mcp__<id>__<tool>` (listed under the prompt's `# Deferred tools`, activated with `ToolSearch select:mcp__<id>__<tool>`), `/mcp` shows every configured server and why any failed, and `ListMcpResourcesTool` fails with `capability_unsupported` when nothing is |
 | `<session_dir>/runtime-selection.json` | `session_selection`; a session-scoped choice never reaches `config.json` |
-| `src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
+| `packages/ai/src/provider/control_plane.zig` | `model.list`, `model.describe`, `selection.validate`, `selection.resolve`, `selection.commit`, `quote.estimate`, replayable event journal |
 
 Interactive surfaces: `Ctrl+O` and `/model` open the route picker, one screen
 of models under a heading per provider (where its key comes from, who bills

@@ -1,0 +1,1091 @@
+//! 权限决策（M0 骨架实现）。
+//!
+//! 本期仅支持 4 种模式的粗粒度决策。完整的决策树（deny/ask rules → tool.checkPermissions → hooks）
+//! 留给沙箱版本，由 rule.zig / prompt.zig / tool context 一起协作。
+//!
+//! 注意：本模块的 `Decision` 是不带 reason 字符串的简单枚举——为了避免在 M0 引入 allocator 关注点。
+//! 扩展到携带 reason 留给 M2/沙箱阶段。
+
+const std = @import("std");
+const Mode = @import("mode.zig").Mode;
+const category = @import("category.zig");
+const rule_matcher = @import("rule_matcher.zig");
+const settings_mod = @import("settings.zig");
+const SessionRules = @import("session_rules.zig").SessionRules;
+const rule_spec = @import("rule_spec.zig");
+const hooks_mod = @import("hooks.zig");
+const bash_readonly = @import("bash_readonly.zig");
+const credential_store = @import("credential_store.zig");
+const sandbox_config = @import("../sandbox/config.zig");
+const sandbox_exec = @import("../sandbox/exec.zig");
+const log = @import("metacodes-base").util.log;
+
+pub const Decision = enum { allow, deny, ask };
+
+/// Optional consumer-owned decision seam. It exists so AgentCore can apply
+/// its Revision 6 logical-Session grants without changing CLI/App semantics or
+/// moving product policy into the shared loop. Null preserves the existing
+/// decision chain byte-for-byte.
+pub const ImportedSource = enum {
+    none,
+    core_safety,
+    active_skill,
+    settings,
+    session_memory,
+};
+
+/// The shared Permission layer passes its already-established decision into a
+/// consumer without discarding why that decision exists.  AgentCore uses this
+/// as the base of its Session policy; product callers without an override keep
+/// the exact existing decision chain.
+pub const ImportedDecision = enum {
+    undecided,
+    deny,
+    ask,
+    allow,
+    core_safety_deny,
+    core_safety_ask,
+    active_skill_deny,
+    active_skill_allow,
+    session_deny,
+
+    pub fn resolved(self: ImportedDecision) ?Decision {
+        return switch (self) {
+            .undecided => null,
+            .deny, .core_safety_deny, .active_skill_deny, .session_deny => .deny,
+            .ask, .core_safety_ask => .ask,
+            .allow, .active_skill_allow => .allow,
+        };
+    }
+
+    pub fn source(self: ImportedDecision) ImportedSource {
+        return switch (self) {
+            .undecided => .none,
+            .deny, .ask, .allow => .settings,
+            .core_safety_deny, .core_safety_ask => .core_safety,
+            .active_skill_deny, .active_skill_allow => .active_skill,
+            .session_deny => .session_memory,
+        };
+    }
+
+    /// A fixed decision is authority already owned by shared Permission.  A
+    /// consumer may observe it for provenance, but cannot replace it.  Only
+    /// the ordinary settings ask/allow/undecided path remains open for a
+    /// Session-scoped consumer to complete.
+    pub fn isFixed(self: ImportedDecision) bool {
+        return switch (self) {
+            .deny,
+            .core_safety_deny,
+            .core_safety_ask,
+            .active_skill_deny,
+            .active_skill_allow,
+            .session_deny,
+            => true,
+            .undecided, .ask, .allow => false,
+        };
+    }
+};
+
+pub const DecisionOverride = struct {
+    ctx: *anyopaque,
+    decideFn: *const fn (
+        ctx: *anyopaque,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+        imported: ImportedDecision,
+    ) ?Decision,
+
+    pub fn decide(
+        self: DecisionOverride,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+        imported: ImportedDecision,
+    ) ?Decision {
+        return self.decideFn(self.ctx, tool_name, arguments_json, imported);
+    }
+};
+
+pub const Context = struct {
+    /// The mode as it was put on the context. `checkClassified` decides under
+    /// `effectiveMode(mode, settings)`, never under this field directly.
+    mode: Mode,
+    /// 旧 schema rule_set(保留兼容,新代码用 settings)。
+    rules: ?*const rule_matcher.RuleSet = null,
+    /// 当前激活 skill 的临时白/黑名单(若有)。优先级:active_skill > settings > rules > mode。
+    active_skill: ?*const @import("../skills/active.zig").ActiveSkillState = null,
+    /// 5 层 settings 聚合(管理 + cli + project local/shared + user)。
+    settings: ?*const settings_mod.MergedSettings = null,
+    /// Session-local allow/deny memory. It participates in the same deny-first
+    /// matrix as imported settings instead of being deferred to the UI layer.
+    session_rules: ?*SessionRules = null,
+    /// AgentCore-only optional seam; product callers leave it null.
+    decision_override: ?DecisionOverride = null,
+    /// rule_spec 匹配上下文(cwd / project_root / home),用于 path / bash compound 等。
+    match_ctx: rule_spec.MatchContext = .{},
+    /// Bash 工具实际使用的沙箱设置(与 ToolContext.sandbox 同一份)。autoAllowBashIfSandboxed
+    /// 只放行 `sandbox_exec.plan` 判为 `.sandboxed` 的调用——设置开着但本机没有沙箱、
+    /// excludedCommands、逃生口 dangerouslyDisableSandbox 都会裸跑,不得按"沙箱内"放行。
+    /// null = 无沙箱。
+    sandbox: ?*const sandbox_config.SandboxSettings = null,
+    /// PreToolUse hook 集合(最高优先,deny-first)。
+    hooks: ?*const hooks_mod.HookSet = null,
+    /// hook spawn 需要 allocator(构造 stdin JSON);未提供 → 跳过 hook。
+    hook_allocator: ?std.mem.Allocator = null,
+    /// memdir 绝对路径(通道 B 自动记忆目录;空串 = 禁用)。模型用 Write/Edit 自管记忆,
+    /// 写此子树内的文件**任何模式都豁免**(对齐 cc isAutoMemPath)。
+    /// 安全:豁免严格限于 memdir 子树(realpath + 分隔符边界,见 memdir.isAutoMemPath);
+    /// deny 规则 / protected paths 仍优先(memdir 在 ~/.metacodes 下不与之重叠,原则上仍受约束)。
+    memdir_abs: []const u8 = "",
+    /// memdir 豁免判定需要 allocator(realpath 归一化);null → 跳过豁免(降级:按常规决策)。
+    memdir_allocator: ?std.mem.Allocator = null,
+    /// **安全关键**:路径判定(protected / accept_edits scope / memdir 豁免)前把 JSON
+    /// 转义原文 unescape,与工具层(write.zig/edit.zig 落盘前 unescapeString)逐字节等价。
+    /// null → 降级为原始转义字节(仅单测/库最小上下文,那里路径不含转义,无绕过面)。
+    /// 见 extractCheckedPath 注释与 B1 绕过。shim 填 ctx.allocator。
+    /// Bash 免询问判定同理:命令先按 bash.zig 的方式 unescape 再判;null → 栈上定长缓冲。
+    path_check_allocator: ?std.mem.Allocator = null,
+};
+
+/// The mode a permission decision runs under: `mode`, or `default` when the
+/// settings disable it (`disableBypassPermissionsMode`, `disableAutoMode`;
+/// MergedSettings.allowsMode). Setters already refuse such a mode
+/// (SessionService.setPermMode, AgentSession.setPermissionMode) and spawns
+/// clamp an AgentDef's or a forked Skill's override; this is the backstop for
+/// every path that still puts one on a context — a setter that does not ask,
+/// a `scopedDerive` override (it keeps the `settings` pointer), a direct store.
+/// The alias is preserved when allowed (`bypass` stays `bypass`).
+pub fn effectiveMode(mode: Mode, settings: ?*const settings_mod.MergedSettings) Mode {
+    const merged = settings orelse return mode;
+    return if (merged.allowsMode(mode)) mode else .default;
+}
+
+fn resolveImported(
+    ctx: *const Context,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+    imported: ImportedDecision,
+) Decision {
+    std.debug.assert(imported.resolved() != null);
+    std.debug.assert(imported.isFixed());
+    if (ctx.decision_override) |override| {
+        // Fixed decisions are reported through the same seam so AgentCore can
+        // retain canonical provenance.  Its return value is deliberately
+        // ignored: the shared layer remains the sole authority for ceilings.
+        _ = override.decide(tool_name, arguments_json, imported);
+    }
+    return imported.resolved().?;
+}
+
+/// 提取路径参数(file_path/notebook_path/path)并 **unescape**——与工具层落盘前的
+/// `util_json.unescapeString` 逐字节等价。owned,caller free;alloc=null / 无路径 / unescape
+/// 失败 → null。
+///
+/// **为何必须 unescape(B1 绕过)**:rule_spec.extractPath 返回 JSON 字符串里的转义原文
+/// (`\uXXXX`/`\"`/`\/` 未还原)。工具层(write.zig:21)先 `unescapeString` 再归一化落盘。
+/// 若权限层直接拿转义原文判 scope/protected,`{"file_path":"/proj/../etc/x"}`
+/// 里的 `..` 不等于字面 `..` → 骗过 isInWorkingDirs/isProtectedPath 判 allow,
+/// 而工具还原成真 `..` 折叠后逃出工作目录集。unescape 消除这条分歧。
+fn extractCheckedPath(alloc: ?std.mem.Allocator, args: []const u8) ?[]u8 {
+    const a = alloc orelse return null;
+    const raw = rule_spec.extractPath(args);
+    if (raw.len == 0) return null;
+    return util_json_mod.unescapeString(raw, a) catch null;
+}
+
+const util_json_mod = @import("metacodes-base").util.json;
+
+/// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
+pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decision {
+    return checkClassified(ctx, tool_name, args, null);
+}
+
+/// Session catalogs classify Host tools from admission-fixed metadata instead
+/// of falling through the legacy "unknown name is read" compatibility rule.
+/// Settings/rules still match the exact tool name; this override affects only
+/// the final mode/risk fallback.
+pub fn checkClassified(
+    ctx: *const Context,
+    tool_name: []const u8,
+    args: []const u8,
+    category_override: ?category.ToolCategory,
+) Decision {
+    // The only mode this decision reads (steps 4 and 5 below). A mode the settings
+    // disable never reaches them: it is decided exactly as `default` is.
+    const mode = effectiveMode(ctx.mode, ctx.settings);
+    if (mode != ctx.mode) log.debug("permission", "mode {s} is disabled by settings; deciding tool={s} as default", .{
+        @tagName(ctx.mode),
+        tool_name,
+    });
+
+    // -1. 最高优先:PreToolUse hook(deny-first)。任一 hook block → deny,
+    //     hook 看不到的工具(matcher 不匹配)直接 proceed 到下层。
+    if (ctx.hooks) |h| {
+        if (ctx.hook_allocator) |ha| {
+            const dec = hooks_mod.runPreToolUse(h, ha, tool_name, args);
+            if (dec == .block) {
+                log.warn("permission", "PreToolUse hook blocked tool={s}", .{tool_name});
+                return resolveImported(ctx, tool_name, args, .core_safety_deny);
+            }
+        }
+    }
+
+    // 0. 最高优先:active skill 白/黑名单
+    if (ctx.active_skill) |as| {
+        if (as.isDisallowed(tool_name, args)) {
+            log.debug("permission", "active skill '{s}' disallowed tool={s}", .{ as.skill_name, tool_name });
+            return resolveImported(ctx, tool_name, args, .active_skill_deny);
+        }
+        if (as.isAllowed(tool_name, args)) {
+            log.debug("permission", "active skill '{s}' allowed tool={s}", .{ as.skill_name, tool_name });
+            return resolveImported(ctx, tool_name, args, .active_skill_allow);
+        }
+    }
+
+    // 1. Imported settings and Session memory form one deny-first matrix.
+    const imported = if (ctx.settings) |settings|
+        settings_mod.evaluate(settings, &ctx.match_ctx, tool_name, args)
+    else
+        settings_mod.Decision.undecided;
+    const remembered = if (ctx.session_rules) |rules|
+        rules.decisionFor(tool_name)
+    else
+        null;
+    if (imported == .deny or
+        (remembered != null and remembered.? == .deny))
+    {
+        log.debug("permission", "imported/session deny tool={s}", .{tool_name});
+        return resolveImported(
+            ctx,
+            tool_name,
+            args,
+            if (imported == .deny) .deny else .session_deny,
+        );
+    }
+
+    // 2. Protected paths are a Core ceiling over imported and temporary allow.
+    if (isProtectedTarget(ctx, tool_name, args)) {
+        log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
+        return resolveImported(ctx, tool_name, args, .core_safety_ask);
+    }
+    if (bashReachesCredentialStore(ctx, tool_name, args)) {
+        log.debug("permission", "credential store read tool={s} -> ask", .{tool_name});
+        return resolveImported(ctx, tool_name, args, .core_safety_ask);
+    }
+
+    if (ctx.decision_override) |override| {
+        const imported_view: ImportedDecision = switch (imported) {
+            .undecided => .undecided,
+            .deny => .deny,
+            .ask => .ask,
+            .allow => .allow,
+        };
+        if (override.decide(tool_name, args, imported_view)) |overridden| {
+            log.debug("permission", "consumer override tool={s} -> {s}", .{
+                tool_name,
+                @tagName(overridden),
+            });
+            return overridden;
+        }
+    }
+
+    if (remembered != null and remembered.? == .allow) {
+        log.debug("permission", "session allow tool={s}", .{tool_name});
+        return .allow;
+    }
+    switch (imported) {
+        .allow => {
+            log.debug("permission", "settings allow tool={s}", .{tool_name});
+            return .allow;
+        },
+        .ask => {
+            log.debug("permission", "settings ask tool={s}", .{tool_name});
+            return .ask;
+        },
+        .deny => unreachable,
+        .undecided => {},
+    }
+
+    // 2.5 memdir 写豁免(通道 B):模型用 Write/Edit 自管自动记忆目录。目标落在 memdir
+    //     子树内 → 任何模式 allow(对齐 cc isAutoMemPath)。**置于 deny/protected 之后**:
+    //     那两层仍优先(deny 规则、protected paths 不被记忆豁免绕过)。
+    //     安全:isAutoMemPath 用 realpath + 分隔符边界,严格限 memdir 子树。
+    if (ctx.memdir_abs.len > 0) {
+        if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit")) {
+            if (ctx.memdir_allocator) |ma| {
+                const memdir = @import("../core/memory/memdir.zig");
+                // unescape 与工具层等价(见 extractCheckedPath):否则转义路径既进不了豁免
+                // 又可能借分歧绕过——统一 unescape 后再判 memdir 子树。
+                if (extractCheckedPath(ctx.path_check_allocator orelse ma, args)) |target| {
+                    defer (ctx.path_check_allocator orelse ma).free(target);
+                    if (memdir.isAutoMemPath(ma, ctx.memdir_abs, target)) {
+                        log.debug("permission", "memdir auto-mem write allow: {s}", .{target});
+                        return .allow;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 旧细粒度规则(向后兼容)
+    if (ctx.rules) |rs| {
+        if (rs.match(tool_name, args)) |d| {
+            log.debug("permission", "legacy rule tool={s} -> {s}", .{ tool_name, @tagName(d) });
+            return d;
+        }
+    }
+
+    // 4. Bash 专属免询问(dont_ask 除外,它的语义就是限制):
+    //    a. 只读命令(bash_readonly:完整词法,每段只读,无写重定向/替换/写选项)→ ALLOW
+    //    b. autoAllowBashIfSandboxed 且本次调用**确实**进沙箱(sandbox_exec.plan)→ ALLOW
+    //    其余落到下方模式兜底(default/acceptEdits/auto 下即 ask)。
+    if (std.mem.eql(u8, tool_name, "Bash")) {
+        const m4 = @import("mode.zig").canonical(mode);
+        if (m4 != .dont_ask and bashAutoAllowed(ctx, args)) return .allow;
+    }
+
+    // 名字兜底只服务 legacy 路径(null dispatcher / dyn_registry):dispatcher 在场时
+    // agent_loop 已把未解析名收敛成显式 .execute,不会落到这里的 unknown-read。
+    const cat = category_override orelse category.getToolCategory(tool_name);
+    const risk: category.RiskLevel = switch (cat) {
+        .read => .low,
+        .write => .medium,
+        .execute => .high,
+    };
+
+    const mode_mod = @import("mode.zig");
+    const m = mode_mod.canonical(mode);
+    const decision: Decision = blk: {
+        if (m == .bypass_permissions) break :blk .allow;
+        if (m == .auto) break :blk if (risk == .low) .allow else .ask;
+        if (m == .dont_ask) break :blk .deny;
+        if (m == .accept_edits) {
+            if (cat == .read) break :blk .allow;
+            if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "NotebookEdit")) {
+                // 对齐 cc:acceptEdits 只自动接受**工作目录集**(cwd + additionalDirectories)
+                // 内的编辑;集外 → ask。/add-dir 由此获得真实语义(扩集)。
+                // 无 cwd 信息(单测/库最小上下文)或无路径参数(malformed,execute 会报
+                // MissingRequiredField)→ 保持旧 allow,不为无意义调用打扰用户。
+                if (ctx.match_ctx.cwd.len > 0) {
+                    // **B1 修复**:必须 unescape 后再判(与工具层落盘等价),否则
+                    // `/proj/../etc/x` 骗过 scope 门却被工具还原成真 `..` 逃逸。
+                    // 有 allocator → unescape 判定;无(单测)→ 降级用原始字节(那里无转义)。
+                    if (extractCheckedPath(ctx.path_check_allocator, args)) |target| {
+                        defer (ctx.path_check_allocator.?).free(target);
+                        if (!rule_spec.isInWorkingDirs(&ctx.match_ctx, target)) {
+                            log.debug("permission", "accept_edits: {s} outside working dirs -> ask", .{target});
+                            break :blk .ask;
+                        }
+                    } else {
+                        const target = rule_spec.extractPath(args);
+                        if (target.len > 0 and !rule_spec.isInWorkingDirs(&ctx.match_ctx, target)) {
+                            log.debug("permission", "accept_edits: {s} outside working dirs -> ask", .{target});
+                            break :blk .ask;
+                        }
+                    }
+                }
+                break :blk .allow;
+            }
+            break :blk .ask;
+        }
+        break :blk if (cat == .read) .allow else .ask;
+    };
+
+    log.debug("permission", "decide tool={s} mode={s} category={s} risk={s} -> {s}", .{
+        tool_name,
+        @tagName(mode),
+        @tagName(cat),
+        @tagName(risk),
+        @tagName(decision),
+    });
+    return decision;
+}
+
+/// Step 4 for a Bash call: read-only, or confined by a sandbox that will
+/// really wrap it. Both verdicts are about the bytes the tool will run: the
+/// command is JSON-unescaped exactly as tools/bash.zig does it.
+fn bashAutoAllowed(ctx: *const Context, args: []const u8) bool {
+    var fallback_buf: [bash_readonly.MAX_COMMAND_BYTES]u8 = undefined;
+    var fallback = std.heap.FixedBufferAllocator.init(&fallback_buf);
+    const scratch = ctx.path_check_allocator orelse fallback.allocator();
+    const command = bash_readonly.commandFromInput(scratch, args) orelse return false;
+    defer scratch.free(command);
+    if (bash_readonly.isReadonly(bash_readonly.hostDialect(), command)) {
+        log.debug("permission", "bash readonly auto-allow: {s}", .{command});
+        return true;
+    }
+    const sb = ctx.sandbox orelse return false;
+    if (!sb.auto_allow_bash_if_sandboxed) return false;
+    if (sandbox_exec.plan(sb, command, sandbox_exec.escapeHatchHonored(sb, args)) != .sandboxed) return false;
+    log.debug("permission", "autoAllowBashIfSandboxed -> allow", .{});
+    return true;
+}
+
+fn bashReachesCredentialStore(ctx: *const Context, tool_name: []const u8, args: []const u8) bool {
+    if (!std.mem.eql(u8, tool_name, "Bash")) return false;
+    var fallback_buf: [bash_readonly.MAX_COMMAND_BYTES]u8 = undefined;
+    var fallback = std.heap.FixedBufferAllocator.init(&fallback_buf);
+    const scratch = ctx.path_check_allocator orelse fallback.allocator();
+    const command = bash_readonly.commandFromInput(scratch, args) orelse return credential_store.mentions(scratch, args);
+    defer scratch.free(command);
+    return credential_store.mentions(scratch, command);
+}
+
+test "a Bash command that reads a credential store asks, over an allow rule and in every mode" {
+    const alloc = std.testing.allocator;
+    const src = "{\"permissions\":{\"allow\":[\"Bash\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const keychain = "{\"command\":\"security find-generic-password -s \\\"Metacode MCP Credentials\\\" -w > /tmp/cred.json\"}";
+    const heredoc = "{\"command\":\"python3 << 'EOF'\\nimport subprocess\\nsubprocess.run(['security','find-generic-password','-a','suno','-w'])\\nEOF\"}";
+    const spliced = "{\"command\":\"security find-generic-pass'word' -s example -w\"}";
+    for ([_]@import("mode.zig").Mode{ .default, .accept_edits, .auto, .bypass_permissions }) |mode| {
+        const allowed = Context{ .mode = mode, .settings = &ms, .path_check_allocator = alloc };
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", keychain));
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", heredoc));
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Bash", spliced));
+        try std.testing.expectEqual(Decision.allow, check(&allowed, "Bash", "{\"command\":\"make test\"}"));
+    }
+    const bare = Context{ .mode = .bypass_permissions };
+    try std.testing.expectEqual(Decision.ask, check(&bare, "Bash", keychain));
+    try std.testing.expectEqual(Decision.allow, check(&bare, "Bash", "{\"command\":\"make test\"}"));
+
+    const denied_src = "{\"permissions\":{\"deny\":[\"Bash\"]}}";
+    var denied_parsed = try std.json.parseFromSlice(std.json.Value, alloc, denied_src, .{});
+    defer denied_parsed.deinit();
+    const DL = try settings_mod.parseLayer(alloc, .user, denied_parsed.value);
+    const denied_layers = try alloc.alloc(settings_mod.Layer, 1);
+    denied_layers[0] = DL;
+    var denied_ms = settings_mod.MergedSettings{ .layers = denied_layers, .allocator = alloc };
+    defer denied_ms.deinit();
+    const denied = Context{ .mode = .default, .settings = &denied_ms };
+    try std.testing.expectEqual(Decision.deny, check(&denied, "Bash", keychain));
+}
+
+test "classified Host effect replaces legacy unknown-name read fallback" {
+    const default = Context{ .mode = .default };
+    try std.testing.expectEqual(Decision.allow, check(&default, "PluginTool", "{}"));
+    try std.testing.expectEqual(Decision.ask, checkClassified(&default, "PluginTool", "{}", .execute));
+    try std.testing.expectEqual(Decision.allow, checkClassified(&default, "PluginTool", "{}", .read));
+
+    const auto = Context{ .mode = .auto };
+    try std.testing.expectEqual(Decision.ask, checkClassified(&auto, "PluginTool", "{}", .execute));
+    try std.testing.expectEqual(Decision.allow, checkClassified(&auto, "PluginTool", "{}", .read));
+}
+
+/// 工具是否在写一个 protected path?仅 Edit/Write/NotebookEdit 关心。
+/// **B1 修复**:路径先 unescape(与工具层落盘等价),否则 `..`/`\/` 等转义
+/// 骗过 basename/段匹配却被工具还原后写进 .ssh/.git 等——该绕过跨所有模式,故此处统一修。
+fn isProtectedTarget(ctx: *const Context, tool_name: []const u8, args: []const u8) bool {
+    if (!(std.mem.eql(u8, tool_name, "Write") or
+        std.mem.eql(u8, tool_name, "Edit") or
+        std.mem.eql(u8, tool_name, "NotebookEdit"))) return false;
+    if (extractCheckedPath(ctx.path_check_allocator, args)) |path| {
+        defer (ctx.path_check_allocator.?).free(path);
+        return settings_mod.isProtectedPath(path);
+    }
+    // 降级(无 allocator:单测/最小上下文,路径无转义):原始字节判定
+    const path = rule_spec.extractPath(args);
+    if (path.len == 0) return false;
+    return settings_mod.isProtectedPath(path);
+}
+
+test "bypass_permissions allows everything including dangerous" {
+    const ctx = Context{ .mode = .bypass_permissions };
+    try std.testing.expect(check(&ctx, "Bash", "rm -rf /") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .allow);
+}
+
+test "legacy bypass alias still works" {
+    const ctx = Context{ .mode = .bypass };
+    try std.testing.expect(check(&ctx, "Write", "") == .allow);
+}
+
+test "memdir 写豁免:子树内任何模式 allow,外部按常规;deny 仍优先(通道 B)" {
+    const a = std.testing.allocator;
+    // 真建一个 memdir 子树(isAutoMemPath 走 realpath,需真实路径)。
+    const memdir = @import("../core/memory/memdir.zig");
+    const fsmod = @import("metacodes-base").util.fs;
+    var home_buf: [256]u8 = undefined;
+    const home = @import("metacodes-base").util.fs.testing.uniqueDir(&home_buf, "cc-zig-decision-memdir");
+    defer fsmod.testing.rmrfBestEffort(home);
+    try memdir.ensureDir(home, "/fake/repo");
+    var mdbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const md = memdir.memdirPath(home, "/fake/repo", &mdbuf);
+
+    // dont_ask(最严):写 memdir 内文件仍 allow(记忆与模式正交)。
+    const ctx = Context{ .mode = .dont_ask, .memdir_abs = md, .memdir_allocator = a };
+    var ibuf: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const inside_args = try std.fmt.bufPrint(&ibuf, "{{\"file_path\":\"{s}/topic.md\",\"content\":\"x\"}}", .{md});
+    try std.testing.expect(check(&ctx, "Write", inside_args) == .allow);
+    try std.testing.expect(check(&ctx, "Edit", inside_args) == .allow);
+
+    // memdir 外的文件:dont_ask 照常 deny(豁免严格限子树)。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/etc/passwd\",\"content\":\"x\"}") == .deny);
+
+    // 未配置 memdir_abs → 连 memdir 路径也不豁免(走常规 dont_ask deny)。
+    const ctx_off = Context{ .mode = .dont_ask };
+    try std.testing.expect(check(&ctx_off, "Write", inside_args) == .deny);
+}
+
+test "auto mode: low risk allow, others ask" {
+    const ctx = Context{ .mode = .auto };
+    try std.testing.expect(check(&ctx, "Read", "") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "") == .ask);
+}
+
+test "default mode: read allow, write/exec ask" {
+    const ctx = Context{ .mode = .default };
+    try std.testing.expect(check(&ctx, "Read", "") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "") == .ask);
+}
+
+test "prompt alias still maps to default mode" {
+    const ctx = Context{ .mode = .prompt };
+    try std.testing.expect(check(&ctx, "Read", "") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .ask);
+}
+
+test "accept_edits: read + Write/Edit allow, Bash ask" {
+    const ctx = Context{ .mode = .accept_edits };
+    try std.testing.expect(check(&ctx, "Read", "") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .allow);
+    try std.testing.expect(check(&ctx, "Edit", "") == .allow);
+    try std.testing.expect(check(&ctx, "NotebookEdit", "") == .allow);
+    try std.testing.expect(check(&ctx, "Bash", "ls") == .ask);
+}
+
+test "dont_ask: nothing matched in rules → deny" {
+    const ctx = Context{ .mode = .dont_ask };
+    try std.testing.expect(check(&ctx, "Read", "") == .deny);
+    try std.testing.expect(check(&ctx, "Write", "") == .deny);
+    try std.testing.expect(check(&ctx, "Bash", "ls") == .deny);
+}
+
+test "settings deny takes precedence over mode bypass" {
+    const alloc = std.testing.allocator;
+    // Build a one-layer settings with Bash(git push) deny
+    const src = "{\"permissions\":{\"deny\":[\"Bash(git push)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const ctx = Context{ .mode = .bypass_permissions, .settings = &ms };
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git push\"}") == .deny);
+    // 其它 Bash 在 bypass 下仍然 allow
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"ls\"}") == .allow);
+}
+
+test "settings allow grants Bash in default mode" {
+    const alloc = std.testing.allocator;
+    const src = "{\"permissions\":{\"allow\":[\"Bash(git *)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const ctx = Context{ .mode = .default, .settings = &ms };
+    // git status:settings allow → allow(不询问)
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git status\"}") == .allow);
+    // npm test:未命中 settings、非 readonly → 落到 mode → ask
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"npm test\"}") == .ask);
+}
+
+test "imported rules and Session memory use the complete deny-first matrix" {
+    var imported_allow = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .allow = &.{"Bash"} },
+        .{},
+    );
+    defer imported_allow.deinit();
+    var imported_ask = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .ask = &.{"Bash"} },
+        .{},
+    );
+    defer imported_ask.deinit();
+    var imported_deny = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .deny = &.{"Bash"} },
+        .{},
+    );
+    defer imported_deny.deinit();
+    var allow_memory = SessionRules{};
+    allow_memory.rememberAllow("Bash");
+    var deny_memory = SessionRules{};
+    deny_memory.rememberDeny("Bash");
+    const args = "{\"command\":\"echo ok\"}";
+
+    try std.testing.expectEqual(Decision.allow, check(&.{
+        .mode = .default,
+        .settings = &imported_allow,
+        .session_rules = &allow_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_deny,
+        .session_rules = &allow_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_allow,
+        .session_rules = &deny_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_deny,
+        .session_rules = &deny_memory,
+    }, "Bash", args));
+
+    try std.testing.expectEqual(Decision.allow, check(&.{
+        .mode = .default,
+        .settings = &imported_ask,
+        .session_rules = &allow_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_ask,
+        .session_rules = &deny_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.ask, check(&.{
+        .mode = .default,
+        .settings = &imported_ask,
+    }, "Bash", args));
+}
+
+test "protected paths override imported and Session allow" {
+    var imported_allow = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .allow = &.{"Write"} },
+        .{},
+    );
+    defer imported_allow.deinit();
+    var allow_memory = SessionRules{};
+    allow_memory.rememberAllow("Write");
+    const ctx = Context{
+        .mode = .bypass_permissions,
+        .settings = &imported_allow,
+        .session_rules = &allow_memory,
+        .path_check_allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(
+        Decision.ask,
+        check(&ctx, "Write", "{\"file_path\":\"/project/.env\"}"),
+    );
+}
+
+test "consumer override observes complete provenance without weakening Core ceilings" {
+    const Probe = struct {
+        seen: ?ImportedDecision = null,
+        replacement: ?Decision = .allow,
+
+        fn decide(
+            raw: *anyopaque,
+            _: []const u8,
+            _: []const u8,
+            imported: ImportedDecision,
+        ) ?Decision {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen = imported;
+            return self.replacement;
+        }
+
+        fn seam(self: *@This()) DecisionOverride {
+            return .{ .ctx = self, .decideFn = decide };
+        }
+    };
+
+    var probe = Probe{};
+    var imported_deny = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .deny = &.{"Bash"} },
+        .{},
+    );
+    defer imported_deny.deinit();
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .bypass_permissions,
+        .settings = &imported_deny,
+        .decision_override = probe.seam(),
+    }, "Bash", "{\"command\":\"echo ok\"}"));
+    try std.testing.expectEqual(ImportedDecision.deny, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.settings, probe.seen.?.source());
+
+    probe.seen = null;
+    var deny_memory = SessionRules{};
+    deny_memory.rememberDeny("Bash");
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .bypass_permissions,
+        .session_rules = &deny_memory,
+        .decision_override = probe.seam(),
+    }, "Bash", "{\"command\":\"echo ok\"}"));
+    try std.testing.expectEqual(ImportedDecision.session_deny, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.session_memory, probe.seen.?.source());
+
+    probe.seen = null;
+    try std.testing.expectEqual(Decision.ask, check(&.{
+        .mode = .bypass_permissions,
+        .decision_override = probe.seam(),
+        .path_check_allocator = std.testing.allocator,
+    }, "Write", "{\"file_path\":\"/project/.env\"}"));
+    try std.testing.expectEqual(ImportedDecision.core_safety_ask, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.core_safety, probe.seen.?.source());
+
+    const PolicyFrame = @import("../skills/runtime/policy_frame.zig").PolicyFrame;
+    const tools = [_][]const u8{ "Read", "Bash" };
+    const root = try PolicyFrame.createRoot(
+        std.testing.allocator,
+        &tools,
+        .unrestricted,
+        .default,
+        .{ .alloc = std.testing.allocator },
+    );
+    defer root.release();
+    const child = try PolicyFrame.derive(root, &.{"Read"}, &.{});
+    defer child.release();
+    const active = @import("../skills/active.zig").ActiveSkillState.borrowFromPolicyFrame(
+        "read-only",
+        child,
+    );
+    probe.seen = null;
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .bypass_permissions,
+        .active_skill = &active,
+        .decision_override = probe.seam(),
+    }, "Bash", "{\"command\":\"echo ok\"}"));
+    try std.testing.expectEqual(ImportedDecision.active_skill_deny, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.active_skill, probe.seen.?.source());
+}
+
+test "null consumer override leaves the shared decision chain inert" {
+    var imported_ask = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .ask = &.{"Bash"} },
+        .{},
+    );
+    defer imported_ask.deinit();
+    const baseline = Context{ .mode = .bypass_permissions, .settings = &imported_ask };
+    const explicit_null = Context{
+        .mode = .bypass_permissions,
+        .settings = &imported_ask,
+        .decision_override = null,
+    };
+    const args = "{\"command\":\"echo ok\"}";
+    try std.testing.expectEqual(check(&baseline, "Bash", args), check(&explicit_null, "Bash", args));
+    try std.testing.expectEqual(Decision.ask, check(&explicit_null, "Bash", args));
+}
+
+test "B1 绕过修复(第4镜像点·规则匹配器): allow 规则 Write(/**) 圈 /proj 不放行 .. 逃逸" {
+    const alloc = std.testing.allocator;
+    // 用户最常见配置:放行整个项目源码树。
+    const src = "{\"permissions\":{\"allow\":[\"Write(/**)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    // match_ctx.alloc 必须填(否则规则匹配退回原始字节,不折叠 ..)
+    const ctx = Context{
+        .mode = .default,
+        .settings = &ms,
+        .match_ctx = .{ .cwd = "/proj", .project_root = "/proj", .alloc = alloc },
+        .path_check_allocator = alloc,
+    };
+    // sanity:圈内正常文件 allow(规则真生效)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/src/a.zig\"}") == .allow);
+    // 明文 .. 逃逸:折叠成 /etc/passwd 不在 /proj → 规则不命中 → 落 mode default → ask(修复前 allow)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/../../etc/passwd\"}") == .ask);
+    // 转义 .. 逃逸:unescape+折叠 同样 ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/\\u002e\\u002e/\\u002e\\u002e/etc/passwd\"}") == .ask);
+}
+
+test "B1 绕过修复(第4镜像点·deny 不被 .. 降级): deny Edit(/secrets/**) 折叠后仍 deny" {
+    const alloc = std.testing.allocator;
+    // project 锚 deny:禁编辑项目内 secrets/ 子树。
+    const src = "{\"permissions\":{\"deny\":[\"Edit(/secrets/**)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const ctx = Context{
+        .mode = .bypass_permissions, // 即便 bypass,deny 仍优先
+        .settings = &ms,
+        .match_ctx = .{ .cwd = "/proj", .project_root = "/proj", .alloc = alloc },
+        .path_check_allocator = alloc,
+    };
+    // 直接编辑 /proj/secrets/key → deny(sanity)
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/secrets/key\"}") == .deny);
+    // 经 /proj/src/../secrets 折回 secrets 子树 → 折叠后仍命中 → deny 不被 `..` 降级
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/src/../secrets/key\"}") == .deny);
+}
+
+test "protected path forces ask even with allow rule" {
+    const alloc = std.testing.allocator;
+    // 用户允许 Write 整个 cwd,但 .env 仍要 ask
+    const src = "{\"permissions\":{\"allow\":[\"Write(./**)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    var match_ctx = rule_spec.MatchContext{ .cwd = "/proj" };
+    const ctx = Context{ .mode = .default, .settings = &ms, .match_ctx = match_ctx };
+    _ = &match_ctx;
+
+    // 普通文件:allow
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/src/foo.zig\"}") == .allow);
+    // .env: protected path 覆盖 → ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/.env\"}") == .ask);
+    // .git/config: protected → ask
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/.git/config\"}") == .ask);
+}
+
+test "bash readonly auto-allow in default mode" {
+    const ctx = Context{ .mode = .default };
+    // Windows 跑 PowerShell/cmd,POSIX 只读判定不适用 → 一律按模式兜底(ask)。
+    const readonly: Decision = if (bash_readonly.hostDialect() == .posix_sh) .allow else .ask;
+    // ls / cat / git status → allow(免询问)
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"ls -la\"}"));
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"git status\"}"));
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"timeout 5 cat foo\"}"));
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"rg foo src | head\"}"));
+    // 写类命令仍 ask
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"rm foo\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git push\"}") == .ask);
+    // 只读首词 + 写尾段 / 重定向 / 写选项 / JSON 转义换行:不再免询问
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"cd / && rm -rf *\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"echo x > ~/.bashrc\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"sed -i 's/a/b/' file\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"find . -delete\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"cat f\\nrm -rf x\"}") == .ask);
+}
+
+test "bash auto-allow judges the unescaped command (heap scratch as in production)" {
+    const ctx = Context{ .mode = .default, .path_check_allocator = std.testing.allocator };
+    const readonly: Decision = if (bash_readonly.hostDialect() == .posix_sh) .allow else .ask;
+    try std.testing.expectEqual(readonly, check(&ctx, "Bash", "{\"command\":\"grep -n \\\"x y\\\" f\"}"));
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"ls \\u003e out\"}"));
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"ls \\u0026\\u0026 rm x\"}"));
+}
+
+test "bash readonly NOT auto-allowed in dont_ask" {
+    // dont_ask:readonly 也不放行(只放 explicit allow)
+    const ctx_da = Context{ .mode = .dont_ask };
+    try std.testing.expect(check(&ctx_da, "Bash", "{\"command\":\"ls\"}") == .deny);
+}
+
+test "autoAllowBashIfSandboxed allows only a call the sandbox will really wrap" {
+    const sb = sandbox_config.SandboxSettings{
+        .enabled = true,
+        .auto_allow_bash_if_sandboxed = true,
+        .excluded_commands = &.{"docker"},
+    };
+    const ctx = Context{ .mode = .default, .sandbox = &sb };
+    // 沙箱内:即便是写命令也 allow(物理边界已限制)——前提是本机真有沙箱(macOS
+    // sandbox-exec / Linux bubblewrap)。没有后端时设置开着也裸跑 → 不得按沙箱放行。
+    const confined: Decision = if (sandbox_exec.hostSupported()) .allow else .ask;
+    try std.testing.expectEqual(confined, check(&ctx, "Bash", "{\"command\":\"npm install\"}"));
+    // excludedCommands 在沙箱外跑 → ask
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"docker run --rm x\"}"));
+    // 逃生口被采纳 → 沙箱外跑 → ask
+    try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}"));
+    // allowUnsandboxedCommands=false:逃生口不被采纳,命令仍进沙箱
+    var strict = sb;
+    strict.allow_unsandboxed_commands = false;
+    try std.testing.expectEqual(confined, check(&.{ .mode = .default, .sandbox = &strict }, "Bash", "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}"));
+    // 没开 autoAllow / 沙箱关闭 → ask
+    var no_auto = sb;
+    no_auto.auto_allow_bash_if_sandboxed = false;
+    try std.testing.expectEqual(Decision.ask, check(&.{ .mode = .default, .sandbox = &no_auto }, "Bash", "{\"command\":\"npm install\"}"));
+    var disabled = sb;
+    disabled.enabled = false;
+    try std.testing.expectEqual(Decision.ask, check(&.{ .mode = .default, .sandbox = &disabled }, "Bash", "{\"command\":\"npm install\"}"));
+}
+
+test "accept_edits: 工作目录集 scope 门(cwd 内 allow / add-dir 内 allow / 集外 ask / .. 逃逸 ask)" {
+    const extra = [_][]const u8{"/extra/lib"};
+    const ctx = Context{
+        .mode = .accept_edits,
+        .match_ctx = .{ .cwd = "/proj", .additional_dirs = &extra },
+    };
+    // cwd 子树内 → 自动放行
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/src/a.zig\"}") == .allow);
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/b.txt\"}") == .allow);
+    // additional dir 内 → 自动放行(/add-dir 的真实语义)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/extra/lib/c.md\"}") == .allow);
+    // 集外 → ask(不再无条件放行)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/etc/hosts.new\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/other/proj/x\"}") == .ask);
+    // `..` 词法逃逸 → ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/../etc/x\"}") == .ask);
+    // NotebookEdit 走 notebook_path,同样受 scope 门
+    try std.testing.expect(check(&ctx, "NotebookEdit", "{\"notebook_path\":\"/proj/n.ipynb\"}") == .allow);
+    try std.testing.expect(check(&ctx, "NotebookEdit", "{\"notebook_path\":\"/tmp2/n.ipynb\"}") == .ask);
+    // read 类不受影响
+    try std.testing.expect(check(&ctx, "Read", "{\"file_path\":\"/etc/hosts\"}") == .allow);
+}
+
+test "B1 绕过修复: accept_edits 下 JSON 转义的 .. 逃逸被 unescape 后拦成 ask" {
+    const a = std.testing.allocator;
+    const extra = [_][]const u8{"/extra/lib"};
+    const ctx = Context{
+        .mode = .accept_edits,
+        .match_ctx = .{ .cwd = "/proj", .additional_dirs = &extra },
+        .path_check_allocator = a,
+    };
+    // `..` = ".." 的 JSON 转义;`/` = "/"。unescape 前 startsWith /proj/ 骗过 scope;
+    // unescape 后折叠成 /etc/cron.d/pwn 逃出工作目录集 → 必须 ask。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/\\u002e\\u002e/\\u002e\\u002e/etc/cron.d/pwn\",\"content\":\"x\"}") == .ask);
+    // 明文 .. 同样拦(normalizeLexical 兜底)。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/../../etc/x\",\"content\":\"x\"}") == .ask);
+    // 转义但仍在集内 → allow(unescape 不误伤合法路径)。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/\\u0073rc/a.zig\",\"content\":\"x\"}") == .allow);
+}
+
+test "B1 绕过修复: protected path 的转义绕过被拦(跨模式,default 模式验证)" {
+    const a = std.testing.allocator;
+    // `.ssh` 明文能被 protected 段匹配拦;但 `.ssh` 之类转义原文过去骗过匹配。
+    // 修复后 default 模式写 ~/.ssh/id_rsa(转义写法)仍判 protected → ask(而非 allow)。
+    const ctx = Context{ .mode = .default, .path_check_allocator = a };
+    // 明文基线:protected → ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/.ssh/id_rsa\"}") == .ask);
+    // 转义 `.ssh`(`.ssh`):unescape 后 = .ssh → 仍判 protected → ask(未修前会漏判)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/\\u002essh/id_rsa\"}") == .ask);
+}
+
+test "accept_edits: 无 cwd 信息或无路径参数保持旧 allow(最小上下文兼容)" {
+    // 无 cwd(单测/库消费者):行为与收窄前一致
+    const ctx_nocwd = Context{ .mode = .accept_edits };
+    try std.testing.expect(check(&ctx_nocwd, "Write", "{\"file_path\":\"/anywhere/x\"}") == .allow);
+    try std.testing.expect(check(&ctx_nocwd, "Write", "") == .allow);
+    // 有 cwd 但无路径参数(malformed,execute 层会报 MissingRequiredField)→ allow 不打扰用户
+    const ctx = Context{ .mode = .accept_edits, .match_ctx = .{ .cwd = "/proj" } };
+    try std.testing.expect(check(&ctx, "Write", "{\"content\":\"x\"}") == .allow);
+}
+
+test "effectiveMode: a mode the settings disable is default; others and aliases pass through" {
+    const no_rules: []const settings_mod.Rule = &.{};
+    const off_layers = [_]settings_mod.Layer{.{
+        .source = .managed,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+        .disable_auto_mode = true,
+    }};
+    const off = settings_mod.MergedSettings{ .layers = &off_layers, .allocator = std.testing.allocator };
+    const plain_layers = [_]settings_mod.Layer{.{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules }};
+    const plain = settings_mod.MergedSettings{ .layers = &plain_layers, .allocator = std.testing.allocator };
+
+    try std.testing.expectEqual(Mode.default, effectiveMode(.bypass_permissions, &off));
+    try std.testing.expectEqual(Mode.default, effectiveMode(.bypass, &off));
+    try std.testing.expectEqual(Mode.default, effectiveMode(.auto, &off));
+    try std.testing.expectEqual(Mode.accept_edits, effectiveMode(.accept_edits, &off));
+    try std.testing.expectEqual(Mode.dont_ask, effectiveMode(.dont_ask, &off));
+    try std.testing.expectEqual(Mode.prompt, effectiveMode(.prompt, &off));
+    // Allowed: the value is untouched, alias included.
+    try std.testing.expectEqual(Mode.bypass_permissions, effectiveMode(.bypass_permissions, &plain));
+    try std.testing.expectEqual(Mode.bypass, effectiveMode(.bypass, &plain));
+    try std.testing.expectEqual(Mode.auto, effectiveMode(.auto, &plain));
+    try std.testing.expectEqual(Mode.bypass_permissions, effectiveMode(.bypass_permissions, null));
+}
+
+test "a mode the settings disable is decided exactly as default; allowed, it keeps its own decisions" {
+    const a = std.testing.allocator;
+    const no_rules: []const settings_mod.Rule = &.{};
+    const off_layers = [_]settings_mod.Layer{
+        .{ .source = .user, .allow = no_rules, .ask = no_rules, .deny = no_rules },
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true, .disable_auto_mode = true },
+    };
+    const off = settings_mod.MergedSettings{ .layers = &off_layers, .allocator = a };
+    const plain_layers = [_]settings_mod.Layer{.{ .source = .user, .allow = no_rules, .ask = no_rules, .deny = no_rules }};
+    const plain = settings_mod.MergedSettings{ .layers = &plain_layers, .allocator = a };
+    const sandbox = sandbox_config.SandboxSettings{ .enabled = true, .auto_allow_bash_if_sandboxed = true };
+
+    const Call = struct { tool: []const u8, args: []const u8, cat: ?category.ToolCategory = null };
+    const calls = [_]Call{
+        .{ .tool = "Read", .args = "{\"file_path\":\"/proj/a.txt\"}" },
+        .{ .tool = "Glob", .args = "{\"pattern\":\"*\"}" },
+        .{ .tool = "Write", .args = "{\"file_path\":\"/proj/a.txt\",\"content\":\"x\"}" },
+        .{ .tool = "Write", .args = "{\"file_path\":\"/elsewhere/a.txt\",\"content\":\"x\"}" },
+        .{ .tool = "Write", .args = "{\"file_path\":\"/proj/.env\",\"content\":\"x\"}" },
+        .{ .tool = "Edit", .args = "{\"file_path\":\"/proj/a.txt\"}" },
+        .{ .tool = "NotebookEdit", .args = "{\"notebook_path\":\"/proj/n.ipynb\"}" },
+        .{ .tool = "ApplyPatch", .args = "{\"patch\":\"x\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"ls\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"npm install\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}" },
+        .{ .tool = "WebFetch", .args = "{\"url\":\"https://example.com\"}" },
+        .{ .tool = "mcp__srv__run", .args = "{}", .cat = .execute },
+        .{ .tool = "mcp__srv__put", .args = "{}", .cat = .write },
+    };
+    const base = Context{
+        .mode = .default,
+        .settings = &off,
+        .match_ctx = .{ .cwd = "/proj", .alloc = a },
+        .sandbox = &sandbox,
+        .path_check_allocator = a,
+    };
+    for ([_]Mode{ .bypass_permissions, .bypass, .auto }) |forbidden_mode| {
+        var forbidden = base;
+        forbidden.mode = forbidden_mode;
+        for (calls) |call| {
+            const as_default = checkClassified(&base, call.tool, call.args, call.cat);
+            const got = checkClassified(&forbidden, call.tool, call.args, call.cat);
+            std.testing.expectEqual(as_default, got) catch |err| {
+                std.debug.print("mode={s} tool={s} args={s}\n", .{ @tagName(forbidden_mode), call.tool, call.args });
+                return err;
+            };
+        }
+    }
+
+    // Twin: the same settings minus the two switches change nothing — each mode
+    // decides as it does with no settings at all, and bypass is not default.
+    for ([_]Mode{ .bypass_permissions, .bypass, .auto }) |allowed_mode| {
+        var with_plain = base;
+        with_plain.mode = allowed_mode;
+        with_plain.settings = &plain;
+        var without = with_plain;
+        without.settings = null;
+        for (calls) |call| try std.testing.expectEqual(
+            checkClassified(&without, call.tool, call.args, call.cat),
+            checkClassified(&with_plain, call.tool, call.args, call.cat),
+        );
+    }
+    var bypass_allowed = base;
+    bypass_allowed.mode = .bypass_permissions;
+    bypass_allowed.settings = &plain;
+    var bypass_forbidden = bypass_allowed;
+    bypass_forbidden.settings = &off;
+    for ([_]Call{
+        .{ .tool = "Write", .args = "{\"file_path\":\"/proj/a.txt\",\"content\":\"x\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}" },
+        .{ .tool = "mcp__srv__run", .args = "{}", .cat = .execute },
+    }) |call| {
+        try std.testing.expectEqual(Decision.allow, checkClassified(&bypass_allowed, call.tool, call.args, call.cat));
+        try std.testing.expectEqual(Decision.ask, checkClassified(&bypass_forbidden, call.tool, call.args, call.cat));
+    }
+}

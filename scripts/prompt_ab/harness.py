@@ -2,7 +2,7 @@
 扫 transcript 取模型**首选工具**(第一个被调用的工具)。
 
 复用 tests/tty 的 tty_driver.run(已验证可驱动真模型 + PTY)。提示词热插拔靠
-src/core/prompt_override.zig 的 env 旁路:env METACODES_PROMPT_OVERRIDE_<SLOT>=<base64>。
+packages/coding/src/core/prompt_override.zig 的 env 旁路:env METACODES_PROMPT_OVERRIDE_<SLOT>=<base64>。
 """
 import os
 import sys

@@ -30,7 +30,7 @@ human decision, the mechanism only makes it cheap).
 ## 2. Version model
 
 - SemVer `MAJOR.MINOR.PATCH`. `build.zig.zon` `.version` is the repository
-  authority; `src/version.zig` `semver` is the single in-source mirror and
+  authority; `packages/base/src/version.zig` `semver` is the single in-source mirror and
   `scripts/eval/runtime_arm_smoke.py --expected-version` already fails
   `zig build test` when the two disagree. The design keeps both files and has
   the cut script edit them together.
@@ -128,7 +128,7 @@ moved ABI revision is at least a minor. `--agentcore-level` raises the level.
 **The input digest** (`input_digest`) covers the tracked files AgentCore is built
 from: `src/`, `lib/`, `sdk/`, `vendor/ripgrep/`, `deps/`, `build.zig`,
 `build.zig.zon` and the bundle and archive tools. It leaves out version lines,
-`src/version.zig`, `sdk/CHANGELOG.md`, the ledger, `sdk/README.md` and the package
+`packages/base/src/version.zig`, `sdk/CHANGELOG.md`, the ledger, `sdk/README.md` and the package
 tests. All of `src/` counts because the library's module root reaches nearly every
 file and Zig's lazy analysis decides what is compiled only during a build. A false
 "changed" costs a patch version; a false "unchanged" would keep a version over
@@ -181,7 +181,7 @@ month. The script (Python 3.9, stdlib only, tested under `scripts/tests/`):
    §2; version = the larger of bump(last tag) and the `-dev` floor, and
    strictly greater than the last tag.
 2. Rewrites, in one commit on branch `release/<version>`:
-   - `build.zig.zon` `.version = "<version>"`, `src/version.zig`
+   - `build.zig.zon` `.version = "<version>"`, `packages/base/src/version.zig`
      `pub const semver = "<version>";`
    - `CHANGELOG.md`: the `## Unreleased` block becomes `## <version> — <UTC
      date>` with its `### Added/Changed/Fixed/…` subsections; an empty
@@ -299,7 +299,7 @@ would fail).
 For the same recursion-guard reason as stage A, the reopen PR is opened by the
 maintainer: `python3 scripts/release_cut.py --reopen` (run right after merging
 the release PR; the cut script prints the reminder) sets `build.zig.zon` /
-`src/version.zig` to `X.Y.(Z+1)-dev`, `sdk/VERSION` and its packages to the next
+`packages/base/src/version.zig` to `X.Y.(Z+1)-dev`, `sdk/VERSION` and its packages to the next
 `-dev` above the latest AgentCore release (`--agentcore-reopen-level`), re-adds the
 empty `## Unreleased` block if the cut left none, repins the fingerprint and opens `chore: reopen
 <next>-dev`. PATCH is the default floor; a maintainer who knows the next
@@ -327,7 +327,7 @@ Two facts must both hold:
 
 1. **Content.** The paths that differ between the merge commit's base
    (`HEAD^1`) and the merge commit are among `build.zig.zon`,
-   `src/version.zig`, `CHANGELOG.md`, `evals/plugin-v1/protocol.json` and
+   `packages/base/src/version.zig`, `CHANGELOG.md`, `evals/plugin-v1/protocol.json` and
    AgentCore's generated files (`agentcore_contract.GENERATED`), and
    regenerating those files from the base in a scratch worktree with
    `release_cut.py`'s own functions reproduces them byte for byte: a bare
@@ -377,7 +377,7 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 
 | link | mechanism |
 |---|---|
-| version ↔ code | `build.zig.zon` + `src/version.zig` mirror, enforced by `runtime_arm_smoke.py` in `zig build test` |
+| version ↔ code | `build.zig.zon` + `packages/base/src/version.zig` mirror, enforced by `runtime_arm_smoke.py` in `zig build test` |
 | AgentCore ↔ everything it ships | §2a: the ledger, the version state gate, `check_bundle_contents`, `verify_package_inputs`, `verify_dist` |
 | version ↔ tag | stage B refuses `-dev` and existing tags; `release_manifest.zig` stable channel requires `git describe --exact-match` == version and a clean tree |
 | bundle ↔ manifest | `scripts/verify_release_bundle.py` (file set, digests, no symlinks, licences) |

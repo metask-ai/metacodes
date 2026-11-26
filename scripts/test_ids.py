@@ -523,6 +523,8 @@ def narrowed_report(enforced: bool) -> Tuple[str, bool]:
 
 def cmd_ci_compare(args) -> int:
     enforced = MIGRATION_LABEL in pr_labels(args.repository, args.pr)
+    if enforced and args.require_unlabelled:
+        raise TestIdError("migration label changed after planning; use CI for the current labels")
     if args.scope_complete == "false":
         report, failed = narrowed_report(enforced)
     else:
@@ -574,6 +576,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ci.add_argument("--repository", required=True)
     ci.add_argument("--pr", type=int, required=True)
     ci.add_argument("--summary")
+    ci.add_argument("--require-unlabelled", action="store_true")
     ci.add_argument("--scope-complete", default="true",
                     help="'false' when the change scope ran part of the suite: nothing to compare")
     ci.set_defaults(handler=cmd_ci_compare)

@@ -1,10 +1,10 @@
 # Learning turn: post-verdict distillation and reconciliation
 
 Status: all eight steps of §11 implemented 2026-10-17. The in-run path
-(steps 1–4) lives in `src/core/learning_turn.zig`, `src/kg/lesson.zig`,
-`src/core/agent_loop.zig`, `src/tools/kg_tools.zig` and
-`src/kg/scoped_recall.zig`; the end-of-run form in
-`src/core/learning_end_of_run.zig` and `src/core/host_check.zig`; the flags
+(steps 1–4) lives in `packages/coding/src/core/learning_turn.zig`, `packages/coding/src/kg/lesson.zig`,
+`packages/coding/src/core/agent_loop.zig`, `packages/coding/src/tools/kg_tools.zig` and
+`packages/coding/src/kg/scoped_recall.zig`; the end-of-run form in
+`packages/coding/src/core/learning_end_of_run.zig` and `packages/coding/src/core/host_check.zig`; the flags
 in `apps/cli/src/main.zig` (`resolveLearningTurn`), `apps/cli/src/repl/loop.zig` and
 `apps/cli/src/repl/headless.zig`; the proofs in
 `control-plane/lean/MetaCodesControl/LearningTurn.lean`; the protocol in
@@ -434,11 +434,11 @@ negative result for the design, not a partial success.
 
 | step | files | evidence that closes it |
 |---|---|---|
-| 1. **Done.** `learning_turn.zig`: `Mode`, `State`, pure `decide`, prompt renderers; `kg/lesson.zig`: envelope parser, binding, selection, note | `src/core/learning_turn.zig`, `src/kg/lesson.zig` | unit tests named after §7 theorems; an envelope test per contract violation |
-| 2. **Done.** In-run attach after the check-gate terminal decision; output-ledger closure; record emission | `src/core/agent_loop.zig`, `src/tools/observation.zig` | component test with a mock provider: failed verdict → distill message → a `KgRemember` of type `lesson` → reconcile message; passed verdict → distill only; tainted → no message, record says so; observe → no message, record carries `would_distill` |
-| 3. **Done** (without the memory-section change, §12). `lesson` envelope and acceptance on the `KgRemember` path | `src/tools/kg_tools.zig` | component test: an accepted envelope is stored with schema type `lesson` and recalled by its marker; a refused one is not stored |
-| 4. **Done.** Same-task lesson section in the outcome note | `src/kg/scoped_recall.zig` | injection test: newest 3 unsuperseded lessons, 320-byte bodies, byte-identical note when no lesson exists |
-| 5. **Done.** End-of-run form | `src/core/host_check.zig`, `src/core/self_evolution.zig` | headless test: `METACODES_LEARNING_TURN=enforce` with a pinned failing check → one provider request → ≥ 1 `remember` call; caps honoured |
+| 1. **Done.** `learning_turn.zig`: `Mode`, `State`, pure `decide`, prompt renderers; `kg/lesson.zig`: envelope parser, binding, selection, note | `packages/coding/src/core/learning_turn.zig`, `packages/coding/src/kg/lesson.zig` | unit tests named after §7 theorems; an envelope test per contract violation |
+| 2. **Done.** In-run attach after the check-gate terminal decision; output-ledger closure; record emission | `packages/coding/src/core/agent_loop.zig`, `packages/guard/src/tools/observation.zig` | component test with a mock provider: failed verdict → distill message → a `KgRemember` of type `lesson` → reconcile message; passed verdict → distill only; tainted → no message, record says so; observe → no message, record carries `would_distill` |
+| 3. **Done** (without the memory-section change, §12). `lesson` envelope and acceptance on the `KgRemember` path | `packages/coding/src/tools/kg_tools.zig` | component test: an accepted envelope is stored with schema type `lesson` and recalled by its marker; a refused one is not stored |
+| 4. **Done.** Same-task lesson section in the outcome note | `packages/coding/src/kg/scoped_recall.zig` | injection test: newest 3 unsuperseded lessons, 320-byte bodies, byte-identical note when no lesson exists |
+| 5. **Done.** End-of-run form | `packages/coding/src/core/host_check.zig`, `packages/coding/src/core/self_evolution.zig` | headless test: `METACODES_LEARNING_TURN=enforce` with a pinned failing check → one provider request → ≥ 1 `remember` call; caps honoured |
 | 6. **Done** (no `doctor` line, §12). Flags, parse errors, `doctor` line | `apps/cli/src/main.zig` | CLI tests like `--check-gate` without `--host-check` |
 | 7. **Done.** `LearningTurn.lean`; trace validation; CHANGELOG | `control-plane/lean/...`, `scripts/eval/workbuddy/trace.py` | `zig build test` with the kernel; `trace.py` fixtures |
 | 8. **Done** (not run). Pre-registered experiment file | `evals/experiments/learning-turn-v1.md` | the protocol of §9 |

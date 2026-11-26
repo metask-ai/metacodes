@@ -1,7 +1,7 @@
 """No built-in destination that is on by default is cleartext to a public host (#474).
 
 The CLI used to fall back to a System-One advisor service at
-``http://58.211.6.133:10420`` (``BUILTIN_DEFAULT`` in ``src/jev/runtime.zig``)
+``http://58.211.6.133:10420`` (``BUILTIN_DEFAULT`` in ``packages/coding/src/jev/runtime.zig``)
 whenever ``config.json`` and the environment named none. Every session whose
 TinyKG store held a matching memory then sent the first 400 bytes of the request
 and up to eight 480-byte memory excerpts over plain HTTP, across the public
@@ -45,7 +45,8 @@ SKIPPED_DIRS = {".git", ".zig-cache", "zig-out", ".lake", "node_modules", "deps"
 # Cleartext destinations the product is allowed to name, keyed by
 # (root-relative POSIX path, `host[:port]` as written) with why each is not on
 # by default. Rule 2 below guards the first one.
-JEV_DEFAULT = ("src/jev/runtime.zig", "58.211.6.133:10420")
+JEV_RUNTIME = "packages/coding/src/jev/runtime.zig"
+JEV_DEFAULT = (JEV_RUNTIME, "58.211.6.133:10420")
 ALLOWED_CLEARTEXT = {
     JEV_DEFAULT: (
         "Jev BUILTIN_DEFAULT: taken only by a host that sets Config.jev_builtin_default; "
@@ -232,7 +233,7 @@ class BuiltinEgressDisciplineTest(unittest.TestCase):
         self.assertEqual(problems(ROOT), [])
 
     def test_the_cli_decision_is_off_and_is_what_main_and_doctor_read(self):
-        runtime = (ROOT / "src" / "jev" / "runtime.zig").read_text(encoding="utf-8")
+        runtime = (ROOT / JEV_RUNTIME).read_text(encoding="utf-8")
         main = (ROOT / "apps" / "cli" / "src" / "main.zig").read_text(encoding="utf-8")
         self.assertRegex(runtime, r"pub const CLI_USES_BUILTIN_DEFAULT = false;")
         # The session and doctor both take it from the constant, so they cannot disagree.
@@ -311,8 +312,9 @@ class BuiltinEgressDisciplineTest(unittest.TestCase):
             self.assertIn("no production literal matches; drop the exemption", report[0])
 
     def _tree_with_default(self, root: Path, decision: str, main: str = "") -> None:
-        (root / "src" / "jev").mkdir(parents=True)
-        (root / "src" / "jev" / "runtime.zig").write_text(
+        (root / "src").mkdir()
+        (root / JEV_RUNTIME).parent.mkdir(parents=True)
+        (root / JEV_RUNTIME).write_text(
             'pub const BUILTIN_DEFAULT: Raw = .{ .url = "http://58.211.6.133:10420" };\n' + decision,
             encoding="utf-8",
         )
@@ -362,8 +364,9 @@ class BuiltinEgressDisciplineTest(unittest.TestCase):
     def test_rule_two_stands_down_once_the_default_is_no_longer_cleartext(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "src" / "jev").mkdir(parents=True)
-            (root / "src" / "jev" / "runtime.zig").write_text(
+            (root / "src").mkdir()
+            (root / JEV_RUNTIME).parent.mkdir(parents=True)
+            (root / JEV_RUNTIME).write_text(
                 'pub const BUILTIN_DEFAULT: Raw = .{ .url = "https://jev.example" };\n'
                 "pub const CLI_USES_BUILTIN_DEFAULT = true;\n",
                 encoding="utf-8",

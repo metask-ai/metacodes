@@ -11,7 +11,7 @@ Cut (`release_cut.py [--level auto|patch|minor|major] [--force-level]`):
   2. last tag = `git describe --tags --abbrev=0`; level = Conventional-Commit
      types of every non-merge commit since it (unknown types count nothing);
   3. version = max(bump(last tag), dev floor), strictly greater than the tag;
-  4. rewrite build.zig.zon, src/version.zig and CHANGELOG.md (`## Unreleased`
+  4. rewrite build.zig.zon, packages/base/src/version.zig and CHANGELOG.md (`## Unreleased`
      -> `## <version> — <date>`, empty `## Unreleased` reinserted), finalize
      AgentCore with its own version (agentcore_release.py: built when its inputs
      changed, reused when not; `--agentcore-level` to raise it), repin the
@@ -235,7 +235,7 @@ def current_versions(root: Path) -> Tuple[str, str]:
     zon = ZON_VERSION_RE.search(read(root, ZON))
     zig = ZIG_VERSION_RE.search(read(root, VERSION_ZIG))
     if zon is None or zig is None:
-        raise CutError("could not find the version declarations in build.zig.zon / src/version.zig")
+        raise CutError("could not find the version declarations in build.zig.zon / packages/base/src/version.zig")
     if zon.group(2) != zig.group(2):
         raise CutError(f"version mirror disagrees: {ZON}={zon.group(2)} {VERSION_ZIG}={zig.group(2)}")
     return zon.group(2), zig.group(2)
