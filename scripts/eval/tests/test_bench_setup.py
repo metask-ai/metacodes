@@ -141,6 +141,10 @@ elif name == "docker":
             sys.exit(1)
     if args[:1] == ["inspect"] and env.get("FAKE_DOCKER_INSPECT"):
         print(env["FAKE_DOCKER_INSPECT"])
+    if args[:1] == ["ps"] and env.get("FAKE_DOCKER_PS"):
+        print(env["FAKE_DOCKER_PS"])
+    if args[:3] == ["network", "inspect", "bridge"] and env.get("FAKE_DOCKER_BRIDGE"):
+        print(env["FAKE_DOCKER_BRIDGE"])
     if args[:1] == ["build"] and args[-1:] == ["-"]:
         (state / ("dockerfile-" + args[args.index("-t") + 1])).write_text(sys.stdin.read())
     images = state / "images"
@@ -180,7 +184,8 @@ elif name == "ssh":
     for key in ("FAKE_LOG", "FAKE_TEMPLATES", "FAKE_BENCH_DELAY", "FAKE_PROFILE_REQUEST",
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
                 "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
-                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT", "FAKE_BENCH_RELEASE_FILE",
+                "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT", "FAKE_DOCKER_PS",
+                "FAKE_DOCKER_BRIDGE", "FAKE_SYSCTL", "FAKE_BENCH_RELEASE_FILE",
                 "FAKE_LATE_TRAFFIC", "FAKE_EGRESS_PROBE_ID"):
         if key in env:
             remote[key] = env[key]
@@ -258,7 +263,29 @@ elif name == "ssh":
         sys.exit(subprocess.call(["/bin/sh", "-c", command], env=remote))
     os.execve("/bin/sh", ["sh", "-c", command], remote)
 elif name == "sysctl":
-    print(env.get("FAKE_HV_SUPPORT", "1"))
+    sysctl_store = state / "sysctl.json"
+    if args[:1] == ["-p"] and len(args) >= 2:
+        values = json.loads(sysctl_store.read_text()) if sysctl_store.exists() else {}
+        for line in Path(args[1]).read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                values[k.strip()] = v.strip()
+        sysctl_store.write_text(json.dumps(values))
+    elif args[:1] == ["-n"] and len(args) >= 2:
+        key = args[1]
+        values = json.loads(sysctl_store.read_text()) if sysctl_store.exists() else {}
+        if key in values:
+            print(values[key])
+        elif env.get("FAKE_SYSCTL"):
+            preset = json.loads(env["FAKE_SYSCTL"])
+            if key in preset:
+                print(preset[key])
+        elif key == "kern.hv_support":
+            print(env.get("FAKE_HV_SUPPORT", "1"))
+        else:
+            print("1")
+    else:
+        print(env.get("FAKE_HV_SUPPORT", "1"))
 elif name == "zig":
     if args[:1] == ["version"]:
         print("0.16.0")
@@ -423,8 +450,11 @@ class SetupFixture(unittest.TestCase):
         # is a file of the fixture.
         self.reachable = f"http://127.0.0.1:{self.release.server_port}/"
         self.daemon_json = root / "etc-docker" / "daemon.json"
+        self.sysctl_conf = root / "etc-sysctl" / "99-metacodes-bench.conf"
         for patcher in (patch.object(setup, "NETWORK_TARGETS", {k: self.reachable for k in setup.NETWORK_TARGETS}),
-                        patch.object(setup, "NETWORK_TIMEOUT", 2), patch.object(setup, "DAEMON_JSON", str(self.daemon_json))):
+                        patch.object(setup, "NETWORK_TIMEOUT", 2),
+                        patch.object(setup, "DAEMON_JSON", str(self.daemon_json)),
+                        patch.object(setup, "SYSCTL_CONF", str(self.sysctl_conf))):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.state = root / "bench-state"
@@ -2890,8 +2920,13 @@ class NetworkSetupTest(SetupFixture):
         blocked = self.closed_port_url()
         targets = {"pypi": blocked, "dockerhub": blocked, "ghcr": blocked, "github": self.reachable}
         self.daemon_json.parent.mkdir()
-        self.daemon_json.write_text('{"log-driver": "json-file", "registry-mirrors": ["https://mirror.corp"]}')
+        self.daemon_json.write_text(json.dumps({
+            "log-driver": "json-file",
+            "registry-mirrors": ["https://mirror.corp"],
+            "default-address-pools": list(setup.DEFAULT_DOCKER_ADDRESS_POOLS),
+        }))
         os.environ["FAKE_REMOTE_SUDO"] = "1"
+        os.environ["FAKE_SYSCTL"] = json.dumps(dict(setup.HOST_SYSCTL_MINIMUMS))
         with patch.object(setup, "NETWORK_TARGETS", targets):
             before = self.config.read_bytes()
             dry = setup.run_setup(self.config, "relay-4090", dry_run=True)
@@ -3108,6 +3143,146 @@ class NetworkSetupTest(SetupFixture):
         self.assertEqual(self.calls("systemctl"), [])
         # Mirrors only fill gaps: a configured value is never proposed over.
         self.assertEqual(self.step(progress, "network")["status"], "ok")
+
+    def test_docker_pools_configures_subnets_pins_bip_avoids_routes_and_is_idempotent(self):
+        self.add_ssh_executor(metrics_bind="172.17.0.1")
+        self.remote_docker()
+        os.environ["FAKE_REMOTE_SUDO"] = "1"
+        os.environ["FAKE_DOCKER_BRIDGE"] = "172.17.0.1 172.17.0.0/16"
+        ip_tool = self.remote_bin / "ip"
+        ip_tool.write_text(
+            "#!/bin/sh\n"
+            "printf 'default via 192.168.10.1 dev enp6s18\\n"
+            "172.18.0.0/16 dev enp6s18 proto kernel\\n"
+            "172.17.0.0/16 dev docker0 proto kernel\\n"
+            "192.168.10.0/24 dev enp6s18 proto kernel\\n'\n"
+        )
+        ip_tool.chmod(0o755)
+        self.daemon_json.parent.mkdir(parents=True, exist_ok=True)
+        self.daemon_json.write_text('{"dns": ["172.17.0.1"]}')
+
+        dry = setup.run_setup(self.config, "relay-4090", dry_run=True)
+        self.assertEqual(self.step(dry, "docker_pools")["status"], "planned", self.step(dry, "docker_pools"))
+        self.assertEqual(json.loads(self.daemon_json.read_text()), {"dns": ["172.17.0.1"]})
+        self.assertEqual(self.calls("systemctl"), [])
+
+        progress = setup.run_setup(self.config, "relay-4090")
+        step = self.step(progress, "docker_pools")
+        self.assertEqual(step["status"], "done", step)
+        daemon = json.loads(self.daemon_json.read_text())
+        self.assertEqual(daemon["dns"], ["172.17.0.1"])
+        self.assertEqual(daemon["bip"], "172.17.0.1/16")
+        bases = [p["base"] for p in daemon["default-address-pools"]]
+        self.assertNotIn("172.18.0.0/15", bases)
+        self.assertEqual(bases, ["172.20.0.0/14", "172.24.0.0/13"])
+        self.assertGreaterEqual(setup.docker_pool_capacity(daemon["default-address-pools"]), setup.MIN_DOCKER_SUBNETS)
+        self.assertEqual([c[1] for c in self.calls("systemctl")], [["restart", "docker"]])
+
+        again = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(self.step(again, "docker_pools")["status"], "ok", self.step(again, "docker_pools"))
+        self.assertEqual(len(self.calls("systemctl")), 1)
+
+    def test_docker_pools_uses_fallback_when_172_space_is_occupied(self):
+        pools = setup.select_docker_address_pools("172.16.0.0/12 dev eth0 proto kernel\n", "172.17.0.1/16")
+        self.assertEqual(pools, [setup.FALLBACK_DOCKER_ADDRESS_POOL])
+
+    def test_docker_pools_refuses_restart_when_trials_running_or_without_sudo(self):
+        self.add_ssh_executor(metrics_bind="172.17.0.1")
+        self.remote_docker()
+        os.environ["FAKE_REMOTE_SUDO"] = "1"
+        os.environ["FAKE_DOCKER_PS"] = "adaptive-rejection-sampler__abc123__env-main-1\nmetacodes-apt-cache"
+        active = setup.run_setup(self.config, "relay-4090")
+        step = self.step(active, "docker_pools")
+        self.assertEqual(step["status"], "manual", step)
+        self.assertIn("运行中的评测容器", step["detail"])
+        self.assertIn("systemctl restart docker", step["command"])
+        self.assertFalse(self.daemon_json.exists())
+        self.assertEqual(self.calls("systemctl"), [])
+
+        os.environ.pop("FAKE_REMOTE_SUDO", None)
+        os.environ.pop("FAKE_DOCKER_PS", None)
+        no_sudo = setup.run_setup(self.config, "relay-4090")
+        step = self.step(no_sudo, "docker_pools")
+        self.assertEqual(step["status"], "manual", step)
+        self.assertIn("无免密 sudo", step["detail"])
+        self.assertIn("systemctl restart docker", step["command"])
+        self.assertFalse(self.daemon_json.exists())
+
+    def test_host_limits_raises_low_sysctls_persists_file_and_reports_manual_without_sudo(self):
+        self.add_ssh_executor(metrics_bind="172.17.0.1")
+        self.remote_docker()
+        low = {key: minimum - 1 for key, minimum in setup.HOST_SYSCTL_MINIMUMS}
+        os.environ["FAKE_SYSCTL"] = json.dumps(low)
+
+        no_sudo = setup.run_setup(self.config, "relay-4090")
+        step = self.step(no_sudo, "host_limits")
+        self.assertEqual(step["status"], "manual", step)
+        self.assertIn("sudo sysctl -p " + str(self.sysctl_conf), step["command"])
+        self.assertFalse(self.sysctl_conf.exists())
+
+        os.environ["FAKE_REMOTE_SUDO"] = "1"
+        self.daemon_json.parent.mkdir(parents=True, exist_ok=True)
+        self.daemon_json.write_text(json.dumps({"default-address-pools": list(setup.DEFAULT_DOCKER_ADDRESS_POOLS)}))
+        dry = setup.run_setup(self.config, "relay-4090", dry_run=True)
+        self.assertEqual(self.step(dry, "host_limits")["status"], "planned", self.step(dry, "host_limits"))
+        self.assertFalse(self.sysctl_conf.exists())
+
+        applied = setup.run_setup(self.config, "relay-4090")
+        step = self.step(applied, "host_limits")
+        self.assertEqual(step["status"], "done", step)
+        written = self.sysctl_conf.read_text()
+        for key, minimum in setup.HOST_SYSCTL_MINIMUMS:
+            self.assertIn(f"{key} = {minimum}", written)
+        self.assertEqual(self.calls("systemctl"), [])
+
+        again = setup.run_setup(self.config, "relay-4090")
+        self.assertEqual(self.step(again, "host_limits")["status"], "ok", self.step(again, "host_limits"))
+
+    def test_prune_orphan_trial_docker_removes_only_stale_trial_resources(self):
+        import datetime as dt
+        now = dt.datetime(2026, 11, 26, 12, 0, 0, tzinfo=dt.timezone.utc)
+        removed = []
+
+        def fake_run(argv, **_kwargs):
+            if argv[:2] == ["docker", "ps"]:
+                out = (
+                    "cid_old old-task__aaa__env-main-1\n"
+                    "cid_new fresh-task__bbb__env-main-1\n"
+                    "cid_pg metacodes-bench-postgres\n"
+                )
+                return subprocess.CompletedProcess(argv, 0, out, "")
+            if argv[:2] == ["docker", "inspect"]:
+                out = (
+                    "cid_old false 2026-11-26T11:30:00.123456789Z\n"
+                    "cid_new false 2026-11-26T11:58:00.000000000Z\n"
+                )
+                return subprocess.CompletedProcess(argv, 0, out, "")
+            if argv[:2] == ["docker", "rm"]:
+                removed.append(tuple(argv))
+                return subprocess.CompletedProcess(argv, 0, argv[2] + "\n", "")
+            if argv[:3] == ["docker", "network", "ls"]:
+                out = (
+                    "nid_old old-task__aaa__env_default\n"
+                    "nid_new fresh-task__bbb__env_default\n"
+                    "nid_busy busy-task__ccc__env_default\n"
+                    "nid_bridge bridge\n"
+                )
+                return subprocess.CompletedProcess(argv, 0, out, "")
+            if argv[:3] == ["docker", "network", "inspect"]:
+                out = (
+                    "nid_old 0 2026-11-26T11:30:00.987654321+00:00\n"
+                    "nid_new 0 2026-11-26T11:58:00Z\n"
+                    "nid_busy 1 2026-11-26T11:00:00Z\n"
+                )
+                return subprocess.CompletedProcess(argv, 0, out, "")
+            if argv[:3] == ["docker", "network", "rm"]:
+                removed.append(tuple(argv))
+                return subprocess.CompletedProcess(argv, 0, argv[3] + "\n", "")
+            raise AssertionError(f"unexpected argv: {argv}")
+
+        containers, networks = remote.prune_orphan_trial_docker(now_utc=now, run_cmd=fake_run)
+        self.assertEqual((containers, networks), (1, 1))
+        self.assertEqual(removed, [("docker", "rm", "cid_old"), ("docker", "network", "rm", "nid_old")])
 
     def test_workbench_egress_probe_failure_is_explained(self):
         self.tunnel_ports()
