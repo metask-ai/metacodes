@@ -47,6 +47,10 @@ def main():
                     errors = []
                     page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
+                    page.wait_for_url('**/#/')
+                    page.get_by_role('heading', name='Profiles', exact=True).wait_for()
+                    assert page.get_by_role('dialog').count() == 0
+                    page.get_by_role('button', name='创建作业', exact=True).click()
                     page.get_by_role('button', name='清空', exact=True).click()
                     page.get_by_role('checkbox', name='fix-git', exact=True).check()
                     page.locator('[name=attempts]').fill('1')
@@ -130,6 +134,7 @@ def main():
                         wait_run(manager, loose)
                     page.set_viewport_size({'width': 390, 'height': 844})
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/new')
+                    page.get_by_role('button', name='创建作业', exact=True).click()
                     page.locator('.form-submit button').wait_for()
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'mobile overflow'
                     assert not errors, errors

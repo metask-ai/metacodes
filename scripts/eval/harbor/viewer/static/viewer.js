@@ -133,7 +133,6 @@ function setConnection(ok, message) {
 // ------------------------------------------------------------ routing
 function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
-  if (parts[0] === 'new') return { view: 'new' };
   if (parts[0] === 'settings') return { view: 'settings', tab: parts[1] || 'database' };
   if (parts[0] === 'providers') return { view: 'settings', tab: 'providers' };
   if (parts[0] === 'monitor') return { view: 'monitor', executor: parts[1] || null };
@@ -160,13 +159,13 @@ async function render() {
   if (state.busy) return;
   state.busy = true;
   state.editing = false;
+  if (location.hash === '#/new') history.replaceState(null, '', '#/');
   const hash = location.hash;
   const r = route();
   try {
-    $('.header-actions a.primary').hidden = true;
+    $('#create-run').hidden = true;
     let node;
-    if (r.view === 'new') node = await renderNewRun();
-    else if (r.view === 'settings') node = await renderSettings(r.tab);
+    if (r.view === 'settings') node = await renderSettings(r.tab);
     else if (r.view === 'monitor') node = await renderMonitor(r.executor);
     else if (r.view === 'run') node = await renderRun(r.name);
     else if (r.view === 'overview') node = await renderOverview();
@@ -252,7 +251,7 @@ function runAgain(b, onlyInvalid) {
   }
   state.suitePick = new Map([...wanted.keys()].map((id) => [id, null]));
   state.taskWanted = wanted;
-  location.hash = '#/new';
+  openRunDialog();
 }
 async function deleteProfile(b, button) {
   if (!confirm(`删除 Profile ${profileName(b)}？工作台会删除运行记录、本机评测结果和汇总。远程 worker 会保留作业详情。`)) return false;
@@ -377,7 +376,7 @@ async function renderOverview() {
   crumbs([]);
   const { profiles, jobs, runs, can_run: canRun } = await api('/api/jobs');
   state.live = profiles.some(profileActive) || jobs.some((j) => j.running) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
-  $('.header-actions a.primary').hidden = !canRun;
+  $('#create-run').hidden = !canRun;
   const chosen = profiles.filter((p) => state.selected.has(p.id));
   const rows = profiles.map((p) => h('tr', {},
     h('td', {}, h('input', { type: 'checkbox', checked: state.selected.has(p.id), 'aria-label': '对比 ' + profileName(p),
@@ -391,7 +390,7 @@ async function renderOverview() {
     h('thead', {}, h('tr', {}, heads.map((head) => h('th', { text: head })))), h('tbody', {}, rows)));
   const listing = panel('Profile 列表', profiles.length + ' 个', profiles.length
     ? table(['对比', 'Profile / 模型', 'MetaCodes 版本', '作业数', '状态', '首轮满分率', '最近运行'], rows)
-    : h('div', { class: 'empty' }, '还没有 Profile。', canRun ? link('#/new', '创建首个作业') : null));
+    : h('div', { class: 'empty' }, '还没有 Profile。', canRun ? h('button', { class: 'button', onclick: openRunDialog }, '创建首个作业') : null));
   const comparison = chosen.length < 2 ? null : panel('Profile 对比', '各 Profile 的最新结果', h('div', {},
     table(['Profile', '一次性完成率', '首轮满分率', '至少通过一次', '初始 Token', '每题平均成本', '每次通过成本', '通过 trial', '缓存命中率'],
       chosen.map((p) => h('tr', {}, [profileName(p), pct(p.summary.one_shot_pass_rate), pct(p.summary.first_pass_rate),
@@ -695,12 +694,32 @@ const RUNNERS = { 'harbor-registry': 'Harbor 注册表', 'harbor-local': '本地
 // The LLM judge that scores a suite/run: model id and how it is reached.
 const judgeText = (j) => '评委 ' + j.model + (j.via === 'metask' ? '（Metask 网关）' : j.via === 'host_env' ? '（执行机器环境变量）' : '');
 
-async function renderNewRun() {
-  state.live = false;
-  navCurrent('overview');
-  $('#title').textContent = '创建作业';
-  crumbs([{ text: 'Profiles', href: '#/' }, { text: '选择 metacodes 版本和高级功能（即Profile），再选评测集' }]);
-  const c = await api('/api/workbench');
+function openRunDialog() {
+  const dialog = h('dialog', { class: 'run-dialog', 'aria-label': '创建作业' });
+  const content = h('div', { text: '读取中…' });
+  dialog.append(h('button', { class: 'button', onclick: () => dialog.close() }, '关闭'), content);
+  document.body.append(dialog);
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    state.runDraft = null;
+    state.taskWanted = null;
+    state.suitePick = null;
+    state.pickBundle = null;
+  }, { once: true });
+  dialog.showModal();
+  async function refreshForm() {
+    if (!dialog.open) return;
+    try {
+      const config = await api('/api/workbench');
+      if (dialog.open) content.replaceChildren(runForm(config, refreshForm, dialog));
+    } catch (error) {
+      content.textContent = error.message;
+    }
+  }
+  refreshForm();
+}
+
+function runForm(c, refreshForm, dialog) {
   const suites = c.suites || [];
   const byId = new Map(suites.map((s) => [s.id, s]));
   // Selected suites, in the order picked: id -> {tasks, defaults, selected, error, loaded}.
@@ -889,7 +908,7 @@ async function renderNewRun() {
     } catch (e) { entry.error = e.message; }
     // Only the suite's latest request counts: an older one may be for another
     // executor, or for this one before a switch away and back.
-    if (state.suitePick.has(id) && state.taskTickets.get(id) === ticket) {
+    if (dialog.open && state.suitePick?.has(id) && state.taskTickets.get(id) === ticket) {
       if (!entry.error) state.taskWanted.delete(id);
       state.suitePick.set(id, entry); drawBoxes(); syncSubmit();
     }
@@ -904,7 +923,7 @@ async function renderNewRun() {
     if (modelMissing) notes.push(`上次的模型 ${modelMissing} 当前不可用，请重新选择。`);
     form.append(h('div', { class: 'callout' }, notes.map((text) => h('p', { text })),
       h('button', { type: 'button', class: 'button', onclick: () => {
-        state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; render();
+        state.runDraft = null; state.taskWanted = null; state.suitePick = null; state.pickBundle = null; refreshForm();
       } }, '改为新的Profile')));
   }
   form.append(
@@ -944,7 +963,9 @@ async function renderNewRun() {
       state.suitePick = null;
       state.runDraft = null;
       state.taskWanted = null;
-      location.hash = profileHref(record);
+      dialog.close();
+      if (location.hash === profileHref(record)) render();
+      else location.hash = profileHref(record);
     } catch (error) {
       feedback.textContent = error.message;
       syncSubmit();
@@ -995,8 +1016,8 @@ async function renderNewRun() {
     setupBox.replaceChildren(...parts);
     for (const d of setupBox.querySelectorAll('details')) if (open.has(d.dataset.key)) d.open = true;
     const active = latest && latest.status === 'running';
-    if (active && route().view === 'new') { state.setupWatch = true; setTimeout(drawSetup, 2000); }
-    else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(render, 500); }
+    if (active && dialog.open) { state.setupWatch = true; setTimeout(drawSetup, 2000); }
+    else if (state.setupWatch && !active) { state.setupWatch = false; setTimeout(refreshForm, 500); }
   }
   // Any commit of the source repository, picked by its time, built on the
   // selected executor's node and then offered as a version like any other.
@@ -1019,7 +1040,7 @@ async function renderNewRun() {
       h('td', { class: 'num', text: new Date(x.committed_at).toLocaleString('zh-CN', { hour12: false }) }),
       h('td', { class: 'mono', text: x.commit.slice(0, 10) }), h('td', { text: x.subject }), h('td', { text: x.author }),
       h('td', {}, x.bundle
-        ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = x.bundle; render(); } }, '已编译 · 选用')
+        ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = x.bundle; refreshForm(); } }, '已编译 · 选用')
         : h('button', { type: 'button', class: 'button', onclick: () => startBuild(x.commit) }, '编译')))))));
   }
   async function startBuild(ref) {
@@ -1040,10 +1061,10 @@ async function renderNewRun() {
     buildState.replaceChildren(h('div', { class: 'setup-step' },
       h('p', {}, h('b', { text: `${title} · ${latest.ref}` }), h('span', { class: 'muted', text: ` · 在 ${latest.executor} 上编译` }),
         latest.error ? h('span', { text: ' · ' + latest.error }) : null, ' ', cancel,
-        latest.status === 'done' && latest.bundle ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = latest.bundle; render(); } }, '选用这个版本') : null),
+        latest.status === 'done' && latest.bundle ? h('button', { type: 'button', class: 'button', onclick: () => { state.pickBundle = latest.bundle; refreshForm(); } }, '选用这个版本') : null),
       (latest.log || []).length ? h('pre', { class: 'muted', text: latest.log.join('\n') }) : null));
-    if (running && route().view === 'new' && commitBox.isConnected) setTimeout(drawBuild, 2000);
-    else if (state.buildWatch === latest.id && latest.status === 'done') { state.buildWatch = null; state.pickBundle = latest.bundle; setTimeout(render, 300); }
+    if (running && dialog.open && commitBox.isConnected) setTimeout(drawBuild, 2000);
+    else if (state.buildWatch === latest.id && latest.status === 'done') { state.buildWatch = null; state.pickBundle = latest.bundle; setTimeout(refreshForm, 300); }
     if (running) state.buildWatch = latest.id;
   }
   commitBox.append(
@@ -2208,7 +2229,7 @@ function mirrorsPanel(m) {
       await api('/api/setup', { executor: name, dry_run: false });
       state.executor = name;
       state.setupWatch = true;
-      location.hash = '#/new';
+      openRunDialog();
     } catch (error) { rerunNote.textContent = error.message; rerun.disabled = false; }
   });
   const todo = pending.length ? h('div', { class: 'panel-body' }, h('div', { class: 'callout mirror-pending' },
@@ -2283,16 +2304,17 @@ async function renderMonitor(name) {
 // ------------------------------------------------------------ refresh loop
 function tick() {
   const label = $('#countdown');
-  if (state.editing) { label.textContent = '编辑中'; return; }
+  if (document.querySelector('.run-dialog[open]') || state.editing) { label.textContent = '编辑中'; return; }
   if (!state.auto || !state.live) { label.textContent = state.live ? '已暂停' : '无运行中'; return; }
   state.countdown -= 1;
   label.textContent = state.countdown + 's';
   if (state.countdown <= 0) { state.countdown = REFRESH_S; render(); }
 }
 document.addEventListener('DOMContentLoaded', () => {
+  $('#create-run').addEventListener('click', openRunDialog);
   $('#refresh').addEventListener('click', () => { state.countdown = REFRESH_S; render(); });
   $('#auto').addEventListener('click', (e) => { state.auto = !state.auto; e.currentTarget.setAttribute('aria-pressed', String(state.auto)); tick(); });
-  window.addEventListener('hashchange', () => { state.countdown = REFRESH_S; window.scrollTo(0, 0); render(); });
+  window.addEventListener('hashchange', () => { document.querySelector('.run-dialog[open]')?.close(); state.countdown = REFRESH_S; window.scrollTo(0, 0); render(); });
   render();
   state.timer = setInterval(tick, 1000);
 });

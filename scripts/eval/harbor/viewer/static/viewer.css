@@ -284,3 +284,6 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .error-span{background:#542f37;color:#ffd8df}
 .trace-span[aria-pressed=true],.trace-span:focus-visible{outline:2px solid currentColor;outline-offset:-2px}
 .trace-detail{margin-top:12px;border-top:1px solid var(--border);padding-top:12px;display:grid;gap:6px;min-width:0;font-size:12px}
+
+.run-dialog{box-sizing:border-box;width:min(56rem,95vw);max-height:90vh;background:var(--surface);color:inherit;border:1px solid var(--border);border-radius:8px}
+.run-dialog::backdrop{background:#0009}
