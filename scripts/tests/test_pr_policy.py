@@ -8,8 +8,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github"))
-from pr_loop.model import LoopError, REQUIRED_CHECKS
-from pr_loop.policy import main, migrate, require_direct_merge
+from pr_policy import PolicyError, REQUIRED_CHECKS, main, migrate, require_direct_merge
 
 
 def ruleset():
@@ -27,12 +26,11 @@ class PolicyTest(unittest.TestCase):
     def test_hidden_bypass_actors_prevent_any_policy_write(self):
         limited = ruleset()
         del limited["bypass_actors"]
-        with patch("pr_loop.adapters.GitHub") as factory, redirect_stdout(io.StringIO()), patch("sys.stderr", new_callable=io.StringIO):
-            api = factory.return_value
-            api.api.return_value = limited
+        with patch("pr_policy.github_api") as api, redirect_stdout(io.StringIO()), patch("sys.stderr", new_callable=io.StringIO):
+            api.return_value = limited
             self.assertEqual(main(["--apply"]), 1)
-            self.assertEqual(api.api.call_count, 1)
-            self.assertEqual(api.api.call_args.args[0], "repos/metask-ai/metacodes/rulesets/23764453")
+            self.assertEqual(api.call_count, 1)
+            self.assertEqual(api.call_args.args[0], "repos/metask-ai/metacodes/rulesets/23764453")
 
     def test_exact_payload_preserves_all_other_protections_and_is_idempotent(self):
         original = ruleset()
@@ -52,7 +50,7 @@ class PolicyTest(unittest.TestCase):
                        lambda r: r["rules"][2]["parameters"]["required_status_checks"][0].update(integration_id=1)):
             r = ruleset()
             change(r)
-            with self.assertRaises(LoopError):
+            with self.assertRaises(PolicyError):
                 migrate(r)
 
     def test_cli_preview_never_writes_and_apply_sends_the_exact_payload(self):
@@ -65,7 +63,7 @@ class PolicyTest(unittest.TestCase):
                     return migrate(ruleset())["rules"]
                 return ruleset()
         api = API()
-        with patch("pr_loop.adapters.GitHub", return_value=api), redirect_stdout(io.StringIO()):
+        with patch("pr_policy.github_api", side_effect=api.api), redirect_stdout(io.StringIO()):
             self.assertEqual(main([]), 0)
             self.assertEqual([m for _, m, _ in api.calls], ["GET"])
             api.calls.clear()

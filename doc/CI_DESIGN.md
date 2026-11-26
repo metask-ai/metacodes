@@ -213,16 +213,9 @@ must require branches to be up to date and must not require a merge queue.
 If main advances, merge main into the PR branch and repeat review and CI.
 A busy main can therefore still require several updates.
 
-The [local watcher](PR_AGENT_LOOP.md) makes an ordinary merge commit for a
-stale branch, validates it through `dx`, pushes it, and waits for fresh
-review and PR CI. Conflicts go to the original worker. Before merging it
-rechecks head/base and effective branch rules, then calls the merge API with
-the reviewed head SHA. Strict server-side checks close the race where main
-moves after that recheck. No deferred auto-merge or admin bypass is used.
-
 ### Policy migration
 
-After deploying the workflow and watcher, a repository rules administrator
+After deploying the workflow, a repository rules administrator
 previews and applies the migration from a checkout containing the tooling:
 
 ```sh
@@ -235,14 +228,12 @@ ruleset, removes only `merge_queue`, enables strict required status checks,
 and preserves every other protection, check source and bypass actor. It
 refuses inactive or broad rulesets and verifies effective main rules after
 the write. It refuses to write if GitHub hides the bypass-actor list, rather
-than replace a ruleset whose complete contents it cannot read. Restart local
-watchers from the updated checkout before cutover. A maintain role alone
-cannot apply it. The watcher refuses direct
-merges until this policy is active.
+than replace a ruleset whose complete contents it cannot read. A maintain role alone
+cannot apply it.
 
 The workflows retain `merge_group` as migration compatibility, so this change
 can land under the old rules. After the queue rule is removed those events
-are not emitted. Existing queued PRs are left alone by an upgraded watcher.
+are not emitted.
 The legacy handler diffs against `base_sha` and retains release version
 ordering checks; it is not the normal delivery path.
 
