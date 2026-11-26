@@ -547,9 +547,7 @@ status, compatibility boundaries, and entry points are defined by
   and `ESC [ 8 ~`), and the key parser knew Home and End only as
   `ESC [ H` and `ESC [ F`, so in tmux both keys did nothing at the prompt
   and in the `/model` list, whose footer offers them. The four forms are now
-  Home and End, also with only Caps Lock or Num Lock in the modifier; with
-  Shift, Alt or Ctrl they are still ignored, like the other cursor and
-  editing keys.
+  Home and End, also with only Caps Lock or Num Lock in the modifier.
 
 - **Terminal modes are turned off when metacodes dies or is stopped.** A
   crash, `kill -QUIT` or `kill -ABRT`, a segmentation fault, or the
@@ -560,6 +558,32 @@ status, compatibility boundaries, and entry points are defined by
   these signals now turn the modes off and give the terminal its settings
   back first; SIGTSTP does so before the process stops, and SIGCONT turns
   them on again.
+
+- **Alt+Backspace deletes a word, also during a reply.** Terminals that send
+  it as ESC DEL in one write (xterm.js in Cursor and VS Code, most Linux
+  terminals, Option as Meta in Terminal.app and iTerm2) had it read as Esc
+  and then Backspace, so during a reply it interrupted the reply and sent the
+  draft. ESC and the next byte written together are now one Alt key: ESC DEL
+  and ESC BS delete the word before the cursor as Ctrl+W does, `ESC O` keys
+  are the SS3 cursor keys (F1 to F4 do nothing), and any other Alt key is
+  dropped instead of becoming Esc and a typed character. Esc and a key read
+  apart are still two keys. Alt+Backspace and Ctrl+Backspace in Kitty's
+  protocol and in modifyOtherKeys, which were dropped, delete a word too.
+
+- **Alt or Ctrl with Left or Right jumps a word.** `ESC [1;3D`,
+  `ESC [1;5C` and the like, which Linux terminals, kitty and WezTerm send,
+  were dropped; Shift with an arrow, Home or End is now that key.
+
+- **GNU screen gets no Kitty keyboard request and no mouse reporting.**
+  Inside screen, an outer terminal on the list that gets the protocol
+  directly (Ghostty, iTerm2, WezTerm, Warp), whose `TERM_PROGRAM` screen
+  passes on, made metacodes request the Kitty protocol, which screen does
+  not forward: the footer offered Shift+Enter for a newline while Shift+Enter
+  submitted. Mouse reporting was on too; told only of the drag mode, the
+  outer terminal reported the mouse in the X10 form, which typed characters
+  such as ` *,@4,` into the input box. Inside screen or Zellij only a `TERM`
+  that names kitty or Ghostty turns the protocol on, drag-to-copy stays off
+  inside screen, and X10 mouse reports are dropped everywhere.
 
 - **A reply that broke off and is sent again says so.** The text that was
   shown stays, with a dim line under it saying the reply broke off, is

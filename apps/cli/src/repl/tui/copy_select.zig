@@ -10,7 +10,7 @@ pub const cursor_query = "\x1b[6n";
 pub const Outcome = enum { not_mine, consumed, copied };
 
 pub fn enable(fd: c_int) void {
-    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .windows or input.insideGnuScreen()) return;
     input.recordMouseSelection(true);
     mirror.enable(fd);
 }
