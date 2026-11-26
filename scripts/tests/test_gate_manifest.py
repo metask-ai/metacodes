@@ -179,10 +179,10 @@ class GateManifestTest(unittest.TestCase):
         self.assertIn('recorded.test_runner = .{ .path = b.path("scripts/recording_test_runner.zig"), .mode = .server };', build,
                       "server mode keeps --test-timeout")
         self.assertIn("units_test_step.dependOn(&test_id_fixture_check.step);", build)
-        self.assertIn("run: zig test src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform", workflow)
+        self.assertIn("run: zig test packages/base/src/platform/platform.zig -lc --test-runner scripts/recording_test_runner.zig --name native-platform", workflow)
         self.assertIn("  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled]\n", workflow)
         self.assertIn('run.setEnvironmentVariable("METACODES_TEST_ROOT",', build)
-        self.assertIn("METACODES_TEST_ROOT: src/platform", workflow)
+        self.assertIn("METACODES_TEST_ROOT: packages/base/src/platform", workflow)
         self.assertIn("needs: [gates-linux, test-ids, scope]", workflow)
 
     def test_the_checklist_runs_what_ci_selects(self):

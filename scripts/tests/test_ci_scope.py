@@ -165,7 +165,7 @@ class ClassifyTest(unittest.TestCase):
 
     def test_markdown_outside_doc_and_the_top_level_is_an_input(self) -> None:
         # Prompt templates are @embedFile'd; agent and Skill fixtures are read by tests.
-        for path in ("src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
+        for path in ("packages/coding/src/core/templates/compact/prompt.md", "tests/e2e/fixtures/agents/release-mcp.md", "sdk/README.md"):
             with self.subTest(path=path):
                 self.assertEqual(ci_scope.classify([path])[0], "full")
 
@@ -427,9 +427,9 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, changes, layout)
                 self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
                 self.assertTrue(chosen.product and chosen.tty)
-        self.assertEqual(layout.owner("src/core/conversation.zig"), "kernel")
-        self.assertEqual(layout.owner("src/core/agent_loop.zig"), "coding")
-        self.assertEqual(layout.owner("src/core/tools_extra.zig"), "coding")
+        self.assertEqual(layout.owner("packages/kernel/src/conversation.zig"), "kernel")
+        self.assertEqual(layout.owner("packages/coding/src/core/agent_loop.zig"), "coding")
+        self.assertEqual(layout.owner("packages/coding/src/core/tools_extra.zig"), "coding")
         self.assertEqual(layout.owner("tests/helpers/x.zig"), "testing")
 
     def test_a_package_is_charged_for_each_baseline_entry_it_is_part_of(self) -> None:
@@ -694,13 +694,13 @@ class PackageScopeMainTest(unittest.TestCase):
         self.assertTrue(json.loads(record.read_text(encoding="utf-8"))["fast_path"])
 
     def test_model_comparison_follows_the_diff_even_on_a_full_migration(self) -> None:
-        (self.repo / "src/core/kernel").mkdir(parents=True)
-        self.edit("src/core/kernel/loop.zig")
+        (self.repo / "packages/kernel/src").mkdir(parents=True)
+        self.edit("packages/kernel/src/loop.zig")
         self.commit("loop")
         for labels in ([], ["--labels", "migration"]):
             got = self.run_main("--event", "pull_request", "--base", "HEAD^1", *labels)
             self.assertEqual((got["offline_eval"], got["model_eval"]), ("true", "true"))
-        self.git("mv", "src/core/kernel/loop.zig", "moved.zig")
+        self.git("mv", "packages/kernel/src/loop.zig", "moved.zig")
         self.commit("move")
         got = self.run_main("--event", "merge_group", "--base", "HEAD^1")
         self.assertEqual(got["model_eval"], "true")
@@ -721,12 +721,15 @@ class PackageScopeMainTest(unittest.TestCase):
             ("tests/e2e/scenarios/02_html_game.conf", True),
             ("tests/e2e/fixtures/answers_13.txt", True),
             ("tests/e2e/scenarios/01_game_design.txt", False),
-            ("src/core/kernel/loop_test.zig", False),
-            ("src/api/model_name_consumers_test.zig", False),
-            ("src/provider/capability_matrix_test.zig", False),
+            ("packages/kernel/src/loop_test.zig", False),
+            ("packages/ai/src/api/model_error_test.zig", False),
+            ("packages/ai/src/provider/capability_matrix_test.zig", False),
             ("packages/kernel/tests/loop.zig", False),
-            ("src/core/kernel/loop.zig", True),
-            ("src/core/test_integrity.zig", True),
+            ("packages/kernel/src/loop.zig", True),
+            ("packages/coding/src/core/test_integrity.zig", True),
+            ("packages/guard/src/core/goal.zig", True),
+            ("packages/session/src/core/agent_session.zig", True),
+            ("packages/base/src/api/model_name.zig", True),
         ):
             with self.subTest(path=path):
                 (self.repo / path).parent.mkdir(parents=True, exist_ok=True)

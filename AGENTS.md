@@ -19,7 +19,7 @@ These rules apply to the entire repository.
   explicit error sets, and compile-time validation over optional-field protocols.
 - Every allocation has an owner. Name allocators by lifetime (`gpa`, `arena`,
   `scratch`) and place `defer` immediately after successful resource acquisition.
-- Path-taking file operations go through `src/platform/fs.zig` (`open`,
+- Path-taking file operations go through `packages/base/src/platform/fs.zig` (`open`,
   `openZ`, `mkdir`, `rmdir`, `chdir`, `chmod`, `fopen`, `unlinkPath`,
   `renameReplace`, `exists`, `realpath`, `finalPath`, `getCwd`) and the
   environment/cwd through `platform.paths`/`util.fs`, never through the
@@ -56,13 +56,13 @@ These rules apply to the entire repository.
   is for a host that sets `Config.jev_builtin_default`, none here): name a
   service in `config.json` or the environment, or use https
   (`zig build test:builtin-egress` enforces it, #474).
-- Receive an HTTP response in `src/` with `http_connection.receiveHead` and
+- Receive an HTTP response with `http_connection.receiveHead` and
   read its body with `http_connection.bodyReader`
-  (`src/api/http_connection.zig`), never with std's `Request.receiveHead`,
+  (`packages/ai/src/api/http_connection.zig`), never with std's `Request.receiveHead`,
   `Response.reader` or `Reader.bodyReader`: Zig 0.16 reads the body of a
   1xx, 204 or 304 answer, and `Request.deinit` drains it, until the server
   closes the connection (`zig build test:http-answer` enforces it, #579).
-- A request in `src/` that sets `keep_alive = false` calls
+- A request that sets `keep_alive = false` calls
   `http_connection.keepServerOpen` before it is sent. Otherwise std writes
   `connection: close` for it, the server closes right after its last byte,
   and behind a transparent proxy that close can overtake the end of the
@@ -78,71 +78,69 @@ These rules apply to the entire repository.
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Packages depend downward only. `layers.zon` declares the packages from the
   lowest (`base`) to the highest (`cli`, then `testing` and `tests`) and
-  assigns every `.zig` file under `src/` and `tests/` to one of them by path.
-  A package's `allowed_dependencies` lists the packages it may import, never
-  the ones that import it, and names only packages declared before it. A new
-  file belongs to a package before it lands. `zig build layer:check` holds
-  every `@import` to those lists from the file that writes it, test blocks
-  and named modules included, and every `build.zig` module import too, and
-  finds package cycles, deep imports into another package's files and module
-  roots wide enough to reach packages they may not depend on.
-  `layer_baseline.zon` records today's violations file edge by file edge and
-  only shrinks: a new violation fails, and so does an entry whose violation
-  is gone, so delete it in the change that removes it (`zig build
-  layer:baseline` prints the baseline that matches the tree). A package may
-  name a `root`, one of its own files; a relative import of another package's
-  root is that package's public entry, not a deep import, so new code reaches
-  `base` and `ai` through `src/base.zig` and `src/ai.zig` instead of growing
-  the baseline. The kernel's `kernel_budget` (lines and the packages it
-  reaches) only goes down, except in a change of its own: `max_lines` may rise
-  together with a new `raise_reason` in a PR that does not itself grow the
-  kernel past the base's budget, and the code that needs the room follows. CI
-  checks the PR against its base (`zig build layer:check -Dlayer-base=<ref>`)
-  and fails when the baseline or the budget grows or `allowed_dependencies`
-  widen. A change to the layering itself goes in its own PR. The base
-  comparison accepts an entry a package split exposes only when the base
-  tree already had that import between two files of one package; an upward
-  entry must already be upward in the base, while a deep one may come from
-  either list. A package may start depending on a package the base lacks
-  only when that package's dependencies and its files, each already in the
-  base tree at the same path, were already within the dependent's reach. A
-  file moved since the base (a rename git detects) is compared under its base
-  path: an upward entry must have been upward there, while a deep one may also
-  be an import the base tree had inside one package. `src/lib.zig`, the
-  `metacodes-core` facade that re-exports the lower packages, is its own
-  `facade` package between `teamwork` and `agentcore`.
-- `kernel` is the counterpart of pi's `pi-agent-core` and holds only
-  `core/conversation`, `core/message`, `core/session_id`,
-  `core/result_budget` and the minimal loop under `core/kernel/`, whose root
-  `core/kernel.zig` is how other packages reach it: the loop, the hooks
-  (`prepare_request`, `before_tool`, `after_tool`, `finish_turn`, `event`, run
-  in the order the caller lists them), the tool interface and the sequential
-  and parallel executor, tested only with a fake provider and fake tools.
-  `core/agent_loop`, `core/tool_exec` and `core/protocol/` are the loop with
-  every peripheral attached, pi's `AgentSession`, and belong to `coding`,
-  except the three protocol files `PermissionContext` is typed with
-  (`ui_event`, `ui_request`, `permission_choice`), which belong to `guard`.
-  Nothing calls the minimal loop yet; `agent_loop` moves onto it capability by
-  capability from migration step 3.2b, and until then `agent_loop.Options`
-  keeps its public shape.
+  assigns every `.zig` file under `packages/`, `src/`, `apps/` and `tests/` to
+  one of them by path. Each lower package (`base`, `ai`, `kernel`, `guard`,
+  `coding`, `session`, `teamwork`) is the directory `packages/<package>/` and
+  the named module `metacodes-<package>`, rooted at
+  `packages/<package>/src/root.zig`. A file reaches another package only
+  through that module and names the file it uses,
+  `@import("metacodes-base").util.log`: the root re-exports its package's
+  files by their path (a file beside a directory of the same name is
+  `<name>_root`, as `tools_root` and `permission_root`), a new file is added
+  to its package's root in the change that adds it, and a relative import
+  cannot leave the package's directory. `build.zig` wires each package module
+  to the packages below it and nothing else (`packageModules`), so the
+  compiler holds the boundary. A package's `allowed_dependencies` lists the
+  packages it may import, never the ones that import it, and names only
+  packages declared before it. `zig build layer:check` holds every `@import`
+  to those lists from the file that writes it, test blocks and named modules
+  included, and every `build.zig` module import too, and finds package
+  cycles, deep imports into another package's files and module roots wide
+  enough to reach packages they may not depend on. `layer_baseline.zon`
+  lists the violations the tree still has, which is none: a new one fails
+  (`zig build layer:baseline` prints the baseline that matches the tree).
+  The kernel's `kernel_budget` (lines and the packages it reaches) only goes
+  down, except in a change of its own: `max_lines` may rise together with a
+  new `raise_reason` in a PR that does not itself grow the kernel past the
+  base's budget, and the code that needs the room follows. CI checks the PR
+  against its base (`zig build layer:check -Dlayer-base=<ref>`) and fails
+  when the baseline or the budget grows or `allowed_dependencies` widen. A
+  change to the layering itself goes in its own PR. `src/` holds only the
+  `facade` package, between `teamwork` and `agentcore`: `src/lib.zig`, the
+  `metacodes-core` module that re-exports the lower packages, and
+  `src/internal.zig`.
+- `kernel` is the counterpart of pi's `pi-agent-core`: `packages/kernel/src/`
+  holds only `conversation`, `message`, `session_id`, `result_budget` and the
+  minimal loop (`loop`, `types`, `executor`), and its root is how other
+  packages reach it: the loop, the hooks (`prepare_request`, `before_tool`,
+  `after_tool`, `finish_turn`, `event`, run in the order the caller lists
+  them), the tool interface and the sequential and parallel executor, tested
+  only with a fake provider and fake tools. `core/agent_loop`,
+  `core/tool_exec` and `core/protocol/` are the loop with every peripheral
+  attached, pi's `AgentSession`, and belong to `coding`, except the three
+  protocol files `PermissionContext` is typed with (`ui_event`, `ui_request`,
+  `permission_choice`), which belong to `guard`. Nothing calls the minimal
+  loop yet; `agent_loop` moves onto it capability by capability from
+  migration step 3.2b, and until then `agent_loop.Options` keeps its public
+  shape.
 - `cli` reaches the lower packages only through the `metacodes-internal`
-  module, rooted at `src/internal.zig` (also in `facade`, and not part of
+  module, rooted at `src/internal.zig` (in `facade`, and not part of
   `metacodes-core`). Every module rooted at a `cli` file imports it, and `cli`
-  files name the file they use, `@import("metacodes-internal").core.agent_loop`,
-  never a relative path into a lower package: such an import puts one file in
-  two modules, which does not compile, and is a new deep import for
-  `layer:check`. The lower named modules (`platform`, `hl`, `code_runtime`) are
-  wired to `metacodes-internal` only, so `cli` uses `platform` as
-  `@import("metacodes-internal").platform`. `src/internal.zig` mirrors the
-  directory tree (`tools.zig` and `permission.zig` are `tools_root` and
-  `permission_root`); exporting a file it does not have yet is a new deep
-  import like any other. The base comparison accepts a deep entry from an
-  entry module when a file that now imports that module by name had an entry
-  to the same target in the base and no longer imports it directly, and a new wide
-  module root beside a base wide root of the same package and directory.
-  `subsystem:boundary` reads each use as an import of the file or module it names, and
-  counts a use that names no file (an alias) as a violation. The lower files'
-  tests run in `internal-test` (`test:units`), whose root is that module.
+  files name the file they use, `@import("metacodes-internal").core.agent_loop`.
+  `src/internal.zig` keeps one namespace over the lower packages, laid out as
+  the tree was before they were split (`core`, `tools`, `api`, ...), and each
+  of its entries names the package file it stands for,
+  `@import("metacodes-coding").core.agent_loop`; exporting a file it does not
+  have yet is one more such entry. The lower named modules (`platform`, `hl`,
+  `code_runtime`) are wired to the packages that use them and to
+  `metacodes-internal`, so `cli` uses `platform` as
+  `@import("metacodes-internal").platform`. `subsystem:boundary` reads each
+  use of an entry module, `metacodes-internal` or a package's, as an import
+  of the file or module it names, and counts a use that names no file (an
+  alias) as a violation. A package's tests run in the test binary rooted at
+  its own module: `zig build test:<package>` (part of `test:units`) and, for
+  the core suite, `zig build test:lib`, which is one sharded binary per
+  package and one for `src/lib.zig`.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
   journals, timestamps, and equivalent configuration churn must not enter prompts.
 - TinyKG is a separately built external binary dependency. The repository owns one
@@ -165,7 +163,7 @@ new feature behind. Users pick features one by one with
 all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
 
 - Add its name to `PreviewFeature` and a field of the same name to
-  `PreviewFeatures` in `src/types.zig`, shrinking `_unused` by one bit; `all`,
+  `PreviewFeatures` in `packages/ai/src/types.zig`, shrinking `_unused` by one bit; `all`,
   `has`, `with` and `max_arg_len` derive from the enum, and a field without a
   matching name fails to compile. The name is what users type, so use
   `snake_case`.
@@ -256,7 +254,7 @@ git diff --check
 ```
 
 `zig build gate:static` runs only the guards that read the source:
-`zig fmt --check build.zig src apps tests`, the scans of `http-status:gate`,
+`zig fmt --check build.zig src apps packages tests`, the scans of `http-status:gate`,
 `subsystem:boundary` and `layer:check` (their self-tests run in `test:units`), the
 `scripts/tests/test_*_discipline.py` scans and `git diff --check`. It takes seconds, and it comes first because the build
 runner has no fail-fast: inside the full gate a failed guard is reported

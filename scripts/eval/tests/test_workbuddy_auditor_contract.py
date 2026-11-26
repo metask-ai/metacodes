@@ -29,7 +29,7 @@ from scripts.eval.workbuddy.trace import (
 from scripts.eval.workbuddy.progress_analysis import analyze_progress
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-OBSERVATION_ZIG = REPO_ROOT / "src" / "tools" / "observation.zig"
+OBSERVATION_ZIG = REPO_ROOT / "packages/guard/src/tools/observation.zig"
 CORPUS_ENV = "METACODES_WB_CORPUS"
 
 

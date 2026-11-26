@@ -61,11 +61,11 @@ it came from, and a slice into a list that later grows is a dangling pointer.
 
 ## Adding a provider
 
-1. Write `src/provider/profiles/<vendor>.zig` declaring a `ProviderProfile`.
-2. Add one line to `BUILTIN_PROFILES` in `src/provider/registry.zig`.
-3. If the vendor speaks its own dialect, write `src/api/dialects/<vendor>.zig`
+1. Write `packages/ai/src/provider/profiles/<vendor>.zig` declaring a `ProviderProfile`.
+2. Add one line to `BUILTIN_PROFILES` in `packages/ai/src/provider/registry.zig`.
+3. If the vendor speaks its own dialect, write `packages/ai/src/api/dialects/<vendor>.zig`
    (see *Vendor integrations* below), add the vendor to `Vendor` in
-   `src/provider/vendor.zig`, and declare it on the profile's routes.
+   `packages/ai/src/provider/vendor.zig`, and declare it on the profile's routes.
 
 A runtime source — the `custom_providers` section, a fetched catalog — registers
 through the same call, and may **replace its own** registrations: re-reading a
@@ -90,7 +90,7 @@ Anthropic transport, which is the opposite of what a name prefix would say.
 ## Vendor integrations: the code is the document
 
 Each vendor's integration notes live in exactly one place: the header of its
-dialect file, `src/api/dialects/<vendor>.zig`. There is no separate
+dialect file, `packages/ai/src/api/dialects/<vendor>.zig`. There is no separate
 integration document to drift from the code. Every header has the same
 sections, in order — 接入点 (endpoints and the profile that declares them),
 协议 (wires and auth), 思考与推理 (thinking parameters and the effort mapping),
@@ -100,20 +100,20 @@ and `dialects/registry.zig` fails a test when one is missing.
 
 | Vendor | Integration file | Built-in profile |
 |---|---|---|
-| OpenAI | `src/api/dialects/openai.zig` | `openai` |
-| Anthropic Claude | `src/api/dialects/claude.zig` | `metask` (Claude models) |
-| Google Gemini | `src/api/dialects/gemini.zig` | `gemini` |
-| Zhipu GLM | `src/api/dialects/glm.zig` | `zai-coding-plan` |
-| Moonshot Kimi | `src/api/dialects/kimi.zig` | `kimi` (open platform), `kimi-code` (Kimi Code subscription) |
-| DeepSeek | `src/api/dialects/deepseek.zig` | `deepseek` |
-| Alibaba Qwen | `src/api/dialects/qwen.zig` | `qwen` |
-| MiniMax | `src/api/dialects/minimax.zig` | `minimax` |
-| Mistral | `src/api/dialects/mistral.zig` | — |
-| OpenRouter | `src/api/dialects/openrouter.zig` | `openrouter`, and catalogs |
-| Amazon Bedrock (Converse wire) | `src/api/dialects/bedrock.zig` | `bedrock`, and catalogs |
+| OpenAI | `packages/ai/src/api/dialects/openai.zig` | `openai` |
+| Anthropic Claude | `packages/ai/src/api/dialects/claude.zig` | `metask` (Claude models) |
+| Google Gemini | `packages/ai/src/api/dialects/gemini.zig` | `gemini` |
+| Zhipu GLM | `packages/ai/src/api/dialects/glm.zig` | `zai-coding-plan` |
+| Moonshot Kimi | `packages/ai/src/api/dialects/kimi.zig` | `kimi` (open platform), `kimi-code` (Kimi Code subscription) |
+| DeepSeek | `packages/ai/src/api/dialects/deepseek.zig` | `deepseek` |
+| Alibaba Qwen | `packages/ai/src/api/dialects/qwen.zig` | `qwen` |
+| MiniMax | `packages/ai/src/api/dialects/minimax.zig` | `minimax` |
+| Mistral | `packages/ai/src/api/dialects/mistral.zig` | — |
+| OpenRouter | `packages/ai/src/api/dialects/openrouter.zig` | `openrouter`, and catalogs |
+| Amazon Bedrock (Converse wire) | `packages/ai/src/api/dialects/bedrock.zig` | `bedrock`, and catalogs |
 
 The OpenAI chat building blocks every compatible vendor shares are
-`src/api/dialects/openai_compat.zig`.
+`packages/ai/src/api/dialects/openai_compat.zig`.
 
 **Which dialect a request uses is a property of the route**, the way an
 OpenRouter endpoint names its upstream. `ProtocolRoute.dialect` declares it for
@@ -148,7 +148,7 @@ resume and the cached prefix stays byte-identical.
 ## Amazon Bedrock
 
 `bedrock_converse` is a wire of its own: Converse JSON requests, answered with
-the AWS event-stream binary framing (`src/api/aws_event_stream.zig`, both CRCs
+the AWS event-stream binary framing (`packages/ai/src/api/aws_event_stream.zig`, both CRCs
 checked) instead of SSE. Like Gemini, the channel declares an origin and the
 transport appends `/model/{modelId}/converse-stream`. The built-in `bedrock`
 profile has one channel per region and authenticates with a Bedrock API key
@@ -288,7 +288,7 @@ terms limit the plan keys to interactive use in coding tools as well.
 
 ## User-Agent
 
-Every request says what it is: `src/api/http_connection.zig`, which all of
+Every request says what it is: `packages/ai/src/api/http_connection.zig`, which all of
 `src/` sends through, sets `User-Agent: metacodes/<version>` unless the
 caller names itself (the OTLP exporter keeps `metacodes-otlp`). Vendors
 tell coding tools apart by this header, some refuse a client they do not
@@ -561,14 +561,14 @@ dropped when the route moved while it ran.
 
 The module performs no I/O. The token exchange is a caller-supplied function, so
 every lifecycle test drives a fake exchange and none needs a network;
-`src/api/oauth_exchange.zig` is the production half, one small auditable
+`packages/ai/src/api/oauth_exchange.zig` is the production half, one small auditable
 `refresh_token` grant over HTTP.
 
 ### Obtaining the first token
 
 The lifecycle above starts from a token that already exists. `metacodes login
 --provider <id>` is how one is obtained (issue #33), and it runs in
-`src/api/oauth_login.zig` — the kernel side, so a front end invokes a flow
+`packages/ai/src/api/oauth_login.zig` — the kernel side, so a front end invokes a flow
 rather than implementing one. Two grants, because one does not cover the field:
 
 - **Loopback redirect + PKCE** is the default. A browser and a short-lived
@@ -854,7 +854,7 @@ receives from `model.list` is the number `selection.commit` compares against.
 A `global` commit therefore reports `requires_persist`; the embedder writes it
 and feeds the resulting revision back.
 
-The order-preserving merge (`src/util/json_merge.zig`) also fixed a pre-existing
+The order-preserving merge (`packages/base/src/util/json_merge.zig`) also fixed a pre-existing
 data-loss bug: `apps/cli/src/app/config.zig`'s writer serialized only its own five fields
 and therefore deleted `theme`, `mcp_servers`, `permission_rules`, and
 `model_tiers` on every theme change. It now merges, and refuses to overwrite a
@@ -938,7 +938,7 @@ prompts or reach a credential it was not given. `quote_hook` and
 and belong to a reviewed profile.
 
 `dialect` (on a channel, or on one model) names the vendor whose parameters the
-requests carry — a value of `Vendor` in `src/provider/vendor.zig`. On a channel
+requests carry — a value of `Vendor` in `packages/ai/src/provider/vendor.zig`. On a channel
 it covers every model the channel serves; on a model, that model only. Absent, the
 vendor is inferred from the model name; a value that names no vendor fails the
 definition (`UnknownDialect`) rather than being guessed.
@@ -1073,7 +1073,7 @@ catalog path below, not the built-in profile's.
 
 ### Catalog documents
 
-`src/provider/openrouter.zig` adapts the OpenRouter shape, which is the one
+`packages/ai/src/provider/openrouter.zig` adapts the OpenRouter shape, which is the one
 worth adapting: it is a router, so it already separates the two things a
 metadata source must keep separate.
 
@@ -1296,61 +1296,61 @@ session from then on.
 
 | File | Responsibility |
 |---|---|
-| `src/provider/ids.zig` | `Slug`, `OfferId` derivation, revision counters |
-| `src/provider/offer.zig` | `ModelOffer`, limits, tri-state capabilities, quotes, admission |
-| `src/provider/controls.zig` | `ControlSpec`, values, validation, revalidation |
-| `src/provider/credential.zig` | typed credentials, provider-scoped resolution, auth materialization |
-| `src/provider/profile.zig` | `ProviderProfile`, `ChannelDescriptor`, protocols, endpoint policy |
-| `src/provider/profiles/*.zig` | one file per built-in provider |
-| `src/provider/registry.zig` | the extension point + offer catalog |
-| `src/provider/selection.zig` | `RuntimeSelection`, `RoutePolicy`, resolution, legacy migration |
-| `src/provider/alias.zig` | pinned/floating alias resolution |
+| `packages/ai/src/provider/ids.zig` | `Slug`, `OfferId` derivation, revision counters |
+| `packages/ai/src/provider/offer.zig` | `ModelOffer`, limits, tri-state capabilities, quotes, admission |
+| `packages/ai/src/provider/controls.zig` | `ControlSpec`, values, validation, revalidation |
+| `packages/ai/src/provider/credential.zig` | typed credentials, provider-scoped resolution, auth materialization |
+| `packages/ai/src/provider/profile.zig` | `ProviderProfile`, `ChannelDescriptor`, protocols, endpoint policy |
+| `packages/ai/src/provider/profiles/*.zig` | one file per built-in provider |
+| `packages/ai/src/provider/registry.zig` | the extension point + offer catalog |
+| `packages/ai/src/provider/selection.zig` | `RuntimeSelection`, `RoutePolicy`, resolution, legacy migration |
+| `packages/ai/src/provider/alias.zig` | pinned/floating alias resolution |
 | `apps/cli/src/app/route_strings.zig` | one-generation retention of the live route's strings |
-| `src/provider/config_doc.zig` | versioned document model and serialization |
-| `src/provider/config_store.zig` | atomic, revisioned, idempotent writer |
-| `src/provider/control_plane.zig` | UI-independent kernel API and event journal |
-| `src/provider/runtime_binding.zig` | selection → transport parameters |
-| `src/provider/startup.zig` | CLI/bootstrap route resolution |
-| `src/provider/host.zig` | process-lifetime registry + catalog + kernel |
-| `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization; rendering and patching a definition |
-| `src/provider/model_listing.zig` | where each wire lists its models, and reading the answer (no I/O) |
-| `src/api/model_probe.zig` | the model-listing GET (`providers probe`, `add --probe`) |
+| `packages/ai/src/provider/config_doc.zig` | versioned document model and serialization |
+| `packages/ai/src/provider/config_store.zig` | atomic, revisioned, idempotent writer |
+| `packages/ai/src/provider/control_plane.zig` | UI-independent kernel API and event journal |
+| `packages/ai/src/provider/runtime_binding.zig` | selection → transport parameters |
+| `packages/ai/src/provider/startup.zig` | CLI/bootstrap route resolution |
+| `packages/ai/src/provider/host.zig` | process-lifetime registry + catalog + kernel |
+| `packages/ai/src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization; rendering and patching a definition |
+| `packages/ai/src/provider/model_listing.zig` | where each wire lists its models, and reading the answer (no I/O) |
+| `packages/ai/src/api/model_probe.zig` | the model-listing GET (`providers probe`, `add --probe`) |
 | `apps/cli/src/app/providers_cli.zig` | `metacodes providers` (`add`, `probe`, `list`, `remove`); the removal `/providers remove` shares |
-| `src/provider/openrouter.zig` | model/endpoint catalogs, router entries, preferences → `RoutePolicy`, router metadata |
-| `src/provider/profiles/openrouter.zig` | the built-in OpenRouter: the `auto` router channel, the key grant, the key page |
-| `src/api/openrouter_login.zig` | OpenRouter's key grant: browser and other-device ways, the exchange, the key description, the manage page |
-| `src/api/openrouter_catalog.zig` | the account's listing for the built-in OpenRouter: trimmed, kept, refreshed in the background |
-| `src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
-| `src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
-| `src/provider/request_profile.zig` | `RequestProfile`, what one endpoint requires of every request on a route |
-| `src/provider/chatgpt_claims.zig` | the ChatGPT workspace inside OpenAI's OAuth tokens |
-| `src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
-| `src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
-| `src/api/bedrock_client.zig` | Bedrock Converse transport |
-| `src/api/aws_event_stream.zig` | AWS event-stream framing (decode, CRC checks) |
-| `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
-| `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
-| `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
-| `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
-| `src/api/oauth_revoke.zig` | signing out of a provider's sign-in: revoke the refresh token, then delete |
-| `src/api/codex_usage.zig` | the Codex backend's usage refusals and their wording |
-| `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33), or the checked pasted key |
-| `src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
-| `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
+| `packages/ai/src/provider/openrouter.zig` | model/endpoint catalogs, router entries, preferences → `RoutePolicy`, router metadata |
+| `packages/ai/src/provider/profiles/openrouter.zig` | the built-in OpenRouter: the `auto` router channel, the key grant, the key page |
+| `packages/ai/src/api/openrouter_login.zig` | OpenRouter's key grant: browser and other-device ways, the exchange, the key description, the manage page |
+| `packages/ai/src/api/openrouter_catalog.zig` | the account's listing for the built-in OpenRouter: trimmed, kept, refreshed in the background |
+| `packages/ai/src/provider/bedrock_catalog.zig` | Bedrock foundation-model and inference-profile catalogs → a region's channel |
+| `packages/ai/src/provider/vendor.zig` | `Vendor`, the dialect a route declares |
+| `packages/ai/src/provider/request_profile.zig` | `RequestProfile`, what one endpoint requires of every request on a route |
+| `packages/ai/src/provider/chatgpt_claims.zig` | the ChatGPT workspace inside OpenAI's OAuth tokens |
+| `packages/ai/src/api/dialects/<vendor>.zig` | one vendor's dialect; its header is the integration document |
+| `packages/ai/src/api/dialects/registry.zig` | vendor → dialect file, name inference, the header contract test |
+| `packages/ai/src/api/bedrock_client.zig` | Bedrock Converse transport |
+| `packages/ai/src/api/aws_event_stream.zig` | AWS event-stream framing (decode, CRC checks) |
+| `packages/ai/src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
+| `packages/ai/src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
+| `packages/ai/src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
+| `packages/ai/src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
+| `packages/ai/src/api/oauth_revoke.zig` | signing out of a provider's sign-in: revoke the refresh token, then delete |
+| `packages/ai/src/api/codex_usage.zig` | the Codex backend's usage refusals and their wording |
+| `packages/ai/src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33), or the checked pasted key |
+| `packages/ai/src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
+| `packages/ai/src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
 | `apps/cli/src/repl/model_picker.zig` | picker state machine (pure) |
 | `apps/cli/src/repl/model_picker_view.zig` | picker rendering |
 | `apps/cli/src/repl/picker_host.zig` | commit + rebind against the session |
-| `src/api/auth_header.zig` | transport-side auth materialization |
-| `src/util/json_merge.zig` | order-preserving JSON object merge |
-| `src/util/json.zig` | canonical JSON string escaping and UTF-8 repair |
+| `packages/ai/src/api/auth_header.zig` | transport-side auth materialization |
+| `packages/base/src/util/json_merge.zig` | order-preserving JSON object merge |
+| `packages/base/src/util/json.zig` | canonical JSON string escaping and UTF-8 repair |
 
 `zig build test:provider` compiles the subsystem from a narrow root, proving it
 builds standalone. It does **not** enforce the import boundary — that root sits
-at `src/`, so every file below it is importable, and adding `src/client.zig`
+at `src/`, so every file below it is importable, and adding `packages/ai/src/client.zig`
 compiles cleanly. `zig build test` runs it and `test:picker`.
 
 `zig build subsystem:boundary` enforces the rule where the rule lives, in the
-source: every `@import` in `src/provider/**` must resolve inside the subsystem,
+source: every `@import` in `packages/ai/src/provider/**` must resolve inside the subsystem,
 to one of seven named leaf files or the five files they reach, or to
 `std`/`builtin`/`platform`; the picker's two files may reach the provider kernel
 and the terminal theme and nothing else. The rule covers the closure, not just

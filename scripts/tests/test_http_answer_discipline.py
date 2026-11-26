@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HELPER = Path("src/api/http_connection.zig")
+HELPER = Path("packages/ai/src/api/http_connection.zig")
 HELPER_METHOD = re.compile(r"(\w+)\s*\.\s*(receiveHead|bodyReader|bodyReaderDecompressing|readerDecompressing)\s*\(")
 READER_CALL = re.compile(r"(\w+)\s*\.\s*reader\s*\(")
 RESPONSE_NAME = re.compile(r"(response|resp)$", re.IGNORECASE)
@@ -77,7 +77,8 @@ class HttpAnswerDisciplineTest(unittest.TestCase):
     def test_scanner_reports_direct_receives_and_reads_and_skips_comments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "src" / "api").mkdir(parents=True)
+            (root / "src").mkdir()
+            (root / HELPER).parent.mkdir(parents=True)
             (root / "src" / "direct.zig").write_text(
                 "fn get(request: *Request) !void {\n"
                 "    var response = try request.receiveHead(&redirect);\n"
@@ -99,7 +100,7 @@ class HttpAnswerDisciplineTest(unittest.TestCase):
                 "}\n",
                 encoding="utf-8",
             )
-            (root / "src" / "api" / "http_connection.zig").write_text(
+            (root / HELPER).write_text(
                 "pub fn receiveHead(request: *Request, buffer: []u8) !Response {\n"
                 "    return request.receiveHead(buffer);\n"
                 "}\n",

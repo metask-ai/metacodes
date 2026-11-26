@@ -722,7 +722,7 @@ pub const App = struct {
     /// KG 启动注入快照(kg/inject.zig;owned)。空串=空态(不注入)。
     kg_summary: []u8 = &.{},
     kg_startup: ?*kg_startup.Startup = null,
-    /// System-One advisor runtime (`src/jev/runtime.zig`); null = not configured.
+    /// System-One advisor runtime (`packages/coding/src/jev/runtime.zig`); null = not configured.
     jev: ?*@import("metacodes-internal").jev.runtime.Runtime = null,
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,

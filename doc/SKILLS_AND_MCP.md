@@ -21,7 +21,7 @@ frozen policy format.
 ### Where Skills are found
 
 Every root below is a *compat* source (`catalog.Profile.compat` in
-`src/skills/runtime/catalog.zig`). A name defined in several places takes the
+`packages/coding/src/skills/runtime/catalog.zig`). A name defined in several places takes the
 highest tier, as in Claude Code — enterprise, then personal, then project — so a
 checked-out repository cannot shadow a Skill the user installed.
 
@@ -47,7 +47,7 @@ Discovery follows what both tools do:
 
 ### `SKILL.md`
 
-The frontmatter is YAML (`src/skills/runtime/frontmatter.zig`): quoted
+The frontmatter is YAML (`packages/coding/src/skills/runtime/frontmatter.zig`): quoted
 strings, folded `>` and literal `|` blocks, block and flow lists, nested maps,
 comments, CRLF and a BOM all parse. As in Codex, a one-line value that only
 looks like a flow collection (`argument-hint: [pr] [priority]`) stays text, and
@@ -128,7 +128,7 @@ freed before the session ends. Completion of `/` commands, `/skills` and
 ### `skillOverrides`
 
 Claude Code's per-Skill setting, read from the same files
-(`src/skills/overrides.zig`): `~/.claude/settings.json` <
+(`packages/coding/src/skills/overrides.zig`): `~/.claude/settings.json` <
 `<project>/.claude/settings.json` < `<project>/.claude/settings.local.json`,
 where the project is the repository root or, outside one, the working
 directory.
@@ -222,7 +222,7 @@ credentials of its own.
 
 ### Sources and precedence
 
-`src/mcp/config.zig` reads, highest precedence first; a server name takes the
+`packages/coding/src/mcp/config.zig` reads, highest precedence first; a server name takes the
 whole entry from the highest source (fields never merge):
 
 | Source | Format | Child environment | `${VAR}` expansion |
@@ -409,7 +409,7 @@ starts it; it does not allow its tools. `ListMcpResourcesTool` and
 
 ### Protocol
 
-The client (`src/mcp/client.zig`, the one implementation every entry point
+The client (`packages/coding/src/mcp/client.zig`, the one implementation every entry point
 runs; see [MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)) speaks MCP 2026-07-28 and
 the handshake revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
 
@@ -484,7 +484,7 @@ An HTTP or SSE server that answers 401 is `needs authentication` in `/mcp`
 and the footer. `metacodes mcp login <server>` logs in once; every session
 after that sends the token and keeps it fresh. The flow is the MCP
 authorization specification's (2025-06-18 / 2025-11-25, with the 2025-03-26
-fallback), in `src/mcp/oauth.zig`:
+fallback), in `packages/coding/src/mcp/oauth.zig`:
 
 1. **Discovery.** An unauthenticated request in the server's own transport
    (a POST of `initialize`, or the SSE stream's GET) earns a 401 whose

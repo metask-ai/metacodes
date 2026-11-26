@@ -5,7 +5,7 @@
 
 | 层 | 内容 | 主要命令 | 依赖 |
 |---|---|---|---|
-| L1 单元 | `src/**/*.zig` 内联 `test` 块 + `tests/unit/` spike | `zig build test:lib` | std + testing.allocator |
+| L1 单元 | `packages/*/src/**/*.zig`、`src/*.zig` 内联 `test` 块 + `tests/unit/` spike | `zig build test:lib`、`zig build test:<包>` | std + testing.allocator |
 | L2 组件 | `tests/component/*.zig`(mock HTTP / pty / 子进程);只测 cli 的在 `apps/cli/tests/component/` | `zig build test:spike`;cli 的用 `zig build test:cli` | 进程内 mock SSE server |
 | L3 集成 | `tests/integration/*.zig`(真 fs、真子进程、真本地 TinyKG) | 同上,或 `zig build test:integration-monolithic` 单进程对照 | tmp 目录 + bundled TinyKG |
 | L4 合约/门禁 | AgentCore ABI、TinyKG 边界、eval 框架、平台层 | `zig build agentcore:test` / `test:tinykg-binary` / `test:eval` / `test:platform` | 见下 |
@@ -21,7 +21,8 @@ L2 必要条件:一条组件测试要跨 ≥3 个真实模块接线(声明=接�
 
 ```bash
 zig build test                   # 完整离线门:core + 聚合 L2/L3 + eval + TinyKG 合约 + 规则传感器 + 隔离根(platform/lsp/provider/picker)
-zig build test:lib               # core 全图;默认 4 个确定性、fail-closed 分片
+zig build test:lib               # core 全图:每个包一个分片二进制加 lib.zig 的一个;coding 默认 4 个确定性、fail-closed 分片
+zig build test:coding            # 只跑一个包的内联测试(base、ai、kernel、guard、coding、session、teamwork)
 zig build test:lib -Dlib-test-shards=2   # 资源紧张机器可降低并发,不减覆盖
 zig build test:lib-monolithic    # 单进程诊断/与分片基线对照
 zig build test:lib-times         # 逐测试耗时、slow buckets 与 top-N
@@ -41,7 +42,7 @@ zig build dev:full               # Debug app + TinyKG;首次安装或 TinyKG 变
 # 单测试调试:图内文件经主套件 + -Dtfilter 过滤(直接 zig test 单文件会因
 # 模块内相对 import 失败);自包含的平台层文件可以单测
 zig build test:lib -Dtfilter="max_turns"
-METACODES_PROC_TEST=1 zig test src/platform/process.zig -lc --test-filter "capture cwd"
+METACODES_PROC_TEST=1 zig test packages/base/src/platform/process.zig -lc --test-filter "capture cwd"
 
 # 性能基线
 hyperfine --warmup 3 './zig-out/bin/metacodes --help'
@@ -169,15 +170,15 @@ Zig 版本、适配新标准库的代码,再用 `-Dupdate-contract` 重新生成
 | 来源 | 记录方 | ID 和位置 |
 |---|---|---|
 | core 套件、聚合 L2/L3 套件 | `scripts/sharded_test_runner.zig` | `zig:<test 名>`,去掉命名空间前缀(`core.agent_loop.test.stops` → `zig:stops`);`decltest` 记为 `zig:decltest <名字>`,无名 `test {}` 记为 `zig:<unnamed>`。位置是完整的命名空间(`core.agent_loop`) |
-| 其余所有 Zig 测试二进制(`cc-test`、`internal-test`、`provider-test`、`mcp-test`、`lsp-test`……),以及 CI 里直接 `zig test src/platform/platform.zig` 的原生进程测试 | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变;也接受 `--test-ids-dir=<目录>`。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
+| 其余所有 Zig 测试二进制(`cc-test`、各包的 `<包>-test`、`provider-test`、`mcp-test`、`lsp-test`……),以及 CI 里直接 `zig test packages/base/src/platform/platform.zig` 的原生进程测试 | `scripts/recording_test_runner.zig`:和 Zig 默认运行器一样走 build runner 的协议,`--test-timeout`、泄漏和错误日志的判定都不变;也接受 `--test-ids-dir=<目录>`。`build.zig` 里的测试二进制都经 `addRecordedTest` 创建 | 同上 |
 | `scripts/tests` | `scripts/tests/__init__.py` 给 `python3 -m unittest` 换上记录用的 result | `py:<类>.<方法>`,位置是模块路径 |
 | `scripts/eval/tests` | `scripts/eval/tests/run_shard.py` | 同上 |
 | TTY 用例 | 不运行,静态列出 `tests/tty/cases/test_*.py` 的顶层 `test_*` 函数 | `tty:<函数名>`,位置是文件名;只报告,不强制 |
 
 两个运行器共用 `scripts/test_id_record.zig` 写记录。`build.zig` 的 `addTestRunArtifact` 把测试根文件所在的
 目录(相对仓库根)经 `METACODES_TEST_ROOT` 传给运行器,记录的第一行写上它,命名空间据此补成
-相对仓库根的完整路径(`src/platform` 根里的 `process.test.x` 和 `src` 根里的 `platform.process.test.x`
-都是 `src.platform.process`);没有这一行的 Zig 记录,`collect` 拒收。`test:units` 用 `scripts/test_id_fixture.zig` 端到端地
+相对仓库根的完整路径(`packages/base/src/platform` 根里的 `process.test.x` 是 `packages.base.src.platform.process`,
+和根目录在别处的二进制记下的同一个文件对得上);没有这一行的 Zig 记录,`collect` 拒收。`test:units` 用 `scripts/test_id_fixture.zig` 端到端地
 核对记录(一个通过、一个跳过、一个无名测试)。`time_test_runner.zig` 是诊断入口,不记录。
 
 比较时一个测试的**键**:ID 在 base 和 head 里都只出现在一处(一个完整命名空间)时,键就是 ID,

@@ -90,9 +90,12 @@ TEST_PACKAGES = ("testing", TESTS_PACKAGE)
 TEST_STEP = re.compile(r'\bb\.step\(\s*"(test:[\w-]+)"')
 BUILD_SCRIPT_SUITE = re.compile(r'"(scripts\.tests\.test_\w+)"')
 MIGRATION_LABEL = "migration"
-MODEL_EVAL_PATHS = ("src/core/", "src/provider/", "src/api/", "packages/kernel/", "packages/ai/")
+MODEL_EVAL_PATHS = (
+    "packages/kernel/", "packages/ai/", "packages/base/src/api/",
+    "packages/coding/src/core/", "packages/guard/src/core/", "packages/session/src/core/",
+)
 CORE_E2E_SUITE = "evals/suites/core-e2e.json"
-MODEL_EVAL_FILES = {"src/client.zig", "src/types.zig", "src/ai.zig", CORE_E2E_SUITE}
+MODEL_EVAL_FILES = {CORE_E2E_SUITE}
 SHOWN = 5
 
 

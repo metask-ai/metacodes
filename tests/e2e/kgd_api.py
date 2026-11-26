@@ -3,7 +3,7 @@
 session does: the port and key come from `<state root>/kg/daemon.json`, and
 requests go to `GET /api/ready` and `POST /api/run` with `x-api-key`
 (doc/TINYKG_INTEGRATION.md, "The local service"; the envelope mirrors
-src/kg/transport.zig `runWithRequestId`).
+packages/coding/src/kg/transport.zig `runWithRequestId`).
 
   kgd_api.py ready <state root> [--wait SECONDS]   exit 0 once the service is ready
   kgd_api.py run <state root> <command> [args...]  print the command's stdout

@@ -1,7 +1,7 @@
 //! Zero-provider evaluation driver for the System-One scoped-recall gate.
 //!
 //! Replays rank-ordered TinyKG BM25 candidate pools through the production
-//! policies of `src/kg/scoped_recall.zig`: the BM25 floor baseline
+//! policies of `packages/coding/src/kg/scoped_recall.zig`: the BM25 floor baseline
 //! (`baselineSelection`) and the judged policy (`Advisor.judgeRecallRelevance`
 //! followed by `judgedSelection`). Every candidate is cut with the same
 //! query-focused window KgClient hands the judge, so the judge sees the bytes

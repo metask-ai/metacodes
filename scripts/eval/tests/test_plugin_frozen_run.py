@@ -175,7 +175,7 @@ class FreezeAndVerifyTest(unittest.TestCase):
             path, runtime = _frozen_fixture(Path(directory))
             manifest = freeze_run(ROOT, path, runtime)
             value = json.loads(path.read_text(encoding="utf-8"))
-            value["implementation_paths"].remove("src/tools/result_spool.zig")
+            value["implementation_paths"].remove("packages/coding/src/tools/result_spool.zig")
             path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
             refresh_implementation_fingerprint(ROOT, path)  # the narrower list repins cleanly...
             load_protocol(ROOT, path)  # ...and the strict loader is satisfied by it.

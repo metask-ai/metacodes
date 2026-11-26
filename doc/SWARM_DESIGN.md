@@ -19,7 +19,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 ## 1. 数据模型(SW0)
 
-`src/swarm/{team,mailbox}.zig` + `src/util/file_lock.zig`(通用工具,已有 swarm 之外的消费者)
+`packages/coding/src/swarm/{team,mailbox}.zig` + `packages/base/src/util/file_lock.zig`(通用工具,已有 swarm 之外的消费者)
 
 - **磁盘**:`{home}/.metacodes/teams/<team>/config.json`(TeamFile)+ `inboxes/<name>.json`(邮箱)。
 - **身份**:`name@team`(确定性,lead 可推算任何 teammate id,重启不变)。`team-lead` 保留名。
@@ -27,13 +27,13 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
   的 `sessionId` 必须等于它所属的 lead session。进程外 member 另外保存每次 spawn 生成的
   `leaseId`；恢复、轮换 session、删除后重建同名成员或启动进程外 teammate 时都以父 session
   和 lease 双重校验。缺少字段的旧配置按不属于当前 session 处理并拒绝操作。
-- **file_lock**(`src/util/file_lock.zig`):`<path>.lock` O_EXCL 哨兵 + mtime 兜底陈旧检测 + **每条陈旧记录单赢家的接管**(防双持有):抢锁者先 O_EXCL 建这条记录专属的认领文件 `<path>.lock.claim.<指纹>.<代>`,持认领后确认锁文件仍是它观测到的那条陈旧记录才删除重建,别人刚抢到的新锁不会被挪走或删掉。
+- **file_lock**(`packages/base/src/util/file_lock.zig`):`<path>.lock` O_EXCL 哨兵 + mtime 兜底陈旧检测 + **每条陈旧记录单赢家的接管**(防双持有):抢锁者先 O_EXCL 建这条记录专属的认领文件 `<path>.lock.claim.<指纹>.<代>`,持认领后确认锁文件仍是它观测到的那条陈旧记录才删除重建,别人刚抢到的新锁不会被挪走或删掉。
 - **mailbox**:锁内读-改-写;消息 `{from,text,timestamp,read,color?,summary?,session_id?,lease_id?}`。生产 SendMessage、idle 和 shutdown 回执都写入发送者的父 session 与 spawn lease；lead、线程 teammate、进程 teammate 消费普通消息时按当前 TeamFile 成员身份校验，缺少或过期身份的旧消息消费后丢弃，防同名替换后的延迟消息注入。`classify` 真顶层 JSON parse 认协议类型(非 substring,防误判);`markReadAt` 选择性标读(协议消息留给消费者);软顶 500(裁最旧已读)+ 硬顶 5000(丢最旧未读 + log.warn)。
 - **updateTeam**:一切 team 变更的唯一锁内 RMW 入口(防丢更新)。
 
 ## 2. 进程内 teammate 运行时(SW1)
 
-`src/swarm/teammate.zig`
+`packages/coding/src/swarm/teammate.zig`
 
 - 每 teammate = 一根 `std.Thread`,跑**持久多轮 agent_loop**(conversation/TaskStore/agent_ident 跨 turn 存活)。
 - 循环:spawn → run → idle(config `is_active=false` + idle_notification→lead 邮箱)→ waitForMail(500ms:shutdown 优先 > lead > peer FIFO;协议消息选择性标读留未读)→ 下一 turn。
@@ -43,7 +43,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 ## 3. 工具面 + lead 接线(SW2)
 
-`src/swarm/{context,tools}.zig`
+`packages/coding/src/swarm/{context,tools}.zig`
 
 - 工具:**TeamCreate**(一 lead 一队,lead 非成员)/ **TeamDelete**(拒活跃成员)/ **SendMessage**(name 直达 / `*` 广播;裸文本对 peer 不可见的纪律)。
 - **Task(name=…)** → spawn teammate 分支(对齐 cc AgentTool)。
@@ -53,7 +53,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 ## 4. tinykg DAG 协调面(SW3,差异化优势)
 
-`src/swarm/teammate.zig::tryClaimFrontierTask`
+`packages/coding/src/swarm/teammate.zig::tryClaimFrontierTask`
 
 - TeamCreate 建共享 KG `kg_inbox` root(lead 的 TaskCreate 落此,teammate frontier 自领此)。
 - 空闲 teammate 节流(2.5s)poll `frontier` → 领 ready 无主叶子(`claimTask` 原子租约)→ 组装 `<assigned-task>` prompt。
@@ -77,7 +77,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 ## 7. 进程外 teammate + 隔离(SW6)
 
-`src/swarm/teammate_process.zig`
+`packages/coding/src/swarm/teammate_process.zig`
 
 - **`--teammate` runtime**:身份 CLI args(--agent-name/--team-name/--parent-session-id/--teammate-lease-id/--teammate-cwd);worktree chdir + **同步更新 app.cwd_abs/project_dir**(光 chdir 没用,工具用 cwd_abs 解析路径);mailbox 消息循环(waitForWork 镜像 in-process);fail-closed 权限。
 - **lead-spawn**:`--teammate-mode process` → Task(name) 走 `spawnTeammateProcess`(createWorktree `git -C repo` + 登记 member `backend_type=process`/worktree_path + `forkExecTeammate` fork **零分配**只 async-signal-safe + 追踪 `process_teammates` 供 deinit kill+removeWorktree)。
@@ -88,15 +88,15 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
   worktree 无法 chdir/realpath 时也直接退出，绝不降级到 lead cwd。spawn 后尚未登记成功
   时的子进程会被 kill+reap，避免留下无主进程。
 - **沙箱**:teammate 进程用同 App/同 Bash 工具,settings 开沙箱则自然套 `wrapCommand`:macOS 走
-  Seatbelt,Linux 走 bubblewrap(`src/sandbox/bwrap.zig`;此前"Linux bubblewrap 不做"的用户指令已由用户
+  Seatbelt,Linux 走 bubblewrap(`packages/guard/src/sandbox/bwrap.zig`;此前"Linux bubblewrap 不做"的用户指令已由用户
   撤回,后端已实现)。
 - register SW7:真 fork+exec e2e / 进程外 teammate 的沙箱包裹验证。
 
 ## 7b. 宿主调度 teammate(AgentCore,issue #277)
 
-`src/swarm/context.zig`(`Scheduler`/`SpawnRequest`/`pending_spawns`)、
-`src/swarm/tools.zig`(`executeSpawnTeammate`/`writeTeamDescription`/`pollLeadInbox`)、
-`src/core/agent_session.zig`(`RuntimeConfig.enable_teams`/`SessionConfig.team`)。
+`packages/coding/src/swarm/context.zig`(`Scheduler`/`SpawnRequest`/`pending_spawns`)、
+`packages/coding/src/swarm/tools.zig`(`executeSpawnTeammate`/`writeTeamDescription`/`pollLeadInbox`)、
+`packages/session/src/core/agent_session.zig`(`RuntimeConfig.enable_teams`/`SessionConfig.team`)。
 
 CLI 的 teammate 是进程内线程或进程外 worktree(SW1/SW6),由 metacodes 进程自己调度。
 嵌入式 AgentCore Host 不一样:它自己掌握进程与会话生命周期,AgentCore **不替它起任何
@@ -156,7 +156,7 @@ vs host `pollLeadInbox`)。
 
 | 项 | 状态 |
 |----|------|
-| Linux bubblewrap 沙箱 | 已实现(`src/sandbox/bwrap.zig`,与 Seatbelt 同一份 `SandboxSettings`;原"排除"指令已撤回) |
+| Linux bubblewrap 沙箱 | 已实现(`packages/guard/src/sandbox/bwrap.zig`,与 Seatbelt 同一份 `SandboxSettings`;原"排除"指令已撤回) |
 | permission 代理(teammate→lead 弹框) | register SW7(当前 fail-closed 安全) |
 | mode 响应 from-gate | register(消费者建时补) |
 | 真 fork+exec 进程外完整 e2e | register SW7(干净进程 harness) |

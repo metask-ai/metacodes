@@ -228,7 +228,7 @@ pub fn build(b: *std.Build) void {
     });
     app.addImport("metask_agentcore", sdk);
     // The Zig test's loopback mock server (mock_server.zig) uses the repo's
-    // src/platform sockets for deterministic Windows accept/close behavior.
+    // packages/base/src/platform sockets for deterministic Windows accept/close behavior.
     // This is runner scaffolding, not an AgentCore bundle input: the
     // source-free link attestation lives in the `link` step's probes, which
     // build from the installed bundle alone.

@@ -10,7 +10,7 @@
 //!     error.ImageInputUnsupported,绝不发出静默降级请求。
 //!
 //! 序列化纯函数级别的矩阵断言(各方言 wire 形态/顺序/能力错误)在
-//! src/api/request.zig、openai_client.zig、gemini_client.zig、dialects/* 内联测试。
+//! packages/ai/src/api/request.zig、openai_client.zig、gemini_client.zig、dialects/* 内联测试。
 
 const std = @import("std");
 const harness = @import("harness");
