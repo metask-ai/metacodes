@@ -254,3 +254,36 @@ def test_colorless_conpty_keeps_unicode_frame(bin_path):
     if a.box_top_row() is None or a.box_bottom_row() is None:
         a._fail("no-color TTY must draw the input box with full-width ─ rules")
     assert b"+-" not in raw, "ASCII box is reserved for explicit /theme mono"
+
+
+MODE_PAIRS = {
+    "Kitty keyboard": (b"\x1b[>1u", b"\x1b[<u"),
+    "modifyOtherKeys": (b"\x1b[>4;2m", b"\x1b[>4m"),
+    "bracketed paste": (b"\x1b[?2004h", b"\x1b[?2004l"),
+    "mouse reporting": (b"\x1b[?1002h", b"\x1b[?1002l"),
+}
+WARP = {"TERM_PROGRAM": "WarpTerminal", "TERM": "xterm-256color"}
+
+
+def _left_on(raw):
+    return [name for name, (on, off) in MODE_PAIRS.items() if raw.rfind(on) > raw.rfind(off)]
+
+
+def test_a_fatal_signal_turns_the_terminal_modes_off_before_the_process_dies(bin_path):
+    _skip_if_conpty()
+    for name in ("QUIT", "ABRT", "ALRM", "SEGV"):
+        raw = run(bin_path, [READY, f"signal:{name}", "sleep:0.8"], env=WARP)
+        assert b"\x1b[>1u" in raw and b"\x1b[?2004h" in raw, f"SIG{name}: the modes were never turned on"
+        left = _left_on(raw)
+        assert not left, f"SIG{name} left {left} on for the shell"
+
+
+def test_sigtstp_turns_the_modes_off_and_sigcont_turns_them_on_again(bin_path):
+    _skip_if_conpty()
+    raw = run(bin_path, [READY, "signal:TSTP", "sleep:0.5", "signal:CONT", "sleep:0.8"], env=WARP)
+    first_on = raw.find(b"\x1b[?2004h")
+    off = raw.find(b"\x1b[?2004l", first_on + 1)
+    assert first_on >= 0 and off > first_on, "SIGTSTP should turn bracketed paste off before stopping"
+    assert raw.find(b"\x1b[<u", first_on) > first_on, "SIGTSTP should pop the Kitty keyboard flags"
+    assert raw.find(b"\x1b[>1u", off) > off and raw.find(b"\x1b[?2004h", off) > off, \
+        "after SIGCONT the modes should be on again"

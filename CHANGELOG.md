@@ -551,6 +551,16 @@ status, compatibility boundaries, and entry points are defined by
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
 
+- **Terminal modes are turned off when metacodes dies or is stopped.** A
+  crash, `kill -QUIT` or `kill -ABRT`, a segmentation fault, or the
+  SIGALRM that ends an exit still running 45 seconds after SIGTERM left the
+  Kitty keyboard flags, modifyOtherKeys, bracketed paste and mouse reporting
+  on: back at the shell, Ctrl+C and mouse clicks arrived as escape sequences
+  until `reset`. `kill -TSTP` stopped metacodes with them on. A panic and
+  these signals now turn the modes off and give the terminal its settings
+  back first; SIGTSTP does so before the process stops, and SIGCONT turns
+  them on again.
+
 - **A reply that broke off and is sent again says so.** The text that was
   shown stays, with a dim line under it saying the reply broke off, is
   discarded and is being retried. The first retry showed nothing.

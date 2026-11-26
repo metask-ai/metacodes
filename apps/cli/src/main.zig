@@ -73,12 +73,14 @@ pub const std_options: std.Options = .{
 };
 
 /// Panics go through the default handler (message, stack trace, abort), after
-/// the TUI writes the reply text its merge window still holds (#328).
+/// the TUI writes the reply text its merge window still holds (#328) and turns
+/// off the terminal modes it turned on.
 pub const panic = std.debug.FullPanic(panicAfterPendingOutput);
 
 fn panicAfterPendingOutput(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
     _ = tui_render_region.flushPendingOnPanic();
+    @import("repl/input.zig").rescueTerminal();
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 

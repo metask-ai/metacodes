@@ -849,6 +849,7 @@ pub fn readKey(fd: c_int, parser: *KeyParser) KeyRead {
 pub fn reconcileModes(fd: c_int) bool {
     if (platform_term.enterRaw(fd) == null) return false;
     emitEnableSequences(fd);
+    rearmRescue();
     return true;
 }
 
@@ -1072,6 +1073,7 @@ pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
         return null;
     };
     emitEnableSequences(fd);
+    armRescue(fd, original orelse orig);
     if (startup) collectStartupInput(fd, startupSettleMs(bg_probe.roundTripMs()));
     return original orelse orig;
 }
@@ -1192,9 +1194,110 @@ pub const StartupText = struct {
 };
 
 pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
+    disarmRescue();
     emitDisableSequences(fd);
     platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
 }
+
+const rescue_capacity = 64;
+comptime {
+    std.debug.assert("\x1b[?2004l".len + mouse_selection_disable.len + kbd_disable_seq.len <= rescue_capacity);
+}
+var g_rescue_fd: c_int = -1;
+var g_rescue_mode: platform_term.SavedMode = undefined;
+var g_rescue_bytes: [rescue_capacity]u8 = undefined;
+var g_rescue_len: usize = 0;
+var g_rescue_armed = std.atomic.Value(bool).init(false);
+var g_rescue_installed = std.atomic.Value(bool).init(false);
+
+fn armRescue(fd: c_int, mode: platform_term.SavedMode) void {
+    if (@import("builtin").os.tag == .windows) return;
+    g_rescue_armed.store(false, .release);
+    const parts = [_][]const u8{
+        "\x1b[?2004l",
+        if (mouseSelectionOn()) mouse_selection_disable else "",
+        if (shouldEnableKittyKeyboard()) kbd_disable_seq else "",
+    };
+    var len: usize = 0;
+    for (parts) |part| {
+        @memcpy(g_rescue_bytes[len..][0..part.len], part);
+        len += part.len;
+    }
+    g_rescue_len = len;
+    g_rescue_fd = fd;
+    g_rescue_mode = mode;
+    g_rescue_armed.store(true, .release);
+    if (@import("builtin").os.tag != .windows and !g_rescue_installed.swap(true, .acq_rel)) rescue_signals.install();
+}
+
+fn disarmRescue() void {
+    g_rescue_armed.store(false, .release);
+}
+
+fn rearmRescue() void {
+    if (g_rescue_fd >= 0) g_rescue_armed.store(true, .release);
+}
+
+pub fn rescueTerminal() void {
+    if (!g_rescue_armed.swap(false, .acq_rel)) return;
+    _ = pfs.writeAll(g_rescue_fd, g_rescue_bytes[0..g_rescue_len]);
+    platform_term.restoreModeKeepingInput(g_rescue_fd, g_rescue_mode);
+}
+
+const rescue_signals = struct {
+    const fatal = [_]std.posix.SIG{ .ABRT, .QUIT, .ALRM, .SEGV, .BUS, .ILL, .FPE, .TRAP };
+    var previous: [fatal.len]std.posix.Sigaction = undefined;
+
+    fn install() void {
+        for (fatal, &previous) |sig, *saved| {
+            std.posix.sigaction(sig, null, saved);
+            if (saved.handler.handler == std.posix.SIG.IGN) continue;
+            const act: std.posix.Sigaction = .{
+                .handler = .{ .handler = onFatal },
+                .mask = std.posix.sigemptyset(),
+                .flags = std.posix.SA.ONSTACK,
+            };
+            std.posix.sigaction(sig, &act, null);
+        }
+        var stop: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.TSTP, null, &stop);
+        if (stop.handler.handler == std.posix.SIG.IGN) return;
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onStop },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.TSTP, &act, null);
+    }
+
+    fn onFatal(sig: std.posix.SIG) callconv(.c) void {
+        rescueTerminal();
+        for (fatal, previous) |candidate, saved| {
+            if (candidate != sig) continue;
+            std.posix.sigaction(sig, &saved, null);
+            break;
+        }
+        std.posix.raise(sig) catch {};
+    }
+
+    fn onStop(_: std.posix.SIG) callconv(.c) void {
+        rescueTerminal();
+        const default: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var ours: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.TSTP, &default, &ours);
+        var stopping = std.posix.sigemptyset();
+        std.posix.sigaddset(&stopping, .TSTP);
+        std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &stopping, null);
+        std.posix.raise(.TSTP) catch {};
+        std.posix.sigaction(.TSTP, &ours, null);
+        rearmRescue();
+        g_resume_requested.store(true, .release);
+    }
+};
 
 /// emitEnableSequences 开的转义模式关回去。关 bracketed paste(始终)+ 键盘协议(仅发过 enable
 /// 的——对称 enterRawMode,同进程 env 不变、探测答案只写一次,判定恒一致,不会发了 enable 没
@@ -1216,6 +1319,7 @@ fn emitDisableSequences(fd: c_int) void {
 /// 不是终端 → null(什么都没动)。
 pub fn lendTerminal(fd: c_int) ?platform_term.SavedMode {
     const saved = platform_term.saveMode(fd) orelse return null;
+    disarmRescue();
     emitDisableSequences(fd);
     platform_term.setCooked(fd);
     return saved;
@@ -1225,6 +1329,7 @@ pub fn lendTerminal(fd: c_int) ?platform_term.SavedMode {
 pub fn takeBackTerminal(fd: c_int, saved: platform_term.SavedMode) void {
     platform_term.restoreMode(fd, saved);
     emitEnableSequences(fd);
+    rearmRescue();
 }
 
 /// 把 `current` 写临时文件,开 $VISUAL/$EDITOR(前台阻塞)编辑,读回(owned,去尾换行)。
@@ -2688,6 +2793,47 @@ test "classifyKittyKeyboard:deny-list / 认得出 / 探测 分流矩阵" {
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("vscode", "tmux-256color", .tmux));
     try testing.expectEqual(KeyboardPolicy.disable, classifyKittyKeyboard(null, "screen-256color", .other));
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("ghostty", t, .other));
+}
+
+test "rescueTerminal writes the off sequences once, only while armed" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const was_installed = g_rescue_installed.swap(true, .acq_rel);
+    defer g_rescue_installed.store(was_installed, .release);
+    const was_mouse = mouseSelectionOn();
+    defer recordMouseSelection(was_mouse);
+    defer disarmRescue();
+    const envs = [_]SavedEnv{
+        try SavedEnv.set("TERM", "xterm-kitty"),
+        try SavedEnv.set(no_keyboard_enhancement_env, null),
+    };
+    defer for (envs) |saved| saved.restore();
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const mode = std.mem.zeroes(platform_term.SavedMode);
+    var buf: [128]u8 = undefined;
+
+    recordMouseSelection(true);
+    armRescue(fds[1], mode);
+    rescueTerminal();
+    rescueTerminal();
+    const all = "\x1b[?2004l" ++ mouse_selection_disable ++ kbd_disable_seq;
+    try testing.expectEqual(@as(isize, all.len), std.c.read(fds[0], &buf, buf.len));
+    try testing.expectEqualStrings(all, buf[0..all.len]);
+    try testing.expectEqual(@as(c_int, 0), platform_term.waitReadable(fds[0], 0));
+
+    recordMouseSelection(false);
+    ppaths.setEnv(no_keyboard_enhancement_env, "1");
+    armRescue(fds[1], mode);
+    disarmRescue();
+    rescueTerminal();
+    try testing.expectEqual(@as(c_int, 0), platform_term.waitReadable(fds[0], 0));
+    rearmRescue();
+    rescueTerminal();
+    const paste_only = "\x1b[?2004l";
+    try testing.expectEqual(@as(isize, paste_only.len), std.c.read(fds[0], &buf, buf.len));
+    try testing.expectEqualStrings(paste_only, buf[0..paste_only.len]);
 }
 
 test "shouldEnableKittyKeyboard: 要探测的终端只在答了 Kitty flags 时才发,提示文案跟着走" {
