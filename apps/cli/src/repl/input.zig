@@ -3023,6 +3023,12 @@ test "paste burst: bracketed paste markers win, and the Enter after them submits
     try testing.expectEqualSlices(Key, &.{ .paste_begin, .{ .char = 'o' }, .{ .char = 'n' }, .{ .char = 'e' }, .enter, .{ .char = 't' }, .{ .char = 'w' }, .{ .char = 'o' }, .paste_end, .enter }, keys);
 }
 
+test "paste burst: a bracketed paste ends the burst before it, so an Enter right after the paste submits" {
+    var buf: [32]Key = undefined;
+    const keys = parseTimed(&.{ .{ .bytes = "a\rb\r\x1b[200~x\x1b[201~", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 5 } }, &buf);
+    try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .shift_enter, .{ .char = 'b' }, .shift_enter, .paste_begin, .{ .char = 'x' }, .paste_end, .enter }, keys);
+}
+
 test "paste burst: splitting a write into back-to-back writes anywhere never changes the keys" {
     const writes = [_]TimedWrite{
         .{ .bytes = "h", .after_ms = 1000 },                        .{ .bytes = "i", .after_ms = 90 },                                .{ .bytes = "\r", .after_ms = 150 },
