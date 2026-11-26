@@ -113,6 +113,37 @@ def test_permission_dialog_does_not_answer_from_pasted_text(bin_path):
     _expect_refused(bin_path, ["raw:\\x1b[200~yes\\x1b[201~", "strictsleep:0.6", "type:n"])
 
 
+def test_permission_dialog_does_not_answer_from_a_paste_without_markers(bin_path):
+    _expect_refused(bin_path, ["raw:yes\\r", "strictsleep:0.6", "type:n"])
+
+
+def test_typing_on_while_the_permission_dialog_opens_does_not_answer_it(bin_path):
+    target = os.path.join(case_tmpdir("cc-tty-dialog-keys-typing-"), "answer.txt")
+    turns = [
+        slow_text_then_tooluse(n_chunks=3, delay=0.3, tool="Write",
+                               tool_input=json.dumps({"file_path": target, "content": "x"})),
+        slow_text_then_end(n_chunks=1, delay=0.1),
+    ]
+    with SlowMockServer(turns) as srv:
+        raw = run(
+            bin_path,
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt", 15),
+             "type:find the node index then print it out", "strictsleep:0.6", "type:y", "sleep:2.5"],
+            base_url=srv.url,
+            permission="default",
+            cwd=case_tmpdir("cc-tty-dialog-keys-project-"),
+            startup_drain=0.8,
+            per_key_drain=0.05,
+        )
+        requests = list(srv.requests)
+    a = TTYAssert(raw)
+    if b"Permission required" not in raw:
+        a._fail("the permission dialog never opened while the draft was typed")
+    result = _tool_result(requests[1]) if len(requests) >= 2 else None
+    if result is None or result.get("is_error") or not os.path.exists(target):
+        a._fail(f"a key typed on into the dialog answered it before the deliberate y: tool_result={result!r}")
+
+
 def test_question_dialog_cancels_on_esc_sent_as_csi_u(bin_path):
     _expect_cancelled(bin_path, [CSI_U_ESC])
 
