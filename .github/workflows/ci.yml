@@ -1349,7 +1349,16 @@ jobs:
       - name: Offline test suite (units)
         if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false' && env.PACKAGE_TESTS == ''
         shell: cmd
+        id: windows_units
+        env:
+          METACODES_PICKER_TRACE: ${{ runner.temp }}\picker.log
         run: zig build test:units -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Picker server events
+        if: failure() && matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && steps.windows_units.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $trace = Join-Path $env:RUNNER_TEMP picker.log
+          if (Test-Path $trace) { Get-Content $trace } else { Write-Output "No picker server events recorded" }
       - name: Offline test suite (affected packages)
         if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.UNITS != 'false' && env.PACKAGE_TESTS != ''
         shell: cmd
