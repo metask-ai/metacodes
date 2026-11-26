@@ -128,6 +128,8 @@ elif name == "docker":
         # A container fetching a URL (setup's egress probe): really fetched.
         import urllib.request
         request = urllib.request.Request(args[-1])
+        if "FAKE_EGRESS_PROBE_ID" in env:
+            request.add_header("X-Bench-Probe-Id", env["FAKE_EGRESS_PROBE_ID"])
         container_env = dict(args[i + 1].split("=", 1) for i, arg in enumerate(args) if arg == "-e")
         if "http_proxy" in container_env:
             request.set_proxy(container_env["http_proxy"].split("://", 1)[-1], "http")
@@ -179,7 +181,7 @@ elif name == "ssh":
                 "FAKE_EXPECT_ACCOUNT_KEY", "FAKE_BREW_PREFIX", "FAKE_RELAY_REQUESTS", "FAKE_RELAY_INTERVAL",
                 "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
                 "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT", "FAKE_BENCH_RELEASE_FILE",
-                "FAKE_LATE_TRAFFIC"):
+                "FAKE_LATE_TRAFFIC", "FAKE_EGRESS_PROBE_ID"):
         if key in env:
             remote[key] = env[key]
     if " results final " in command or " results summary " in command or " pack " in command:
@@ -2827,10 +2829,14 @@ class NetworkSetupTest(SetupFixture):
         from http.server import BaseHTTPRequestHandler
         from urllib.parse import urlsplit
         egress = importlib.import_module("scripts.eval.harbor.bench.egress")
-        probe = types.SimpleNamespace(served=[], proxy_checked=[])
+        probe = types.SimpleNamespace(id=self.root.name, served=[], proxy_checked=[])
+        os.environ["FAKE_EGRESS_PROBE_ID"] = probe.id
 
         class Origin(BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.headers.get("X-Bench-Probe-Id") != probe.id:
+                    self.send_error(404)
+                    return
                 probe.served.append(self.path)
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
@@ -2859,6 +2865,21 @@ class NetworkSetupTest(SetupFixture):
             patcher.start()
             self.addCleanup(patcher.stop)
         return probe
+
+    def test_external_probe_records_every_get_from_its_own_fixture(self):
+        probe = self.local_external_probe()
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for headers in ({}, {"X-Bench-Probe-Id": probe.id + "-other"}):
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                direct.open(urllib.request.Request(probe.url, headers=headers), timeout=5)
+            with refused.exception:
+                self.assertEqual(refused.exception.code, 404)
+        request = urllib.request.Request(f"http://127.0.0.1:{probe.port}/json/version",
+                                         headers={"X-Bench-Probe-Id": probe.id})
+        for _ in range(2):
+            with direct.open(request, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+        self.assertEqual(probe.served, ["/json/version"] * 2)
 
     def test_blocked_registries_propose_mirrors_and_one_click_applies_them(self):
         probe = self.local_external_probe()
