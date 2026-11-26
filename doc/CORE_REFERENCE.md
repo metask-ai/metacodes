@@ -62,7 +62,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 |----|---------------------|------------|------------------|
 | `base` | `packages/base/src/` · `metacodes-base` | `util/` · `platform/`(另是 named module `platform`) · `symbols/` · `highlight/` · `code/`(named module `code_runtime`) · `version*` · `release_contract` · `api/model_name` · `tools/test_tmp` | 无 |
 | `ai` | `packages/ai/src/` · `metacodes-ai` | `api/` · `provider/` · `client` · `types` · `json` · `preview` · `core/` 里的 `auth` · `recorder` · `context_pressure` | base |
-| `kernel` | `packages/kernel/src/` · `metacodes-kernel` | `conversation` · `message` · `session_id` · `result_budget`,以及最小内核 `loop` · `types` · `executor`(循环、钩子、工具接口、顺序/并行执行器,还没有调用方) | base、ai |
+| `kernel` | `packages/kernel/src/` · `metacodes-kernel` | `conversation` · `message` · `session_id` · `result_budget`,以及最小内核 `loop` · `types` · `executor`(循环与回合驱动、流式消息草稿、历史投影、钩子、工具接口、顺序/并行分批执行器;生产 `agent_loop` 与 `tool_exec` 共用) | base、ai |
 | `guard` | `packages/guard/src/` · `metacodes-guard` | `permission*` · `sandbox/` · `formal/` · `core/` 里的 `workspace_policy` · `tool_result_artifact` · `answer_queue` · `shell` · `shutdown` · `memory/memdir` · 工具观测与规则影响证据 · `protocol/` 里 `PermissionContext` 用到的三个文件 · `tools/common` · `tools/observation` | base、ai、kernel |
 | `coding` | `packages/coding/src/` · `metacodes-coding` | `core/` 其余文件(含 `agent_loop` · `tool_exec` · `protocol/` 其余文件) · `tools*` · `skills/` · `agents/` · `mcp/` · `kg/` · `lsp/` · `jev/` · `swarm/` · `telemetry/` · `plugin/` · `sandbox/filesystem` · `formal/task_audit` | base、ai、kernel、guard |
 | `session` | `packages/session/src/` · `metacodes-session` | `core/agent_session` · `core/session_host` | 以上各包 |

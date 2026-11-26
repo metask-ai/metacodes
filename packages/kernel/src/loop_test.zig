@@ -538,3 +538,101 @@ test "a tool withdrawn from the request does not run even when the model calls i
     try std.testing.expectEqualStrings("unknown tool `read`+N", harness.result(2, 0).content);
     try std.testing.expect(std.mem.indexOf(u8, log.text(), "run read") == null);
 }
+
+test "drive respects dynamic turn limits and abort precedence" {
+    const StopKind = enum { done, aborted, limited };
+    const Driver = struct {
+        cap: u32,
+        aborted: bool = false,
+        steps: u32 = 0,
+        grow_once: bool = false,
+
+        fn limit(self: *@This()) u32 {
+            return self.cap;
+        }
+        fn isAborted(self: *@This()) bool {
+            return self.aborted;
+        }
+        fn step(self: *@This(), turns: u32) error{}!kernel.StepOutcome(StopKind) {
+            self.steps += 1;
+            if (self.grow_once and turns == 0) {
+                self.grow_once = false;
+                self.cap += 1;
+            }
+            return .continue_run;
+        }
+        fn onAborted(_: *@This(), _: u32) StopKind {
+            return .aborted;
+        }
+        fn onLimit(_: *@This(), _: u32) StopKind {
+            return .limited;
+        }
+    };
+
+    var growing = Driver{ .cap = 1, .grow_once = true };
+    const grown = try kernel.drive(StopKind, &growing, Driver.limit, Driver.isAborted, Driver.step, Driver.onAborted, Driver.onLimit, false);
+    try std.testing.expectEqual(StopKind.limited, grown);
+    try std.testing.expectEqual(@as(u32, 2), growing.steps);
+
+    var zero_abort_first = Driver{ .cap = 0, .aborted = true };
+    const first = try kernel.drive(StopKind, &zero_abort_first, Driver.limit, Driver.isAborted, Driver.step, Driver.onAborted, Driver.onLimit, true);
+    try std.testing.expectEqual(StopKind.aborted, first);
+
+    var zero_limit_first = Driver{ .cap = 0, .aborted = true };
+    const second = try kernel.drive(StopKind, &zero_limit_first, Driver.limit, Driver.isAborted, Driver.step, Driver.onAborted, Driver.onLimit, false);
+    try std.testing.expectEqual(StopKind.limited, second);
+}
+
+test "assistant draft orders blocks, drops reasoning-only turns, and survives allocation failures" {
+    try std.testing.checkAllAllocationFailures(gpa, struct {
+        fn assemble(allocator: std.mem.Allocator) !void {
+            var draft = kernel.AssistantDraft.init(allocator);
+            defer draft.deinit();
+            try draft.appendReasoningOwned(try allocator.dupe(u8, "{\"id\":\"r1\"}"));
+            try draft.appendThinking("plan");
+            try draft.appendText("hello");
+            const tool_use: @import("message.zig").ToolUse = blk: {
+                const id = try allocator.dupe(u8, "t1");
+                errdefer allocator.free(id);
+                const name = try allocator.dupe(u8, "Read");
+                errdefer allocator.free(name);
+                break :blk .{ .id = id, .name = name, .input = try allocator.dupe(u8, "{}") };
+            };
+            try draft.appendToolUseOwned(tool_use);
+            const blocks = (try draft.finishBlocks("m1", .{ .drop_reasoning_without_content = true })).?;
+            defer {
+                for (blocks) |block| block.deinit(allocator);
+                allocator.free(blocks);
+            }
+            try std.testing.expectEqual(@as(usize, 4), blocks.len);
+            try std.testing.expectEqualStrings("m1", blocks[0].reasoning_item.model);
+            try std.testing.expectEqualStrings("plan", blocks[1].thinking);
+            try std.testing.expectEqualStrings("hello", blocks[2].text);
+            try std.testing.expectEqualStrings("Read", blocks[3].tool_use.name);
+        }
+    }.assemble, .{});
+
+    var reasoning_only = kernel.AssistantDraft.init(gpa);
+    defer reasoning_only.deinit();
+    try reasoning_only.appendReasoningOwned(try gpa.dupe(u8, "{\"id\":\"r1\"}"));
+    try std.testing.expect(!reasoning_only.hasSubstantiveOutput());
+    try std.testing.expectEqual(@as(?[]@import("message.zig").Block, null), try reasoning_only.finishBlocks("m1", .{ .drop_reasoning_without_content = true }));
+
+    var partial = kernel.AssistantDraft.init(gpa);
+    defer partial.deinit();
+    try partial.appendReasoningOwned(try gpa.dupe(u8, "{\"id\":\"r1\"}"));
+    try partial.appendThinking("plan");
+    try partial.appendText("partial");
+    try partial.appendToolUseOwned(.{
+        .id = try gpa.dupe(u8, "t1"),
+        .name = try gpa.dupe(u8, "Read"),
+        .input = try gpa.dupe(u8, "{}"),
+    });
+    const kept = (try partial.finishPartialText()).?;
+    defer {
+        for (kept) |block| block.deinit(gpa);
+        gpa.free(kept);
+    }
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings("partial", kept[0].text);
+}
