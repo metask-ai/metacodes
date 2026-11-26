@@ -129,18 +129,19 @@ class StoreLibrary:
         views = list(self._views(None, False).values())
         return sorted(views, key=lambda view: view["started_at"] or "", reverse=True)
 
-    def trial_detail(self, job: Any, trial: Any) -> Optional[Dict[str, Any]]:
+    def trial_record(self, job: Any, trial: Any) -> Optional[Tuple[str, str, str]]:
         if not all(isinstance(v, str) and data.NAME.match(v) for v in (job, trial)):
             return None
-        # A trial is keyed by its directory; the page names it by the
-        # directory's name. A name repeated in two nested runs resolves like
-        # data.Library.trial_dir: the first by path.
         with self.store.read() as tx:
-            found = tx.query("SELECT name, detail_json FROM trials WHERE job = ? AND (name = ? OR "
+            found = tx.query("SELECT name, projection, detail_json FROM trials WHERE job = ? AND (name = ? OR "
                              "substr(name, length(name) - length(?)) = ?)", (job, trial, trial, "/" + trial))
+        return min(found) if found else None
+
+    def trial_detail(self, job: Any, trial: Any) -> Optional[Dict[str, Any]]:
+        found = self.trial_record(job, trial)
         if not found:
             return None
-        detail = json.loads(min(found)[1])
+        detail = json.loads(found[2])
         _refresh(detail["row"], dt.datetime.now(dt.timezone.utc))
         return detail
 

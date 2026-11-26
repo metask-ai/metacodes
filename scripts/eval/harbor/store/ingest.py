@@ -417,13 +417,16 @@ class RootResult:
                 "profiles_written": self.profiles_written}
 
 
-def _stored_files(tx: Tx, job: str) -> Dict[str, StoredFile]:
+def _stored_files(tx: Tx, job: str, prefix: Optional[str] = None) -> Dict[str, StoredFile]:
     """The job's file rows. A path that could not be written back safely
     (a database edited elsewhere) is ignored."""
+    query = "SELECT relpath, size, mtime_ns, state, sha256, trial, kind, tail_sha256 FROM files WHERE job = ?"
+    args = [job]
+    if prefix is not None:
+        query += " AND (substr(relpath, 1, length(?)) = ? OR relpath IN (?, ?))"
+        args += [prefix + "/", prefix + "/", _metrics_path(prefix), _lifecycle_path(prefix)]
     return {relpath: StoredFile(int(size), int(mtime), state, sha, trial, kind, tail)
-            for relpath, size, mtime, state, sha, trial, kind, tail in tx.query(
-                "SELECT relpath, size, mtime_ns, state, sha256, trial, kind, tail_sha256 FROM files WHERE job = ?",
-                (job,))
+            for relpath, size, mtime, state, sha, trial, kind, tail in tx.query(query, args)
             if safe_relpath(relpath)}
 
 
@@ -583,33 +586,40 @@ def _entries(tx: Tx, relpaths: Sequence[str], stored: Dict[str, StoredFile]) -> 
     return entries
 
 
+def derive_trial(store: Store, job: str, prefix: str, stored: Dict[str, StoredFile], result: JobResult,
+                 log: Callable[[str], None], *, known: Optional[Tuple[str, str]] = None) -> None:
+    inputs = trial_inputs(prefix, stored)
+    digest = digest_inputs(inputs, stored)
+    if known is None:
+        with store.read() as tx:
+            known = tx.one("SELECT inputs_digest, projection FROM trials WHERE job = ? AND name = ?", (job, prefix))
+    if known == (digest, PROJECTION):
+        return
+    try:
+        if not safe_relpath(prefix):
+            raise StoreError(f"refusing to project stored trial {prefix!r}: unsafe path")
+        with store.read() as tx:
+            entries = _entries(tx, inputs, stored)
+        with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
+            job_dir = materialize(Path(temp), job, entries)
+            projected = project_trial(job_dir.joinpath(*prefix.split("/")))
+        with store.transaction() as tx:
+            write_trial(tx, job, prefix, projected, digest)
+    except Exception as exc:
+        log(f"bench store: deriving {job}/{prefix} failed: {type(exc).__name__}: {exc}")
+        result.trials_failed += 1
+        return
+    result.trials_derived += 1
+
+
 def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result: JobResult,
                   log: Callable[[str], None] = lambda message: None) -> None:
-    """Recompute trial projections whose input bytes or code changed. A trial
-    that cannot be projected or stored is logged and retried on the next
-    pass; it never keeps the job's other trials out of the store."""
     trials = trial_locations(stored)
     with store.read() as tx:
         known = {name: (digest, projection) for name, digest, projection in tx.query(
             "SELECT name, inputs_digest, projection FROM trials WHERE job = ?", (job,))}
     for prefix in trials:
-        inputs = trial_inputs(prefix, stored)
-        digest = digest_inputs(inputs, stored)
-        if known.get(prefix) == (digest, PROJECTION):
-            continue
-        try:
-            with store.read() as tx:
-                entries = _entries(tx, inputs, stored)
-            with tempfile.TemporaryDirectory(prefix="bench-store-") as temp:
-                job_dir = materialize(Path(temp), job, entries)
-                projected = project_trial(job_dir.joinpath(*prefix.split("/")))
-            with store.transaction() as tx:
-                write_trial(tx, job, prefix, projected, digest)
-        except Exception as exc:
-            log(f"bench store: deriving {job}/{prefix} failed: {type(exc).__name__}: {exc}")
-            result.trials_failed += 1
-            continue
-        result.trials_derived += 1
+        derive_trial(store, job, prefix, stored, result, log, known=known.get(prefix))
     gone = sorted(set(known) - set(trials))
     if gone:
         with store.transaction() as tx:
@@ -618,7 +628,17 @@ def derive_trials(store: Store, job: str, stored: Dict[str, StoredFile], result:
         result.trials_removed = len(gone)
 
 
-def refresh_job_projection(store: Store, name: str, log: Callable[[str], None]) -> JobResult:
+def refresh_trial_projection(store: Store, job: str, prefix: str, log: Callable[[str], None]) -> JobResult:
+    with store.read() as tx:
+        stored = _stored_files(tx, job, prefix)
+    result = JobResult(job, "unchanged")
+    derive_trial(store, job, prefix, stored, result, log)
+    if result.trials_derived:
+        result.outcome = "updated"
+    return result
+
+
+def refresh_job_header(store: Store, name: str) -> None:
     with store.read() as tx:
         row = tx.one("SELECT source_dir, inputs_digest FROM jobs WHERE name = ?", (name,))
         stored = _stored_files(tx, name)
@@ -629,6 +649,12 @@ def refresh_job_projection(store: Store, name: str, log: Callable[[str], None]) 
         header = data.job_header(materialize(Path(temp), name, entries))
     with store.transaction() as tx:
         tx.execute(_upsert_sql("jobs", ("name",)), header_values(name, row[0], header, row[1]))
+
+
+def refresh_job_projection(store: Store, name: str, log: Callable[[str], None]) -> JobResult:
+    refresh_job_header(store, name)
+    with store.read() as tx:
+        stored = _stored_files(tx, name)
     result = JobResult(name, "updated")
     derive_trials(store, name, stored, result, log)
     return result

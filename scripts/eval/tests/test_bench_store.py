@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -25,6 +26,7 @@ import types
 import unittest
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -466,34 +468,135 @@ class IngestTest(StoreCase):
         self.assertFalse(any(p.startswith("outside/") for p in paths))
         self.assertFalse(any(b"TOP-SECRET-VALUE" in c for c in contents))
 
-    def test_worker_reads_reproject_archived_trial_from_stored_bytes(self):
+    def test_worker_reads_reproject_only_the_requested_archived_trial(self):
+        frozen_time(self)
         job = _job(self.root, "worker-job", "m", planned=2)
         trial = _trial(job, "task__a", reward=1, steps=[{"tool_calls": [
             {"function_name": "Skill", "arguments": {"name": "review"}}]}])
-        sibling = _trial(job, "task__b", reward=0)
+        sibling = _trial(job, "task__b", reward=0, steps=[])
+        _write(job / ".bench-metrics" / (trial.name + ".jsonl"), json.dumps(
+            {"request": 1, "complete": True, "output_tokens": 5, "ttft_ms": 120, "generation_ms": 500}))
         store = self.sqlite()
         ingest.ingest_root(store, self.root)
-        shutil.rmtree(job)
-        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        relpath = sibling.name + "/agent/trajectory.json"
+        with store.read() as tx:
+            original = tx.one("SELECT sha256 FROM files WHERE relpath = ?", (relpath,))[0]
+        content = b'{"steps": 1}'
+        digest = hashlib.sha256(content).hexdigest()
         with store.transaction() as tx:
+            ingest.put_blob(tx, digest, content)
+            tx.execute("UPDATE files SET sha256 = ? WHERE relpath = ?", (digest, relpath))
             tx.execute("UPDATE trials SET projection = 'old'")
             tx.execute("UPDATE trials SET detail_json = '{}' WHERE name = ?", (trial.name,))
-        project_trial = ingest.project_trial
-
-        def project(path):
-            if path.name == sibling.name:
-                raise ValueError("trial unavailable")
-            return project_trial(path)
-
-        with patch.object(ingest, "project_trial", side_effect=project), patch.object(ingest, "stderr_log") as log:
-            self.assertEqual(results.worker_result(node, "trial", job, trial.name)["skills"], [["review", 1]])
+        shutil.rmtree(job)
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        with patch.object(ingest, "project_trial", wraps=ingest.project_trial) as project, patch.object(
+                ingest, "refresh_job_header", wraps=ingest.refresh_job_header) as header, patch.object(
+                ingest, "stderr_log") as log:
+            details = [results.worker_result(node, "trial", job, trial.name) for _ in range(5)]
+            self.assertTrue(all(detail == details[0] for detail in details))
+            self.assertEqual(details[0]["skills"], [["review", 1]])
+            self.assertEqual(details[0]["row"]["ttft_ms"], 120)
+            self.assertEqual([call.args[0].name for call in project.call_args_list], [trial.name])
+            header.assert_not_called()
+            log.assert_not_called()
             self.assertEqual(len(results.worker_result(node, "job", job)["rows"]), 2)
             self.assertEqual(results.worker_result(node, "trial", job, sibling.name)["row"]["reward"], 0)
-            self.assertEqual(log.call_count, 3)
+            self.assertEqual(log.call_count, 2)
             self.assertIn(sibling.name, log.call_args.args[0])
-        results.worker_result(node, "job", job)
+            with store.read() as tx:
+                self.assertEqual(tx.one("SELECT projection FROM trials WHERE name = ?", (sibling.name,)), ("old",))
+            with store.transaction() as tx:
+                tx.execute("UPDATE files SET sha256 = ? WHERE relpath = ?", (original, relpath))
+            self.assertEqual(results.worker_result(node, "trial", job, sibling.name)["row"]["reward"], 0)
+            self.assertEqual(log.call_count, 2)
         with store.read() as tx:
             self.assertEqual(tx.query("SELECT DISTINCT projection FROM trials"), [(ingest.PROJECTION,)])
+
+    def test_worker_trial_resolves_nested_duplicate_names_like_library(self):
+        job = _job(self.root, "nested", "m", planned=2)
+        first = _trial(job / data.NESTED_RUNS / "a", "task__a", reward=1)
+        _trial(job / data.NESTED_RUNS / "z", "task__a", reward=0)
+        store = self.sqlite()
+        ingest.ingest_root(store, self.root)
+        expected = StoreLibrary(store).trial_detail(job.name, first.name)
+        with store.transaction() as tx:
+            tx.execute("UPDATE trials SET projection = 'old'")
+        shutil.rmtree(job)
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        with patch.object(ingest, "project_trial", wraps=ingest.project_trial) as project:
+            detail = results.worker_result(node, "trial", job, first.name)
+        self.assertEqual(detail["row"]["reward"], expected["row"]["reward"])
+        self.assertEqual(project.call_count, 1)
+        with store.read() as tx:
+            self.assertEqual(tx.query("SELECT name FROM trials WHERE projection = ?", (ingest.PROJECTION,)),
+                             [(first.relative_to(job).as_posix(),)])
+
+    def test_worker_trial_checks_source_before_refreshing(self):
+        job = _job(self.root, "worker-job", "m", planned=1)
+        trial = _trial(job, "task__a", reward=1)
+        store = self.sqlite()
+        ingest.ingest_root(store, self.root)
+        with store.transaction() as tx:
+            tx.execute("UPDATE jobs SET source_dir = ?, projection = 'old'", (str(self.temp / "other"),))
+            tx.execute("UPDATE trials SET projection = 'old'")
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        with patch.object(ingest, "project_trial") as project, patch.object(ingest, "refresh_job_header") as header:
+            for operation, name in (("trial", trial.name), ("job", None)):
+                self.assertIsNone(results.worker_result(node, operation, job, name))
+            project.assert_not_called()
+            header.assert_not_called()
+
+    def test_worker_trial_never_projects_an_unsafe_stored_key(self):
+        job = _job(self.root, "worker-job", "m", planned=1)
+        trial = _trial(job, "task__a", reward=1)
+        store = self.sqlite()
+        ingest.ingest_root(store, self.root)
+        with store.transaction() as tx:
+            tx.execute("UPDATE trials SET name = ?, projection = 'old'", ("../" + trial.name,))
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        with patch.object(ingest, "project_trial") as project, patch.object(ingest, "stderr_log") as log:
+            self.assertEqual(results.worker_result(node, "trial", job, trial.name)["row"]["reward"], 1)
+            project.assert_not_called()
+            self.assertIn("unsafe path", log.call_args.args[0])
+
+    def test_concurrent_worker_trial_reads_recheck_versions_under_lock(self):
+        job = _job(self.root, "worker-job", "m", planned=1)
+        trial = _trial(job, "task__a", reward=1)
+        store = self.sqlite()
+        ingest.ingest_root(store, self.root)
+        with store.transaction() as tx:
+            tx.execute("UPDATE jobs SET projection = 'old'")
+            tx.execute("UPDATE trials SET projection = 'old'")
+        shutil.rmtree(job)
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        barrier = threading.Barrier(2)
+        root_lock = ingest.root_lock
+
+        @contextlib.contextmanager
+        def lock(root):
+            barrier.wait(timeout=10)
+            with root_lock(root):
+                yield
+
+        with patch.object(ingest, "root_lock", side_effect=lock), patch.object(
+                ingest, "project_trial", wraps=ingest.project_trial) as project, patch.object(
+                ingest, "refresh_job_header", wraps=ingest.refresh_job_header) as header:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                reads = [pool.submit(results.worker_result, node, "trial", job, trial.name) for _ in range(2)]
+                self.assertEqual([read.result(timeout=15)["row"]["reward"] for read in reads], [1, 1])
+            self.assertEqual(project.call_count, 1)
+            self.assertEqual(header.call_count, 1)
+
+    def test_worker_summary_and_final_still_reject_incomplete_ingestion(self):
+        job = _job(self.root, "worker-job", "m", planned=1)
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        for operation in ("summary", "final"):
+            for result in (ingest.JobResult(job.name, "skipped"),
+                           ingest.JobResult(job.name, "updated", trials_failed=1)):
+                with self.subTest(operation=operation, result=result), patch.object(
+                        ingest, "ingest_job", return_value=result), self.assertRaisesRegex(ValueError, "尚未完整"):
+                    results.worker_result(node, operation, job)
 
     def test_stale_projection_is_recomputed_from_stored_bytes(self):
         frozen_time(self)
