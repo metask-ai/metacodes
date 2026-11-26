@@ -122,6 +122,10 @@ def hand_cases():
         _case("wide_wraps_whole_on_autowrap", "中文字中".encode(), rows=3, cols=7, autowrap=True),
         _case("wide_half_overwritten", "中文\x1b[2Gx".encode(), rows=3, cols=7),
         _case("emoji_and_combining", "a😀b é─⏺❯".encode(), rows=3, cols=12),
+        _case("zero_width_marks_and_wide_emoji", ("e" + chr(0x301) + "x" + chr(0x2705) + "y" + chr(0x1F468) + chr(0x200D)
+                                                  + chr(0x1F4BB) + "|1" + chr(0xFE0F) + chr(0x20E3)).encode(),
+              rows=2, cols=9, autowrap=True),
+        _case("mark_after_the_last_column", ("abcd" + chr(0x301) + "e").encode(), rows=2, cols=4, autowrap=True),
         _case("sequences_split_across_feeds", [
             ("feed", b"ab\x1b"), ("feed", b"[2"), ("feed", b"Kc\xe4"), ("feed", b"\xb8"),
             ("feed", b"\xadd\x1b]0;t"), ("feed", b"itle\x07e\x1b[?20"), ("feed", b"26hf"),

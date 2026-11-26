@@ -9,42 +9,31 @@
   ESC[?25l/h 光标显隐、SGR(颜色→border_class)。
 未知 final byte(?2004h / >4;1m 等)安静吞掉。
 
-char_width 逐行复刻 apps/cli/src/repl/tui/term.zig:codepointDisplayWidth,
-否则光标列断言与实现对不齐。
+char_width 按 terminal_width.py 给宽度:scripts/gen_char_width.py 从 Unicode 数据生成,
+和 apps/cli/tests/component/vterm.zig 共用一份。它模拟终端,不照抄 TUI 自己的估算
+(apps/cli/src/repl/tui/term.zig),所以 TUI 算窄了的字会在这里折行、留下残影。
+零宽字符(组合符、ZWJ、变体选择符)挂在前一格上,不占列。
 """
+import bisect
+
+import terminal_width
+
+
+_ZERO_STARTS = [start for start, _ in terminal_width.ZERO]
+_WIDE_STARTS = [start for start, _ in terminal_width.WIDE]
+
+
+def _in_ranges(ranges, starts, cp: int) -> bool:
+    i = bisect.bisect_right(starts, cp) - 1
+    return i >= 0 and cp <= ranges[i][1]
 
 
 def char_width(cp: int) -> int:
-    """复刻 term.zig:codepointDisplayWidth。控制字符=0,CJK/emoji 全角=2,其余=1。"""
-    if cp < 0x20 or cp == 0x7F:
+    if cp < 0xA0:
+        return 0 if cp < 0x20 or cp == 0x7F else 1
+    if _in_ranges(terminal_width.ZERO, _ZERO_STARTS, cp):
         return 0
-    if 0x1100 <= cp <= 0x115F:
-        return 2
-    if 0x2E80 <= cp <= 0x303E:
-        return 2
-    if 0x3041 <= cp <= 0x33FF:
-        return 2
-    if 0x3400 <= cp <= 0x4DBF:
-        return 2
-    if 0x4E00 <= cp <= 0x9FFF:
-        return 2
-    if 0xA000 <= cp <= 0xA4CF:
-        return 2
-    if 0xAC00 <= cp <= 0xD7A3:
-        return 2
-    if 0xF900 <= cp <= 0xFAFF:
-        return 2
-    if 0xFE30 <= cp <= 0xFE4F:
-        return 2
-    if 0xFF00 <= cp <= 0xFF60:
-        return 2
-    if 0xFFE0 <= cp <= 0xFFE6:
-        return 2
-    if 0x1F300 <= cp <= 0x1FAFF:
-        return 2
-    if 0x20000 <= cp <= 0x2FFFD:
-        return 2
-    if 0x30000 <= cp <= 0x3FFFD:
+    if _in_ranges(terminal_width.WIDE, _WIDE_STARTS, cp):
         return 2
     return 1
 
@@ -390,7 +379,24 @@ class Screen:
             return "danger"
         return "plain"
 
+    def _attach_mark(self, ch: str):
+        if self._pending_wrap:
+            col = self.col
+        elif self.col > 0:
+            col = self.col - 1
+        else:
+            return
+        col = min(col, self.cols - 1)
+        cell = self.grid[self.row][col]
+        if cell.cont and col > 0:
+            cell = self.grid[self.row][col - 1]
+        if len(cell.ch) < 4:
+            cell.ch += ch
+
     def _put_char(self, ch: str, w: int):
+        if w == 0 and ord(ch[0]) >= 0xA0:
+            self._attach_mark(ch)
+            return
         if self.autowrap:
             # 严格 DEC autowrap:若处 pending-wrap,先延迟换行(下移+回列0)再放字符。
             if self._pending_wrap:

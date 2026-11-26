@@ -595,6 +595,16 @@ status, compatibility boundaries, and entry points are defined by
   shows its first line. The transcript view (Ctrl+O) and `--resume` show the
   call as well.
 
+- **Wide emoji no longer leave rules behind in the TUI.** ✅, ❌, ⭐, ⚡ and
+  the other emoji outside the U+1F300 block were measured one column wide
+  where the terminal draws two: once such a line wrapped in the terminal, as
+  the prompt does, every redraw left a `────` row behind, and a table with
+  them had its borders out of line. Widths now come from a table generated
+  from the Unicode 16 data (East Asian Width, combining marks, format
+  characters); a character terminals draw differently, such as a ZWJ
+  sequence or a flag, counts at least as wide as tmux and GNU screen draw
+  it, so it never wraps unseen.
+
 - **`bench pull` also pulls verifier and sidecar images.** It took only the
   first `docker_image` of a task's `task.toml`, which in the FrontierHarness
   tasks is the separate verifier's, so their environment images and the
