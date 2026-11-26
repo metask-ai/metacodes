@@ -87,7 +87,7 @@ const Case = struct {
     tmp: std.testing.TmpDir,
     root_buf: [std.fs.max_path_bytes]u8,
     root: []const u8,
-    guards: [route_variables.len + 1]EnvGuard,
+    guards: [route_variables.len + 2]EnvGuard,
     guard_count: usize,
 
     fn init(self: *Case) !void {
