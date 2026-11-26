@@ -214,8 +214,8 @@ CI:Gates (Linux) 的 `units`、`product`、`checks` 三条腿在跑测试时顺�
   并列出键。其他 PR 只出报告。
 - base 的 ID 集合取合并出 base 提交的那个 PR 的 CI 产物,或者 main 上该提交的 nightly、手动触发
   的 CI 产物,都要求树和 base 相同。找不到时,普通 PR 退而用 main 最近一次的产物出报告;
-  migration PR 直接失败:等 main 的头就是 PR 的 base 时在 main 上手动触发一次 CI
-  (`gh workflow run ci.yml --ref main`),再重跑这个 job。
+  migration PR 在三个独立的 Linux 作业里运行第一父提交的测试，并按该版本的
+  `tests/test_ids/linux-sources.tsv` 核对来源和分片后比较。缺分片、基准运行失败或测试范围不全时门禁失败。
 - CI 在 PR 的标签变化时(`labeled`、`unlabeled`)也会重跑,比较时读的是当时的标签,所以先跑完 CI
   再加 `migration` 标签,也会得到强制模式的 `Gates (Linux)`。
 

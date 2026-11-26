@@ -27,6 +27,7 @@ pub const ToolRun = types.ToolRun;
 pub const TurnDecision = types.TurnDecision;
 pub const TurnReport = types.TurnReport;
 pub const run = loop.run;
+pub const appendHistoryMessage = loop.appendHistoryMessage;
 
 test {
     std.testing.refAllDecls(@This());
