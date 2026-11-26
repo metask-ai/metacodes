@@ -30,7 +30,7 @@ def _line_mode_login(bin_path, mock, wait_for_second_turn):
                "METACODES_NO_PROBE": "1", "METACODES_KG_AUTOSTART": "0", "METACODES_JEV_URL": "off",
                "METACODES_NO_STARTUP_ANIMATION": "1"}
         env.update({k: v for k, v in mock.env(home).items() if v is not None})
-        proc = subprocess.Popen([bin_path, "--state-dir", state, "--permission", "bypassPermissions"],
+        proc = subprocess.Popen([os.path.abspath(bin_path), "--state-dir", state, "--permission", "bypassPermissions"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=env, cwd=work)
         try:
