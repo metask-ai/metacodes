@@ -78,13 +78,13 @@ When you encounter an obstacle, do not use destructive actions as a shortcut to 
   - To read files use Read instead of cat, head, tail, or sed\n
   - To edit files use Edit instead of sed or awk\n
   - To create files use Write instead of cat with heredoc or echo redirection\n
-  - Use CodeMap to outline definitions in a source file or a group of files.\n
-  - Use FindSymbol to locate named definitions across files.\n
  - You can call multiple tools in one response. Run independent calls in parallel; keep dependent calls sequential.\n
 \n
 # Deferred tools\n
 The tools below are available but their parameter schemas are not loaded yet, so you cannot call them directly. To use one, first call ToolSearch with `select:<name>` (or keywords) to fetch its schema; after that it is callable like any other tool.\n
 \n
+- CodeMap — Produce a structural outline of source code using its language server. Pass one file path or a glob to list definitions,…\n
+- FindSymbol — Find where a symbol is DEFINED across the codebase (SOURCE CODE only). Returns definitions with file:line and signature.…\n
 - BashOutput — A backgrounded job's exit is announced to you automatically; you do not need to call this in a loop. Read stdout/stderr …\n
 - KillShell — Terminate a running backgrounded Bash job by job_id\n
 - Monitor — Start a background monitor that runs a command and streams stdout line-by-line. Its exit is announced to you automatical…\n
@@ -278,45 +278,6 @@ Usage:\n
 "description":"The full patch text, from '*** Begin Patch' to '*** End Patch'."}},
 "required":[
 "patch"]}},
-{
-"name":"CodeMap",
-"description":"Produce a structural outline of source code using its language server. Pass one file path or a glob to list definitions, line numbers and signatures. An unavailable language server is reported explicitly. Use FindSymbol to locate a named definition across files. Use Read with offset and limit to inspect a definition's body.",
-"input_schema":{
-"type":"object",
-"properties":{
-"path":{
-"type":"string",
-"description":"A file path OR a glob pattern (e.g. src/**/*)"}},
-"required":[
-"path"]}},
-{
-"name":"FindSymbol",
-"description":"Find where a symbol is DEFINED across the codebase (SOURCE CODE only). Returns definitions with file:line and signature. Use this to jump to a function/type/class definition by name when you don't know which file it lives in. Requires an installed language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd); an empty result is qualified when one is unavailable, so `[]` alone means not defined.",
-"input_schema":{
-"type":"object",
-"properties":{
-"name":{
-"type":"string",
-"description":"The symbol name to find the definition of"},
-"kind":{
-"type":"string",
-"description":"Optional kind filter",
-"enum":[
-"function",
-"method",
-"struct",
-"enum",
-"union",
-"type",
-"constant",
-"variable",
-"class",
-"interface"]},
-"path":{
-"type":"string",
-"description":"Optional directory/glob to scope the search (defaults to cwd)"}},
-"required":[
-"name"]}},
 {
 "name":"ReadArtifact",
 "description":"Read a bounded byte range from a recoverable tool-result artifact. Use this whenever a tool result reports it was truncated and names an artifact_id — re-running the tool costs a full round-trip and still will not return the omitted bytes. offset is zero-based bytes; limit is capped at 32768 and may be reduced further to fit the context budget, in which case next_offset carries the remainder. The result is always bounded and never spills recursively. A turn has a recovery allowance of half its result budget; calls beyond it return recovery_allowance_exhausted with the offset to resume from in the next turn.",

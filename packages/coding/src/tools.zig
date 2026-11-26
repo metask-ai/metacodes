@@ -207,6 +207,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CodeMap",
+        .deferred = true,
         .description = "Produce a structural outline of source code: functions, types, classes, " ++
             "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
             "plain-text, config, JSON, or docs). Pass a file path for one file, or a glob (e.g. " ++
@@ -224,6 +225,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "FindSymbol",
+        .deferred = true,
         .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
             "Returns definitions with " ++
             "file:line and signature. Use this to jump to a function/type/class definition by " ++

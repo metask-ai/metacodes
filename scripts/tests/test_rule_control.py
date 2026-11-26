@@ -254,7 +254,7 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
     def test_glob_in_schema_does_not_hide_executable_governance_wiring(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        source = root / "src/tools.zig"
+        source = root / "packages/coding/src/tools.zig"
         source.write_text(
             'const pattern = "**/*.zig";\n' + source.read_text(encoding="utf-8") + "// */\n",
             encoding="utf-8",

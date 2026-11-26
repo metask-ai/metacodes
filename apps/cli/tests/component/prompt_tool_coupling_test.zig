@@ -52,8 +52,8 @@ test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     try std.testing.expect(std.mem.indexOf(u8, read.description, "cat -n format") != null);
     const edit = findDef(defs, "Edit").?;
     try std.testing.expect(std.mem.indexOf(u8, edit.description, "exact string replacements") != null);
-    try std.testing.expect(findDef(defs, "CodeMap") != null);
-    try std.testing.expect(findDef(defs, "FindSymbol") != null);
+    try std.testing.expect(findDef(defs, "CodeMap").?.deferred);
+    try std.testing.expect(findDef(defs, "FindSymbol").?.deferred);
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.request_tools = .{ .advertised = defs, .catalog = defs };
     for ([_][]const u8{ "Glob", "Grep" }) |name| {
@@ -529,7 +529,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__search — Search a KnowForge knowledge base by keyword. Returns fragments") != null);
     try std.testing.expect(std.mem.indexOf(u8, system, "\n- knowforge__overview — Knowledge base overview.") != null);
 
-    const search_sse = try harness.toolSearchSse(a, "select:knowforge__search,TaskCreate,TaskUpdate,TaskOutput,CronList,BashOutput");
+    const search_sse = try harness.toolSearchSse(a, "select:knowforge__search,CodeMap,FindSymbol,TaskCreate,TaskUpdate,TaskOutput,CronList,BashOutput");
     defer a.free(search_sse);
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
     defer srv.stop();
@@ -571,7 +571,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__search") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_system, "- knowforge__overview") != null);
 
-    const deferred_names = [_][]const u8{ "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop", "BashOutput", "Monitor", "KillShell", "CronCreate", "CronList", "CronDelete" };
+    const deferred_names = [_][]const u8{ "CodeMap", "FindSymbol", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop", "BashOutput", "Monitor", "KillShell", "CronCreate", "CronList", "CronDelete" };
     try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"ScheduleWakeup\"") != null);
     for (deferred_names) |name| {
         const field = try std.fmt.allocPrint(a, "\"name\":\"{s}\"", .{name});
@@ -604,7 +604,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
         defer a.free(field);
         try std.testing.expectEqual(selected, std.mem.indexOf(u8, second_tools, field) != null);
     }
-    for ([_][]const u8{ "TaskCreate", "TaskUpdate", "TaskOutput", "CronList", "BashOutput" }) |name| try std.testing.expect(activated.contains(name));
+    for ([_][]const u8{ "CodeMap", "FindSymbol", "TaskCreate", "TaskUpdate", "TaskOutput", "CronList", "BashOutput" }) |name| try std.testing.expect(activated.contains(name));
     try std.testing.expect(std.mem.indexOf(u8, second_system, "- knowforge__overview") != null);
 }
 

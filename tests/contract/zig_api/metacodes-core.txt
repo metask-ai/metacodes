@@ -9704,7 +9704,7 @@ metacodes-core.tools.ToolEntry.preview_feature: ?@import("preview.zig").Feature 
 metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <43040 bytes, sha256 5e7376a9f2b0>
+metacodes-core.tools.registry: const []const ToolEntry = <43076 bytes, sha256 830c538fc02f>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8

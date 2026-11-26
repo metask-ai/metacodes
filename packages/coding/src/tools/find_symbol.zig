@@ -1,4 +1,3 @@
-//! FindSymbol 工具(默认常驻;2026-06-08 从 deferred 提出):跨文件找符号*定义*位置。
 //! 不同于 Grep(返回所有出现),只返回定义,带 file:line + 签名。
 //!
 //! 先快后准:rg -l -w <name> 找候选文件 → 逐个经 LSP documentSymbol 抽符号、留 name 匹配的定义。
