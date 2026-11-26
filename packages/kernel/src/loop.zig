@@ -100,38 +100,47 @@ fn runTools(options: Options, events: *types.Dispatcher, calls: []const types.To
     defer for (tasks) |*task| task.deinit();
     var turn_arena: std.heap.ArenaAllocator = .init(gpa);
     defer turn_arena.deinit();
-    const arena = turn_arena.allocator();
-    var hook_failure: ?anyerror = null;
-    var start: usize = 0;
-    while (start < tasks.len) {
-        const end = executor.batchEnd(tasks, start);
-        const batch = tasks[start..end];
+    var ctx = ToolBatchContext{ .options = options, .events = events, .arena = turn_arena.allocator() };
+    try executor.dispatchBatches(tasks, &ctx, ToolBatchContext.mode, ToolBatchContext.execute, false);
+    try appendResults(options.conversation, events, tasks);
+    if (ctx.hook_failure) |err| return err;
+}
+
+const ToolBatchContext = struct {
+    options: Options,
+    events: *types.Dispatcher,
+    arena: std.mem.Allocator,
+    hook_failure: ?anyerror = null,
+
+    fn mode(_: *ToolBatchContext, task: executor.Task) ?types.ExecutionMode {
+        return task.executionMode();
+    }
+
+    fn execute(ctx: *ToolBatchContext, batch: []executor.Task, _: ?types.ExecutionMode) !void {
+        const options = ctx.options;
         for (batch) |*task| {
-            events.emit(.{ .tool_start = task.call });
+            ctx.events.emit(.{ .tool_start = task.call });
             if (options.abort.isAborted()) {
                 task.result = executor.aborted_result;
                 continue;
             }
-            gate(options.hooks, arena, task) catch |err| {
-                hook_failure = hook_failure orelse err;
+            gate(options.hooks, ctx.arena, task) catch |err| {
+                ctx.hook_failure = ctx.hook_failure orelse err;
                 task.result = .{ .content = @errorName(err), .is_error = true };
             };
         }
-        executor.runBatch(gpa, batch, options.abort, events);
+        executor.runBatch(options.stream_gpa, batch, options.abort, ctx.events);
         for (batch) |*task| {
             for (options.hooks) |hook| {
                 const after = hook.after_tool orelse continue;
-                after(hook.context, arena, task.call, &task.result.?) catch |err| {
-                    hook_failure = hook_failure orelse err;
+                after(hook.context, ctx.arena, task.call, &task.result.?) catch |err| {
+                    ctx.hook_failure = ctx.hook_failure orelse err;
                 };
             }
-            events.emit(.{ .tool_end = .{ .call = task.call, .result = task.result.? } });
+            ctx.events.emit(.{ .tool_end = .{ .call = task.call, .result = task.result.? } });
         }
-        start = end;
     }
-    try appendResults(options.conversation, events, tasks);
-    if (hook_failure) |err| return err;
-}
+};
 
 fn gate(hooks: []const types.Hook, arena: std.mem.Allocator, task: *executor.Task) !void {
     if (task.tool == null) {
