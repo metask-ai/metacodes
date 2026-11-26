@@ -1542,7 +1542,7 @@ pub fn executeSlots(
     rid: log.RequestId,
 ) error{ HostToolFatal, OutOfMemory }!void {
     const dispatch = SlotDispatch{ .ctx = base_ctx, .allocator = parent_allocator, .rid = rid };
-    try kernel.executor.dispatchBatches(slots, dispatch, SlotDispatch.mode, SlotDispatch.execute, true);
+    try kernel.executor.dispatchBatches(slots, dispatch, SlotDispatch.mode, SlotDispatch.executeBatch, true);
 }
 
 const SlotDispatch = struct {
@@ -1555,7 +1555,7 @@ const SlotDispatch = struct {
         return if (slotSafe(self.ctx, slot)) .parallel else .sequential;
     }
 
-    fn execute(self: SlotDispatch, batch: []Slot, execution_mode: ?kernel.ExecutionMode) error{ HostToolFatal, OutOfMemory }!void {
+    fn executeBatch(self: SlotDispatch, batch: []Slot, execution_mode: ?kernel.ExecutionMode) error{ HostToolFatal, OutOfMemory }!void {
         if (execution_mode == null) {
             if (batch[0].decision == .run and batch[0].prefetched)
                 observeSuccessfulExecutions(batch, self.ctx);

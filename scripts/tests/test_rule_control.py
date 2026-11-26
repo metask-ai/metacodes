@@ -293,9 +293,15 @@ class ExecutionOntologySensorTests(unittest.TestCase):
             (root / relative).mkdir(parents=True, exist_ok=True)
         (root / "packages/coding/src/core/tool_exec.zig").write_text(
             "pub fn executeSlots() void {\n"
-            "  if (slots[i].decision == .run and slots[i].prefetched)\n"
-            "    observeSuccessfulExecutions(slots[i .. i + 1], base_ctx);\n"
-            "  observeSuccessfulExecutions(slots[i..j], base_ctx);\n"
+            "  try kernel.executor.dispatchBatches(slots, dispatch, SlotDispatch.mode, SlotDispatch.executeBatch, true);\n"
+            "}\n"
+            "fn executeBatch() void {\n"
+            "  if (execution_mode == null) {\n"
+            "    if (batch[0].decision == .run and batch[0].prefetched)\n"
+            "      observeSuccessfulExecutions(batch, self.ctx);\n"
+            "    return;\n"
+            "  }\n"
+            "  observeSuccessfulExecutions(batch, self.ctx);\n"
             "}\n"
             "fn observeSuccessfulExecutions() void {\n"
             "  const task_id = tasks.uniqueActiveKgTaskId() orelse return;\n"
@@ -382,6 +388,21 @@ class ExecutionOntologySensorTests(unittest.TestCase):
             [{"step": "test:kg-ontology-feedback", "filter": "L2 KG ontology feedback:"}],
             observation.feedback_bindings,
         )
+
+    def test_dispatch_and_both_observer_calls_are_required(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        source = root / "packages/coding/src/core/tool_exec.zig"
+        original = source.read_text(encoding="utf-8")
+        for marker in (
+            "SlotDispatch.executeBatch",
+            "      observeSuccessfulExecutions(batch, self.ctx);",
+            "\n  observeSuccessfulExecutions(batch, self.ctx);",
+        ):
+            with self.subTest(marker=marker):
+                source.write_text(original.replace(marker, ""), encoding="utf-8")
+                result = rule_control.observe_execution_ontology_feedback(root)
+                self.assertIn("successful_execution_sensor", result.missing_declarations)
 
     def test_disconnected_tool_exec_sensor_is_observed(self) -> None:
         temporary, root = self.make_repo()
