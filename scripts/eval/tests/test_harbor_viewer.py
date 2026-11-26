@@ -285,6 +285,55 @@ class LeaderboardTest(unittest.TestCase):
         jobs = {job["name"]: job for job in Workbench(data.Library([self.root])).leaderboard(None)["boards"][0]["jobs"]}
         self.assertEqual(jobs["rewarded-crash"]["score"], 0.0)
 
+    def test_leaderboard_and_job_view_attach_profile_versions_and_keep_latest_per_profile(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        for name, started, reward in (
+            ("p1-old", "2026-11-24T08:00:00Z", 0.0),
+            ("p1-new", "2026-11-25T08:00:00Z", 1.0),
+            ("p2-run", "2026-11-25T09:00:00Z", 0.5),
+            ("p1-partial", "2026-11-25T10:00:00Z", 1.0),
+        ):
+            job = _job(root, name, "same-model", planned=2)
+            _write(job / "result.json", {"started_at": started, "finished_at": started, "n_total_trials": 2})
+            _trial(job, "task0__aaa", reward=reward)
+            if name != "p1-partial":
+                _trial(job, "task1__aaa", reward=reward)
+        profiles_dir = root / ".bench-profiles"
+        _write(profiles_dir / "prof-a.json", {
+            "id": "prof-a", "name": "v0.13.0-formal-gate", "status": "finished",
+            "created_at": "2026-11-25T00:00:00Z", "features": ["formal-gate"],
+            "metacodes": {"label": "0.13.0"},
+            "items": [
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-old", "status": "finished", "tasks": ["task0", "task1"]},
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-new", "status": "finished", "tasks": ["task0", "task1"]},
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-partial", "status": "finished", "tasks": ["task0"]},
+            ],
+        })
+        _write(profiles_dir / "prof-b.json", {
+            "id": "prof-b", "name": "v0.12.0-baseline", "status": "finished",
+            "created_at": "2026-11-24T00:00:00Z", "features": [],
+            "metacodes": {"label": "0.12.0"},
+            "items": [
+                {"suite": "terminal-bench-2.1", "model": "same-model", "run": "p2-run", "status": "finished", "tasks": ["task0", "task1"]},
+            ],
+        })
+        wb = Workbench(data.Library([root]))
+        self.addCleanup(wb.close)
+        board = wb.leaderboard("terminal-bench-2.1")
+        subset = board["boards"][1]
+        ranked = [j for j in subset["jobs"] if j["ranked"]]
+        self.assertEqual([j["name"] for j in ranked], ["p1-new", "p2-run"])
+        self.assertEqual([j["profile_name"] for j in ranked], ["v0.13.0-formal-gate", "v0.12.0-baseline"])
+        self.assertEqual([j["profile_version"] for j in ranked], ["0.13.0", "0.12.0"])
+        self.assertEqual(ranked[0]["profile_features"], ["formal-gate"])
+        self.assertEqual(board["unranked"], [])
+        job_detail = wb.job("p1-new")
+        self.assertEqual(job_detail["profile"], "prof-a")
+        self.assertEqual(job_detail["profile_name"], "v0.13.0-formal-gate")
+        self.assertEqual(job_detail["profile_version"], "0.13.0")
+        self.assertEqual(job_detail["profile_features"], ["formal-gate"])
+
 
 class ServerTest(unittest.TestCase):
     def setUp(self):
