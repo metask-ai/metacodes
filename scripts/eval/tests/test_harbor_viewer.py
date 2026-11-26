@@ -470,7 +470,7 @@ vm.createContext(ctx);
 vm.runInContext(fs.readFileSync({json.dumps(str(self.VIEWER_JS))}, 'utf8'), ctx);
 {script}
 """
-        proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, check=True)
+        proc = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", check=True)
         return json.loads(proc.stdout)
 
     def test_cross_profile_compare_dock_prefers_same_model_full_run_and_lists_all_jobs(self):
