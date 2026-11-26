@@ -43,6 +43,7 @@ LEAD_TURNS = [
     _sse([("text", "LEAD-TURN-ENDED")]),
     _sse([("text", "LEAD-SAW-TEAMMATE")]),
 ]
+LEAD_TURNS_WITHOUT_A_MESSAGE = [LEAD_TURNS[0], LEAD_TURNS[1], LEAD_TURNS[3], LEAD_TURNS[4]]
 TEAMMATE_TURN = _sse([("text", "TEAMMATE-REPLY")])
 
 
@@ -51,9 +52,11 @@ def _from_teammate(messages):
 
 
 class _Providers:
-    def __init__(self):
+    def __init__(self, lead_turns=LEAD_TURNS):
+        self.lead_turns = lead_turns
         self.lead = []
         self.teammate = []
+        self.first_teammate_messages = None
         self.lock = threading.Lock()
 
     def __enter__(self):
@@ -73,11 +76,13 @@ class _Providers:
                         "output_config": body.get("output_config")}
                 with outer.lock:
                     if _from_teammate(body.get("messages", [])):
+                        if outer.first_teammate_messages is None:
+                            outer.first_teammate_messages = body.get("messages", [])
                         outer.teammate.append(seen)
                         reply = TEAMMATE_TURN
                     else:
                         outer.lead.append(seen)
-                        reply = LEAD_TURNS[min(len(outer.lead), len(LEAD_TURNS)) - 1]
+                        reply = outer.lead_turns[min(len(outer.lead), len(outer.lead_turns)) - 1]
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
                 self.end_headers()
@@ -133,10 +138,12 @@ def _workspace(origin, global_default):
     return env, project
 
 
-def _run_team(bin_path, global_default, before=()):
+def _run_team(bin_path, global_default, before=(), lead_turns=LEAD_TURNS, providers_out=None):
     if os.name == "nt":
         raise SkipTest("process teammates are POSIX-only")
-    with _Providers() as providers:
+    with _Providers(lead_turns) as providers:
+        if providers_out is not None:
+            providers_out.append(providers)
         env, project = _workspace(providers.origin, global_default)
         run(bin_path, [READY] + list(before) + ["type:go", "key:enter", wait_for("LEAD-TURN-ENDED", 30), "sleep:0.5",
                                                 wait_for("LEAD-SAW-TEAMMATE", 30), "sleep:0.5"],
@@ -170,3 +177,12 @@ def test_a_process_teammate_follows_the_route_the_lead_moved_to_with_model(bin_p
     lead, teammate = _run_team(bin_path, global_default=True,
                                before=["type:/model use b-model", "key:enter", wait_for("switched to", 10), "sleep:0.5"])
     _assert_teammate_on_the_leads_route(lead, teammate, "b")
+
+
+def test_a_process_teammate_starts_on_its_task_prompt_without_a_message_from_the_lead(bin_path):
+    seen = []
+    lead, teammate = _run_team(bin_path, global_default=True, lead_turns=LEAD_TURNS_WITHOUT_A_MESSAGE, providers_out=seen)
+    assert teammate, "the teammate never started on the Task prompt"
+    first = json.dumps(seen[0].first_teammate_messages[0])
+    assert MARK + " reply briefly" in first, "the teammate's first turn is not its Task prompt: %s" % first
+    assert len(lead) >= 4, "the lead was not woken by the teammate's report: %d requests" % len(lead)

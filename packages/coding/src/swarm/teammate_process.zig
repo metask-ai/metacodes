@@ -562,6 +562,7 @@ pub const SpawnFn = *const fn (a: std.mem.Allocator, p: SpawnProcessParams) anye
 pub fn spawnTeammateProcess(
     sw: *swarm_ctx.SwarmContext,
     name_raw: []const u8,
+    prompt: []const u8,
     worktree_path: []const u8, // 空 = 无 worktree(共享 cwd)
     worktree_base: []const u8, // 非空且 worktree_path 非空 → createWorktree(git 起点,如 HEAD)
     repo: []const u8, // git repo 根(git -C;lead 的 project_dir)。空退回进程 cwd
@@ -669,6 +670,12 @@ pub fn spawnTeammateProcess(
             process_mod.killJob(@intCast(pid));
             process_mod.reapBlocking(@intCast(pid));
         }
+    }
+
+    if (prompt.len > 0) {
+        var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const inbox = team_mod.inboxPath(sw.state_root, sw.team_sanitized, name_s, &inbox_buf);
+        try mailbox.deliverWithIdentity(a, inbox, sw.self_name, prompt, null, null, sw.session.asSlice(), sw.senderLease().asSlice());
     }
 
     // ④ 记录供关闭清理。

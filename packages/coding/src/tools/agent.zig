@@ -308,7 +308,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             // (agent_loop.Options.swarm 注释:"null = 非 lead 上下文"),所以这里只可能是顶层
             // lead loop,ctx.lsp 忠实反映用户的开关。若将来把 lsp 透传进 subagent,这个等价
             // 关系就断了,得改用显式的配置字段。
-            const pid = tp.spawnTeammateProcess(sw, name, wt, if (wt.len > 0) "HEAD" else "", ctx.project_dir, ctx.session.asSlice(), ctx.abort, &tp.forkExecTeammate, ctx.lsp != null) catch |err| return err;
+            const pid = tp.spawnTeammateProcess(sw, name, prompt, wt, if (wt.len > 0) "HEAD" else "", ctx.project_dir, ctx.session.asSlice(), ctx.abort, &tp.forkExecTeammate, ctx.lsp != null) catch |err| return err;
             return std.fmt.allocPrint(ctx.allocator, "{{\"teammate\":\"{s}\",\"pid\":{d},\"backend\":\"process\",\"status\":\"spawned\"}}", .{ name_s, pid });
         }
 

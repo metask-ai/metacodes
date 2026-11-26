@@ -450,6 +450,12 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **A process teammate starts on the task it was given.** `Task` with a
+  teammate name under `--teammate-mode process` started the teammate
+  without its prompt: the teammate came online and waited until the lead
+  sent it a message. The prompt now goes to the teammate's inbox from the
+  lead as soon as it is started, the way a message from the lead does.
+
 - **A process teammate runs on the lead's route.** A teammate started with
   `--teammate-mode process` chose its route again in its own worktree: it
   could land on another provider or model than the lead, without the lead's
