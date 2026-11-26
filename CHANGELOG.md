@@ -459,6 +459,10 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **Hints name Ctrl+X Ctrl+O as the transcript key.** The dim line a long
+  resumed conversation starts with and the transcript's footer said
+  Ctrl+O, which opens `/model`.
+
 - **The TUI draws ScheduleWakeup, CodeMap, FindSymbol, ReadArtifact,
   TeamCreate, TeamDelete, SendMessage and ExecuteCode calls.** They ran with
   nothing on screen. Each now gets `⏺ <tool>(<arguments>)` and its result:

@@ -239,6 +239,21 @@ def test_resume_replays_the_conversation_as_it_was_shown(bin_path):
     _assert_hint(raw, sid)
 
 
+def test_resume_of_a_long_session_names_the_key_that_shows_the_rest(bin_path):
+    env, cwd = _workspace()
+    sid, _ = _seed(bin_path, env, cwd)
+    (path,) = glob.glob(os.path.join(env["METACODES_HOME"], "projects", "*", sid, "transcript.jsonl"))
+    turn = _transcript_lines(env, sid)
+    with open(path, "a", encoding="utf-8") as f:
+        for _ in range(110):
+            f.writelines(turn)
+    with SlowMockServer([simple_text("UNUSED")]) as srv:
+        raw = run(bin_path, ["waitbytes:earlier messages:15", "sleep:0.5", "key:ctrl_c", "key:ctrl_c", wait_for(HINT)],
+                  env=env, cwd=cwd, base_url=srv.url, extra_args=["--resume", sid])
+    assert "earlier messages · ctrl+x ctrl+o shows the whole conversation".encode() in raw, \
+        "the replay of a long session should name Ctrl+X Ctrl+O, the key that opens the transcript"
+
+
 def test_resume_command_redraws_the_screen_as_the_resumed_session(bin_path):
     env, cwd = _workspace()
     sid, live = _seed_tool_session(bin_path, env, cwd)

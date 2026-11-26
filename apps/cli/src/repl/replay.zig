@@ -27,7 +27,7 @@ const TuiBackend = @import("tui/tui_backend.zig").TuiBackend;
 const Theme = @import("tui/theme.zig").Theme;
 
 /// At most this many stored messages are replayed (Claude Code renders at
-/// most 200 without virtualization); Ctrl+O shows the whole conversation.
+/// most 200 without virtualization); Ctrl+X Ctrl+O shows the whole conversation.
 pub const MAX_REPLAYED_MESSAGES: usize = 200;
 
 pub const ToolCall = struct { id: []const u8, name: []const u8, input: []const u8 };
@@ -171,7 +171,7 @@ pub fn replay(allocator: std.mem.Allocator, target: Target, conversation: *Conve
 
     for (steps) |step| switch (step) {
         .elided => |count| {
-            const line = try std.fmt.allocPrint(allocator, "{s}… {d} earlier messages · ctrl+o shows the whole conversation{s}\n", .{ target.theme.dim, count, target.theme.reset });
+            const line = try std.fmt.allocPrint(allocator, "{s}… {d} earlier messages · ctrl+x ctrl+o shows the whole conversation{s}\n", .{ target.theme.dim, count, target.theme.reset });
             defer allocator.free(line);
             target.region.writeGenText(line);
         },

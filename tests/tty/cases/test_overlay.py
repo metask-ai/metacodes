@@ -121,6 +121,7 @@ def test_ctrl_x_ctrl_o_enters_inline_transcript(bin_path):
     raw = run(bin_path, ["sleep:0.8", "key:ctrl_x", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
     assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen(ESC[?1049h)"
     assert b"Showing detailed transcript" in raw, "应渲染 cc 风格 transcript footer"
+    assert b"ctrl+x ctrl+o to toggle" in raw, "the transcript footer should name Ctrl+X Ctrl+O, the key that opens it"
 
 
 def test_ctrl_o_via_kitty_csi_u(bin_path):

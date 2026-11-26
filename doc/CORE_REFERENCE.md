@@ -303,7 +303,7 @@ host 注入。host 注入的 user 记录不是用户原话:agent_loop 的每个�
 KG/验证/需求账本提醒、后台任务通知、学习轮……)都经 `Conversation.appendHostText` 写入,消息带
 `Message.origin = .host`(只进 transcript 的 `"origin":"host"`,从不进请求);
 `host_injection_meter.isHostText`(认 origin,也认无此字段的旧记录里的门标记)让 web_search 显示
-query、Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入分开。策略由
+query、Ctrl+X Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入分开。策略由
 `control-plane/lean/MetaCodesControl/ProgressUpdates.lean` 证明(叙述归零、任一阈值未达不触发、
 任意轨迹下决策数有界)。默认系统提示同时新增 "Progress updates on longer tasks" 段,定义多阶段
 任务的进度沟通预期(单步任务不要求)。

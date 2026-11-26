@@ -729,7 +729,7 @@ its conversation, goal and model route restored, and appends to the same
 transcript. Under the banner, the REPL writes the conversation back as its
 turns were shown live (`apps/cli/src/repl/replay.zig`: prompts, replies and tool cards
 through the live rendering paths; at most the last 200 messages, opening at a
-typed prompt, after a dim count of the rest; Ctrl+O shows all of it). What the
+typed prompt, after a dim count of the rest; Ctrl+X Ctrl+O shows all of it). What the
 live view never showed stays out: messages the runtime wrote itself
 (`Message.origin = host`, recorded as `"origin":"host"` in `transcript.jsonl`;
 a record without the key is the user's or the model's) and text blocks that
