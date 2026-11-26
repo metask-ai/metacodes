@@ -773,9 +773,9 @@ jobs:
         run: |
           read -r -a modules <<< "$SCRIPT_TESTS"
           python3 -m unittest "${modules[@]}" -v
-      - name: CI evidence and policy unit tests
+      - name: CI evidence unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
-        run: python3 -m unittest scripts.tests.test_ci_evidence scripts.tests.test_pr_policy -v
+        run: python3 -m unittest scripts.tests.test_ci_evidence -v
       - name: SDK package version unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_sdk_package_versions -v

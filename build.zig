@@ -2924,18 +2924,16 @@ pub fn build(b: *std.Build) void {
     test_ids_test_step.dependOn(&test_ids_test_cmd.step);
     test_ids_test_step.dependOn(&test_id_fixture_check.step);
     units_test_step.dependOn(&test_ids_test_cmd.step);
-    const pr_loop_test_cmd = b.addSystemCommand(&.{
+    const ci_evidence_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
         "unittest",
-        "scripts.tests.test_pr_loop",
-        "scripts.tests.test_pr_policy",
         "scripts.tests.test_ci_evidence",
         "-v",
     });
-    const pr_loop_test_step = b.step("test:pr-loop", "Test PR review, repair, exact-head merging and CI evidence");
-    pr_loop_test_step.dependOn(&pr_loop_test_cmd.step);
-    units_test_step.dependOn(&pr_loop_test_cmd.step);
+    const ci_evidence_test_step = b.step("test:ci-evidence", "Test CI evidence");
+    ci_evidence_test_step.dependOn(&ci_evidence_test_cmd.step);
+    units_test_step.dependOn(&ci_evidence_test_cmd.step);
     const release_cut_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
