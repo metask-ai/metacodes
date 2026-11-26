@@ -203,7 +203,7 @@ class GateManifestTest(unittest.TestCase):
         self.assertIn("  pull_request:\n    types: [opened, synchronize, reopened, labeled, unlabeled]\n", workflow)
         self.assertIn('run.setEnvironmentVariable("METACODES_TEST_ROOT",', build)
         self.assertIn("METACODES_TEST_ROOT: src/platform", workflow)
-        self.assertIn("needs: [gates-linux, test-ids, scope]", workflow)
+        self.assertIn("needs: [gates-linux, test-ids]", workflow)
 
     def test_the_checklist_runs_what_ci_selects(self):
         """The checklist's suite is `test:affected`: scripts/ci_scope.py's

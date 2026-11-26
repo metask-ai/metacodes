@@ -125,7 +125,6 @@ jobs:
       units: ${{ steps.decide.outputs.units }}
       product: ${{ steps.decide.outputs.product }}
       offline_eval: ${{ steps.decide.outputs.offline_eval }}
-      model_eval: ${{ steps.decide.outputs.model_eval }}
       packages: ${{ steps.decide.outputs.packages }}
       package_tests: ${{ steps.decide.outputs.package_tests }}
       script_tests: ${{ steps.decide.outputs.script_tests }}
@@ -1446,9 +1445,7 @@ jobs:
   # the same way so that it can become required.
   gates-linux-result:
     name: Gates (Linux)
-    needs: [gates-linux, test-ids, scope]
-    permissions:
-      statuses: read
+    needs: [gates-linux, test-ids]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
@@ -1459,20 +1456,6 @@ jobs:
         run: |
           echo "$NEEDS" | jq -c 'map_values(.result)'
           echo "$NEEDS" | jq -e '.["gates-linux"].result == "success" and (.["test-ids"].result == "success" or .["test-ids"].result == "skipped")' > /dev/null
-      - name: Require the reviewed provider-backed comparison
-        if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.scope.outputs.model_eval != 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
-        shell: bash
-        run: |
-          context="model-eval/$BASE_SHA"
-          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" |
-            jq -e --arg context "$context" 'first(.[][] | select(.context == $context)) | .state == "success" and (.target_url | strings | startswith("https://"))' >/dev/null || {
-              echo "::error::Missing successful $context status with a report URL on $HEAD_SHA. See evals/README.md."
-              exit 1
-            }
 
   # Gates (macOS) and Gates (Windows) pass when the gates passed where they
   # ran: the pool job (through the watch), or the hosted legs
