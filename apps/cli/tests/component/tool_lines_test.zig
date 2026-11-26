@@ -236,6 +236,32 @@ test "L2 a reply cut at max_tokens and continued stays one reply in the TUI, und
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, screen, "⏺"));
 }
 
+test "L2 a reply that breaks off and is sent again gets a dim line under it saying it is discarded, from the first re-issue" {
+    const broken =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half-writ\"}}\n\n" ++
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"boom\"}}\n\n";
+    const good = try textSse(gpa, "m2", "clean answer", "end_turn");
+    defer gpa.free(good);
+    const bodies = [_][]const u8{ broken, good };
+
+    var fx: Fixture = undefined;
+    try fx.init(&bodies);
+    defer fx.deinit();
+    const screen = try fx.drawnTurn();
+    defer gpa.free(screen);
+
+    try expectLine(screen, "⏺ half-writ");
+    try expectRowContaining(screen, "  ⎿  The reply above broke off and is discarded. Retrying in ");
+    try expectRowContaining(screen, "(attempt 1/");
+    try expectLine(screen, "⏺ clean answer");
+    const half = std.mem.indexOf(u8, screen, "⏺ half-writ").?;
+    const notice = std.mem.indexOf(u8, screen, "The reply above broke off").?;
+    const answer = std.mem.indexOf(u8, screen, "⏺ clean answer").?;
+    try std.testing.expect(half < notice and notice < answer);
+}
+
 test "L2 two ScheduleWakeup calls in one reply each show their own result before the next call's line" {
     const call = try twoToolUsesSse(gpa, "ScheduleWakeup", "{\"delaySeconds\":300,\"prompt\":\"first wake\",\"reason\":\"REASON-ONE\",\"noop\":false}", "{\"delaySeconds\":600,\"prompt\":\"second wake\",\"reason\":\"REASON-TWO\",\"noop\":false}");
     defer gpa.free(call);

@@ -133,6 +133,7 @@ pub const TuiBackend = struct {
     /// retry 提示是否显示(前台 agent_depth==0 才 true;门控见 .retry_notice)。
     show_retry: bool = false,
     continue_assistant: bool = false,
+    discarded_segment: bool = false,
     /// usage 累加目标(L1:usage 走 CoreEvent.usage 总线;TuiBackend 累加进 app.usage)。
     /// 指向 &app.usage(core UsageTotals)。null = 不累加(测试/无 App)。
     usage_acc: ?*@import("metacodes-internal").core.usage.UsageTotals = null,
@@ -327,8 +328,14 @@ pub const TuiBackend = struct {
                 self.region.writeGenText(s);
             },
             .retry_notice => |r| {
-                // 门控对齐旧 RetryUi(agent_loop:312-314):仅前台显示、前 3 次隐藏。
+                // 门控对齐旧 RetryUi(agent_loop:312-314):仅前台显示;建连重试前 3 次隐藏,
+                // 已出字的那段作废后的重发每次都提示。
                 if (!self.show_retry) return;
+                if (self.discarded_segment) {
+                    self.discarded_segment = false;
+                    self.writeDiscardedNotice(r.attempt, r.max, r.delay_ms);
+                    return;
+                }
                 if (r.attempt < 3) return;
                 const secs = (r.delay_ms + 999) / 1000;
                 var buf: [256]u8 = undefined;
@@ -370,10 +377,13 @@ pub const TuiBackend = struct {
             // 这条是给进程外/程序化消费者的证据流,TUI no-op。
             .file_changes => {},
             // 输出语义定性:TUI 边流边渲染,已把文字写进 scrollback,不事后重标;只用
-            // output_segment_end 的 continued:续写接在同一个 ⏺ 里。区分 commentary/final
-            // 的是 web/headless/评测。
+            // output_segment_end 的 continued(续写接在同一个 ⏺ 里)和 discarded(重发时在
+            // 作废那段下面补一行说明)。区分 commentary/final 的是 web/headless/评测。
             .output_segment_begin => {},
-            .output_segment_end => |e| self.continue_assistant = e.disposition == .continued,
+            .output_segment_end => |e| {
+                self.continue_assistant = e.disposition == .continued;
+                if (e.disposition == .discarded) self.discarded_segment = true;
+            },
             // #452: only a Run with retractable re-issues emits it; the REPL
             // never sets them (output already in scrollback cannot be taken back).
             .thinking_discarded => {},
@@ -382,6 +392,16 @@ pub const TuiBackend = struct {
             // Session-only (AgentSession run inputs); the REPL steers through queue_message.
             .input_adopted => {},
         }
+    }
+
+    fn writeDiscardedNotice(self: *TuiBackend, attempt: u32, max: u32, delay_ms: u64) void {
+        const secs = (delay_ms + 999) / 1000;
+        var buf: [256]u8 = undefined;
+        const line = if (self.colorize)
+            std.fmt.bufPrint(&buf, "  \x1b[2m⎿  The reply above broke off and is discarded. Retrying in {d}s… (attempt {d}/{d})\x1b[0m\n", .{ secs, attempt, max }) catch return
+        else
+            std.fmt.bufPrint(&buf, "  ⎿  The reply above broke off and is discarded. Retrying in {d}s… (attempt {d}/{d})\n", .{ secs, attempt, max }) catch return;
+        self.region.writeGenText(line);
     }
 
     /// 渲染起始卡到滚动历史(tool_card.renderStart)。需 theme+alloc;缺则跳过。
