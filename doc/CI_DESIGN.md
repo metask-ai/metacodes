@@ -104,8 +104,10 @@ but a test inside a product package's directory counts as a change to that
 package. With `layer_baseline.zon` empty and `test:base`, `test:ai`,
 `test:kernel`, `test:guard`, `test:coding`, `test:session`, `test:teamwork`,
 `test:facade`, `test:agentcore` and `test:cli` declared in `build.zig`, every
-product package in `layers.zon` narrows to its affected closure under the
-`packages` scope.
+product package above `base` narrows to its affected closure under the
+`packages` scope; a change touching `base` affects every product package and
+stays in `full` scope so the native platform spawn suite (`METACODES_PROC_TEST`)
+and ReleaseSafe core gate continue to run.
 
 `build.zig`, `build.zig.zon`, `layers.zon`, `layer_baseline.zon`, the
 `testing` package (`tests/_harness/`, `tests/helpers/`), `.github/`,

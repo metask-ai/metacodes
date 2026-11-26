@@ -2828,7 +2828,7 @@ pub fn build(b: *std.Build) void {
         }).step);
     }
     if (@import("builtin").os.tag == .macos) eval_test_step.dependOn(&project_rule_mac_pilot_run.step);
-    units_test_step.dependOn(release_test_step);
+    package_test_steps[packageIndex("base")].dependOn(release_test_step);
     units_test_step.dependOn(http_status_gate_step);
     units_test_step.dependOn(subsystem_boundary_step);
     package_test_steps[packageIndex("ai")].dependOn(provider_test_step);
@@ -3127,7 +3127,7 @@ pub fn build(b: *std.Build) void {
     });
     const rule_control_test_step = b.step("test:rule-control", "Test the rule-control sensors on fixtures and on the checked-in tree");
     rule_control_test_step.dependOn(&rule_control_test_cmd.step);
-    units_test_step.dependOn(&rule_control_test_cmd.step);
+    cli_test_step.dependOn(&rule_control_test_cmd.step);
     const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "apps", "packages", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
@@ -3712,6 +3712,7 @@ pub fn build(b: *std.Build) void {
     const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test);
     const dispatcher_metadata_step = b.step("test:dispatcher-metadata", "Run the ToolDispatcher metadata acceptance suite");
     dispatcher_metadata_step.dependOn(&dispatcher_metadata_run.step);
+    agentcore_package_test_step.dependOn(&dispatcher_metadata_run.step);
     units_test_step.dependOn(&dispatcher_metadata_run.step);
 
     // Focused Skill Runtime gate. Keep this work independently

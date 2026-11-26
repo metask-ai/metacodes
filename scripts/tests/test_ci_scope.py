@@ -435,6 +435,7 @@ class LayoutTest(unittest.TestCase):
             ("src/lib.zig", ("facade", "agentcore", "cli")),
             ("packages/teamwork/src/root.zig", ("teamwork", "facade", "agentcore", "cli")),
             ("packages/coding/src/core/agent_loop.zig", ("coding", "session", "teamwork", "facade", "agentcore", "cli")),
+            ("packages/ai/src/root.zig", ("ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli")),
         ):
             with self.subTest(path=path):
                 scope, reason = ci_scope.classify([path], layout=layout)
@@ -442,6 +443,9 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, [("M", path)], layout)
                 self.assertEqual(chosen.packages, expected)
                 self.assertEqual(chosen.package_tests, tuple(f"test:{pkg}" for pkg in expected))
+        scope, reason = ci_scope.classify(["packages/base/src/platform/process.zig"], layout=layout)
+        self.assertEqual(scope, "full", reason)
+        self.assertIn("every product package", reason)
         self.assertEqual(layout.owner("packages/kernel/src/conversation.zig"), "kernel")
         self.assertEqual(layout.owner("packages/coding/src/core/agent_loop.zig"), "coding")
         self.assertEqual(layout.owner("packages/coding/src/core/tools_extra.zig"), "coding")
@@ -488,7 +492,10 @@ class LayoutTest(unittest.TestCase):
         # migration empties layer_baseline.zon.
         self.assertEqual(ci_scope.classify(["src/side/a.zig"], layout=fixture_layout(".{}"))[0], "full")
         self.assertIn("no test:<package> step", ci_scope.classify(["src/side/a.zig"], layout=fixture_layout(".{}"))[1])
-        self.assertEqual(ci_scope.classify(["src/low/x.zig"], layout=fixture_layout(".{}").cleared())[0], "packages")
+        self.assertEqual(ci_scope.classify(["src/side/a.zig"], layout=fixture_layout(".{}").cleared())[0], "packages")
+        scope, reason = ci_scope.classify(["src/low/x.zig"], layout=fixture_layout(".{}").cleared())
+        self.assertEqual(scope, "full")
+        self.assertIn("every product package", reason)
 
     def test_an_affected_package_without_its_test_step_is_the_full_scope(self) -> None:
         layout = fixture_layout(build=FIXTURE_BUILD.replace('"test:top"', '"test:top-other"'))

@@ -286,6 +286,8 @@ def classify(paths: Sequence[str], deleted: Sequence[str] = (), *,
     if untested:
         return "full", f"full scope: affected packages have no test:<package> step in {BUILD}: {', '.join(untested)}"
     ordered = [package for package in layout.order if package in changed]
+    if affected == layout.products:
+        return "full", f"full scope: {', '.join(ordered)} affects every product package, so the full suite runs"
     return "packages", f"packages scope: {', '.join(ordered)} changed; the affected packages are {', '.join(affected)}"
 
 
