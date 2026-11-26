@@ -450,6 +450,13 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **The TUI draws ScheduleWakeup, CodeMap, FindSymbol, ReadArtifact,
+  TeamCreate, TeamDelete, SendMessage and ExecuteCode calls.** They ran with
+  nothing on screen. Each now gets `⏺ <tool>(<arguments>)` and its result:
+  a JSON result one field per line, text folded after 10 lines, an error's
+  first line. In the live view a result line wider than the terminal is cut
+  with `…`; the transcript view (Ctrl+O) shows it whole.
+
 - **The TUI draws an ApplyPatch call.** A patch changed files without a line
   on screen. It now gets a start line naming the files it touches and, under
   it, the added/modified/deleted counts and the diff.

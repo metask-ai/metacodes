@@ -179,3 +179,26 @@ test "L2 an ApplyPatch call reaches the TUI as a tool line naming the file, then
     const reply_row = std.mem.indexOf(u8, screen, "all done") orelse return error.TestExpectedEqual;
     try std.testing.expect(tool_row < reply_row);
 }
+
+test "L2 a ScheduleWakeup call reaches the TUI as a tool line with its arguments, then its result one field per line" {
+    const call = try toolUseSse(gpa, "ScheduleWakeup", "{\"delaySeconds\":300,\"prompt\":\"check the build\",\"reason\":\"CI takes five minutes\",\"noop\":false}");
+    defer gpa.free(call);
+    const bodies = [_][]const u8{ call, FINAL_SSE };
+
+    var fx: Fixture = undefined;
+    try fx.init(&bodies);
+    defer fx.deinit();
+    const screen = try fx.drawnTurn();
+    defer gpa.free(screen);
+
+    try std.testing.expectEqual(@as(usize, 1), fx.app.cron_registry.count());
+    try expectRowContaining(screen, "⏺ ScheduleWakeup(delaySeconds: 300, prompt: \"check the build\", ");
+    try expectRowContaining(screen, "  ⎿  scheduledFor: ");
+    try expectLine(screen, "     clampedDelaySeconds: 300");
+    try expectLine(screen, "     wasClamped: false");
+    try expectLine(screen, "     reason: CI takes five minutes");
+    try std.testing.expect(std.mem.indexOf(u8, screen, "{\"scheduledFor\"") == null);
+    const tool_row = std.mem.indexOf(u8, screen, "⏺ ScheduleWakeup").?;
+    const reply_row = std.mem.indexOf(u8, screen, "all done") orelse return error.TestExpectedEqual;
+    try std.testing.expect(tool_row < reply_row);
+}

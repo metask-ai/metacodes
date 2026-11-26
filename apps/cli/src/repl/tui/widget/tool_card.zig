@@ -77,7 +77,7 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     for (summary_tools) |t| {
         if (std.mem.eql(u8, tool_name, t)) return .summary;
     }
-    if (isMcpTool(tool_name)) return .summary;
+    if (isMcpTool(tool_name) or isGenericCardTool(tool_name)) return .summary;
     // 有副作用、返回 JSON 的工具:有人话渲染器(renderJsonToolSummary)→ summary。
     // 否则 hidden 会让 agent_loop 连 ⏺ 起始卡都跳过(工具被调用时 TUI 完全无感,
     // 2026-06-04 实测过的 WebSearch bug)。
@@ -543,6 +543,9 @@ fn renderResultBody(
 ) !void {
     if (isMcpTool(tool_name)) {
         return renderMcpResult(alloc, th, output_text, out, opts, kind);
+    }
+    if (isGenericCardTool(tool_name)) {
+        return renderGenericToolResult(alloc, th, output_text, out, opts, kind);
     }
     if (kind == .err) {
         return renderErrorBody(alloc, th, output_text, out, opts);
@@ -1400,7 +1403,7 @@ fn jsonUnescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 /// 对齐 cc:Write/Edit→文件 basename;Bash→命令首行;Read→basename;Grep/Glob→pattern;
 /// WebFetch→域名;WebSearch→"query";其余→空(标题不带括号)。caller free。
 fn headerArg(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
-    if (isMcpTool(tool_name)) return mcpArgSummary(alloc, args);
+    if (isMcpTool(tool_name) or isGenericCardTool(tool_name)) return argSummary(alloc, args);
     if (std.mem.eql(u8, tool_name, "ApplyPatch")) return patchFilesSummary(alloc, args);
     if (std.mem.eql(u8, tool_name, "Bash")) {
         if (extractField(args, "command")) |cmd| {
@@ -1651,7 +1654,7 @@ fn patchFilesSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
 }
 const REPLACEMENT_CHAR = "\u{FFFD}";
 
-fn mcpArgSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
+fn argSummary(alloc: std.mem.Allocator, args: []const u8) ![]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, args, .{}) catch return alloc.dupe(u8, "");
     defer parsed.deinit();
     if (parsed.value != .object) return alloc.dupe(u8, "");
@@ -1738,7 +1741,7 @@ fn renderMcpResult(
         var plain: std.ArrayList(u8) = .empty;
         defer plain.deinit(alloc);
         try appendPrintable(alloc, &plain, output_text);
-        return renderGenericFold(alloc, th, plain.items, out, opts);
+        return renderFoldedText(alloc, th, plain.items, out, opts);
     };
     defer alloc.free(text);
     if (kind == .err) {
@@ -1746,7 +1749,80 @@ fn renderMcpResult(
         if (line.len == 0) return renderErrorBody(alloc, th, output_text, out, opts);
         return appendLine(alloc, out, th.danger, line, th.reset);
     }
-    return renderGenericFold(alloc, th, text, out, opts);
+    return renderFoldedText(alloc, th, text, out, opts);
+}
+
+const GENERIC_CARD_TOOLS = [_][]const u8{
+    "ScheduleWakeup", "CodeMap",    "FindSymbol",  "ReadArtifact",
+    "TeamCreate",     "TeamDelete", "SendMessage", "ExecuteCode",
+};
+const GUTTER_COLS: usize = 5;
+
+fn isGenericCardTool(tool_name: []const u8) bool {
+    for (GENERIC_CARD_TOOLS) |name| if (std.mem.eql(u8, tool_name, name)) return true;
+    return false;
+}
+
+fn renderGenericToolResult(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    output_text: []const u8,
+    out: *std.ArrayList(u8),
+    opts: RenderOpts,
+    kind: ResultKind,
+) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    if (kind == .err) {
+        if (extractField(output_text, "detail") != null or extractField(output_text, "message") != null)
+            return renderErrorBody(alloc, th, output_text, out, opts);
+        try appendPrintable(alloc, &text, std.mem.trim(u8, output_text, " \t\r\n"));
+        const line = firstLine(text.items);
+        if (line.len == 0) return renderErrorBody(alloc, th, output_text, out, opts);
+        return appendLine(alloc, out, th.danger, line, th.reset);
+    }
+    try appendReadable(alloc, &text, output_text);
+    return renderFoldedText(alloc, th, text.items, out, opts);
+}
+
+fn appendReadable(alloc: std.mem.Allocator, out: *std.ArrayList(u8), output_text: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, output_text, .{}) catch return appendPrintable(alloc, out, output_text);
+    defer parsed.deinit();
+    if (parsed.value != .object) return appendPrintable(alloc, out, output_text);
+    var fields = parsed.value.object.iterator();
+    while (fields.next()) |field| {
+        if (out.items.len > 0) try out.append(alloc, '\n');
+        try appendPrintable(alloc, out, field.key_ptr.*);
+        try out.appendSlice(alloc, ": ");
+        switch (field.value_ptr.*) {
+            .string => |value| {
+                const first = firstLine(value);
+                try appendPrintable(alloc, out, first);
+                if (first.len < value.len) try out.appendSlice(alloc, " …");
+            },
+            else => {
+                const value = try std.json.Stringify.valueAlloc(alloc, field.value_ptr.*, .{});
+                defer alloc.free(value);
+                try out.appendSlice(alloc, value);
+            },
+        }
+    }
+}
+
+fn renderFoldedText(alloc: std.mem.Allocator, th: Theme, text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    if (opts.cols <= GUTTER_COLS + 1 or opts.verbose or opts.transcript) return renderGenericFold(alloc, th, text, out, opts);
+    var capped: std.ArrayList(u8) = .empty;
+    defer capped.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try capped.append(alloc, '\n');
+        first = false;
+        const shown = try layout.truncate(alloc, line, opts.cols - GUTTER_COLS, "…");
+        defer if (shown.ptr != line.ptr) alloc.free(shown);
+        try capped.appendSlice(alloc, shown);
+    }
+    return renderGenericFold(alloc, th, capped.items, out, opts);
 }
 
 /// 这些工具有副作用、返回 JSON,需提关键字段拼人话(绝不裸吐 JSON),由 renderJsonToolSummary 处理。
@@ -2704,4 +2780,97 @@ test "an ApplyPatch start line keeps file names on one line and out of the termi
     const empty = try renderStart(a, theme_mod.monochrome, "ApplyPatch", "{}");
     defer a.free(empty);
     try testing.expectEqualStrings("* ApplyPatch\n", empty);
+}
+
+test "the tools that drew nothing get a start line naming the tool and its arguments" {
+    const a = testing.allocator;
+    for (GENERIC_CARD_TOOLS) |name| {
+        try testing.expectEqual(ResultRenderMode.summary, resultRenderMode(name));
+        try testing.expect(showStartCard(name));
+    }
+    const start = try renderStart(a, theme_mod.monochrome, "ScheduleWakeup", "{\"delaySeconds\":300,\"prompt\":\"check CI\",\"reason\":\"CI takes five minutes\",\"noop\":false}");
+    defer a.free(start);
+    try capture.expectContains(start, "* ScheduleWakeup(delaySeconds: 300, prompt: \"check CI\", reason: ");
+    try capture.expectContains(start, "…)\n");
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, start, "\n"));
+
+    const team = try renderStart(a, theme_mod.monochrome, "TeamCreate", "{\"name\":\"release\"}");
+    defer a.free(team);
+    try testing.expectEqualStrings("* TeamCreate(name: \"release\")\n", team);
+}
+
+test "a tool's JSON result reads as one field per line, never as raw JSON" {
+    const a = testing.allocator;
+    const wakeup = try renderResult(a, theme_mod.monochrome, "ScheduleWakeup", "{}", "{\"scheduledFor\":1795708800000,\"clampedDelaySeconds\":300,\"wasClamped\":false,\"reason\":\"CI takes five minutes\",\"noop\":false}", .ok, 0, .{});
+    defer a.free(wakeup);
+    try capture.expectContains(wakeup, "scheduledFor: 1795708800000");
+    try capture.expectContains(wakeup, "clampedDelaySeconds: 300");
+    try capture.expectContains(wakeup, "wasClamped: false");
+    try capture.expectContains(wakeup, "reason: CI takes five minutes");
+    try testing.expect(std.mem.indexOf(u8, wakeup, "{\"") == null);
+
+    const artifact = try renderResult(a, theme_mod.monochrome, "ReadArtifact", "{}", "{\"artifact_id\":\"sha256:ab\",\"returned_bytes\":17,\"data\":\"line one\\nline two\"}", .ok, 0, .{});
+    defer a.free(artifact);
+    try capture.expectContains(artifact, "data: line one …");
+    try testing.expect(std.mem.indexOf(u8, artifact, "line two") == null);
+}
+
+test "a plain-text tool result is folded, and in the live view a long line is cut to the terminal" {
+    const a = testing.allocator;
+    var outline: std.ArrayList(u8) = .empty;
+    defer outline.deinit(a);
+    for (0..15) |i| try outline.print(a, "fn symbol_{d}() line {d}\n", .{ i, i });
+    const folded = try renderResult(a, theme_mod.monochrome, "CodeMap", "{\"path\":\"src\"}", outline.items, .ok, 0, .{});
+    defer a.free(folded);
+    try capture.expectContains(folded, "fn symbol_9() line 9");
+    try testing.expect(std.mem.indexOf(u8, folded, "symbol_10") == null);
+    try capture.expectContains(folded, "… +5 lines");
+
+    const wide = "x" ** 200;
+    const cut = try renderResult(a, theme_mod.monochrome, "ExecuteCode", "{}", wide, .ok, 0, .{ .cols = 40 });
+    defer a.free(cut);
+    try testing.expect(std.mem.indexOf(u8, cut, wide) == null);
+    try capture.expectContains(cut, "x…");
+    var rows = std.mem.splitScalar(u8, std.mem.trimEnd(u8, cut, "\n"), '\n');
+    while (rows.next()) |row| try testing.expect(term.displayWidth(row) <= 40);
+
+    const full = try renderResult(a, theme_mod.monochrome, "ExecuteCode", "{}", wide, .ok, 0, .{ .cols = 40, .transcript = true });
+    defer a.free(full);
+    try capture.expectContains(full, wide);
+}
+
+test "a failed tool shows the error's detail or its first line, in the error colour" {
+    const a = testing.allocator;
+    const text = try renderResult(a, theme_mod.monochrome, "FindSymbol", "{}", "no language server for .foo\nsecond line", .err, 0, .{});
+    defer a.free(text);
+    try capture.expectContains(text, "no language server for .foo");
+    try testing.expect(std.mem.indexOf(u8, text, "second line") == null);
+
+    const structured = try renderResult(a, theme_mod.monochrome, "SendMessage", "{}", "{\"error\":{\"code\":\"other\",\"category\":\"system_error\",\"detail\":\"no such teammate\"}}", .err, 0, .{});
+    defer a.free(structured);
+    try capture.expectContains(structured, "no such teammate");
+    try testing.expect(std.mem.indexOf(u8, structured, "system_error") == null);
+}
+
+test "control characters in a tool's arguments or result never reach the terminal" {
+    const a = testing.allocator;
+    const start = try renderStart(a, theme_mod.monochrome, "SendMessage", "{\"to\\u001b[2J\":\"lead\",\"message\":\"hi\\u001b]0;x\\u0007\"}");
+    defer a.free(start);
+    try testing.expect(std.mem.indexOfScalar(u8, start, 0x1b) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, start, 0x07) == null);
+
+    const raw = try renderResult(a, theme_mod.monochrome, "ExecuteCode", "{}", "ok\x1b]0;x\x07done", .ok, 0, .{});
+    defer a.free(raw);
+    try testing.expect(std.mem.indexOfScalar(u8, raw, 0x1b) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, raw, 0x07) == null);
+    try capture.expectContains(raw, "ok" ++ REPLACEMENT_CHAR ++ "]0;x" ++ REPLACEMENT_CHAR ++ "done");
+
+    const decoded = try renderResult(a, theme_mod.monochrome, "TeamCreate", "{}", "{\"team\":\"a\\u001b[2Jb\"}", .ok, 0, .{});
+    defer a.free(decoded);
+    try testing.expect(std.mem.indexOfScalar(u8, decoded, 0x1b) == null);
+    try capture.expectContains(decoded, "team: a" ++ REPLACEMENT_CHAR ++ "[2Jb");
+
+    const failed = try renderResult(a, theme_mod.monochrome, "CodeMap", "{}", "bad\x1b[31m path", .err, 0, .{});
+    defer a.free(failed);
+    try testing.expect(std.mem.indexOf(u8, failed, "\x1b[31m path") == null);
 }
