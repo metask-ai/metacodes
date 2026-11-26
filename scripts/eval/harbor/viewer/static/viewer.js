@@ -1383,8 +1383,8 @@ function usagePanel(title, counts, empty) {
   if (!counts) return panel(title, null, h('div', { class: 'empty', text: '暂无统计数据' }));
   const total = counts.reduce((sum, [, n]) => sum + n, 0);
   const max = counts.reduce((largest, [, n]) => Math.max(largest, n), 1);
-  return panel(title, total + ' 次', counts.length ? h('div', { class: 'panel-body bars' }, counts.map(([name, n]) =>
-    h('div', { class: 'bar-row' }, h('span', { class: 'tool-name', text: name ?? '名称未知' }),
+  return panel(title, total + ' 次', counts.length ? h('div', { class: 'panel-body usage-bars' }, counts.map(([name, n]) =>
+    h('div', { class: 'usage-row' }, h('span', { class: 'tool-name', text: name ?? '名称未知' }),
       h('div', { class: 'bar' }, h('span', { width: (100 * n / max) + '%' })), h('span', { class: 'num', text: n }))))
     : h('div', { class: 'empty', text: empty }));
 }

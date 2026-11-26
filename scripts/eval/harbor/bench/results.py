@@ -102,9 +102,16 @@ def worker_result(node, operation, directory, trial=None):
             return {"view": view, "tasks": task_summaries(rows), "store_id": store.identity(),
                     "source": str(directory.resolve())}
         with store.read() as tx:
-            source = tx.one("SELECT source_dir FROM jobs WHERE name = ?", (name,))
+            source = tx.one("SELECT source_dir, projection FROM jobs WHERE name = ?", (name,))
+            stale_trials = tx.one("SELECT 1 FROM trials WHERE job = ? AND projection <> ? LIMIT 1",
+                                  (name, ingest.PROJECTION))
         if not source or source[0] != str(directory.resolve()):
             return None
+        if source[1] != ingest.PROJECTION or stale_trials:
+            with ingest.root_lock(directory.parent):
+                refreshed = ingest.refresh_job_projection(store, name, ingest.stderr_log)
+                if refreshed.trials_failed:
+                    raise ValueError("worker 作业数据无法更新")
         if operation == "job":
             return library.job_view(name)
         if operation == "trial" and isinstance(trial, str) and data.NAME.fullmatch(trial):

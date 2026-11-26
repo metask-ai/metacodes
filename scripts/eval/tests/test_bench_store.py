@@ -35,7 +35,7 @@ from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest, library as library_module, migrate, schema
 from scripts.eval.harbor.store.backend import Store, StoreError
 from scripts.eval.harbor.store.library import StoreLibrary
-from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench import data, results
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
@@ -465,6 +465,22 @@ class IngestTest(StoreCase):
         self.assertNotIn("task__a/agent/leak.txt", paths)
         self.assertFalse(any(p.startswith("outside/") for p in paths))
         self.assertFalse(any(b"TOP-SECRET-VALUE" in c for c in contents))
+
+    def test_worker_reads_reproject_archived_trial_from_stored_bytes(self):
+        job = _job(self.root, "worker-job", "m", planned=1)
+        trial = _trial(job, "task__a", reward=1, steps=[{"tool_calls": [
+            {"function_name": "Skill", "arguments": {"name": "review"}}]}])
+        store = self.sqlite()
+        ingest.ingest_root(store, self.root)
+        shutil.rmtree(job)
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        for operation in ("trial", "job"):
+            with store.transaction() as tx:
+                tx.execute("UPDATE trials SET projection = 'old', detail_json = '{}' WHERE job = ?", (job.name,))
+            results.worker_result(node, operation, job, trial.name)
+            self.assertEqual(results.worker_result(node, "trial", job, trial.name)["skills"], [["review", 1]])
+            with store.read() as tx:
+                self.assertEqual(tx.one("SELECT projection FROM trials WHERE job = ?", (job.name,))[0], ingest.PROJECTION)
 
     def test_stale_projection_is_recomputed_from_stored_bytes(self):
         frozen_time(self)

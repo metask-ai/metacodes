@@ -114,9 +114,10 @@ th.center{text-align:center;height:auto;padding-top:8px;padding-bottom:8px}
 .filters button{font-size:12px;color:var(--muted);padding:4px 9px;border-radius:4px;border:1px solid transparent}
 .filters button.on{color:var(--text);border-color:var(--control)}
 input[type=search]{height:30px;padding:0 9px;background:var(--ground);border:1px solid var(--control);border-radius:4px;width:190px;font-size:12px}
-.bars{display:flex;flex-direction:column;gap:8px}
-.bar-row{display:grid;grid-template-columns:110px 1fr 40px;gap:10px;align-items:center;font-size:12px}
-.bar-row .bar{height:6px;background:var(--raised)}.bar-row .bar span{display:block;height:100%;background:var(--accent)}
+.usage-bars{display:flex;flex-direction:column;gap:8px}
+.usage-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) max-content;gap:10px;align-items:center;font-size:12px}
+.usage-row .tool-name{overflow-wrap:anywhere}
+.usage-row .bar{height:6px;background:var(--raised)}.usage-row .bar span{display:block;height:100%;background:var(--accent)}
 .tests{display:flex;flex-direction:column}
 .test{display:grid;grid-template-columns:auto 1fr;gap:8px;padding:7px 0;border-top:1px solid var(--rule);font-size:12px}
 .test:first-child{border:0}

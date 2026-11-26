@@ -67,6 +67,7 @@ def main():
                     steps = [{'step_id': i, 'source': 'agent', 'tool_calls': [
                         {'tool_call_id': str(i), 'function_name': 'Read', 'arguments': {'index': i}}]}
                              for i in range(1, 31)]
+                    steps[0]['tool_calls'][0].update(function_name='Skill', arguments={'name': 'long-skill-' * 12})
                     (trial / 'agent/trajectory.json').write_text(json.dumps({'steps': steps}))
                     (job / '.bench-metrics').mkdir()
                     (job / '.bench-metrics/fix-git__fake.jsonl').write_text('\n'.join(json.dumps(r) for r in [
@@ -90,9 +91,16 @@ def main():
                     page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/job/{name}/fix-git__fake')
                     page.get_by_text('920', exact=True).first.wait_for()
                     page.get_by_text('2,020', exact=True).first.wait_for()
+                    page.set_viewport_size({'width': 1120, 'height': 900})
                     for route in (f'job/{name}/fix-git__fake', f'profile/{profile}/task/{name}/fix-git/fix-git__fake'):
                         page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/{route}')
                         page.wait_for_function("document.querySelector('.trace-chart')?.dataset.scope.includes(location.hash)")
+                        rows = page.locator('.usage-row')
+                        assert rows.count() == 3
+                        for row in rows.all():
+                            assert row.locator('.num').evaluate(
+                                "el => el.getBoundingClientRect().right <= Math.min(window.innerWidth, "
+                                "el.closest('.panel').getBoundingClientRect().right)")
                         last = page.locator('.tool-span').last
                         last.click()
                         scroller = page.locator('.trace-scroll')
