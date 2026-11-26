@@ -256,6 +256,12 @@ class ProfileManager:
         return self.dir / (profile + ".json")
 
     def save(self, record: Dict[str, Any]) -> None:
+        next_index = record.get("next_item_index", 0)
+        for item in record["items"]:
+            if "index" not in item:
+                item["index"] = next_index
+            next_index = max(next_index, item["index"] + 1)
+        record["next_item_index"] = next_index
         atomic_json(self.path(record["id"]), record)
 
     def records(self) -> List[Dict[str, Any]]:
@@ -495,9 +501,11 @@ class ProfileManager:
         record = self.get(profile)
         if record is None:
             raise ValueError("评测配置不存在")
-        if type(index) is not int or not 0 <= index < len(record["items"]):
-            raise ValueError("评测集不存在")
-        return record, record["items"][index]
+        if type(index) is int:
+            for item in record["items"]:
+                if item["index"] == index:
+                    return record, item
+        raise ValueError("评测集不存在")
 
     def submission_action(self, profile, submission, action):
         with self.lock:
@@ -515,6 +523,13 @@ class ProfileManager:
                     elif item["status"] == "running":
                         item["cancel_requested"] = True
                 self.save(record)
+            elif action == "delete":
+                if any(item["status"] not in ITEM_DONE for item in items):
+                    raise ValueError("请先取消作业，等所有评测结束后再删除")
+                record["concurrency"] = profile_concurrency(record)
+                record.setdefault("next_item_index", len(record["items"]))
+                record["items"] = [item for item in record["items"] if item["submission"] != submission]
+                self.save(record)
             elif action == "run":
                 if any(item["status"] not in ITEM_DONE for item in items):
                     raise ValueError("作业还在等待或运行")
@@ -524,7 +539,7 @@ class ProfileManager:
                 planned = [rerun(item, item["tasks"], 0) for item in originals]
                 record = self._append({"id": profile}, None, planned)
             else:
-                raise ValueError("作业操作只能是 cancel 或 run")
+                raise ValueError("作业操作只能是 cancel、run 或 delete")
         self.wake()
         return public(record)
 
@@ -735,7 +750,7 @@ class ProfileManager:
 
 def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int) -> Dict[str, Any]:
     again = {key: value for key, value in item.items()
-             if key not in ("waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry", "concurrency")}
+             if key not in ("index", "waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry", "concurrency")}
     request = {key: value for key, value in item["request"].items() if key != "concurrency"}
     again.update(request={**request, "tasks": list(tasks)}, tasks=list(tasks), status="pending",
                  run=None, error=None, started_at=None, finished_at=None)
@@ -752,6 +767,7 @@ def queued_since(record: Dict[str, Any]) -> str:
 def restore_submissions(record):
     items = record.get("items") or []
     for index, item in enumerate(items):
+        item.setdefault("index", index)
         if item.get("submission"):
             continue
         item["submission"] = "legacy-" + str(item.get("queued_at") or index)

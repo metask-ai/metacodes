@@ -1431,7 +1431,9 @@ tasks all of them ran (`common_tasks` and each model's `common_summary` in
 Each submission creates one job (作业). All suite/model pairs in the request
 carry the same `submission` ID. The profile page can cancel one job or rerun
 its original evaluations together (`POST /api/profile/submission` with `id`,
-`submission` and `action` of `cancel` or `run`). Rerunning a whole job
+`submission` and `action` of `cancel`, `run` or `delete`). Deleting an ended submission removes
+its evaluations and retries from the profile and preserves stored run results.
+Item controls use the evaluation’s returned `index` across deletions. Rerunning a whole job
 creates a new job on its recorded executor. A single evaluation retry and an
 automatic retry stay in the original job. For older records, the workbench
 groups evaluations by their original queue timestamp and assigns automatic

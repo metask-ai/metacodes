@@ -1095,6 +1095,43 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn(left['submission'], {group, ended['items'][2]['submission']})
         self.assertEqual([i['suite'] for i in replay['items'][-2:]], [i['suite'] for i in first['items']])
 
+    def test_delete_last_submission_preserves_legacy_profile_concurrency(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        created = self.client.request('api/profiles/run', self.request())
+        pid = created['id']
+        command = {'id': pid, 'submission': created['items'][0]['submission']}
+        self.client.request('api/profile/submission', {**command, 'action': 'cancel'})
+        record = self.manager.profiles.get(pid)
+        del record['concurrency']
+        record['items'][-1]['concurrency'] = 1
+        self.manager.profiles.save(record)
+        self.client.request('api/profile/submission', {**command, 'action': 'delete'})
+        reloaded = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(reloaded['items'], [])
+        self.assertEqual(reloaded['concurrency'], 1)
+        queued = self.client.request('api/profiles/run', self.request(profile=pid))
+        self.assertEqual([item['concurrency'] for item in queued['items']], [1, 1])
+
+    def test_delete_submission_preserves_other_item_handles(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        first = self.client.request('api/profiles/run', self.request())
+        pid = first['id']
+        command = {'id': pid, 'submission': first['items'][0]['submission']}
+        def action(name):
+            return self.client.request('api/profile/submission', {**command, 'action': name})
+        self.client.request('api/profiles/run', self.request(profile=pid))
+        with self.assertRaisesRegex(ValueError, '请先取消'):
+            action('delete')
+        action('cancel')
+        remaining = action('delete')['items']
+        self.assertEqual([item['index'] for item in remaining], [2, 3])
+        with self.assertRaisesRegex(ValueError, '评测集不存在'):
+            self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'cancel'})
+        self.client.request('api/profile/item', {'id': pid, 'index': 2, 'action': 'cancel'})
+        self.assertEqual([i['status'] for i in self.manager.profiles.get(pid)['items']], ['skipped', 'pending'])
+
     def test_old_queued_auto_retry_is_cancelled_and_its_original_replayed_once(self):
         self.manager.profiles.stop()
         self.manager.profiles._thread.join()
