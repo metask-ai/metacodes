@@ -1479,6 +1479,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: The gates passed where they ran
         env:
+          GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
         run: python3 scripts/ci_pool_plan.py verdict --platform macos
 
@@ -1492,6 +1493,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: The gates passed where they ran
         env:
+          GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
         run: python3 scripts/ci_pool_plan.py verdict --platform windows
 
