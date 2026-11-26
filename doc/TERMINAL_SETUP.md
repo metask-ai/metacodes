@@ -169,6 +169,8 @@ chars = "\u001b\r"
 
 Inside tmux, Shift+Enter reaches metacodes only when tmux forwards extended keys
 in CSI u form (see `extended-keys` and `extended-keys-format` in tmux(1)).
+metacodes cannot see that setting, so inside tmux the footer says
+`\ + ⏎ for newline` even when tmux forwards the keys.
 
 ## Turning the keyboard protocol off
 
@@ -188,7 +190,7 @@ and `/terminal-setup` says the variable is set.
 ## The footer hint
 
 The footer says `shift + ⏎ for newline` when Shift+Enter inserts a newline: the
-terminal speaks the keyboard protocol; VS Code's `keybindings.json` holds the
+terminal speaks the keyboard protocol (outside tmux, see above); VS Code's `keybindings.json` holds the
 binding (whoever added it), and so does that of every profile with shortcuts of
 its own; or `/terminal-setup` mapped it in Apple Terminal, the Terminal running
 now is not the one that was running at setup (setup records it even when run

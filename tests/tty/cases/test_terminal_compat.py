@@ -206,7 +206,7 @@ def _multiline_footer(bin_path, term_program):
         events = [READY, "type:a\\", "raw:\\x0d", "type:b", "sleep:0.3"]
     else:
         events = [READY, "type:a", "key:shift_enter", "type:b", "sleep:0.3"]
-    raw = run(bin_path, events, env={"TERM_PROGRAM": term_program, "TERM": "xterm-256color"})
+    raw = run(bin_path, events, env={"TERM_PROGRAM": term_program, "TERM": "xterm-256color", "TMUX": None})
     sc = Screen(24, 80)
     sc.feed(raw)
     return "\n".join(sc.line_text(r) for r in range(sc.rows))

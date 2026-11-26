@@ -1024,7 +1024,8 @@ pub fn shouldEnableKittyKeyboard() bool {
 }
 
 /// 当前终端的换行方式提示(对齐真 cc getNewlineInstructions,但按 cc-zig 实际能力):
-/// - 发了 Kitty 协议(认得出的终端、或探测答了)→ Shift+Enter 真换行 → "shift + ⏎ for newline"
+/// - 发了 Kitty 协议(认得出的终端、或探测答了)→ Shift+Enter 真换行 → "shift + ⏎ for newline";
+///   tmux 里照发,但 tmux 默认不转发 extended keys,Shift+Enter 到这里仍是 \r,所以不算
 /// - 没发(deny-list 的 Apple Terminal 等、探测说不支持或没答,Shift+Enter 发裸 \r=Enter 会提交)
 ///   → "\ + ⏎ for newline"(cc-zig 无 macOS 原生 modifier 检测,故 Apple Terminal 只能靠
 ///   backslash 续行,不能照抄真 cc 对 Apple 的 "shift+⏎" 文案——那会误导)。
@@ -1034,7 +1035,8 @@ pub fn shouldEnableKittyKeyboard() bool {
 ///   一行时出现,那时用户已经敲过字,所以这条判据不会晚。
 /// - 终端自己把 Shift+Enter 绑成了 ESC CR(/terminal-setup,#386;recordNewlineBinding)→ 也是 shift。
 pub fn newlineHint() []const u8 {
-    const shift_newline = shouldEnableKittyKeyboard() or platform_term.keyRecordsTypeText() or g_newline_binding.load(.acquire);
+    const protocol_newline = shouldEnableKittyKeyboard() and !nonEmptyEnv("TMUX");
+    const shift_newline = protocol_newline or platform_term.keyRecordsTypeText() or g_newline_binding.load(.acquire);
     return if (shift_newline) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }
 
@@ -2701,7 +2703,7 @@ test "shouldEnableKittyKeyboard: 要探测的终端只在答了 Kitty flags 时�
             .probe => answered,
         };
         try testing.expectEqual(expected, shouldEnableKittyKeyboard());
-        try testing.expectEqualStrings(if (expected) shift else backslash, newlineHint());
+        try testing.expectEqualStrings(if (expected and !nonEmptyEnv("TMUX")) shift else backslash, newlineHint());
     }
 }
 
@@ -2714,6 +2716,38 @@ fn restoreEnv(name: [*:0]const u8, saved: ?[:0]u8) void {
         ppaths.setEnv(name, value.ptr);
         testing.allocator.free(value);
     } else ppaths.unsetEnv(name);
+}
+
+const SavedEnv = struct {
+    name: [*:0]const u8,
+    value: ?[:0]u8,
+
+    fn set(name: [*:0]const u8, value: ?[*:0]const u8) !SavedEnv {
+        const previous = if (std.c.getenv(name)) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+        if (value) |v| ppaths.setEnv(name, v) else ppaths.unsetEnv(name);
+        return .{ .name = name, .value = previous };
+    }
+
+    fn restore(self: SavedEnv) void {
+        if (self.value) |v| {
+            ppaths.setEnv(self.name, v.ptr);
+            testing.allocator.free(v);
+        } else ppaths.unsetEnv(self.name);
+    }
+};
+
+test "newlineHint: inside tmux the keyboard protocol stays on, but the hint is \\ + ⏎: tmux sends Shift+Enter as Enter unless extended-keys forwards it" {
+    defer recordNewlineBinding(false);
+    recordNewlineBinding(false);
+    const envs = [_]SavedEnv{
+        try SavedEnv.set("TMUX", "/tmp/tmux-0/default,1,0"),
+        try SavedEnv.set("TERM", "xterm-256color"),
+        try SavedEnv.set(no_keyboard_enhancement_env, null),
+    };
+    defer for (envs) |saved| saved.restore();
+    try testing.expect(shouldEnableKittyKeyboard());
+    if (platform_term.keyRecordsTypeText()) return;
+    try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
 }
 
 test "keyboardPolicy: METACODES_NO_KEYBOARD_ENHANCEMENT keeps the protocol off for every terminal, and keyboardSummary says why" {

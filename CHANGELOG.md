@@ -407,6 +407,10 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Inside tmux the multi-line hint says `\ + ⏎ for newline`.** It said
+  `shift + ⏎ for newline`, but under tmux's default configuration
+  Shift+Enter arrives as Enter and submits.
+
 - **A multi-line paste waits for Enter in terminals that do not mark
   pastes.** Without bracketed paste markers (a terminal that does not support
   them, the classic Windows console, a multiplexer that drops them) a paste

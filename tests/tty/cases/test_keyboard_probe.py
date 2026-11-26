@@ -10,7 +10,7 @@ ConPTY 也不透传应用发的私有序列,字节级断言在那里观测不到
 """
 import sys
 
-from tty_driver import IDLE, run, wait_for, case_tmpdir
+from tty_driver import IDLE, READY, run, wait_for, case_tmpdir
 from asserts import TTYAssert
 from slow_mock_server import SlowModels
 
@@ -152,6 +152,16 @@ def test_tmux_is_not_asked_and_keeps_kitty(bin_path):
     raw = _run(bin_path, ["sleep:0.8"], _unknown_terminal(TMUX="/tmp/tmux-0/default,1,0"))
     assert KITTY_QUERY not in raw, "tmux 里不应探测"
     assert KITTY_ENABLE in raw, "tmux 照旧应收到 Kitty enable"
+
+
+def test_tmux_multiline_hint_is_backslash_though_kitty_stays_on(bin_path):
+    _posix_only()
+    raw = _run(bin_path, [READY, "type:a\\", "raw:\\x0d", "type:b", wait_for(BACKSLASH_HINT, 5), "sleep:0.3"],
+               _unknown_terminal(TMUX="/tmp/tmux-0/default,1,0"))
+    a, screen = _screen(raw)
+    assert KITTY_ENABLE in raw, "tmux should still get the Kitty enable"
+    assert BACKSLASH_HINT in screen and SHIFT_HINT not in screen, \
+        "in tmux Shift+Enter is a plain Enter unless extended-keys forwards it, so the hint must be \\+⏎:\n" + screen
 
 
 def test_no_probe_env_skips_the_question(bin_path):
