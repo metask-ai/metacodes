@@ -55,7 +55,13 @@ const SleptTime = struct {
 
     fn wait(self: *SleptTime, cond: *sync.Condition, mutex: *sync.Mutex, slice_ns: u64) void {
         if (@import("builtin").is_test) AbortAtFirstSlice.beginSlice(slice_ns);
-        if (!cond.timedWait(mutex, slice_ns)) self.ns += slice_ns;
+        const traffic: ?*WaitTraffic = if (@import("builtin").is_test) WaitTraffic.active else null;
+        if (traffic) |t| {
+            if (t.wakeups < MIN_WAKEUPS) t.next.post(testing.io);
+        }
+        if (cond.timedWait(mutex, slice_ns)) {
+            if (traffic) |t| t.wakeups += 1;
+        } else self.ns += slice_ns;
     }
 };
 
@@ -733,8 +739,6 @@ const WINDOW_MS: u64 = 4 * WAIT_POLL_MS;
 /// 墙钟上限只兜底等待不收尾;多睡一片由睡满的分片时长判断,这里给负载高的机器留出调度延迟。
 const WAIT_HANG_MS: u64 = 2 * WINDOW_MS;
 const MIN_WAKEUPS: u64 = 2 * WINDOW_MS / WAIT_POLL_MS;
-const ECHO_PACE_MS: u64 = 5;
-const FLOOD_PARAMS = "{\"uri\":\"file:///tmp/proj/other.zig\",\"count\":400,\"interval_ms\":5}";
 
 fn startMock(a: std.mem.Allocator, abort: ?transport_mod.AbortCheck) !*Client {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
@@ -757,6 +761,10 @@ fn expectFullWindow(wait: []const u8, elapsed_ms: i64) !void {
         std.debug.print("the {s} wait of {d} ms ended after {d} ms\n", .{ wait, WINDOW_MS, elapsed_ms });
         return error.WaitEndedEarly;
     }
+    if (elapsed_ms >= @as(i64, WAIT_HANG_MS)) {
+        std.debug.print("the {s} wait of {d} ms took {d} ms\n", .{ wait, WINDOW_MS, elapsed_ms });
+        return error.WaitHung;
+    }
 }
 
 fn lastWaitSleptMs(cl: *Client) u64 {
@@ -771,10 +779,6 @@ fn expectEndsAtWindow(cl: *Client, wait: []const u8, elapsed_ms: i64) !void {
     if (slept_ms >= WINDOW_MS + WAIT_POLL_MS) {
         std.debug.print("the {s} wait of {d} ms slept {d} ms in timed-out slices\n", .{ wait, WINDOW_MS, slept_ms });
         return error.WaitOverran;
-    }
-    if (elapsed_ms >= @as(i64, WAIT_HANG_MS)) {
-        std.debug.print("the {s} wait of {d} ms took {d} ms\n", .{ wait, WINDOW_MS, elapsed_ms });
-        return error.WaitHung;
     }
 }
 
@@ -813,17 +817,41 @@ const AbortAtFirstSlice = struct {
     }
 };
 
-const EchoRequests = struct {
-    cl: *Client,
-    stop: std.atomic.Value(bool) = .init(false),
-    answered: std.atomic.Value(u64) = .init(0),
+const WaitTraffic = struct {
+    threadlocal var active: ?*WaitTraffic = null;
 
-    fn run(self: *EchoRequests) void {
-        while (!self.stop.load(.acquire)) {
-            const answer = self.cl.sendRequest("mock/echo", null, REQUEST_TIMEOUT_MS) catch return;
-            self.cl.allocator.free(answer);
-            _ = self.answered.fetchAdd(1, .monotonic);
-            util_time.sleepMs(ECHO_PACE_MS);
+    cl: *Client,
+    event: enum { echo, diagnostics },
+    next: std.Io.Semaphore = .{},
+    wakeups: u64 = 0,
+    stop: std.atomic.Value(bool) = .init(false),
+    sent: u64 = 0,
+
+    fn start(self: *WaitTraffic) !std.Thread {
+        const thread = try @import("platform").thread.spawn(.full, run, .{self});
+        active = self;
+        return thread;
+    }
+
+    fn finish(self: *WaitTraffic, thread: std.Thread) void {
+        active = null;
+        self.stop.store(true, .release);
+        self.next.post(testing.io);
+        thread.join();
+    }
+
+    fn run(self: *WaitTraffic) void {
+        while (true) {
+            self.next.waitUncancelable(testing.io);
+            if (self.stop.load(.acquire)) return;
+            switch (self.event) {
+                .echo => {
+                    const answer = self.cl.sendRequest("mock/echo", null, REQUEST_TIMEOUT_MS) catch return;
+                    self.cl.allocator.free(answer);
+                },
+                .diagnostics => self.cl.sendNotification("mock/publish", "{\"uri\":\"file:///tmp/proj/other.zig\"}") catch return,
+            }
+            self.sent += 1;
         }
     }
 };
@@ -860,34 +888,35 @@ test "Client: a diagnostics wait woken by answers to other requests still lasts 
     const path = "/tmp/proj/quiet.zig";
     const token = try cl.openFile(path, "a\n");
 
-    var echoes: EchoRequests = .{ .cl = cl };
-    const requester = try std.Thread.spawn(.{}, EchoRequests.run, .{&echoes});
+    var traffic: WaitTraffic = .{ .cl = cl, .event = .echo };
+    const requester = try traffic.start();
     const started = util_time.nowMs();
     const outcome = cl.waitForDiagnostics(path, token, WINDOW_MS);
     const elapsed = util_time.nowMs() - started;
-    const answered = echoes.answered.load(.monotonic);
-    echoes.stop.store(true, .release);
-    requester.join();
+    traffic.finish(requester);
 
     try testing.expectEqual(DiagnosticsWait.timed_out, outcome);
     try expectFullWindow("diagnostics", elapsed);
-    try expectWokenOften(answered);
+    try testing.expect(traffic.sent >= MIN_WAKEUPS);
+    try expectWokenOften(traffic.wakeups);
 }
 
 test "Client: a request wait woken by diagnostics for another file still lasts its timeout (#741)" {
     const cl = try startMock(testing.allocator, null);
     defer cl.shutdown();
-    try cl.sendNotification("mock/flood", FLOOD_PARAMS);
-
     const pushes_before = pushesSoFar(cl);
+    var traffic: WaitTraffic = .{ .cl = cl, .event = .diagnostics };
+    const publisher = try traffic.start();
     const started = util_time.nowMs();
     const answer = cl.sendRequest("mock/unanswered", null, WINDOW_MS);
     const elapsed = util_time.nowMs() - started;
     const pushes = pushesSoFar(cl) - pushes_before;
+    traffic.finish(publisher);
 
     try testing.expectError(error.Timeout, answer);
     try expectFullWindow("request", elapsed);
-    try expectWokenOften(pushes);
+    try testing.expect(pushes >= MIN_WAKEUPS);
+    try expectWokenOften(traffic.wakeups);
 }
 
 test "Client: an abort still ends a wait at its next poll slice (#741)" {
