@@ -35,7 +35,7 @@ from scripts.eval.harbor.store import config as store_config
 from scripts.eval.harbor.store import ingest, library as library_module, migrate, schema
 from scripts.eval.harbor.store.backend import Store, StoreError
 from scripts.eval.harbor.store.library import StoreLibrary
-from scripts.eval.harbor.bench import data
+from scripts.eval.harbor.bench import data, results
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import atomic_json
 from scripts.eval.harbor.bench.workbench import Workbench
@@ -465,6 +465,35 @@ class IngestTest(StoreCase):
         self.assertNotIn("task__a/agent/leak.txt", paths)
         self.assertFalse(any(p.startswith("outside/") for p in paths))
         self.assertFalse(any(b"TOP-SECRET-VALUE" in c for c in contents))
+
+    def test_worker_reads_reproject_archived_trial_from_stored_bytes(self):
+        job = _job(self.root, "worker-job", "m", planned=2)
+        trial = _trial(job, "task__a", reward=1, steps=[{"tool_calls": [
+            {"function_name": "Skill", "arguments": {"name": "review"}}]}])
+        sibling = _trial(job, "task__b", reward=0)
+        store = self.sqlite()
+        ingest.ingest_root(store, self.root)
+        shutil.rmtree(job)
+        node = types.SimpleNamespace(root=self.temp, cfg={"store": {"backend": "sqlite", "path": "bench.sqlite3"}})
+        with store.transaction() as tx:
+            tx.execute("UPDATE trials SET projection = 'old'")
+            tx.execute("UPDATE trials SET detail_json = '{}' WHERE name = ?", (trial.name,))
+        project_trial = ingest.project_trial
+
+        def project(path):
+            if path.name == sibling.name:
+                raise ValueError("trial unavailable")
+            return project_trial(path)
+
+        with patch.object(ingest, "project_trial", side_effect=project), patch.object(ingest, "stderr_log") as log:
+            self.assertEqual(results.worker_result(node, "trial", job, trial.name)["skills"], [["review", 1]])
+            self.assertEqual(len(results.worker_result(node, "job", job)["rows"]), 2)
+            self.assertEqual(results.worker_result(node, "trial", job, sibling.name)["row"]["reward"], 0)
+            self.assertEqual(log.call_count, 3)
+            self.assertIn(sibling.name, log.call_args.args[0])
+        results.worker_result(node, "job", job)
+        with store.read() as tx:
+            self.assertEqual(tx.query("SELECT DISTINCT projection FROM trials"), [(ingest.PROJECTION,)])
 
     def test_stale_projection_is_recomputed_from_stored_bytes(self):
         frozen_time(self)
