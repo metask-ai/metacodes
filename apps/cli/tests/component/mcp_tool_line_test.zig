@@ -31,12 +31,7 @@ const FINAL_SSE =
 const Server = enum { echo, failing };
 
 const FAILING_SERVER =
-    \\"$1" | awk '{
-    \\  n = length($0)
-    \\  if (index($0, "\"content\":[") > 0 && substr($0, n - 2) == "]}}") $0 = substr($0, 1, n - 3) "],\"isError\":true}}"
-    \\  print
-    \\  fflush()
-    \\}'
+    \\"$1" | sed -u '/"content":\[/s/]}}$/],"isError":true}}/'
     \\
 ;
 
