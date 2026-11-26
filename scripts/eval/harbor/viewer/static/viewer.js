@@ -178,7 +178,19 @@ async function render() {
     else node = await renderCompare(r.jobs, r.profile);
     // Keep open <details> and scroll position across a live refresh.
     const open = new Set([...document.querySelectorAll('#app details[open]')].map((d) => d.dataset.key));
+    const oldChart = $('.trace-chart');
+    const newChart = node.querySelector('.trace-chart');
+    const sameTrace = oldChart && newChart && oldChart.dataset.scope === newChart.dataset.scope;
+    const scrollLeft = sameTrace ? oldChart.parentElement.scrollLeft : 0;
+    const focused = document.activeElement;
+    const focusKey = sameTrace && oldChart.contains(focused) ? focused.dataset.key : null;
+    const focusScroller = sameTrace && oldChart.parentElement === focused;
     $('#app').replaceChildren(node);
+    if (sameTrace) {
+      newChart.parentElement.scrollLeft = scrollLeft;
+      const target = focusScroller ? newChart.parentElement : focusKey && newChart.querySelector(`[data-key="${CSS.escape(focusKey)}"]`);
+      if (target) target.focus({ preventScroll: true });
+    }
     for (const d of document.querySelectorAll('#app details')) if (open.has(d.dataset.key)) d.open = true;
     setConnection(true);
     $('#updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -1317,6 +1329,66 @@ function timePanel(t) {
     panel('工具耗时', `${timing.reduce((a, x) => a + x.calls, 0)} 次`, tools));
 }
 
+function tracePanel(steps, trial) {
+  if (!steps.length) return panel('轨迹', null, h('div', { class: 'empty', text: '还没有轨迹' }));
+  const scope = JSON.stringify([location.hash, trial]);
+  const previous = $('.trace-chart');
+  const activeKey = previous?.dataset.scope === scope ? previous.querySelector('[aria-pressed=true]')?.dataset.key : null;
+  const chart = h('div', { class: 'trace-chart', 'data-scope': scope });
+  const detail = h('div', { class: 'trace-detail' });
+  let selected;
+  let column = 1;
+  function span(label, kind, row, start, width, title, content) {
+    const button = h('button', { type: 'button', class: 'trace-span ' + kind, text: label, title, 'data-key': row + '-' + start,
+      'aria-pressed': 'false', onclick: () => {
+        if (selected) selected.setAttribute('aria-pressed', 'false');
+        selected = button;
+        selected.setAttribute('aria-pressed', 'true');
+        detail.replaceChildren(h('strong', { text: title }), ...content());
+      } });
+    button.style.gridRow = row;
+    button.style.gridColumn = start + ' / span ' + width;
+    chart.append(button);
+    if (!selected || button.dataset.key === activeKey) button.click();
+  }
+  function resultNodes(observations) {
+    return observations.flatMap(o => [h('b', { text: o.is_error ? '结果（错误）' : '结果' }), h('pre', { text: o.content })]);
+  }
+  for (const s of steps) {
+    const width = Math.max(1, s.tool_calls.length);
+    const label = s.source === 'user' ? '任务' : s.source === 'agent' ? 'Agent' : s.source;
+    const title = '#' + s.id + ' · ' + label;
+    const ids = new Set(s.tool_calls.map(call => call.id));
+    const unmatched = s.observations.filter(o => !ids.has(o.call));
+    span(title, 'step-span', 1, column, width, title, () => [
+      h('div', { class: 'msg-text', text: s.message }),
+      ...(s.reasoning ? [h('details', { class: 'reason' }, h('summary', { text: '思考过程' }), h('pre', { text: s.reasoning }))] : []),
+      ...resultNodes(unmatched)]);
+    s.tool_calls.forEach((call, i) => {
+      const results = s.observations.filter(o => o.call === call.id);
+      const error = results.some(o => o.is_error);
+      const duration = call.elapsed_ms == null ? '' : ' · ' + msf(call.elapsed_ms);
+      const name = call.name + duration + (error ? ' · 错误' : '');
+      span(name, error ? 'error-span' : 'tool-span', 2, column + i, 1, title + ' / ' + name, () => [
+        h('b', { text: '参数' }), h('pre', { text: call.arguments }), ...resultNodes(results)]);
+    });
+    column += width;
+  }
+  return panel('轨迹', steps.length + ' 步 · 按操作顺序排列', h('div', { class: 'panel-body' },
+    h('div', { class: 'trace-layout' }, h('div', { class: 'trace-labels' }, h('span', { text: '步骤' }),
+      h('span', { text: '工具' })), h('div', { class: 'trace-scroll', tabindex: '0' }, chart)), detail));
+}
+
+function usagePanel(title, counts, empty) {
+  if (!counts) return panel(title, null, h('div', { class: 'empty', text: '暂无统计数据' }));
+  const total = counts.reduce((sum, [, n]) => sum + n, 0);
+  const max = counts.reduce((largest, [, n]) => Math.max(largest, n), 1);
+  return panel(title, total + ' 次', counts.length ? h('div', { class: 'panel-body usage-bars' }, counts.map(([name, n]) =>
+    h('div', { class: 'usage-row' }, h('span', { class: 'tool-name', text: name ?? '名称未知' }),
+      h('div', { class: 'bar' }, h('span', { width: (100 * n / max) + '%' })), h('span', { class: 'num', text: n }))))
+    : h('div', { class: 'empty', text: empty }));
+}
+
 function trialBody(t) {
   const r = t.row;
   const metrics = h('section', { class: 'metrics' },
@@ -1344,32 +1416,10 @@ function trialBody(t) {
     .map((x) => h('div', { class: 'test' }, badge(x.status === 'passed' ? 'pass' : x.status === 'failed' ? 'fail' : 'invalid'),
       h('span', { class: 'mono', text: x.name.split('::').pop() }), x.message ? h('span', { class: 'msg', text: x.message }) : null)))
     : h('div', { class: 'empty', text: '判分没有写出逐条测试报告' });
-  const maxTool = Math.max(1, ...t.tools.map(([, n]) => n));
-  const tools = t.tools.length ? h('div', { class: 'panel-body bars' }, t.tools.map(([name, n]) =>
-    h('div', { class: 'bar-row' }, h('span', { class: 'tool-name', text: name }), h('div', { class: 'bar' }, h('span', { width: (100 * n / maxTool) + '%' })), h('span', { class: 'num', text: n }))))
-    : h('div', { class: 'empty', text: '没有工具调用' });
-  parts.push(h('div', { class: 'grid-2' }, panel('判分测试', t.tests ? `${t.tests.passed}/${t.tests.total} 通过` : null, tests), panel('工具使用', `${t.tools.reduce((a, [, n]) => a + n, 0)} 次`, tools)));
-
-  const steps = t.steps.map((s, i) => {
-    const body = h('div', { class: 'step-body' });
-    if (s.message) body.append(h('div', { class: 'msg-text', text: s.message }));
-    if (s.reasoning) body.append(h('details', { class: 'reason', 'data-key': `r${i}` }, h('summary', { text: '思考过程' }), h('pre', { text: s.reasoning })));
-    for (const c of s.tool_calls) {
-      const obs = s.observations.filter((o) => o.call === c.id);
-      body.append(h('details', { class: 'call', 'data-key': `c${i}-${c.id}` },
-        h('summary', {}, h('span', { class: 'tool-name', text: c.name }), c.elapsed_ms !== null && c.elapsed_ms !== undefined ? h('span', { class: 'num muted', text: msf(c.elapsed_ms) }) : null,
-          h('span', { class: 'faint', text: c.arguments.slice(0, 120) })),
-        h('pre', { text: c.arguments })));
-      for (const o of obs) body.append(h('details', { class: 'obs' + (o.is_error ? ' error' : ''), 'data-key': `o${i}-${o.call}` },
-        h('summary', {}, h('span', { text: o.is_error ? '结果（错误）' : '结果' }), h('span', { class: 'faint', text: o.content.slice(0, 120) })),
-        h('pre', { text: o.content })));
-    }
-    for (const o of s.observations.filter((o) => !s.tool_calls.some((c) => c.id === o.call))) {
-      body.append(h('details', { class: 'obs', 'data-key': `x${i}-${o.call}` }, h('summary', { text: '结果' }), h('pre', { text: o.content })));
-    }
-    return h('div', { class: 'step' }, h('div', { class: 'step-src' }, h('b', { text: s.source === 'agent' ? 'agent' : s.source === 'user' ? '任务' : s.source }), '#' + s.id), body);
-  });
-  parts.push(panel('轨迹', `${t.steps.length} 步`, h('div', { class: 'panel-body timeline' }, steps.length ? steps : h('div', { class: 'empty', text: '还没有轨迹' }))));
+  parts.push(panel('判分测试', t.tests ? `${t.tests.passed}/${t.tests.total} 通过` : null, tests));
+  parts.push(h('div', { class: 'grid-2' }, usagePanel('工具使用', t.tools, '没有工具调用'),
+    usagePanel('Skill 使用', t.skills, '没有 Skill 调用')));
+  parts.push(tracePanel(t.steps, r.trial));
   parts.push(h('div', { class: 'grid-2' },
     panel('判分输出', '末尾', h('div', { class: 'panel-body' }, t.verifier_output ? h('pre', { class: 'block', text: t.verifier_output }) : h('div', { class: 'empty', text: '无' }))),
     panel('metacodes stderr', '末尾', h('div', { class: 'panel-body' }, t.stderr ? h('pre', { class: 'block', text: t.stderr }) : h('div', { class: 'empty', text: '无' })))));

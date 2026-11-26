@@ -240,21 +240,23 @@ const FakeCli = struct {
             try text.appendSlice(a, "  --permission-prompts <target> (\"host\", \"none\")\n");
         }
         try text.appendSlice(a, "HELP\nexit 0 ;;\nesac\n");
-        try text.print(a, "rec='{s}'\n", .{self.recordPath()});
-        try text.appendSlice(a,
-            \\printf 'argc:%s\n' "$#" > "$rec"
-            \\for a in "$@"; do printf 'arg:%s\n' "$(printf '%s' "$a" | tr '\n' '|')" >> "$rec"; done
-            \\printf 'cwd:%s\n' "$(pwd -P)" >> "$rec"
-            \\env | sed 's/^/env:/' >> "$rec"
-            \\seat=''
-            \\prev=''
-            \\for a in "$@"; do
-            \\  if [ "$prev" = "--add-dir" ]; then seat="$a"; fi
-            \\  prev="$a"
-            \\done
-            \\echo '{"type":"system","subtype":"init"}'
-            \\
-        );
+        if (scenario != .hang) {
+            try text.print(a, "rec='{s}'\n", .{self.recordPath()});
+            try text.appendSlice(a,
+                \\printf 'argc:%s\n' "$#" > "$rec"
+                \\for a in "$@"; do printf 'arg:%s\n' "$(printf '%s' "$a" | tr '\n' '|')" >> "$rec"; done
+                \\printf 'cwd:%s\n' "$(pwd -P)" >> "$rec"
+                \\env | sed 's/^/env:/' >> "$rec"
+                \\seat=''
+                \\prev=''
+                \\for a in "$@"; do
+                \\  if [ "$prev" = "--add-dir" ]; then seat="$a"; fi
+                \\  prev="$a"
+                \\done
+                \\echo '{"type":"system","subtype":"init"}'
+                \\
+            );
+        }
         switch (scenario) {
             .ok, .confinement, .missing_cost => {
                 try text.appendSlice(a, "cat > \"$seat/handoff.md\" <<'HANDOFF'\n");
@@ -267,7 +269,15 @@ const FakeCli = struct {
             .exit_nonzero => try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"total_cost_usd\":0.1}'\nexit 3\n"),
             .killed => try text.appendSlice(a, "kill -9 $$\n"),
             .hang => {
-                try text.print(a, "(n=0; while :; do n=$((n+1)); echo $n > '{s}'; sleep 0.1; done) &\necho $! > '{s}'\nsleep 300\n", .{ self.heartbeatPath(), self.pidfilePath() });
+                try text.print(a,
+                    \\/bin/sh -c '
+                    \\  printf .
+                    \\  echo "$$" > "$1"
+                    \\  while sleep 0.1; do printf .; done
+                    \\' sh '{s}' >> '{s}' &
+                    \\wait
+                    \\
+                , .{ self.pidfilePath(), self.heartbeatPath() });
             },
             .no_handoff => try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"total_cost_usd\":0.05}'\nexit 0\n"),
             .over_budget => try text.appendSlice(a, "echo '{\"type\":\"result\",\"subtype\":\"error_max_budget_usd\",\"is_error\":true,\"total_cost_usd\":0.5}'\nexit 1\n"),
@@ -322,16 +332,14 @@ fn recordHasEnv(record: []const u8, name: []const u8) bool {
 }
 
 /// The grandchild's heartbeat stopped: it died with its group. Its pid is
-/// no evidence under bwrap, whose `--unshare-pid` makes `$!` a pid of the
+/// no evidence under bwrap, whose `--unshare-pid` makes it a pid of the
 /// sandbox's namespace, so the test watches what the process does instead.
 fn heartbeatStopped(path: [:0]const u8) bool {
     util_time.sleepMs(300);
-    const before = swarm_team.readFileAlloc(testing.allocator, path) orelse return false;
-    defer testing.allocator.free(before);
+    const before = pfs.statPath(path) catch return false;
     util_time.sleepMs(800);
-    const after = swarm_team.readFileAlloc(testing.allocator, path) orelse return false;
-    defer testing.allocator.free(after);
-    return std.mem.eql(u8, before, after);
+    const after = pfs.statPath(path) catch return false;
+    return before.size > 0 and before.size == after.size;
 }
 
 // ── scripted provider ───────────────────────────────────────────────────────
@@ -1079,59 +1087,69 @@ test "teamwork drivers L2: unavailable sandbox refuses external harness before e
     try testing.expectEqual(@as(usize, 0), scripted.calls);
 }
 
-test "teamwork drivers L2: claude seat timeout, wallclock budget and abort kill the whole group" {
+test "teamwork drivers L2: claude seat timeout kills the whole group" {
+    try expectSeatGroupKilled(.timeout);
+}
+
+test "teamwork drivers L2: claude seat wallclock budget kills the whole group" {
+    try expectSeatGroupKilled(.wallclock);
+}
+
+test "teamwork drivers L2: claude seat abort kills the whole group" {
+    try expectSeatGroupKilled(.abort);
+}
+
+fn expectSeatGroupKilled(mode: enum { timeout, wallclock, abort }) !void {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // comptime: the rest is POSIX-only
-    const Mode = enum { timeout, wallclock, abort };
-    for ([_]Mode{ .timeout, .wallclock, .abort }) |mode| {
-        var fx: Fixture = undefined;
-        try fx.init("cc-zig-teamwork-drivers-kill", 5);
-        defer fx.deinit();
-        var fake: FakeCli = .{};
-        try fake.install(&fx, .hang);
-        const seat = try fx.addSeat(.implementer, 1, .claude_code);
-        const spec = try claudeSpec(fake.scriptPath(), switch (mode) {
-            .wallclock => .{ .wallclock_only = .{ .seconds = 1 } },
-            .timeout, .abort => .cost,
-        });
-        var options = claudeOptions();
-        if (mode == .timeout) options.timeout_ms = 800;
-        var impl = claude_code.ClaudeCodeDriver.init(options, fx.binding(seat));
-        var abort = types.AbortSignal.init();
+    var fx: Fixture = undefined;
+    try fx.init("cc-zig-teamwork-drivers-kill", 5);
+    defer fx.deinit();
+    var fake: FakeCli = .{};
+    try fake.install(&fx, .hang);
+    const seat = try fx.addSeat(.implementer, 1, .claude_code);
+    const spec = try claudeSpec(fake.scriptPath(), switch (mode) {
+        .wallclock => .{ .wallclock_only = .{ .seconds = 1 } },
+        .timeout, .abort => .cost,
+    });
+    var options = claudeOptions();
+    if (mode == .timeout) options.timeout_ms = 800;
+    var impl = claude_code.ClaudeCodeDriver.init(options, fx.binding(seat));
+    var abort = types.AbortSignal.init();
 
-        const Aborter = struct {
-            fn run(signal: *types.AbortSignal, pidfile: [*:0]const u8) void {
-                var waited: u32 = 0;
-                while (waited < 10_000 and !pfs.exists(pidfile)) : (waited += 20) util_time.sleepMs(20);
-                util_time.sleepMs(100);
-                signal.abort(.user_interrupt);
-            }
-        };
-        var thread: ?std.Thread = null;
-        if (mode == .abort) thread = try std.Thread.spawn(.{}, Aborter.run, .{ &abort, fake.pidfilePath().ptr });
-        const started = util_time.nowMs();
-        var outcome = try impl.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
-        defer outcome.deinit(testing.allocator);
-        if (thread) |t| t.join();
-        const elapsed = util_time.nowMs() - started;
-
-        switch (mode) {
-            .timeout => try testing.expect(outcome.failed == .timed_out),
-            .wallclock => try testing.expect(outcome == .budget_exhausted),
-            .abort => try testing.expect(outcome == .aborted),
+    const Aborter = struct {
+        fn run(signal: *types.AbortSignal, pidfile: [*:0]const u8) void {
+            var waited: u32 = 0;
+            while (waited < 10_000 and !pfs.exists(pidfile)) : (waited += 20) util_time.sleepMs(20);
+            signal.abort(.user_interrupt);
         }
-        try testing.expect(elapsed < 20_000);
+    };
+    const thread = if (mode == .abort)
+        try @import("platform").thread.spawn(.waiter, Aborter.run, .{ &abort, fake.pidfilePath().ptr })
+    else
+        null;
+    defer if (thread) |t| t.join();
+    const started = util_time.nowMs();
+    var outcome = try impl.driver().run(testing.allocator, &spec, fx.paths(seat), &abort);
+    defer outcome.deinit(testing.allocator);
+    const elapsed = util_time.nowMs() - started;
 
-        // The grandchild the CLI left behind died with its group.
-        try testing.expect(pfs.exists(fake.pidfilePath().ptr));
-        try testing.expect(heartbeatStopped(fake.heartbeatPath()));
-
-        // Unknown spend consumes the cap unless wallclock-only was explicit.
-        try testing.expectEqual(@as(usize, 1), fx.ledger.entries);
-        const line = try fx.lastLedgerLine(testing.allocator);
-        defer testing.allocator.free(line);
-        try testing.expect(std.mem.indexOf(u8, line, if (mode == .wallclock) "\"source\":\"wallclock_only\"" else "\"source\":\"reserved\"") != null);
-        if (mode == .wallclock) try testing.expect(fx.ledger.wallclock_ms >= 1000);
+    switch (mode) {
+        .timeout => try testing.expect(outcome.failed == .timed_out),
+        .wallclock => try testing.expect(outcome == .budget_exhausted),
+        .abort => try testing.expect(outcome == .aborted),
     }
+    try testing.expect(elapsed < 20_000);
+
+    // The grandchild the CLI left behind died with its group.
+    try testing.expect(pfs.exists(fake.pidfilePath().ptr));
+    try testing.expect(heartbeatStopped(fake.heartbeatPath()));
+
+    // Unknown spend consumes the cap unless wallclock-only was explicit.
+    try testing.expectEqual(@as(usize, 1), fx.ledger.entries);
+    const line = try fx.lastLedgerLine(testing.allocator);
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line, if (mode == .wallclock) "\"source\":\"wallclock_only\"" else "\"source\":\"reserved\"") != null);
+    if (mode == .wallclock) try testing.expect(fx.ledger.wallclock_ms >= 1000);
 }
 
 /// Records every Bash dispatch the seat's tool observer is tapped with.

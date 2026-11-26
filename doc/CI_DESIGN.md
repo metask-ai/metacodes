@@ -74,11 +74,6 @@ the interactive Bench smoke. Changes to the evaluation harness, shared inputs or
 core runtime keep the complete offline evaluation. The nightly run and a migration
 test-ID comparison include it too.
 
-The change summary also reports whether merging requires a provider-backed
-base/head comparison. The existing **Gates (Linux)** check verifies the latest
-maintainer-attested result for that pair. The assessment runs with per-run approval
-outside PR CI. [Evaluation procedure](../evals/README.md)
-
 `layers.zon` assigns every path under `src/`, `apps/`, `packages/` and
 `tests/` to a package and
 lists what each may import (`allowed_dependencies`); `layer:check` holds the
@@ -208,41 +203,17 @@ Run full primary-platform CI on `pull_request`, then merge the exact reviewed
 head. A label change runs it again (the `labeled` and `unlabeled` events),
 because the test ID comparison and the version state gate judge the
 labels the PR has when they run. Ordinary pushes to `main` do not repeat that run. The four required
-check names and their GitHub Actions source stay unchanged. `Protect main`
-must require branches to be up to date and must not require a merge queue.
-If main advances, merge main into the PR branch and repeat review and CI.
-A busy main can therefore still require several updates.
+check names and their GitHub Actions source stay unchanged.
 
-The [local watcher](PR_AGENT_LOOP.md) makes an ordinary merge commit for a
-stale branch, validates it through `dx`, pushes it, and waits for fresh
-review and PR CI. Conflicts go to the original worker. Before merging it
-rechecks head/base and effective branch rules, then calls the merge API with
-the reviewed head SHA. Strict server-side checks close the race where main
-moves after that recheck. No deferred auto-merge or admin bypass is used.
-
-### Policy migration
-
-After deploying the workflow and watcher, a repository rules administrator
-previews and applies the migration from a checkout containing the tooling:
+Confirm the required checks and independent review cover the same commit.
+Set `REVIEWED_SHA` to the full commit ID recorded in the review and merge:
 
 ```sh
-python3 .github/pr-policy.py
-python3 .github/pr-policy.py --apply
+gh pr merge "${PR_NUMBER:?}" --repo metask-ai/metacodes --squash --match-head-commit "${REVIEWED_SHA:?}"
 ```
 
-The preview prints existing and proposed rules. The write fetches the current
-ruleset, removes only `merge_queue`, enables strict required status checks,
-and preserves every other protection, check source and bypass actor. It
-refuses inactive or broad rulesets and verifies effective main rules after
-the write. It refuses to write if GitHub hides the bypass-actor list, rather
-than replace a ruleset whose complete contents it cannot read. Restart local
-watchers from the updated checkout before cutover. A maintain role alone
-cannot apply it. The watcher refuses direct
-merges until this policy is active.
-
-The workflows retain `merge_group` as migration compatibility, so this change
-can land under the old rules. After the queue rule is removed those events
-are not emitted. Existing queued PRs are left alone by an upgraded watcher.
+If the head advances, review and validate the new commit before merging.
+The workflows also support GitHub's `merge_group` event.
 The legacy handler diffs against `base_sha` and retains release version
 ordering checks; it is not the normal delivery path.
 

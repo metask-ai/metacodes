@@ -102,27 +102,7 @@ context，权限会改变动作空间，sandbox 会改变失败模式，trace �
 （`apps/cli/src/repl/tui/`）或 CLI 包内测试时，仍测产品运行和终端交互。完整的
 `zig build test`、带 `migration` 标签的 PR 和 main 的夜间检查都运行全套离线评测。
 
-**Change scope** 显示 **Provider-backed comparison before merge — Required** 时，合并还需要真模型对比。
-改核心循环、provider 实现、核心 E2E 题目的正文、同名 `.conf` 或题目引用的测试数据，都会触发。
-只改循环的独立单测（例如 `loop_test.zig`）会运行离线测试。自动触发路径见 `scripts/ci_scope.py`。其他改动若影响整个 Agent Loop，
-给 PR 加 `model-eval` 标签也会触发。按以下顺序取得并登记结果。
-
-1. 先取得这一次调用模型的明确授权，约定模型、题集、trial 数、预算和验收条件。
-   默认采用 `evals/suites/core-e2e.json`。在受控环境分别构建当前 PR 的 base 和 head。
-2. 用下文的 `run-paired` 传入两个二进制、各自完整 SHA、同一模型和约定预算
-   （`--max-cumulative-cost-usd`、`--max-cumulative-tokens`）。
-   用 `compare --factor harness` 生成报告，核对样本完整性、可信成功数、成本和耗时。
-3. 有仓库提交状态写权限的维护者审核报告。样本完整且满足事先约定的验收条件后，
-   把可供评审人访问的报告链接登记在本次 head 上，再重跑失败的 **Gates (Linux)**。
-   下面四个变量分别是目标仓库、实际测过的 base SHA、head SHA 和报告的 HTTPS 地址。
-
-```sh
-gh api --method POST "repos/$REPOSITORY/statuses/$HEAD_SHA" \
-  -f state=success -f context="model-eval/$BASE_SHA" -f target_url="$REPORT_URL"
-```
-
-缺授权、缺报告或发现回归时保留阻塞。CI 仅读取最新登记状态，模型凭据留在执行评测的环境里。
-base 或 head 更新后要用新提交对复测。旧合并队列事件使用组的 base 和 head。
+按需进行真模型对照时，先取得本次调用授权，并约定模型、题集、次数和预算。
 
 ### 1. 校验任务定义
 
