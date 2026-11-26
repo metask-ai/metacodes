@@ -178,7 +178,19 @@ async function render() {
     else node = await renderCompare(r.jobs, r.profile);
     // Keep open <details> and scroll position across a live refresh.
     const open = new Set([...document.querySelectorAll('#app details[open]')].map((d) => d.dataset.key));
+    const oldChart = $('.trace-chart');
+    const newChart = node.querySelector('.trace-chart');
+    const sameTrace = oldChart && newChart && oldChart.dataset.scope === newChart.dataset.scope;
+    const scrollLeft = sameTrace ? oldChart.parentElement.scrollLeft : 0;
+    const focused = document.activeElement;
+    const focusKey = sameTrace && oldChart.contains(focused) ? focused.dataset.key : null;
+    const focusScroller = sameTrace && oldChart.parentElement === focused;
     $('#app').replaceChildren(node);
+    if (sameTrace) {
+      newChart.parentElement.scrollLeft = scrollLeft;
+      const target = focusScroller ? newChart.parentElement : focusKey && newChart.querySelector(`[data-key="${CSS.escape(focusKey)}"]`);
+      if (target) target.focus({ preventScroll: true });
+    }
     for (const d of document.querySelectorAll('#app details')) if (open.has(d.dataset.key)) d.open = true;
     setConnection(true);
     $('#updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
