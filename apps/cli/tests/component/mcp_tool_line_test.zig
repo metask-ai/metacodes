@@ -39,10 +39,15 @@ const PAIR_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
-const Server = enum { echo, failing };
+const Server = enum { echo, failing, lone_surrogates };
 
 const FAILING_SERVER =
     \\"$1" | sed -u '/"content":\[/s/]}}$/],"isError":true}}/'
+    \\
+;
+
+const LONE_SURROGATE_SERVER =
+    \\"$1" | sed -u 's/LONE-HIGH/\\ud83d/g; s/LONE-LOW/\\udc80/g'
     \\
 ;
 
@@ -95,6 +100,10 @@ const Home = struct {
         try self.tmp.dir.createDirPath(std.testing.io, ".metacodes");
         const config = switch (server) {
             .echo => try std.fmt.allocPrint(gpa, "{{\"mcpServers\":{{\"plc\":{{\"command\":\"{s}/{s}\",\"args\":[]}}}}}}", .{ cwd, MOCK_MCP }),
+            .lone_surrogates => blk: {
+                try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plc-lone.sh", .data = LONE_SURROGATE_SERVER });
+                break :blk try std.fmt.allocPrint(gpa, "{{\"mcpServers\":{{\"plc\":{{\"command\":\"/bin/sh\",\"args\":[\"{s}/plc-lone.sh\",\"{s}/{s}\"]}}}}}}", .{ root, cwd, MOCK_MCP });
+            },
             .failing => blk: {
                 try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plc-fail.sh", .data = FAILING_SERVER });
                 break :blk try std.fmt.allocPrint(gpa, "{{\"mcpServers\":{{\"plc\":{{\"command\":\"/bin/sh\",\"args\":[\"{s}/plc-fail.sh\",\"{s}/{s}\"]}}}}}}", .{ root, cwd, MOCK_MCP });
@@ -262,6 +271,73 @@ test "L2 two MCP calls in one reply each reach the TUI as their call line with t
         "⏺ " ++ MCP_TOOL ++ "(message: \"second call\")",
         "  ⎿  second call",
     });
+}
+
+fn toolResultContent(body: []const u8) ![]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    defer parsed.deinit();
+    for (parsed.value.object.get("messages").?.array.items) |message| {
+        const content = message.object.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |block| {
+            if (block != .object) continue;
+            const kind = block.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "tool_result")) continue;
+            const inner = block.object.get("content") orelse continue;
+            if (inner == .string) return gpa.dupe(u8, inner.string);
+        }
+    }
+    return error.NoToolResult;
+}
+
+test "L2 an MCP result whose text holds half a surrogate pair reaches the model as text with U+FFFD, not as invalid JSON" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!pfs.exists(MOCK_MCP)) return error.SkipZigTest;
+    var home: Home = undefined;
+    try home.init(.lone_surrogates);
+    defer home.deinit();
+
+    const call = try toolUseSse(gpa, "{\"message\":\"a LONE-HIGH b LONE-LOW c\"}");
+    defer gpa.free(call);
+    const bodies = [_][]const u8{ call, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(gpa);
+    defer gpa.free(url);
+    var session: Session = undefined;
+    try session.init(url);
+    defer session.deinit();
+    const app = session.app;
+    _ = app.dyn_registry.find(MCP_TOOL) orelse return error.McpToolNotRegistered;
+
+    const t = try region_harness.Term.create(gpa, .{ .rows = 24, .cols = 100 });
+    defer t.destroy();
+    t.region.enterGenerating(app, null);
+    var tui = cc.tui_backend.TuiBackend.init(&t.region);
+    tui.theme = &t.region.theme;
+    tui.alloc = gpa;
+    const backend = tui.backend();
+
+    try app.conversation.appendText(.user, "echo it back");
+    var options = cc.session_service.buildRunOptions(app, null);
+    options.max_turns = 3;
+    const result = try cc.agent_loop.run(&app.conversation, app.provider(), app.tool_defs, &app.permission_ctx, options, &backend, app.allocator);
+    t.region.leaveGenerating(app);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const second = server.requestAt(1).?.body();
+    const result_json = try toolResultContent(second);
+    defer gpa.free(result_json);
+    const result_value = try std.json.parseFromSlice(std.json.Value, gpa, result_json, .{});
+    defer result_value.deinit();
+    const blocks = result_value.value.object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("a \u{FFFD} b \u{FFFD} c", blocks[0].object.get("text").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, second, "invalid_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"is_error\":true") == null);
+
+    const screen = try t.transcriptAlloc(.{});
+    defer gpa.free(screen);
+    try expectLine(screen, "  ⎿  a \u{FFFD} b \u{FFFD} c");
 }
 
 test "L2 an MCP call the server marks as failed shows its first line of text in the TUI, not the server's JSON" {

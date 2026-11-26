@@ -11696,6 +11696,7 @@ metacodes-core.mcp_protocol.result_stream.Outcome: union(enum)
 metacodes-core.mcp_protocol.result_stream.Outcome.result: tool_result.ToolResultBody
 metacodes-core.mcp_protocol.result_stream.Outcome.diagnostic: Diagnostic
 metacodes-core.mcp_protocol.result_stream.project: fn project( allocator: std.mem.Allocator, capture: *artifact_store.Capture, artifact_root: []const u8, expected_id: u64, era: Era, limits: Limits, budget: result_budget.Budget, has_output_schema: bool, require_content: bool, ) error{OutOfMemory}!Outcome
+metacodes-core.mcp_protocol.result_stream.replaceLoneSurrogates: fn replaceLoneSurrogates(bytes: []u8) usize
 metacodes-core.mcp_protocol.result_stream.writeSuccessfulResultOfSize: fn writeSuccessfulResultOfSize( capture: *artifact_store.Capture, result_bytes: usize, ) !void
 metacodes-core.mcp_protocol.result_stream.fillSessionArtifactQuota: fn fillSessionArtifactQuota(allocator: std.mem.Allocator, root: []const u8) !void
 metacodes-core.mcp_protocol.client = metacodes-core.mcp_client
