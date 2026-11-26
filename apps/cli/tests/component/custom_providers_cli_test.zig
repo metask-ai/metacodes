@@ -630,7 +630,7 @@ test "remove with nothing stored for the id is still a no, whatever else oauth/ 
     try testing.expect(case.exists("state/oauth/other.json"));
 }
 
-test "a stored login remove cannot delete is reported and stays, not passed over" {
+test "a stored login remove cannot delete is reported, stays, and fails the command" {
     var case: Case = undefined;
     if (!try case.init()) return error.SkipZigTest;
     defer case.deinit();
@@ -639,10 +639,88 @@ test "a stored login remove cannot delete is reported and stays, not passed over
     try case.write("state/oauth/relay.json/held", "");
 
     const removed = try case.run(&.{}, &.{ "providers", "remove", "relay" });
-    try removed.expectExit(0);
+    try removed.expectExit(1);
     try expectContains(removed.stderr, "warning: its stored login (oauth/relay.json) could not be removed");
     try expectAbsent(removed.stderr, "Removed its stored login");
     try expectAbsent(removed.stderr, "nothing to remove");
+    try testing.expect(case.exists("state/oauth/relay.json/held"));
+}
+
+test "a stored key remove cannot delete is reported, stays, and fails the command" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    try case.write("state/keys/relay.json/held", "");
+
+    const removed = try case.run(&.{}, &.{ "providers", "remove", "relay" });
+    try removed.expectExit(1);
+    try expectContains(removed.stderr, "warning: its stored key could not be removed: ");
+    try expectAbsent(removed.stderr, "Removed its stored key");
+    try expectAbsent(removed.stderr, "nothing to remove");
+    try testing.expect(case.exists("state/keys/relay.json/held"));
+}
+
+test "list shows an id with only a stored key or login left, and none of the providers metacodes ships" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    const a = case.arena();
+    try case.write("state/keys/relay.json", "{\"schema_version\":1,\"kind\":\"api_key\",\"key\":\"sk-left\",\"stored_at\":1}");
+    try case.write("state/oauth/sso.json", "{\"access_token\":\"at-sso\",\"refresh_token\":\"rt-sso\",\"expires_at\":4102444800}");
+    try case.write("state/keys/deepseek.json", "{\"schema_version\":1,\"kind\":\"api_key\",\"key\":\"sk-ds\",\"stored_at\":1}");
+    try case.write("state/oauth/sso.json.tmp", "");
+
+    const alone = try case.run(&.{}, &.{ "providers", "list" });
+    try alone.expectExit(0);
+    try expectContains(alone.stdout, "No providers of your own in ");
+    try expectContains(alone.stdout, try std.fmt.allocPrint(a, "relay  (no definition left)\n  key:    stored in {s}/keys/relay.json\n", .{case.state}));
+    try expectContains(alone.stdout, try std.fmt.allocPrint(a, "sso  (no definition left)\n  login:  stored in {s}/oauth/sso.json\n", .{case.state}));
+    try expectContains(alone.stdout, "2 id(s) with only a stored key or login left; ");
+    try expectAbsent(alone.stdout, "deepseek");
+
+    try (try case.run(&.{}, &.{ "providers", "add", "gateway", "--base-url", "https://gateway.example.com/v1", "--protocol", "openai_chat", "--model", "glm-4.6" })).expectExit(0);
+    try case.write("state/keys/gateway.json", "{\"schema_version\":1,\"kind\":\"api_key\",\"key\":\"sk-gw\",\"stored_at\":1}");
+    const beside = try case.run(&.{}, &.{ "providers", "list" });
+    try beside.expectExit(0);
+    try expectContains(beside.stdout, "1 provider(s) of your own in ");
+    try expectAbsent(beside.stdout, "gateway  (no definition left)");
+    try expectContains(beside.stdout, "relay  (no definition left)");
+    try expectContains(beside.stdout, "2 id(s) with only a stored key or login left; ");
+}
+
+test "logout --provider forgets the key and login left for an id that is no longer defined" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    const a = case.arena();
+    try case.write("state/keys/relay.json", "{\"schema_version\":1,\"kind\":\"api_key\",\"key\":\"sk-left\",\"stored_at\":1}");
+    try case.write("state/oauth/relay.json", "{\"access_token\":\"at-relay\",\"refresh_token\":\"rt-relay\",\"expires_at\":4102444800}");
+    try case.write("state/oauth/other.json", "{\"access_token\":\"at-other\",\"refresh_token\":\"rt-other\",\"expires_at\":4102444800}");
+
+    const out = try case.run(&.{}, &.{ "logout", "--provider", "relay" });
+    try out.expectExit(0);
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "Removed the stored key for relay ({s}/keys/relay.json).", .{case.state}));
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "Removed the stored login for relay ({s}/oauth/relay.json); relay is not defined here, so it was not revoked at the server.", .{case.state}));
+    try expectAbsent(out.stderr, "unknown provider");
+    try testing.expect(!case.exists("state/keys/relay.json"));
+    try testing.expect(!case.exists("state/oauth/relay.json"));
+    try testing.expect(case.exists("state/oauth/other.json"));
+
+    const again = try case.run(&.{}, &.{ "logout", "--provider", "relay" });
+    try again.expectExit(2);
+    try expectContains(again.stderr, "error: unknown provider 'relay'");
+}
+
+test "logout --provider fails when the login left for an undefined id cannot be removed" {
+    var case: Case = undefined;
+    if (!try case.init()) return error.SkipZigTest;
+    defer case.deinit();
+    try case.write("state/oauth/relay.json/held", "");
+
+    const out = try case.run(&.{}, &.{ "logout", "--provider", "relay" });
+    try out.expectExit(1);
+    try expectContains(out.stderr, "warning: the stored login for relay could not be removed: ");
+    try expectAbsent(out.stderr, "Removed the stored login");
     try testing.expect(case.exists("state/oauth/relay.json/held"));
 }
 

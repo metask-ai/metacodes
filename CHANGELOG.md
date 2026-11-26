@@ -450,6 +450,16 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **`providers` shows and forgets what a removed provider left behind, and
+  fails when it cannot remove it.** `providers list` also lists an id that
+  has only a stored key (`keys/<id>.json`) or login (`oauth/<id>.json`)
+  left, with where each one is, and `logout --provider <id>` forgets them
+  for an id with no definition instead of answering `unknown provider`; with
+  no definition to name a revocation endpoint, the login is not revoked at
+  the server, and it says so. `providers remove`, and that `logout`, exit 1
+  when a stored key or login could not be removed: `remove` used to warn and
+  exit 0.
+
 - **A dialog left open no longer keeps a closed terminal waiting 45
   seconds** (#763). With `/help`, `/skills` or a `/login` pane open, a closed
   terminal (SIGHUP) or a `kill` (SIGTERM) went unnoticed until the 45-second
