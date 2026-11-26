@@ -103,6 +103,32 @@ CI runs the same gates on Linux, macOS and Windows. Pull requests from first-tim
 contributors wait for a maintainer to approve the workflow run; that is a
 GitHub setting, not a judgement on your change.
 
+### Cleaning up a merged branch
+
+Keep GitHub's **Automatically delete head branches** setting off. Merge with
+the usual approvals and checks, leaving the head branch in place. Deleting
+the base of an open stacked PR can close it.
+
+For your own same-repository delivery branch, set `head_branch` to the
+lower PR's head ref. Check before merging and again immediately before
+cleanup. One match is enough to keep the branch, including for draft PRs:
+
+```sh
+no_open_dependents() {
+  open_prs=$(gh pr list -R metask-ai/metacodes --state open \
+    --base "$head_branch" --limit 1 --json number) && [ "$open_prs" = '[]' ]
+}
+```
+
+If either check finds a PR or fails, keep the branch. Each upper PR's owner
+can then retarget it in stack order and recheck its diff, reviews and CI.
+Coordinate a fresh cleanup check once the owners have finished. When both
+checks pass, confirm the lower PR merged and the branch is disposable,
+neither default nor protected. Delete it with a Git lease against the merged
+PR's recorded head SHA so a later push keeps the branch alive. The PR query
+and Git deletion are separate operations. Coordinate with anyone preparing
+a new PR against the branch before deleting it.
+
 ## Getting help
 
 - Questions and design ideas: [GitHub Discussions](https://github.com/metask-ai/metacodes/discussions).
