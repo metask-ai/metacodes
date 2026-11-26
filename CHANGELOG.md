@@ -450,6 +450,14 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **A teammate's report is no longer shown as if the user had typed it.**
+  A report the lead's inbox brought in, between turns or while the lead sat
+  idle at the prompt, started the lead's next turn as it should, but was
+  echoed into the conversation as `❯ <teammate-status …>` or
+  `❯ <teammate-message …>`, like a prompt the user had written. It still
+  starts that turn and reaches the model unchanged; only what the user
+  queued during a reply is echoed now.
+
 - **`/login metask` without the TUI moves the session to the new
   sign-in.** With standard input not a terminal, `/login metask` stored a
   second Metask sign-in and revoked the first (#561), but the session went

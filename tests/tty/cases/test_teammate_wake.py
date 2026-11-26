@@ -118,6 +118,10 @@ def test_an_idle_lead_takes_a_teammate_report_without_a_key(bin_path):
         a._fail(f"the woken turn did not carry the teammate's report: {lead_requests[3][-1]!r}")
     if a.final.find_last_row("LEAD-SAW-TEAMMATE") is None:
         a._fail("the woken turn's reply is not on the screen")
+    echoed = sorted({sc.line_text(r).strip() for sc in a.frame_screens + [a.final] for r in range(sc.rows)
+                     if sc.line_text(r).strip().startswith("❯ <teammate-")})
+    if echoed:
+        a._fail(f"the teammate's report was echoed as typed input: {echoed}")
 
 
 def test_a_lead_with_a_draft_in_the_box_is_not_woken_by_a_teammate_report(bin_path):

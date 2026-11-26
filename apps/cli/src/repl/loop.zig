@@ -223,6 +223,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         g_idle_lead_report = null;
         allocator.free(report);
     };
+    var lead_reports: std.ArrayList(u8) = .empty;
+    defer lead_reports.deinit(allocator);
     var unsent_draft: ?input.LineEditor = null;
     defer if (unsent_draft) |*draft| draft.deinit();
 
@@ -263,32 +265,39 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         // 入队当作下一轮 user input(idle→立即;有 draft→排在队尾)。
         if (g_idle_lead_report) |report| {
             g_idle_lead_report = null;
-            _ = msg_queue.push(report);
-            allocator.free(report);
+            defer allocator.free(report);
+            appendLeadReport(allocator, &lead_reports, report) catch {};
         }
         if (app.swarm.hasTeam()) {
             if (@import("metacodes-internal").swarm.tools.pollLeadInbox(allocator, &app.swarm) catch null) |pulled| {
-                _ = msg_queue.push(pulled);
-                allocator.free(pulled);
+                defer allocator.free(pulled);
+                appendLeadReport(allocator, &lead_reports, pulled) catch {};
             }
         }
+        const queued_count = msg_queue.len() + @intFromBool(lead_reports.items.len > 0);
 
-        if (app.unbound() == null and shouldRunLoopContinuation(app, msg_queue.len())) {
+        if (app.unbound() == null and shouldRunLoopContinuation(app, queued_count)) {
             try runLoopContinuation(&turn_host);
             continue;
         }
 
         // tty:输入框(含状态/footer)由 readLineRaw 内的 RenderRegion 自画(钉底)。
         // 非 tty:保留裸 "> " prompt 供 pipe 模式可读。
-        const has_queued = msg_queue.len() > 0;
+        const has_queued = queued_count > 0;
         if (!tty and !has_queued) cmd_output.print("> ", .{});
 
         const line = if (msg_queue.popAllJoined("\n\n")) |q| blk: {
             // 待发送队列消费:上一轮生成期入队的(可能多条)消息一次性合并 → 本轮 input,
             // 回显 ❯ <内容> 到 scrollback。多条用空行分隔合成一次提交(对齐 cc 同模式批量)。
             echoUserSubmission(app, q, if (tui_region) |*r| r else null);
-            break :blk q; // q owned,与 readLine 返回所有权一致
-        } else if (tty)
+            if (lead_reports.items.len == 0) break :blk q; // q owned,与 readLine 返回所有权一致
+            const joined = std.mem.concat(allocator, u8, &.{ q, "\n\n", lead_reports.items }) catch break :blk q;
+            allocator.free(q);
+            lead_reports.clearRetainingCapacity();
+            break :blk joined;
+        } else if (lead_reports.items.len > 0)
+            lead_reports.toOwnedSlice(allocator) catch continue
+        else if (tty)
             readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?, &unsent_draft, true) catch |err| switch (err) {
                 // The double-press exits leave quietly, as Claude Code does;
                 // only `/exit` says goodbye.
@@ -1683,6 +1692,11 @@ fn endInputRegion(app: *app_mod.App, region: *render_region_mod.RenderRegion) vo
     if (region.ui.phase != .input) return;
     if (region.pickerOpen()) app.pending_overlay = .model_picker_kept;
     region.endInput();
+}
+
+fn appendLeadReport(allocator: std.mem.Allocator, reports: *std.ArrayList(u8), report: []const u8) !void {
+    if (reports.items.len > 0) try reports.appendSlice(allocator, "\n\n");
+    try reports.appendSlice(allocator, report);
 }
 
 /// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。
