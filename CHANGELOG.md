@@ -459,6 +459,10 @@ status, compatibility boundaries, and entry points are defined by
   Home and End, also with only Caps Lock or Num Lock in the modifier; with
   Shift, Alt or Ctrl they are still ignored, like the other cursor and
   editing keys.
+- **AskUserQuestion's Other answer no longer offers Ctrl+G.** The footer
+  said `ctrl+g to edit in Vim`, which does nothing while typing an Other
+  answer; Ctrl+G opens the editor only for a note.
+
 - **An MCP result with half a surrogate pair in its text is read, with
   U+FFFD for that half.** It was rejected as invalid JSON, so the call
   failed and the model never saw the text.
