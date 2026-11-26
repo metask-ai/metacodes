@@ -1379,6 +1379,16 @@ function tracePanel(steps, trial) {
       h('span', { text: '工具' })), h('div', { class: 'trace-scroll', tabindex: '0' }, chart)), detail));
 }
 
+function usagePanel(title, counts, empty) {
+  if (!counts) return panel(title, null, h('div', { class: 'empty', text: '暂无统计数据' }));
+  const total = counts.reduce((sum, [, n]) => sum + n, 0);
+  const max = counts.reduce((largest, [, n]) => Math.max(largest, n), 1);
+  return panel(title, total + ' 次', counts.length ? h('div', { class: 'panel-body bars' }, counts.map(([name, n]) =>
+    h('div', { class: 'bar-row' }, h('span', { class: 'tool-name', text: name ?? '名称未知' }),
+      h('div', { class: 'bar' }, h('span', { width: (100 * n / max) + '%' })), h('span', { class: 'num', text: n }))))
+    : h('div', { class: 'empty', text: empty }));
+}
+
 function trialBody(t) {
   const r = t.row;
   const metrics = h('section', { class: 'metrics' },
@@ -1406,12 +1416,9 @@ function trialBody(t) {
     .map((x) => h('div', { class: 'test' }, badge(x.status === 'passed' ? 'pass' : x.status === 'failed' ? 'fail' : 'invalid'),
       h('span', { class: 'mono', text: x.name.split('::').pop() }), x.message ? h('span', { class: 'msg', text: x.message }) : null)))
     : h('div', { class: 'empty', text: '判分没有写出逐条测试报告' });
-  const maxTool = Math.max(1, ...t.tools.map(([, n]) => n));
-  const tools = t.tools.length ? h('div', { class: 'panel-body bars' }, t.tools.map(([name, n]) =>
-    h('div', { class: 'bar-row' }, h('span', { class: 'tool-name', text: name }), h('div', { class: 'bar' }, h('span', { width: (100 * n / maxTool) + '%' })), h('span', { class: 'num', text: n }))))
-    : h('div', { class: 'empty', text: '没有工具调用' });
-  parts.push(h('div', { class: 'grid-2' }, panel('判分测试', t.tests ? `${t.tests.passed}/${t.tests.total} 通过` : null, tests), panel('工具使用', `${t.tools.reduce((a, [, n]) => a + n, 0)} 次`, tools)));
-
+  parts.push(panel('判分测试', t.tests ? `${t.tests.passed}/${t.tests.total} 通过` : null, tests));
+  parts.push(h('div', { class: 'grid-2' }, usagePanel('工具使用', t.tools, '没有工具调用'),
+    usagePanel('Skill 使用', t.skills, '没有 Skill 调用')));
   parts.push(tracePanel(t.steps, r.trial));
   parts.push(h('div', { class: 'grid-2' },
     panel('判分输出', '末尾', h('div', { class: 'panel-body' }, t.verifier_output ? h('pre', { class: 'block', text: t.verifier_output }) : h('div', { class: 'empty', text: '无' }))),
