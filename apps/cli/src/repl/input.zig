@@ -258,8 +258,8 @@ pub const KeyParser = struct {
     }
 
     fn feedCarried(self: *KeyParser, b: u8, more_queued: bool) void {
+        self.burst.lf_closes_newline = b == '\r';
         if (self.state == .normal and !self.in_bracketed_paste and (b == '\r' or b == '\n')) {
-            self.burst.lf_closes_newline = b == '\r';
             self.push(.shift_enter);
             return;
         }
@@ -3203,6 +3203,49 @@ test "feedRead: after a bracketed paste read the way the prompt reads it, the ne
     @import("metacodes-internal").platform.sync.sleepMs(30);
     try testing.expect(pfs.writeAll(fds[1], "\r"));
     try testing.expectEqual(Key.enter, (try readKeys(fds[0], &parser, 1, &buf))[0]);
+}
+
+fn readUntilQuiet(fd: c_int, parser: *KeyParser, out: []Key) []Key {
+    var n: usize = 0;
+    while (n < out.len) {
+        if (parser.drain()) |key| {
+            out[n] = key;
+            n += 1;
+            continue;
+        }
+        if (platform_term.waitReadable(fd, 50) <= 0) break;
+        var b: [1]u8 = undefined;
+        if (platform_term.readInput(fd, &b) != 1) break; // no EINTR: waitReadable reported data
+        if (parser.feedEditorRead(fd, b[0])) |key| {
+            out[n] = key;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+test "feedRead: a paste mixing CR, LF and CR LF reads at the prompt as the timed model parses it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const pastes = [_]struct { bytes: []const u8, text: []const u8 }{
+        .{ .bytes = "one\rX\nthree", .text = "one\nX\nthree" },
+        .{ .bytes = "a\rb\nc\r\nd\re", .text = "a\nb\nc\nd\ne" },
+        .{ .bytes = "x\r\r\ny\rz\n", .text = "x\n\ny\nz\n" },
+    };
+    for (pastes) |paste| {
+        errdefer std.debug.print("paste {f}\n", .{std.ascii.hexEscape(paste.bytes, .upper)});
+        var model_buf: [32]Key = undefined;
+        const model = parseTimed(&.{.{ .bytes = paste.bytes, .after_ms = 1000 }}, &model_buf);
+        var text: [32]u8 = undefined;
+        try testing.expectEqualStrings(paste.text, typedText(model, &text));
+        var parser = KeyParser{};
+        try testing.expect(pfs.writeAll(fds[1], paste.bytes));
+        var buf: [32]Key = undefined;
+        try testing.expectEqualSlices(Key, model, readUntilQuiet(fds[0], &parser, &buf));
+    }
 }
 
 /// `stream` read the way platform/terminal.zig reads a console that sends
