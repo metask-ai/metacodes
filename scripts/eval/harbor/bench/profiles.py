@@ -480,6 +480,51 @@ class ProfileManager:
             self.save(record)
         return {"id": record["id"], "auto_rerun_invalid": enabled}
 
+    def set_authoritative(self, profile: Any, suite: Any, model: Any, run: Any,
+                          check_run: Any = None) -> Dict[str, Any]:
+        if not isinstance(suite, str) or not suite:
+            raise ValueError("suite 必须是非空字符串")
+        if model is not None and not isinstance(model, str):
+            raise ValueError("model 必须是字符串或 null")
+        model_key = model or ""
+        clear = run is None or run == ""
+        if not clear and (not isinstance(run, str) or not data.NAME.fullmatch(run)):
+            raise ValueError("run 名称无效")
+        with self.lock:
+            record = self.get(profile)
+            if record is None:
+                raise ValueError("评测配置不存在")
+            if clear:
+                table = record.get("authoritative")
+                if isinstance(table, dict) and isinstance(table.get(suite), dict):
+                    table[suite].pop(model_key, None)
+                    if not table[suite]:
+                        table.pop(suite, None)
+                prune_authoritative(record)
+                self.save(record)
+                return public(record)
+            matches = [item for item in record.get("items") or []
+                       if item.get("suite") == suite and (item.get("model") or "") == model_key
+                       and item.get("run") == run]
+            if not matches:
+                raise ValueError("这个评测结果不属于当前 Profile 的该评测集和模型")
+            if not any(item.get("status") in ITEM_DONE for item in matches):
+                raise ValueError("请等这个评测结束后再设为权威")
+            if check_run is not None:
+                check_run(run)
+            table = record.get("authoritative")
+            if not isinstance(table, dict):
+                table = {}
+                record["authoritative"] = table
+            per_suite = table.get(suite)
+            if not isinstance(per_suite, dict):
+                per_suite = {}
+                table[suite] = per_suite
+            per_suite[model_key] = run
+            prune_authoritative(record)
+            self.save(record)
+            return public(record)
+
     def cancel(self, profile: Any) -> Dict[str, Any]:
         with self.lock:
             record = self.get(profile)
@@ -529,6 +574,7 @@ class ProfileManager:
                 record["concurrency"] = profile_concurrency(record)
                 record.setdefault("next_item_index", len(record["items"]))
                 record["items"] = [item for item in record["items"] if item["submission"] != submission]
+                prune_authoritative(record)
                 self.save(record)
             elif action == "run":
                 if any(item["status"] not in ITEM_DONE for item in items):
@@ -817,17 +863,66 @@ def profile_concurrency(record: Dict[str, Any]) -> int:
     return latest or DEFAULT_CONCURRENCY
 
 
+def authoritative_map(record: Dict[str, Any]) -> Dict[tuple[str, str], str]:
+    raw = record.get("authoritative")
+    if not isinstance(raw, dict):
+        return {}
+    available = {(item.get("suite"), item.get("model") or "", item.get("run"))
+                 for item in record.get("items") or [] if isinstance(item, dict) and item.get("run")}
+    found: Dict[tuple[str, str], str] = {}
+    for suite, per_model in raw.items():
+        if not isinstance(suite, str) or not isinstance(per_model, dict):
+            continue
+        for model_key, run in per_model.items():
+            if not isinstance(model_key, str) or not isinstance(run, str) or not run:
+                continue
+            if (suite, model_key, run) in available:
+                found[(suite, model_key)] = run
+    return found
+
+
+def authoritative_dict(mapping: Dict[tuple[str, str], str]) -> Dict[str, Dict[str, str]]:
+    nested: Dict[str, Dict[str, str]] = {}
+    for (suite, model_key), run in sorted(mapping.items()):
+        nested.setdefault(suite, {})[model_key] = run
+    return nested
+
+
+def prune_authoritative(record: Dict[str, Any]) -> bool:
+    before = record.get("authoritative")
+    cleaned = authoritative_dict(authoritative_map(record))
+    if cleaned:
+        record["authoritative"] = cleaned
+    else:
+        record.pop("authoritative", None)
+    return record.get("authoritative") != before
+
+
+def submission_labels(record: Dict[str, Any]) -> Dict[str, str]:
+    labels: Dict[str, str] = {}
+    for item in record.get("items") or []:
+        sub = item.get("submission")
+        if sub and sub not in labels:
+            labels[sub] = f"作业 {len(labels) + 1}"
+    return labels
+
+
 def public(record: Dict[str, Any]) -> Dict[str, Any]:
     """A profile record without the internal per-item launch requests."""
     value = restore_submissions(json.loads(json.dumps(record)))
     value["default_name"] = default_name(record)
     value["concurrency"] = profile_concurrency(record)
+    auth = authoritative_map(value)
+    labels = submission_labels(value)
+    value["authoritative"] = authoritative_dict(auth)
     for item in value.get("items") or []:
         if item.get("status") == "pending":
             try:
                 item["concurrency"] = dataset_concurrency(item["suite"], value["concurrency"])
             except ValueError:
                 item["concurrency"] = value["concurrency"]
+        item["submission_label"] = labels.get(item.get("submission"))
+        item["authoritative"] = bool(item.get("run") and auth.get((item["suite"], item.get("model") or "")) == item.get("run"))
         item.pop("request", None)
         item.pop("route", None)
     return value

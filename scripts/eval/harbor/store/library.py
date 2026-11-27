@@ -236,7 +236,21 @@ class StoreLibrary:
                     items = [item for item in record.get("items") or [] if item.get("run") == job]
                     for item in items:
                         item["run"] = None
-                    if items:
+                    changed = bool(items)
+                    auth = record.get("authoritative")
+                    if isinstance(auth, dict):
+                        for suite in list(auth):
+                            per_model = auth.get(suite)
+                            if not isinstance(per_model, dict):
+                                continue
+                            for model_key in [k for k, v in per_model.items() if v == job]:
+                                per_model.pop(model_key, None)
+                                changed = True
+                            if not per_model:
+                                auth.pop(suite, None)
+                        if not auth:
+                            record.pop("authoritative", None)
+                    if changed:
                         tx.execute("UPDATE profiles SET record_json = ? WHERE id = ?", (ingest._json(record), profile))
 
     def _owned_sources(self, owners, label: str):

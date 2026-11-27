@@ -348,6 +348,50 @@ class LeaderboardTest(unittest.TestCase):
         self.assertEqual(job_detail["profile_name"], "v0.13.0-formal-gate")
         self.assertEqual(job_detail["profile_version"], "0.13.0")
         self.assertEqual(job_detail["profile_features"], ["formal-gate"])
+        self.assertEqual(job_detail["submission_label"], "作业 2")
+        self.assertFalse(job_detail["authoritative"])
+
+    def test_leaderboard_prefers_authoritative_run_over_newer_runs(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        for name, started, reward in (
+            ("p1-old", "2026-11-24T08:00:00Z", 0.25),
+            ("p1-new", "2026-11-25T08:00:00Z", 1.0),
+            ("p1-partial", "2026-11-25T10:00:00Z", 1.0),
+        ):
+            job = _job(root, name, "same-model", planned=2)
+            _write(job / "result.json", {"started_at": started, "finished_at": started, "n_total_trials": 2})
+            _trial(job, "task0__aaa", reward=reward)
+            if name != "p1-partial":
+                _trial(job, "task1__aaa", reward=reward)
+        profile_path = root / ".bench-profiles" / "prof-a.json"
+        record = {
+            "id": "prof-a", "name": "v0.13.0", "status": "finished",
+            "created_at": "2026-11-25T00:00:00Z", "features": [],
+            "metacodes": {"label": "0.13.0"},
+            "authoritative": {"terminal-bench-2.1": {"same-model": "p1-old"}},
+            "items": [
+                {"submission": "s1", "suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-old", "status": "finished", "tasks": ["task0", "task1"]},
+                {"submission": "s2", "suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-new", "status": "finished", "tasks": ["task0", "task1"]},
+                {"submission": "s3", "suite": "terminal-bench-2.1", "model": "same-model", "run": "p1-partial", "status": "finished", "tasks": ["task0"]},
+            ],
+        }
+        _write(profile_path, record)
+        wb = Workbench(data.Library([root]))
+        self.addCleanup(wb.close)
+        board = wb.leaderboard("terminal-bench-2.1")
+        ranked = [j for j in board["boards"][1]["jobs"] if j["ranked"]]
+        self.assertEqual([j["name"] for j in ranked], ["p1-old"])
+        self.assertTrue(ranked[0]["authoritative"])
+        self.assertEqual(board["unranked"], [])
+
+        record["authoritative"] = {"terminal-bench-2.1": {"same-model": "p1-partial"}}
+        _write(profile_path, record)
+        wb.library.sync()
+        board2 = wb.leaderboard("terminal-bench-2.1")
+        self.assertEqual([j for j in board2["boards"][1]["jobs"] if j["ranked"]], [])
+        self.assertEqual([j["name"] for j in board2["unranked"]], ["p1-partial"])
+        self.assertTrue(board2["unranked"][0]["authoritative"])
 
 
 class ServerTest(unittest.TestCase):
@@ -609,6 +653,119 @@ ctx.api = async () => payload;
             ["0.12.0", "verification_final_gate", "requirement_ledger", "test_integrity", "delivery_cadence", "stall_gate"],
             ["0.12.0", "默认功能"],
         ])
+
+    def test_cross_profile_compare_dock_prefers_authoritative_run(self):
+        result = self._run_js("""
+const chosen = [
+  {
+    id: 'prof-a', name: 'Profile A',
+    items: [
+      { submission: 's1', suite: 'fh', suite_name: 'FH', model: 'model-x', tasks: ['t1', 't2'], authoritative: true,
+        started_at: '2026-11-24T10:00:00Z', job: { name: 'a-auth', planned: 2, started_at: '2026-11-24T10:00:00Z' } },
+      { submission: 's2', suite: 'fh', suite_name: 'FH', model: 'model-x', tasks: ['t1', 't2', 't3', 't4'], authoritative: false,
+        started_at: '2026-11-25T10:00:00Z', job: { name: 'a-newer', planned: 4, started_at: '2026-11-25T10:00:00Z' } },
+    ],
+  },
+  {
+    id: 'prof-b', name: 'Profile B',
+    items: [
+      { submission: 's1', suite: 'fh', suite_name: 'FH', model: 'model-x', tasks: ['t1', 't2'], authoritative: false,
+        started_at: '2026-11-24T10:30:00Z', job: { name: 'b-x', planned: 2, started_at: '2026-11-24T10:30:00Z' } },
+    ],
+  },
+];
+const dock = vm.runInContext('multiProfileCompareDock', ctx)(chosen);
+const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+const all = walk(dock);
+const link = all.find((n) => n.tagName === 'a');
+const selects = all.filter((n) => n.tagName === 'select');
+const labelsA = selects[1].children.map((o) => o.textContent);
+console.log(JSON.stringify({ href: link.href, labelsA }));
+""")
+        self.assertEqual(result["href"], "#/compare/a-auth,b-x")
+        self.assertTrue(any("★ 权威" in label and "a-auth" in label for label in result["labelsA"]))
+
+    def test_same_profile_compare_shows_job_labels_and_authoritative_override(self):
+        result = self._run_js("""
+const jobs = {
+  'run-1': {
+    name: 'run-1', model: 'm', suite: 'terminal-bench-2.1', suite_name: 'TB 2.1',
+    profile: 'prof-a', profile_name: 'Profile A', submission_label: '作业 1',
+    profile_item_model: 'm', authoritative: false, running: false,
+    summary: { cost_per_task: 0.02, cost_per_pass: 0.02, tasks_solved: 1, tasks_attempted: 1,
+               total_tokens: 1000, token_trials: 1, cache_hit_rate: 0.5 },
+    rows: [{ task: 't1', trial: 't1__a', first_attempt: true, status: 'fail', cost_usd: 0.02, total_tokens: 1000, elapsed_s: 10 }],
+  },
+  'run-2': {
+    name: 'run-2', model: 'm', suite: 'terminal-bench-2.1', suite_name: 'TB 2.1',
+    profile: 'prof-a', profile_name: 'Profile A', submission_label: '作业 2',
+    profile_item_model: 'm', authoritative: true, running: false,
+    summary: { cost_per_task: 0.01, cost_per_pass: 0.01, tasks_solved: 1, tasks_attempted: 1,
+               total_tokens: 800, token_trials: 1, cache_hit_rate: 0.6 },
+    rows: [{ task: 't1', trial: 't1__b', first_attempt: true, status: 'pass', cost_usd: 0.01, total_tokens: 800, elapsed_s: 8 }],
+  },
+};
+const posts = [];
+ctx.render = async () => {};
+ctx.api = async (url, payload) => {
+  if (payload !== undefined) { posts.push({ url, payload }); return {}; }
+  if (url.startsWith('/api/profile?')) return { id: 'prof-a', name: 'Profile A', can_run: true };
+  return jobs[decodeURIComponent(url.split('name=')[1])];
+};
+(async () => {
+  const root = await vm.runInContext('renderCompare', ctx)(['run-1', 'run-2'], 'prof-a');
+  const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+  const tables = walk(root).filter((n) => n.tagName === 'table');
+  const summaryRows = walk(tables[0]).filter((n) => n.tagName === 'tr').slice(1);
+  const firstCells = summaryRows.map((tr) => tr.children[0].textContent);
+  const buttons = walk(tables[0]).filter((n) => n.tagName === 'button' && (n.textContent === '设为权威' || n.textContent === '取消权威'));
+  buttons[0].dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  console.log(JSON.stringify({ title: nodes['#title'].textContent, firstCells, buttonLabels: buttons.map((b) => b.textContent), posts }));
+})();
+""")
+        self.assertEqual(result["title"], "作业对比台")
+        self.assertIn("作业 1", result["firstCells"][0])
+        self.assertIn("作业 2", result["firstCells"][1])
+        self.assertIn("权威", result["firstCells"][1])
+        self.assertEqual(result["buttonLabels"], ["设为权威", "取消权威"])
+        self.assertEqual(result["posts"], [{
+            "url": "/api/profile/authoritative",
+            "payload": {"id": "prof-a", "suite": "terminal-bench-2.1", "model": "m", "run": "run-1"},
+        }])
+
+    def test_profile_authoritative_panel_selects_and_links_job_comparison(self):
+        result = self._run_js("""
+const profile = {
+  id: 'prof-a', name: 'Profile A', can_run: true,
+  items: [
+    { submission: 's1', suite: 'terminal-bench-2.1', suite_name: 'Terminal-Bench 2.1', model: 'm', status: 'finished',
+      tasks: ['t1'], authoritative: false, job: { name: 'run-1', planned: 1, running: false, summary: { first_pass_rate: 0.5 } } },
+    { submission: 's2', suite: 'terminal-bench-2.1', suite_name: 'Terminal-Bench 2.1', model: 'm', status: 'finished',
+      tasks: ['t1'], authoritative: true, job: { name: 'run-2', planned: 1, running: false, summary: { first_pass_rate: 1.0 } } },
+  ],
+};
+const posts = [];
+ctx.render = async () => {};
+ctx.api = async (url, payload) => { posts.push({ url, payload }); return {}; };
+const groups = vm.runInContext('groupedItems', ctx)(profile);
+const panel = vm.runInContext('authoritativePanel', ctx)(profile, groups, false);
+const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+const all = walk(panel);
+const sel = all.find((n) => n.tagName === 'select');
+const compare = all.find((n) => n.tagName === 'a');
+sel.value = 'run-1';
+sel.dispatch('change');
+setTimeout(() => {
+  console.log(JSON.stringify({ href: compare.attrs.href, optionValues: sel.children.map((o) => o._value), posts }));
+}, 0);
+""")
+        self.assertEqual(result["href"], "#/profile/prof-a/compare/run-1,run-2")
+        self.assertEqual(result["optionValues"], ["", "run-2", "run-1"])
+        self.assertEqual(result["posts"], [{
+            "url": "/api/profile/authoritative",
+            "payload": {"id": "prof-a", "suite": "terminal-bench-2.1", "model": "m", "run": "run-1"},
+        }])
 
 
 if __name__ == "__main__":

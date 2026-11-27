@@ -15,7 +15,15 @@ from typing import Any, Dict, Optional
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.suites import leaderboards
 from scripts.eval.harbor.bench import builds, data, executors, monitor, results
-from scripts.eval.harbor.bench.profiles import PROFILE_ACTIVE, ProfileManager, public as public_profile, runs_of
+from scripts.eval.harbor.bench.profiles import (
+    PROFILE_ACTIVE,
+    ProfileManager,
+    authoritative_map,
+    prune_authoritative,
+    public as public_profile,
+    runs_of,
+    submission_labels,
+)
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
 from scripts.eval.harbor.store import config as store_config
@@ -52,21 +60,52 @@ def task_group(task, rows, item, job):
     return group
 
 
+def _item_tasks(view):
+    by_task = {}
+    for row in view.get("rows") or []:
+        by_task.setdefault(row["task"], []).append(row)
+    by_task.update(view.get("task_summaries") or {})
+    return by_task
+
+
+def _active_authoritative(record, views):
+    auth = authoritative_map(record)
+    active = {}
+    for (suite, model_key), run in auth.items():
+        if run not in views:
+            continue
+        chosen = next((item for item in reversed(record.get("items") or [])
+                       if item.get("suite") == suite and (item.get("model") or "") == model_key
+                       and item.get("run") == run), None)
+        if chosen is not None:
+            active[(suite, model_key)] = (chosen, run)
+    return active
+
+
 def latest_results(record, views):
-    """Per (suite, model, task), the rows of the last run that has them: a
-    rerun replaces the earlier result, which stays in `history` (job names,
-    oldest first). A run that stopped (cancelled, interrupted, failed) with
-    only invalid attempts of a task leaves that task's earlier result."""
+    active_auth = _active_authoritative(record, views)
     latest, history = {}, {}
+    for (suite, _model_key), (chosen, run) in active_auth.items():
+        view = views[run]
+        for task, rows in _item_tasks(view).items():
+            latest[(suite, chosen.get("model"), task)] = (chosen, view["name"], rows)
     for item in record.get("items") or []:
         view = views.get(item.get("run")) if item.get("run") else None
         if view is None:
             continue
+        suite_model = (item["suite"], item.get("model") or "")
+        by_task = _item_tasks(view)
+        if suite_model in active_auth:
+            if view["name"] == active_auth[suite_model][1]:
+                continue
+            for task in by_task:
+                key = (item["suite"], item.get("model"), task)
+                if key in latest:
+                    prev = history.setdefault(key, [])
+                    if view["name"] not in prev:
+                        prev.append(view["name"])
+            continue
         stopped = item["status"] in ("cancelled", "interrupted", "failed")
-        by_task = {}
-        for row in view.get("rows") or []:
-            by_task.setdefault(row["task"], []).append(row)
-        by_task.update(view.get("task_summaries") or {})
         for task, rows in by_task.items():
             key = (item["suite"], item.get("model"), task)
             invalid = rows["counts"]["invalid"] == rows["trials"] if isinstance(rows, dict) else all(
@@ -83,6 +122,8 @@ def _profile_lookup(records):
     by_id, by_job = {}, {}
     for record in records:
         pub = public_profile(record)
+        labels = submission_labels(pub)
+        auth = authoritative_map(pub)
         meta = {
             "profile": pub["id"],
             "profile_name": pub.get("name") or pub.get("default_name") or pub["id"],
@@ -91,8 +132,16 @@ def _profile_lookup(records):
         }
         by_id[pub["id"]] = meta
         for item in pub.get("items") or []:
-            if item.get("run"):
-                by_job[item["run"]] = meta
+            run = item.get("run")
+            if run:
+                by_job[run] = {
+                    **meta,
+                    "submission": item.get("submission"),
+                    "submission_label": labels.get(item.get("submission")),
+                    "item_index": item.get("index"),
+                    "profile_item_model": item.get("model"),
+                    "authoritative": auth.get((item["suite"], item.get("model") or "")) == run,
+                }
     return by_id, by_job
 
 
@@ -427,7 +476,24 @@ class Workbench:
         names = set(self.library.job_names()).union(n for n, r in runs.items() if r.get("worker_summary"))
         views = [view for view in (self.job_view(name, True, runs, aggregate=True) for name in sorted(names))
                  if view and view.get("suite") == suite_id and not view["running"]]
-        by_id, by_job = _profile_lookup(self.profile_records())
+        records = self.profile_records()
+        by_id, by_job = _profile_lookup(records)
+        view_names = {view["name"] for view in views}
+        auth_runs = {}
+        for record in records:
+            for (auth_suite, model_key), run in authoritative_map(record).items():
+                if auth_suite == suite_id and run in view_names:
+                    auth_runs[(record["id"], model_key)] = run
+        filtered_views = []
+        for view in views:
+            meta = by_job.get(view["name"]) or by_id.get(view.get("profile"))
+            if meta:
+                model_key = (meta["profile_item_model"] or "") if "profile_item_model" in meta else (view.get("model") or "")
+                pinned = auth_runs.get((meta["profile"], model_key))
+                if pinned is not None and view["name"] != pinned:
+                    continue
+            filtered_views.append(view)
+        views = filtered_views
         boards, ranked_anywhere, ranked_profiles = [], set(), set()
         for board in (b for b in published if suite_id in b["suites"]):
             tasks = set(board["tasks"]) if board.get("tasks") else None
@@ -497,15 +563,23 @@ class Workbench:
             if view is not None:
                 full[view["name"]] = view
         value = self.profile_summary(record, full)
+        active_auth = _active_authoritative(record, full)
         latest, history = latest_results(record, full)
-        tasks = [{**task_group(task, rows, item, job), "history": history.get(key, [])}
+        labels = submission_labels(value)
+        tasks = [{**task_group(task, rows, item, job),
+                  "submission": item.get("submission"),
+                  "submission_label": labels.get(item.get("submission")),
+                  "authoritative": (item["suite"], item.get("model") or "") in active_auth,
+                  "history": history.get(key, [])}
                  for key, (item, job, rows) in latest.items() for task in [key[2]]]
         for item in value["items"]:
             item["local_run"] = item.get("run") in local_names
+            if (item["suite"], item.get("model") or "") in active_auth:
+                continue
             if item["status"] in ("pending", "running") and item.get("run") not in full:
                 tasks += [{"task": t, "job": None, "suite": item["suite"], "suite_name": item.get("suite_name"),
                            "model": item.get("model"), "attempts": [], "first_status": None, "passed": 0,
-                           "valid": 0, "history": []}
+                           "valid": 0, "authoritative": False, "history": []}
                           for t in item.get("tasks") or [] if (item["suite"], item.get("model"), t) not in latest]
         value["tasks"] = sorted(tasks, key=lambda t: (t["suite"], t["model"] or "", t["task"]))
         return value
@@ -580,6 +654,22 @@ class Workbench:
             raise ValueError(READ_ONLY)
         return self.profiles.set_auto_rerun(profile, enabled)
 
+    def set_profile_authoritative(self, profile, suite, model, run) -> Dict[str, Any]:
+        if not self.manager:
+            raise ValueError(READ_ONLY)
+        self.library.maybe_sync()
+        if self.profiles.get(profile) is None and any(r["id"] == profile for r in self.profile_records()):
+            raise ValueError(f"评测配置 {profile} 来自共用数据库里的其他 jobs 目录，请在那个 jobs 目录的工作台设置权威评测")
+
+        def check_run(name):
+            view = self.job_view(name, with_rows=False, aggregate=True)
+            if view is None:
+                raise ValueError("找不到该评测的结果数据，无法设为权威")
+            if view.get("running"):
+                raise ValueError("请等这个评测结束后再设为权威")
+
+        return self.profiles.set_authoritative(profile, suite, model, run, check_run=check_run)
+
     def rename_profile(self, profile, name) -> Dict[str, Any]:
         if not self.manager:
             raise ValueError(READ_ONLY)
@@ -630,7 +720,8 @@ class Workbench:
             items = [item for item in record["items"] if item.get("run") == name]
             for item in items:
                 item["run"] = None
-            if items:
+            pruned = prune_authoritative(record)
+            if items or pruned:
                 self.profiles.save(record)
         self._remove_run_files([name], worker_jobs)
 

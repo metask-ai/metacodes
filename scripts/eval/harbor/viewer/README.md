@@ -14,7 +14,7 @@ python3 -m scripts.eval.harbor.viewer.server --jobs-dir ~/harbor-runs --port 187
 | View | Answers |
 |---|---|
 | Profiles `#/` | profile versions and status, profile comparison, and historical standalone evaluations |
-| Profile `#/profile/<id>` | frozen metacodes version and advanced features, jobs grouped by submission with job and evaluation controls, comparisons between jobs, every task's latest attempts (a rerun replaces the earlier result); set its concurrency (并发数, for every dataset it runs), rename it, run it again or rerun its tasks with invalid attempts (automatically too, when 自动重跑 is on), stop its queue, delete it once ended |
+| Profile `#/profile/<id>` | frozen metacodes version and advanced features, jobs grouped by submission with job and evaluation controls, per-suite authoritative evaluation overrides (评测权威与作业对比) and multi-job comparisons, every task's authoritative or latest attempts; set its concurrency (并发数, for every dataset it runs), rename it, run it again or rerun its tasks with invalid attempts (automatically too, when 自动重跑 is on), stop its queue, delete it once ended |
 | 任务 `#/profile/<id>/task/<job>/<task>[/<trial>]` | attempts side by side, then the selected attempt as on the trial view, with previous/next task and the replaced runs |
 | 创建作业 (dialog in Profiles) | executor, metacodes version and advanced features (the profile), models, several suites and their tasks, attempts (concurrency is set on the profile page); the start button stays at the bottom of the window |
 | 系统配置 `#/settings` | database selection and migration, model providers and Metask account login |

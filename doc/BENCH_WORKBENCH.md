@@ -1475,11 +1475,20 @@ that the new value was saved and shows the concurrency WorkBuddy is still using.
 If an active run cannot be updated, the page reports the failure and the
 saved value still applies to the queue.
 
-A rerun replaces the earlier result: per suite, model and task the profile
+A rerun replaces the earlier result by default: per suite, model and task the profile
 counts only the attempts of the latest run that has them, and lists the
 replaced runs as the task's history. A run that stopped (cancelled,
 interrupted or failed) with only invalid attempts of a task leaves that
-task's earlier result in place. 创建作业 and 重跑无效的题 use one model: the
+task's earlier result in place. To choose which job's evaluation represents a
+suite (and model) instead of automatic latest-run merging, set an authoritative
+evaluation (`POST /api/profile/authoritative` with `id`, `suite`, `model` and
+`run`, or `run: null` to clear; 设为权威 / 取消权威 on the profile's 评测权威与作业对比
+panel, job queue rows, or same-profile 作业对比台). While an authoritative run is
+set for `(suite, model)`, the profile's summary metrics, overview card, task
+list, model comparison, cross-profile comparison default and public leaderboard
+all use that run's results exclusively; other runs of the same suite stay
+available for job-to-job comparison and task history. Deleting that run or its
+submission clears the authoritative selection automatically. 创建作业 and 重跑无效的题 use one model: the
 page's model filter, else the last run's. The profile page's 创建作业 opens the launch
 page on that profile with its datasets, tasks and last parameters, and
 重跑无效的题 keeps only the tasks whose latest attempts include an invalid one
@@ -1570,7 +1579,8 @@ the taubench.com text board for that domain (pass^1). On each board a finished j
 its finished trials on the board's tasks, an invalid trial counting 0, with
 cost per task as the mean over tasks of each task's mean priced cost; it is
 ranked when it covers at least 80% of those tasks, and a job ranked on no
-board is listed apart. When a board has
+board is listed apart. When a profile has designated an authoritative run for
+that suite and model, only that run represents the profile on the board. When a board has
 costs, a scatter plots pass rate against cost per task. Published numbers
 come from other harnesses, runtimes, attempt counts and judges, so a rank is
 a reference, not a like-for-like comparison. To refresh a board, edit its

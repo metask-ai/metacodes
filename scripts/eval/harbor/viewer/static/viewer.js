@@ -340,6 +340,17 @@ function groupedItems(b) {
   return [...groups].map(([id, entries], index) => ({ id, entries, label: '作业 ' + (index + 1) })).reverse();
 }
 
+async function setAuthoritative(profileId, suite, model, run, control) {
+  if (control) control.disabled = true;
+  try {
+    await api('/api/profile/authoritative', { id: profileId, suite, model: model ?? null, run: run || null });
+    await render();
+  } catch (error) {
+    if (control) control.disabled = false;
+    setConnection(false, error.message);
+  }
+}
+
 function comparisonPicker(profiles, crossProfile) {
   const bySuite = new Map();
   for (const profile of profiles) {
@@ -347,45 +358,88 @@ function comparisonPicker(profiles, crossProfile) {
       for (const { item } of group.entries) {
         if (!item.job) continue;
         if (!bySuite.has(item.suite)) bySuite.set(item.suite, []);
-        bySuite.get(item.suite).push({ run: item.job.name, suite: item.suite_name || item.suite,
-          owner: crossProfile ? profile.id : group.id,
-          label: [crossProfile ? profileName(profile) : null, group.label, item.model, item.tasks?.length ? `${item.tasks.length} 题` : null, item.run].filter(Boolean).join(' · ') });
+        const rate = item.job.summary?.first_pass_rate;
+        bySuite.get(item.suite).push({
+          run: item.job.name,
+          suite: item.suite_name || item.suite,
+          owner: crossProfile ? profile.id : item.job.name,
+          authoritative: Boolean(item.authoritative),
+          startedAt: item.job.started_at || item.started_at || '',
+          label: [
+            item.authoritative ? '★ 权威' : null,
+            crossProfile ? profileName(profile) : null,
+            group.label,
+            item.model,
+            item.tasks?.length ? `${item.tasks.length} 题` : null,
+            rate !== null && rate !== undefined ? pct(rate) : null,
+            item.run,
+          ].filter(Boolean).join(' · '),
+        });
       }
     }
   }
   const choices = [...bySuite].filter(([, entries]) => new Set(entries.map((e) => e.owner)).size > 1);
-  if (!choices.length) return h('p', { class: 'muted', text: '需要两个' + (crossProfile ? ' Profile' : '作业') + '都有同一评测集的结果。' });
+  if (!choices.length) return h('p', { class: 'muted', text: '需要至少两份同一评测集的结果才能对比。' });
   const key = profiles.map((p) => p.id).join(',');
   const picked = state.comparisons.get(key) || {};
+  const currentSuite = bySuite.has(picked.suite) ? picked.suite : choices[0][0];
   const suite = h('select', { 'aria-label': '对比评测集' }, choices.map(([id, entries]) =>
-    h('option', { value: id, selected: id === picked.suite }, entries[0].suite)));
-  const left = h('select', { 'aria-label': '第一份结果' });
-  const right = h('select', { 'aria-label': '第二份结果' });
-  const compare = h('a', { class: 'button', text: '逐题对比' });
-  const options = (entries, selected) => entries.map((e) => h('option', { value: e.run, selected: e.run === selected }, e.label));
-  function selectPair() {
-    const entries = bySuite.get(suite.value);
-    const first = entries.find((e) => e.run === left.value);
-    right.replaceChildren(...options(entries.filter((e) => e.owner !== first.owner), picked.right));
-    updateLink();
+    h('option', { value: id, selected: id === currentSuite }, entries[0].suite)));
+  const list = h('div', { class: 'cmp-run-list', role: 'group', 'aria-label': '选择参与对比的作业评测' });
+  const compare = h('a', { class: 'button primary sm', text: '逐题对比 →' });
+  const hint = h('span', { class: 'muted', style: 'font-size:12px' });
+
+  function selectedRuns(entries) {
+    const saved = picked.runsBySuite?.[suite.value];
+    const valid = Array.isArray(saved) ? saved.filter((r) => entries.some((e) => e.run === r)) : [];
+    if (valid.length >= 2) return new Set(valid);
+    const auth = entries.find((e) => e.authoritative);
+    const defaults = auth ? [auth, ...entries.filter((e) => e.run !== auth.run)].slice(0, 2) : entries.slice(0, 2);
+    return new Set(defaults.map((e) => e.run));
   }
-  function updateLink() {
-    Object.assign(picked, { suite: suite.value, left: left.value, right: right.value });
+
+  function updateLink(entries, chosenSet) {
+    const ordered = [...entries].reverse().filter((e) => chosenSet.has(e.run)).map((e) => e.run);
+    picked.suite = suite.value;
+    picked.runsBySuite = { ...(picked.runsBySuite || {}), [suite.value]: ordered };
     state.comparisons.set(key, picked);
     const prefix = crossProfile ? '#/compare/' : profileHref(profiles[0]) + '/compare/';
-    compare.href = prefix + [left.value, right.value].map(encodeURIComponent).join(',');
+    if (ordered.length >= 2) {
+      compare.href = prefix + ordered.map(encodeURIComponent).join(',');
+      compare.removeAttribute('aria-disabled');
+      compare.textContent = `逐题对比（已选 ${ordered.length} 项） →`;
+      hint.textContent = '';
+    } else {
+      compare.removeAttribute('href');
+      compare.setAttribute('aria-disabled', 'true');
+      compare.textContent = '逐题对比 →';
+      hint.textContent = '请至少勾选 2 项评测结果';
+    }
   }
-  function selectSuite() {
-    left.replaceChildren(...options(bySuite.get(suite.value), picked.left));
-    selectPair();
+
+  function drawRuns() {
+    const entries = bySuite.get(suite.value);
+    const chosenSet = selectedRuns(entries);
+    list.replaceChildren(...entries.map((e) => {
+      const box = h('input', {
+        type: 'checkbox',
+        checked: chosenSet.has(e.run),
+        onchange: () => {
+          if (box.checked) chosenSet.add(e.run);
+          else chosenSet.delete(e.run);
+          updateLink(entries, chosenSet);
+        },
+      });
+      return h('label', { class: 'cmp-run-opt' }, box, h('span', { class: 'mono', text: e.label }));
+    }));
+    updateLink(entries, chosenSet);
   }
-  suite.onchange = selectSuite;
-  left.onchange = selectPair;
-  right.onchange = updateLink;
-  selectSuite();
-  return h('div', { class: 'compare-picker' },
-    h('label', { class: 'field' }, '评测集', suite), h('label', { class: 'field' }, '第一份结果', left),
-    h('label', { class: 'field' }, '第二份结果', right), compare);
+
+  suite.onchange = drawRuns;
+  drawRuns();
+  return h('div', { class: 'compare-picker-multi' },
+    h('div', { class: 'compare-picker-bar' }, h('label', { class: 'field' }, '评测集', suite), compare, hint),
+    list);
 }
 
 function profileSuiteEntries(chosen) {
@@ -402,8 +456,9 @@ function profileSuiteEntries(chosen) {
           run: item.job.name,
           model: item.model || '',
           tasks: tasksCount,
+          authoritative: Boolean(item.authoritative),
           startedAt: item.job.started_at || item.started_at || '',
-          label: [group.label, item.model || '—', tasksCount ? `${tasksCount} 题` : null, item.job.name].filter(Boolean).join(' · '),
+          label: [item.authoritative ? '★ 权威' : null, group.label, item.model || '—', tasksCount ? `${tasksCount} 题` : null, item.job.name].filter(Boolean).join(' · '),
         });
       }
     }
@@ -413,7 +468,8 @@ function profileSuiteEntries(chosen) {
 
 function bestJobEntry(entries, model) {
   const pool = model !== null ? entries.filter((e) => e.model === model) : entries;
-  return [...pool].sort((a, b) => b.tasks - a.tasks || String(b.startedAt).localeCompare(String(a.startedAt)))[0];
+  return [...pool].sort((a, b) => Number(Boolean(b.authoritative)) - Number(Boolean(a.authoritative))
+    || b.tasks - a.tasks || String(b.startedAt).localeCompare(String(a.startedAt)))[0];
 }
 
 function pickDefaultProfileJobs(chosen, byProfile, saved) {
@@ -620,6 +676,69 @@ function attemptStrip(t, href) {
   }));
 }
 
+function authoritativePanel(b, groups, showModel) {
+  const buckets = new Map();
+  for (const group of groups) {
+    for (const { item } of group.entries) {
+      if (!item.job || item.job.running || item.status === 'running') continue;
+      const key = `${item.suite}\0${item.model || ''}`;
+      if (!buckets.has(key)) {
+        buckets.set(key, {
+          suite: item.suite,
+          suiteName: item.suite_name || item.suite,
+          model: item.model || '',
+          entries: [],
+        });
+      }
+      const list = buckets.get(key).entries;
+      if (!list.some((e) => e.run === item.job.name)) {
+        list.push({
+          run: item.job.name,
+          groupLabel: group.label,
+          tasks: item.tasks?.length || item.job.planned || 0,
+          rate: item.job.summary?.first_pass_rate,
+          authoritative: Boolean(item.authoritative),
+        });
+      }
+    }
+  }
+  const relevant = [...buckets.values()].filter((bucket) => bucket.entries.length >= 2 || bucket.entries.some((e) => e.authoritative));
+  if (!relevant.length) return null;
+  const rows = relevant.map((bucket) => {
+    const pinned = bucket.entries.find((e) => e.authoritative) || null;
+    const optionText = (e) => [
+      e.authoritative ? '★ 权威' : null,
+      e.groupLabel,
+      e.tasks ? `${e.tasks} 题` : null,
+      e.rate !== null && e.rate !== undefined ? `首次满分 ${pct(e.rate)}` : null,
+      e.run,
+    ].filter(Boolean).join(' · ');
+    const control = b.can_run
+      ? h('select', {
+        class: 'auth-select',
+        'aria-label': `${bucket.suiteName}${bucket.model ? ' ' + bucket.model : ''} 权威评测`,
+        onchange: (event) => setAuthoritative(b.id, bucket.suite, bucket.model || null, event.currentTarget.value || null, event.currentTarget),
+      },
+      h('option', { value: '', selected: !pinned, text: '自动（按最新运行合并）' }),
+      ...bucket.entries.map((e) => h('option', { value: e.run, selected: e.authoritative, text: optionText(e) })))
+      : (pinned ? h('span', { class: 'tag pos', text: `★ 权威 · ${pinned.groupLabel} · ${pinned.run}` }) : h('span', { class: 'muted', text: '自动（按最新运行合并）' }));
+    const compareRuns = [...bucket.entries].reverse().map((e) => encodeURIComponent(e.run)).join(',');
+    const compareBtn = bucket.entries.length >= 2
+      ? h('a', { class: 'button sm accent', href: `${profileHref(b)}/compare/${compareRuns}`, text: `对比作业 (${bucket.entries.length}) →` })
+      : h('span', { class: 'faint', text: '仅 1 份结果' });
+    return h('tr', {},
+      h('td', {}, h('strong', { text: bucket.suiteName }), pinned ? h('span', { class: 'tag pos', style: 'margin-left:6px', text: '已指定权威' }) : null),
+      showModel ? h('td', { class: 'mono muted', text: bucket.model || '—' }) : null,
+      h('td', {}, control),
+      h('td', { class: 'num' }, compareBtn));
+  });
+  const heads = ['评测集', ...(showModel ? ['模型'] : []), '权威数据来源', '作业对比'];
+  return panel('评测权威与作业对比', '按评测维度选定权威结果；统计卡片、任务列表、对比默认项与榜单均以此为准',
+    h('div', { class: 'table-scroll' }, h('table', { class: 'auth-table' },
+      h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: i === heads.length - 1 ? 'num' : null, text: t })))),
+      h('tbody', {}, rows))));
+}
+
 async function renderProfile(id) {
   navCurrent('overview');
   const b = await api('/api/profile?id=' + encodeURIComponent(id));
@@ -656,15 +775,18 @@ async function renderProfile(id) {
         onclick: () => { state.taskFilter = state.taskFilter === k ? 'all' : k; render(); } },
         h('i', { class: 'dot s-' + k }), STATUS[k] + ' ', h('b', { text: String(scopedCounts[k]) }))));
 
-  const banner = h('section', { class: 'profile-banner', 'aria-label': '各题最新结果' },
+  const authCount = new Set(b.items.filter((i) => i.authoritative).map((i) => `${i.suite}\0${i.model || ''}`)).size;
+  const banner = h('section', { class: 'profile-banner', 'aria-label': authCount ? '权威评测汇总' : '各题最新结果' },
     h('div', { class: 'profile-banner-left' },
       metric('一次性完成率', pct(s.one_shot_pass_rate), int(s.counts.pass) + ' 通过 / ' + int(s.valid) + ' 有效', true),
       metric('首轮满分率', pct(s.first_pass_rate), int(s.first_passed) + ' / ' + int(s.first_valid) + ' 首次有效'),
       metric('至少通过一次', pct(s.solved_rate), int(s.tasks_solved) + ' / ' + int(s.tasks_attempted) + ' 道')),
     h('div', { class: 'profile-banner-right' },
       h('div', {},
-        h('div', { style: 'display:flex;justify-content:space-between;gap:10px;font-size:11.5px;margin-bottom:6px;flex-wrap:wrap' },
-          h('span', { class: 'muted', text: `首次结局分布（${scopeLabel} · 点击状态筛选下方任务）` }),
+        h('div', { style: 'display:flex;justify-content:space-between;gap:10px;font-size:11.5px;margin-bottom:6px;flex-wrap:wrap;align-items:center' },
+          h('span', { class: 'muted', style: 'display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap' },
+            `首次结局分布（${scopeLabel} · 点击状态筛选下方任务）`,
+            authCount ? h('span', { class: 'tag pos', text: `已指定 ${authCount} 项权威评测` }) : null),
           h('span', { class: 'mono muted', text: `${scopedTasks.length} 道题` })),
         outcomeBar(scopedCounts, scopedTasks.length, true),
         statusPills),
@@ -675,6 +797,7 @@ async function renderProfile(id) {
         h('div', {}, h('span', { text: '缓存命中率' }), h('strong', { text: pct(s.cache_hit_rate) })))));
 
   const groups = groupedItems(b);
+  const authPanel = authoritativePanel(b, groups, modelsPresent.length > 1);
   const runningItem = b.items.find((i) => i.status === 'running');
   const latestGroup = groups[0];
   const pendingItems = b.items.filter((i) => i.status === 'pending').length;
@@ -698,9 +821,10 @@ async function renderProfile(id) {
       activeProg,
       h('span', { class: 'muted', style: 'font-size:12px', text: [
         pendingItems ? `队列剩余 ${pendingItems} 项` : `共 ${groups.length} 个作业`,
+        authCount ? `已设 ${authCount} 项权威` : null,
         `并发 ${b.concurrency}`,
         `自动重跑：${b.auto_rerun_invalid ? '开' : '关'}`,
-      ].join(' · ') })),
+      ].filter(Boolean).join(' · ') })),
     h('div', { class: 'row-actions', style: 'flex-wrap:wrap' },
       b.can_run && b.tasks.some((t) => t.model === runModel(b) && hasInvalid(t))
         ? h('button', { type: 'button', class: 'button sm', onclick: () => runAgain(b, true) }, '重跑无效的题') : null,
@@ -760,11 +884,23 @@ async function renderProfile(id) {
   const itemRow = (item, index) => {
     const j = item.job; const js = j?.summary;
     const href = item.local_run ? '#/run/' + encodeURIComponent(item.run) : j ? '#/job/' + encodeURIComponent(j.name) : null;
-    return h('tr', { class: href ? 'link' : null, onclick: href ? () => { location.hash = href; } : null },
-      h('td', {}, href ? link(href, item.suite_name || item.suite) : h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
-        item.concurrency ? `并发 ${item.concurrency}` : null,
-        item.auto_rerun ? `自动重跑无效的题 第 ${item.auto_rerun} 轮` : null,
-        skippedFeatures(b, item).length ? `本次未开启 ${skippedFeatures(b, item).join(', ')}` : null].filter(Boolean).join(' · ') })),
+    const canPin = Boolean(b.can_run && j && !j.running && item.status !== 'running');
+    const authBtn = canPin ? h('button', {
+      type: 'button',
+      class: item.authoritative ? 'button' : 'button accent',
+      title: item.authoritative ? '取消此评测的权威指定，恢复按最新运行合并' : '将此评测结果设为该评测维度的权威数据',
+      onclick: (e) => {
+        e.stopPropagation();
+        setAuthoritative(b.id, item.suite, item.model ?? null, item.authoritative ? null : j.name, e.currentTarget);
+      },
+    }, item.authoritative ? '取消权威' : '设为权威') : null;
+    return h('tr', { class: [href ? 'link' : null, item.authoritative ? 'ours' : null].filter(Boolean).join(' ') || null, onclick: href ? () => { location.hash = href; } : null },
+      h('td', {}, href ? link(href, item.suite_name || item.suite) : h('span', { text: item.suite_name || item.suite }),
+        item.authoritative ? h('span', { class: 'tag pos', style: 'margin-left:6px', text: '权威' }) : null,
+        h('span', { class: 'sub', text: [item.category_name, `${item.tasks.length} 道题`,
+          item.concurrency ? `并发 ${item.concurrency}` : null,
+          item.auto_rerun ? `自动重跑无效的题 第 ${item.auto_rerun} 轮` : null,
+          skippedFeatures(b, item).length ? `本次未开启 ${skippedFeatures(b, item).join(', ')}` : null].filter(Boolean).join(' · ') })),
       h('td', { text: item.model || '—' }),
       h('td', {}, h('span', { text: item.status === 'running' && item.cancel_requested ? '正在停止' : ITEM_STATUS[item.status] || item.status }), item.error ? h('span', { class: 'sub flag', text: item.error }) : null,
         item.auto_rerun_error ? h('span', { class: 'sub flag', text: item.auto_rerun_error }) : null),
@@ -773,7 +909,7 @@ async function renderProfile(id) {
       h('td', { class: 'num', text: js ? pct(js.first_pass_rate) : '—' }),
       h('td', { class: 'num', text: js ? compact(js.total_tokens) : '—' }),
       h('td', { class: 'num', text: j ? dur(j.wall_s) : '—' }),
-      b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index), j && !j.running && item.status !== 'running' ? h('button', { class: 'button', onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除结果') : null)) : null);
+      b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, authBtn, itemActions(b, index), j && !j.running && item.status !== 'running' ? h('button', { class: 'button', onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除结果') : null)) : null);
   };
   const itemHeads = ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', ...(b.can_run ? ['操作'] : [])];
   const itemTable = (rows, empty) => h('div', { class: 'table-scroll' }, h('table', {},
@@ -881,12 +1017,12 @@ async function renderProfile(id) {
           trialHref ? h('span', { class: 'acc', style: 'font-size:11.5px', text: '轨迹 ↗' }) : null));
       return card;
     })) : h('div', { class: 'muted', text: '等待运行' });
-    const historyNote = sel.history?.length ? h('span', { class: 'muted', style: 'font-size:11.5px' }, `历史覆盖 ${sel.history.length} 次 `,
+    const historyNote = sel.history?.length ? h('span', { class: 'muted', style: 'font-size:11.5px' }, `${sel.authoritative ? '其他作业记录' : '历史覆盖'} ${sel.history.length} 次 `,
       ...sel.history.map((job) => h('a', { class: 'acc mono', style: 'margin-left:4px', href: `#/profile/${encodeURIComponent(b.id)}/task/${encodeURIComponent(job)}/${encodeURIComponent(sel.task)}`, text: job.slice(-8) }))) : null;
     drawer.replaceChildren(
       h('div', { class: 'drawer-head' },
         h('div', { style: 'min-width:0' },
-          h('div', { class: 'muted', style: 'font-size:11.5px', text: [sel.suite_name || sel.suite, sel.model || '—', `${selIndex + 1} / ${ordered.length}`].join(' · ') }),
+          h('div', { class: 'muted', style: 'font-size:11.5px', text: [sel.suite_name || sel.suite, sel.model || '—', sel.submission_label, sel.authoritative ? '★ 权威' : null, `${selIndex + 1} / ${ordered.length}`].filter(Boolean).join(' · ') }),
           h('div', { class: 'drawer-title', text: sel.task })),
         h('div', { style: 'display:flex;gap:5px;flex:none' },
           h('button', { type: 'button', class: 'button sm', disabled: !prev, 'aria-label': '上一题',
@@ -911,7 +1047,10 @@ async function renderProfile(id) {
         href ? h('div', { class: 'drawer-actions' }, h('a', { class: 'button accent sm', href, text: '打开完整任务页（轨迹 / 测试 / 上下文）↗' })) : null));
   }
 
-  const tasksPanel = panel('逐任务（最新结果）', `${scopedTasks.length} 道` + (!showSuiteCol && !showModelCol ? ' · 已隐去重复评测集/模型列' : ''),
+  const allAuth = scopedTasks.length > 0 && scopedTasks.every((t) => t.authoritative);
+  const someAuth = scopedTasks.some((t) => t.authoritative);
+  const tasksTitle = allAuth ? '逐任务（权威结果）' : someAuth ? '逐任务（权威 / 最新结果）' : '逐任务（最新结果）';
+  const tasksPanel = panel(tasksTitle, `${scopedTasks.length} 道` + (!showSuiteCol && !showModelCol ? ' · 已隐去重复评测集/模型列' : ''),
     h('div', {}, chips, modelChips,
       h('div', { class: 'panel-body toolbar', style: 'justify-content:space-between' }, search, sortSelect),
       h('div', { class: 'table-scroll' }, h('table', { class: 'task-table' },
@@ -919,7 +1058,7 @@ async function renderProfile(id) {
   workspace.append(tasksPanel, drawer);
   drawWorkspace();
 
-  return h('div', {}, banner, jobsStrip, expandedArea, workspace);
+  return h('div', {}, banner, jobsStrip, authPanel, expandedArea, workspace);
 }
 
 // The profile's concurrency, the only place it is set: every dataset
@@ -1852,9 +1991,9 @@ function deltaRel(curr, base) {
   const d = (curr - base) / base * 100;
   return { value: d, text: (d > 0 ? '+' : '') + Math.round(d) + '%' };
 }
-function compareCsv(jobs, tasks, byJob) {
+function compareCsv(jobs, tasks, byJob, titleOf = jobTitle) {
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const head = ['task', ...jobs.flatMap((j) => [`${jobTitle(j)} status`, `${jobTitle(j)} tokens`, `${jobTitle(j)} elapsed_s`])];
+  const head = ['task', ...jobs.flatMap((j) => [`${titleOf(j)} status`, `${titleOf(j)} tokens`, `${titleOf(j)} elapsed_s`])];
   const lines = [head.map(esc).join(',')];
   for (const task of tasks) {
     lines.push([task, ...byJob.flatMap((m) => {
@@ -1867,10 +2006,10 @@ function compareCsv(jobs, tasks, byJob) {
 
 async function renderCompare(names, profileId) {
   navCurrent('overview');
-  $('#title').textContent = '多版本对比台';
   const uniqueNames = [...new Set(names.filter(Boolean))];
-  crumbs([{ text: 'Profiles', href: '#/' }, ...(profileId ? [{ text: 'Profile 作业', href: profileHref({ id: profileId }) }] : []), { text: '多版本对比' }]);
   if (uniqueNames.length < 2) {
+    $('#title').textContent = profileId ? '作业对比台' : '多版本对比台';
+    crumbs([{ text: 'Profiles', href: '#/' }, ...(profileId ? [{ text: 'Profile 作业', href: profileHref({ id: profileId }) }] : []), { text: profileId ? '作业对比' : '多版本对比' }]);
     state.live = false;
     return panel('对比', null, h('div', { class: 'empty', text: '从首页或榜单勾选 2 个以上 Profile，或从 Profile 详情进入作业对比。' }));
   }
@@ -1879,6 +2018,24 @@ async function renderCompare(names, profileId) {
   const baseName = uniqueNames.includes(state.compareBaseline) ? state.compareBaseline : uniqueNames[0];
   state.compareBaseline = baseName;
   const jobs = [loaded.find((j) => j.name === baseName), ...loaded.filter((j) => j.name !== baseName)];
+  const sameProfile = Boolean(jobs[0].profile && jobs.every((j) => j.profile === jobs[0].profile));
+  const targetProfileId = profileId || (sameProfile ? jobs[0].profile : null);
+  const profileObj = targetProfileId ? await api('/api/profile?id=' + encodeURIComponent(targetProfileId)).catch(() => null) : null;
+  const canOverride = Boolean(sameProfile && profileObj?.can_run);
+  $('#title').textContent = sameProfile ? '作业对比台' : '多版本对比台';
+  crumbs([
+    { text: 'Profiles', href: '#/' },
+    ...(targetProfileId ? [{ text: profileObj ? profileName(profileObj) : (jobs[0].profile_name || 'Profile 作业'), href: profileHref({ id: targetProfileId }) }] : []),
+    { text: sameProfile ? '作业对比' : '多版本对比' },
+  ]);
+  const labelCounts = new Map();
+  for (const j of jobs) if (j.submission_label) labelCounts.set(j.submission_label, (labelCounts.get(j.submission_label) || 0) + 1);
+  const titleOf = (j) => {
+    if (!sameProfile) return jobTitle(j);
+    if (!j.submission_label) return j.name;
+    return labelCounts.get(j.submission_label) > 1 ? `${j.submission_label} · ${j.name.slice(-8)}` : j.submission_label;
+  };
+  const subOf = (j) => (sameProfile ? [j.model, j.name].filter(Boolean).join(' · ') : [j.submission_label, jobSub(j)].filter(Boolean).join(' · '));
   const colors = jobs.map((_, i) => profileColor(i));
   const byJob = jobs.map((j) => {
     const m = new Map();
@@ -1892,7 +2049,7 @@ async function renderCompare(names, profileId) {
 
   const chips = jobs.map((j, i) => {
     const isBase = i === 0;
-    const removeBtn = jobs.length > 2 ? h('button', { type: 'button', title: '移出对比', 'aria-label': '移出 ' + jobTitle(j),
+    const removeBtn = jobs.length > 2 ? h('button', { type: 'button', title: '移出对比', 'aria-label': '移出 ' + titleOf(j),
       onclick: () => {
         const rest = jobs.filter((x) => x.name !== j.name).map((x) => x.name);
         location.hash = prefix + rest.map(encodeURIComponent).join(',');
@@ -1901,12 +2058,13 @@ async function renderCompare(names, profileId) {
       onclick: () => { state.compareBaseline = j.name; render(); } }, '设为基准') : null;
     return h('span', { class: 'ver-chip', style: `border-color:${colors[i]}88` },
       h('span', { style: `color:${colors[i]}`, text: '★' }),
-      h('strong', { class: 'mono', text: jobTitle(j) }),
+      h('strong', { class: 'mono', text: titleOf(j) }),
+      j.authoritative ? h('span', { class: 'tag pos', text: '权威' }) : null,
       isBase ? h('span', { class: 'tag warn', text: '基准' }) : pinBtn,
       removeBtn);
   });
   const exportBtn = h('button', { type: 'button', class: 'button sm', onclick: () => {
-    const blob = new Blob([compareCsv(jobs, tasks, byJob)], { type: 'text/csv;charset=utf-8' });
+    const blob = new Blob([compareCsv(jobs, tasks, byJob, titleOf)], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = h('a', { href: url, download: 'bench-compare.csv' });
     a.click();
@@ -1943,8 +2101,17 @@ async function renderCompare(names, profileId) {
     const roleTag = isBase ? h('span', { class: 'tag warn', style: 'margin-right:6px', text: '基准' })
       : h('button', { type: 'button', class: 'tag acc', style: 'margin-right:6px;cursor:pointer', title: '点击设为基准',
         onclick: () => { state.compareBaseline = j.name; render(); } }, i === jobs.length - 1 ? '候选' : `版本 ${i + 1}`);
+    const authAction = canOverride && j.suite && !j.running
+      ? h('td', { class: 'num' }, h('button', {
+        type: 'button',
+        class: j.authoritative ? 'button sm' : 'button sm accent',
+        onclick: (e) => setAuthoritative(j.profile, j.suite, j.profile_item_model ?? j.model ?? null, j.authoritative ? null : j.name, e.currentTarget),
+      }, j.authoritative ? '取消权威' : '设为权威'))
+      : (canOverride ? h('td', { class: 'num' }, dash()) : null);
     return h('tr', { class: !isBase && i === jobs.length - 1 ? 'ours' : null },
-      h('td', {}, roleTag, h('strong', { class: 'mono', text: jobTitle(j) }), h('span', { class: 'sub mono', text: jobSub(j) })),
+      h('td', {}, roleTag, h('strong', { class: 'mono', text: titleOf(j) }),
+        j.authoritative ? h('span', { class: 'tag pos', style: 'margin-left:6px', text: '权威' }) : null,
+        h('span', { class: 'sub mono', text: subOf(j) })),
       h('td', { class: 'num mono' + (rDelta.startsWith('+') ? ' pos' : rDelta.startsWith('-') ? ' neg' : '') },
         pct(commonRates[i], 1), rDelta ? ` (${rDelta})` : ''),
       h('td', { class: 'num mono' }, isBase ? h('span', { class: 'faint', text: '基准' })
@@ -1957,10 +2124,12 @@ async function renderCompare(names, profileId) {
         h('span', { class: 'sub mono', text: `通过 ${usd(s.cost_per_pass)}` })),
       h('td', { class: 'num mono', text: `${s.tasks_solved || 0} / ${s.tasks_attempted || 0}` }),
       h('td', { class: 'num mono', text: compact(meanTok) }),
-      h('td', { class: 'num mono', text: pct(s.cache_hit_rate) }));
+      h('td', { class: 'num mono', text: pct(s.cache_hit_rate) }),
+      authAction);
   });
-  const summaryHeads = ['Profile 版本', '共同题首次满分', '较基准胜负', '共同题成本 / 均通过', '前沿', '全量每题 / 通过成本', '至少通过一次', '平均总 Token', '缓存命中'];
-  const summaryPanel = panel('多版本总览矩阵', `共同首次有效 ${common.length} / ${tasks.length} 题 · 成本变化与前沿均按共同题计算 · 点击版本标签可切换基准`,
+  const summaryHeads = [sameProfile ? '作业' : 'Profile 版本', '共同题首次满分', '较基准胜负', '共同题成本 / 均通过', '前沿', '全量每题 / 通过成本', '至少通过一次', '平均总 Token', '缓存命中', ...(canOverride ? ['权威覆盖'] : [])];
+  const summaryPanel = panel(sameProfile ? '作业总览矩阵' : '多版本总览矩阵',
+    `共同首次有效 ${common.length} / ${tasks.length} 题 · 成本变化与前沿均按共同题计算 · 点击标签可切换基准` + (canOverride ? ' · 可直接指定权威结果' : ''),
     h('div', { class: 'table-scroll' }, h('table', {},
       h('thead', {}, h('tr', {}, summaryHeads.map((t, i) => h('th', { class: i > 0 && i !== 4 ? 'num' : null, text: t })))),
       h('tbody', {}, summaryRows))));
@@ -1990,7 +2159,7 @@ async function renderCompare(names, profileId) {
   };
   const flowBar = tasks.length ? h('section', { class: 'flow-strip' },
     h('div', { class: 'flow-head' },
-      h('strong', { text: `${tasks.length} 道题演进分布（${jobTitle(jobs[candIdx])} vs ${jobTitle(jobs[0])}）` }),
+      h('strong', { text: `${tasks.length} 道题演进分布（${titleOf(jobs[candIdx])} vs ${titleOf(jobs[0])}）` }),
       h('span', { class: 'mono' },
         h('span', { class: 'pos', text: `突破通过 ${flowCounts.gain}` }), ' · ',
         h('span', { class: 'muted', text: `持续通过 ${flowCounts.same_pass}` }), ' · ',
@@ -2063,12 +2232,17 @@ async function renderCompare(names, profileId) {
       h('th', { text: '任务' }),
       ...jobs.map((j, i) => h('th', {},
         h('span', { style: `color:${colors[i]};margin-right:5px`, text: '★' }),
-        h('span', { text: jobTitle(j) }),
-        h('span', { class: 'sub mono', text: [j.profile_version ? `v${j.profile_version}` : null, modelsAcrossJobs.size > 1 ? j.model : null, i === 0 ? '基准' : i === candIdx ? '候选' : `版本 ${i + 1}`].filter(Boolean).join(' · ') }))),
+        h('span', { text: titleOf(j) }),
+        h('span', { class: 'sub mono', text: [
+          !sameProfile && j.profile_version ? `v${j.profile_version}` : null,
+          modelsAcrossJobs.size > 1 ? j.model : null,
+          j.authoritative ? '权威' : null,
+          i === 0 ? '基准' : i === candIdx ? '候选' : `版本 ${i + 1}`,
+        ].filter(Boolean).join(' · ') }))),
       h('th', { text: '演进趋势' }),
       h('th', { class: 'num' }, 'Token 变化', h('span', { class: 'sub', text: '候选 vs 基准' })))),
     tbody));
-  const matrixPanel = panel(`${jobs.length} 版本逐题演进矩阵`, '点击任意单元格直达 Trial 轨迹与判分详情',
+  const matrixPanel = panel(sameProfile ? `${jobs.length} 份作业逐题演进矩阵` : `${jobs.length} 版本逐题演进矩阵`, '点击任意单元格直达 Trial 轨迹与判分详情',
     h('div', {}, h('div', { class: 'panel-body toolbar', style: 'justify-content:space-between' }, filterChips, search), matrixTable));
   return h('div', {}, ctrlBar, summaryPanel, flowBar, matrixPanel);
 }
@@ -2401,6 +2575,7 @@ function boardPanel(board, suiteId, selectedSet, ourColorMap) {
     h('td', {}, h('span', { class: 'harness' }, chk, harness && !r.ours ? null : glyph(lookOf(r)),
       r.ours ? h('span', {}, h('strong', { text: ourEntryLabel(r.ours) }),
         r.ours.profile_version ? h('span', { class: 'tag mono', style: `margin-left:6px;border-color:${col}66;color:${col}`, text: 'v' + r.ours.profile_version }) : null,
+        r.ours.authoritative ? h('span', { class: 'tag pos', style: 'margin-left:6px', text: '权威' }) : null,
         r.ours.profile_features?.length ? h('span', { class: 'sub mono', text: r.ours.profile_features.join(', ') }) : null)
         : r.harness)),
     h('td', { class: 'muted' }, h('span', { class: 'harness' }, harness && !r.ours ? glyph(lookOf(r)) : null, r.model || '—')),
