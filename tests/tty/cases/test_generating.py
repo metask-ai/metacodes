@@ -524,7 +524,7 @@ def test_completion_spinner_never_commits_to_history(bin_path):
 
     # 两轮短对话(各 ~1.6s),复刻用户"在么 / 你是谁"多轮场景。离线 mock,确定性。
     turns = [slow_text_then_end(n_chunks=4, delay=0.4),
-             slow_text_then_end(n_chunks=4, delay=0.4).replace(b"tok", b"second_tok")]
+             slow_text_then_end(n_chunks=4, delay=0.4).replace(b'"text":"tok', b'"text":"second_tok')]
     with SlowMockServer(turns) as srv:
         raw = run(bin_path,
                   [READY, "type:在么", "key:enter", wait_for("tok3", 15), IDLE,
