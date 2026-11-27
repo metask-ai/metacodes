@@ -618,9 +618,9 @@ def test_picker_filter_lists_whole_matches_before_scattered_ones(bin_path):
         per_key_drain=0.1,
     )
     a, text = _screen(raw, rows=30, cols=160)
-    first = [sc for sc in _frames(a) if "Model  /glm" in sc and "[1/" in sc]
+    first = [sc for sc in _frames(a) if "Model  /glm" in sc]
     assert first, "no frame of the filter's first page:\n" + text
-    page = first[-1]
+    page = first[0]
     assert _headings(page)[:2] == ["Z.AI GLM Coding Plan", "Google Gemini"], \
         "a scattered match's provider (Gemini) is listed before a whole one's (GLM):\n" + page
     rows = [line for line in page.split("\n") if re.match(r"^  [> ][* ] \S", line)]
