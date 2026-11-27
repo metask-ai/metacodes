@@ -1221,6 +1221,13 @@ status, compatibility boundaries, and entry points are defined by
   of `gate:static`, refuses a request with `keep_alive = false` that does not
   make that call before it is sent.
 
+- **Monitor asks before it starts a command, as Bash does.** Monitor runs
+  a shell command in the background and is now classified with Bash as a
+  tool that executes: it asks in `default`, `acceptEdits` and `auto`, is
+  refused in `dontAsk` and runs in `bypassPermissions`. Bash's read-only
+  shortcut does not extend to it, so a Monitor command that only reads
+  asks too.
+
 ## 0.13.0 — 2026-11-20
 
 ### Changed

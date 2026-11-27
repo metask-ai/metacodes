@@ -45,7 +45,7 @@ pub fn getToolCategory(tool_name: []const u8) ToolCategory {
     // KgRemember 是持久写(跨会话 store);按 read 分类会被 auto 等模式静默放行(M5)。
     // KgRecall/KgContext 是只读检索/遍历 → read。
     if (std.mem.eql(u8, tool_name, "KgRemember")) return .write;
-    if (std.mem.eql(u8, tool_name, "Bash")) return .execute;
+    if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Monitor")) return .execute;
     return .read;
 }
 
@@ -70,6 +70,11 @@ test "getToolCategory write tools" {
 
 test "getToolCategory execute tools" {
     try std.testing.expect(getToolCategory("Bash") == .execute);
+}
+
+test "getToolCategory: Monitor starts a shell command, so it is execute with high risk like Bash" {
+    try std.testing.expect(getToolCategory("Monitor") == .execute);
+    try std.testing.expect(getRiskLevel("Monitor") == .high);
 }
 
 test "getToolCategory: KgRemember=write,KgRecall/KgContext=read" {

@@ -307,7 +307,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Monitor",
-        .category = .read,
+        .category = .execute,
         .deferred = true,
         .description = "Start a background monitor that runs a command and streams stdout line-by-line. Its exit is announced to you automatically. Use to watch logs, poll status, or react to file changes mid-conversation. Each stdout line is collected into a ring buffer readable via BashOutput(job_id, until=\"output\") as lines arrive; a plain BashOutput waits up to wait_ms for the monitor to exit. Stop with KillShell(job_id). Args: command (required), description (required, e.g. 'errors in /var/log/app.log'). Optional: persistent (default false; if true, no timeout).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -1427,7 +1427,7 @@ test "builtin permission categories cover the registry and preserve legacy behav
         .{ "BashOutput", .read },
         .{ "ReadArtifact", .read },
         .{ "KillShell", .read },
-        .{ "Monitor", .read },
+        .{ "Monitor", .execute },
         .{ "NotebookEdit", .write },
         .{ "EnterWorktree", .read },
         .{ "ExitWorktree", .read },
