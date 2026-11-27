@@ -328,6 +328,39 @@ def test_shift_enter_during_a_reply_inserts_a_newline(bin_path):
             a._fail(f"{name}: Shift+Enter sent the draft when the reply ended: {sent}")
 
 
+ALT_BACKSPACES = {
+    "ESC DEL in one write": ["raw:\\x1b\\x7f"],
+    "CSI-u ESC[127;3u": ["raw:\\x1b[127;3u"],
+    "modifyOtherKeys ESC[27;3;127~": ["raw:\\x1b[27;3;127~"],
+}
+
+
+def test_alt_backspace_during_a_reply_deletes_a_word_and_does_not_interrupt(bin_path):
+    for name, alt_backspace in ALT_BACKSPACES.items():
+        a, requests = _reply_with_keys(bin_path, ["type:KEEP GONE"] + alt_backspace + ["strictsleep:0.5"])
+        frames = _reply_frames(a)
+        if not any(_box_rows(a, sc) == ["❯ KEEP"] for sc in frames):
+            last = frames[-1].render_ascii() if frames else "(no frame drawn during the reply)"
+            a._fail(f"{name}: the word before the cursor was not deleted during the reply; last frame:\n{last}")
+        if b"Interrupted" in a.raw:
+            a._fail(f"{name}: Alt+Backspace interrupted the reply")
+        if len(requests) != 1:
+            sent = [_user_texts(body)[-1] for body in requests[1:]]
+            a._fail(f"{name}: the draft was sent: {sent}")
+
+
+def test_f1_during_a_reply_neither_interrupts_nor_types(bin_path):
+    a, requests = _reply_with_keys(bin_path, ["type:DRAFT", "raw:\\x1bOP", "strictsleep:0.5"])
+    frames = _reply_frames(a)
+    if not any(_box_rows(a, sc) == ["❯ DRAFT"] for sc in frames):
+        last = frames[-1].render_ascii() if frames else "(no frame drawn during the reply)"
+        a._fail(f"F1 changed the draft during the reply; last frame:\n{last}")
+    if b"Interrupted" in a.raw:
+        a._fail("F1 (ESC O P) interrupted the reply")
+    if len(requests) != 1:
+        a._fail(f"F1 sent the draft: {[_user_texts(body)[-1] for body in requests[1:]]}")
+
+
 def test_enter_after_shift_enter_during_a_reply_sends_one_message(bin_path):
     """Enter after Shift+Enter during a reply queues the whole draft, and the
     next request carries it as one message with its newline. With #456 the

@@ -114,8 +114,12 @@ pub fn pastedByte(key: Key) ?u8 {
 ///     - 13;5 = Ctrl+Enter
 ///   ESC [ < b;x;y M/m  SGR 鼠标报告(按下/拖动 M,松开 m)→ .mouse
 ///   ESC [ row;col R   光标位置应答(DSR 6n)→ .cursor_position
+///   ESC [ M b x y     X10 鼠标报告(GNU screen 没把 SGR 鼠标模式转给外层终端时)→ 整条 .unknown
 ///   ESC CR            Meta+Return = Shift+Enter(/terminal-setup 装进终端的绑定),仅当两字节
 ///                     同批到达(feedRead / feedQueued);一字节一字节的 feed 仍是 Esc + Enter
+///   ESC DEL / ESC BS  同批到达 = Alt+Backspace,删上一个词(.ctrl_w)
+///   ESC O A–D/H/F     同批到达 = SS3 光标键;ESC O P–S(F1–F4)等 → .unknown
+///   ESC + 其它字节     同批到达 = Alt+该键 → .unknown,不拆成 Esc + 该键
 /// 其它 CSI(私有前缀、更多参数段、认不出的组合)整条吃掉、报一个 .unknown;OSC 应答(`ESC ] 11 ; … BEL`)
 /// 同样整条吃掉——终端应答不会漏成字符。
 pub const KeyParser = struct {
@@ -150,7 +154,9 @@ pub const KeyParser = struct {
     // 背景色 `ESC]11;rgb:…`)。只认数字编号 + `;` 开头的形状:Alt+] 之后敲别的(包括什么都不敲、
     // 等到 ESC 超时)仍是原来那几个键。迟到的背景色应答以前会变成 Esc、字符、Esc——两次 Esc
     // 连按清空了输入框。
-    const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_semi2, csi_num3, csi_skip, sgr_mouse, osc_seen, osc_ps, osc_body, osc_st };
+    const State = enum { normal, esc_seen, ss3_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_semi2, csi_num3, csi_skip, sgr_mouse, x10_mouse, osc_seen, osc_ps, osc_body, osc_st };
+
+    const x10_mouse_report_bytes = 3;
 
     /// CSI 的参数/中间字节(0x20-0x3F):数字、`;`、`:`、私有前缀 `<=>?`、空格../。
     fn csiParam(b: u8) bool {
@@ -204,7 +210,7 @@ pub const KeyParser = struct {
                 self.queueOscPrefix();
                 break :blk .esc;
             },
-            .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_semi2, .csi_num3, .csi_skip, .sgr_mouse, .osc_body => null,
+            .ss3_seen, .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_semi2, .csi_num3, .csi_skip, .sgr_mouse, .x10_mouse, .osc_body => null,
         };
         self.state = .normal;
         return key;
@@ -279,6 +285,17 @@ pub const KeyParser = struct {
         return key;
     }
 
+    fn metaKey(self: *KeyParser, b: u8) ?Key {
+        switch (b) {
+            0x7f, 0x08 => return .ctrl_w,
+            'O' => {
+                self.state = .ss3_seen;
+                return null;
+            },
+            else => return .unknown,
+        }
+    }
+
     pub fn feed(self: *KeyParser, b: u8) ?Key {
         if (b == 0x1b) self.esc_burst = false;
         switch (self.state) {
@@ -320,11 +337,15 @@ pub const KeyParser = struct {
                     self.state = .esc_seen;
                     return .esc;
                 }
-                // 其它字符:这是"孤立 ESC + 该字符"两个独立键(用户极快连打,或终端把
-                // 两次按键合批送来)。兑现 ESC 为本次返回值,该字符的键暂存 pending,
-                // 调用方 while(drain()) 取出——否则该字符被吞(早期 bug)。
+                if (self.esc_burst) return self.metaKey(b);
+                // 其它字符:ESC 和它分两次到,是"孤立 ESC + 该字符"两个独立键。兑现 ESC 为本次
+                // 返回值,该字符的键暂存 pending,调用方 while(drain()) 取出——否则该字符被吞(早期 bug)。
                 self.push(byteToKey(b));
                 return .esc;
+            },
+            .ss3_seen => {
+                self.state = .normal;
+                return cursorKey(b);
             },
             .csi_seen => {
                 if (b >= '0' and b <= '9') {
@@ -334,6 +355,11 @@ pub const KeyParser = struct {
                 }
                 if (b == '<') {
                     self.state = .sgr_mouse;
+                    self.mouse_field = 0;
+                    return null;
+                }
+                if (b == 'M') {
+                    self.state = .x10_mouse;
                     self.mouse_field = 0;
                     return null;
                 }
@@ -417,9 +443,8 @@ pub const KeyParser = struct {
                 if (b == 'R') return .{ .cursor_position = .{ .row = saturate16(self.num1), .col = saturate16(self.num2) } };
                 const modifier = KeyModifier.fromParam(self.num2);
                 if (b == 'u') return decodeModifiedKey(self.num1, modifier);
-                if (modifier != KeyModifier.none) return .unknown;
-                if (b == '~') return tildeKey(self.num1);
-                return if (self.num1 == 1) cursorKey(b) else .unknown;
+                const plain = if (b == '~') tildeKey(self.num1) else if (self.num1 == 1) cursorKey(b) else Key.unknown;
+                return if (modifier == KeyModifier.none) plain else modifiedEditingKey(plain, modifier);
             },
             .csi_semi2 => {
                 if (b >= '0' and b <= '9') {
@@ -475,6 +500,12 @@ pub const KeyParser = struct {
                 }
                 self.state = .csi_skip;
                 return self.feed(b);
+            },
+            .x10_mouse => {
+                self.mouse_field += 1;
+                if (self.mouse_field < x10_mouse_report_bytes) return null;
+                self.state = .normal;
+                return .unknown;
             },
             .csi_skip => {
                 if (csiParam(b)) return null;
@@ -660,6 +691,7 @@ fn decodeModifiedKey(codepoint: u32, modifier: KeyModifier) Key {
         27 => .esc,
         127 => switch (modifier) {
             KeyModifier.none, KeyModifier.shift_only => .backspace,
+            KeyModifier.alt_only, KeyModifier.ctrl_only => .ctrl_w,
             else => .unknown,
         },
         else => switch (modifier) {
@@ -719,6 +751,19 @@ fn cursorKey(final: u8) Key {
         'F' => .end,
         else => .unknown,
     };
+}
+
+fn modifiedEditingKey(plain: Key, modifier: KeyModifier) Key {
+    if (modifier == KeyModifier.shift_only) return switch (plain) {
+        .up, .down, .left, .right, .home, .end => plain,
+        else => .unknown,
+    };
+    if (modifier == KeyModifier.alt_only or modifier == KeyModifier.ctrl_only) return switch (plain) {
+        .left => .alt_b,
+        .right => .alt_f,
+        else => .unknown,
+    };
+    return .unknown;
 }
 
 fn tildeKey(number: u32) Key {
@@ -849,6 +894,7 @@ pub fn readKey(fd: c_int, parser: *KeyParser) KeyRead {
 pub fn reconcileModes(fd: c_int) bool {
     if (platform_term.enterRaw(fd) == null) return false;
     emitEnableSequences(fd);
+    rearmRescue();
     return true;
 }
 
@@ -953,7 +999,8 @@ pub const Multiplexer = enum {
     /// tmux 接受 modifyOtherKeys 且不转发 Kitty 给外层(对齐真 cc):照旧直接发。
     tmux,
     /// GNU screen、zellij,或 TERM 是 screen*/tmux* 而本进程不在 tmux 里(经 SSH 从复用器里连过来):
-    /// 照旧只看环境认不认得出终端。
+    /// 只有 TERM 认得出(kitty、Ghostty)才发。TERM_PROGRAM 是从外层继承来的,screen 不把协议请求
+    /// 转给外层终端,所以不看它。
     other,
 };
 
@@ -965,11 +1012,20 @@ pub fn classifyKittyKeyboard(term_program: ?[]const u8, term: ?[]const u8, multi
     // TERM 是终端给自己起的 shell 设的;TERM_PROGRAM 会从外层继承(从 Terminal.app 或 VS Code
     // 里启动的 kitty 仍带着外层的 TERM_PROGRAM)。TERM 认得出就以它为准,先于 deny-list。
     if (kittyTerm(term.?)) return .enable;
+    if (multiplexer == .other) return .disable;
     if (term_program) |tp| {
         for (kitty_deny_term_programs) |n| if (std.mem.eql(u8, tp, n)) return .disable;
         for (kitty_term_programs) |n| if (std.mem.eql(u8, tp, n)) return .enable;
     }
-    return if (multiplexer == .other) .disable else .probe;
+    return .probe;
+}
+
+pub fn insideGnuScreen() bool {
+    return nonEmptyEnv("STY");
+}
+
+pub fn insideTmux() bool {
+    return nonEmptyEnv("TMUX");
 }
 
 fn kittyTerm(term: []const u8) bool {
@@ -1078,6 +1134,7 @@ pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
         return null;
     };
     emitEnableSequences(fd);
+    armRescue(fd, original orelse orig);
     if (startup) collectStartupInput(fd, startupSettleMs(bg_probe.roundTripMs()));
     return original orelse orig;
 }
@@ -1198,9 +1255,110 @@ pub const StartupText = struct {
 };
 
 pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
+    disarmRescue();
     emitDisableSequences(fd);
     platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
 }
+
+const rescue_capacity = 64;
+comptime {
+    std.debug.assert("\x1b[?2004l".len + mouse_selection_disable.len + kbd_disable_seq.len <= rescue_capacity);
+}
+var g_rescue_fd: c_int = -1;
+var g_rescue_mode: platform_term.SavedMode = undefined;
+var g_rescue_bytes: [rescue_capacity]u8 = undefined;
+var g_rescue_len: usize = 0;
+var g_rescue_armed = std.atomic.Value(bool).init(false);
+var g_rescue_installed = std.atomic.Value(bool).init(false);
+
+fn armRescue(fd: c_int, mode: platform_term.SavedMode) void {
+    if (@import("builtin").os.tag == .windows) return;
+    g_rescue_armed.store(false, .release);
+    const parts = [_][]const u8{
+        "\x1b[?2004l",
+        if (mouseSelectionOn()) mouse_selection_disable else "",
+        if (shouldEnableKittyKeyboard()) kbd_disable_seq else "",
+    };
+    var len: usize = 0;
+    for (parts) |part| {
+        @memcpy(g_rescue_bytes[len..][0..part.len], part);
+        len += part.len;
+    }
+    g_rescue_len = len;
+    g_rescue_fd = fd;
+    g_rescue_mode = mode;
+    g_rescue_armed.store(true, .release);
+    if (@import("builtin").os.tag != .windows and !g_rescue_installed.swap(true, .acq_rel)) rescue_signals.install();
+}
+
+fn disarmRescue() void {
+    g_rescue_armed.store(false, .release);
+}
+
+fn rearmRescue() void {
+    if (g_rescue_fd >= 0) g_rescue_armed.store(true, .release);
+}
+
+pub fn rescueTerminal() void {
+    if (!g_rescue_armed.swap(false, .acq_rel)) return;
+    _ = pfs.writeAll(g_rescue_fd, g_rescue_bytes[0..g_rescue_len]);
+    platform_term.restoreModeKeepingInput(g_rescue_fd, g_rescue_mode);
+}
+
+const rescue_signals = struct {
+    const fatal = [_]std.posix.SIG{ .ABRT, .QUIT, .ALRM, .SEGV, .BUS, .ILL, .FPE, .TRAP };
+    var previous: [fatal.len]std.posix.Sigaction = undefined;
+
+    fn install() void {
+        for (fatal, &previous) |sig, *saved| {
+            std.posix.sigaction(sig, null, saved);
+            if (saved.handler.handler == std.posix.SIG.IGN) continue;
+            const act: std.posix.Sigaction = .{
+                .handler = .{ .handler = onFatal },
+                .mask = std.posix.sigemptyset(),
+                .flags = std.posix.SA.ONSTACK,
+            };
+            std.posix.sigaction(sig, &act, null);
+        }
+        var stop: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.TSTP, null, &stop);
+        if (stop.handler.handler == std.posix.SIG.IGN) return;
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onStop },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.TSTP, &act, null);
+    }
+
+    fn onFatal(sig: std.posix.SIG) callconv(.c) void {
+        rescueTerminal();
+        for (fatal, previous) |candidate, saved| {
+            if (candidate != sig) continue;
+            std.posix.sigaction(sig, &saved, null);
+            break;
+        }
+        std.posix.raise(sig) catch {};
+    }
+
+    fn onStop(_: std.posix.SIG) callconv(.c) void {
+        rescueTerminal();
+        const default: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var ours: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.TSTP, &default, &ours);
+        var stopping = std.posix.sigemptyset();
+        std.posix.sigaddset(&stopping, .TSTP);
+        std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &stopping, null);
+        std.posix.raise(.TSTP) catch {};
+        std.posix.sigaction(.TSTP, &ours, null);
+        rearmRescue();
+        g_resume_requested.store(true, .release);
+    }
+};
 
 /// emitEnableSequences 开的转义模式关回去。关 bracketed paste(始终)+ 键盘协议(仅发过 enable
 /// 的——对称 enterRawMode,同进程 env 不变、探测答案只写一次,判定恒一致,不会发了 enable 没
@@ -1222,6 +1380,7 @@ fn emitDisableSequences(fd: c_int) void {
 /// 不是终端 → null(什么都没动)。
 pub fn lendTerminal(fd: c_int) ?platform_term.SavedMode {
     const saved = platform_term.saveMode(fd) orelse return null;
+    disarmRescue();
     emitDisableSequences(fd);
     platform_term.setCooked(fd);
     return saved;
@@ -1231,6 +1390,7 @@ pub fn lendTerminal(fd: c_int) ?platform_term.SavedMode {
 pub fn takeBackTerminal(fd: c_int, saved: platform_term.SavedMode) void {
     platform_term.restoreMode(fd, saved);
     emitEnableSequences(fd);
+    rearmRescue();
 }
 
 /// 把 `current` 写临时文件,开 $VISUAL/$EDITOR(前台阻塞)编辑,读回(owned,去尾换行)。
@@ -1654,7 +1814,7 @@ test "KeyParser: lone ESC flushes via flushEsc (interrupt 用)" {
 
 test "KeyParser: ESC followed by printable char yields two keys (esc + char, 不吞字符)" {
     var p = KeyParser{};
-    // ESC 后紧跟 'x'(终端把两次快按合批送来,或用户极快连打):
+    // ESC 后紧跟 'x',逐字节 feed(不知道是不是同批到的):
     // feed(0x1b) 进 esc_seen 不出键;feed('x') 兑现 .esc 并把 'x' 暂存 pending。
     try testing.expect(p.feed(0x1b) == null);
     const first = p.feed('x').?;
@@ -2258,10 +2418,18 @@ test "KeyParser: Home and End as tmux, GNU screen, the Linux console and rxvt se
     try testing.expectEqualSlices(Key, &.{ .{ .char = 'a' }, .{ .char = 'b' }, .{ .char = 'c' }, .home, .{ .char = 'X' }, .end, .{ .char = 'Y' }, .home, .{ .char = 'Z' }, .end }, keys);
 }
 
-test "KeyParser: Shift, Alt or Ctrl next to a lock still keeps a cursor or editing key from being the plain key" {
-    for ([_][]const u8{ "\x1b[1;2A", "\x1b[1;66A", "\x1b[1;5D", "\x1b[1;133D", "\x1b[1;3H", "\x1b[1;67F", "\x1b[3;130~", "\x1b[5;69~", "\x1b[6;2~", "\x1b[1;2~", "\x1b[4;5~", "\x1b[7;66~", "\x1b[8;3~" }) |seq| {
-        try expectSequence(seq, .unknown);
-    }
+test "KeyParser: Shift on an arrow, Home or End is that key, Alt or Ctrl on Left or Right jumps a word, and other modified cursor and editing keys are dropped" {
+    const cases = [_]struct { []const u8, Key }{
+        .{ "\x1b[1;2A", .up },       .{ "\x1b[1;66A", .up },      .{ "\x1b[1;2D", .left },
+        .{ "\x1b[1;2~", .home },     .{ "\x1b[7;66~", .home },    .{ "\x1b[1;2F", .end },
+        .{ "\x1b[1;5D", .alt_b },    .{ "\x1b[1;133D", .alt_b },  .{ "\x1b[1;3D", .alt_b },
+        .{ "\x1b[1;3C", .alt_f },    .{ "\x1b[1;5C", .alt_f },    .{ "\x1b[1;67C", .alt_f },
+        .{ "\x1b[1;3H", .unknown },  .{ "\x1b[1;67F", .unknown }, .{ "\x1b[3;130~", .unknown },
+        .{ "\x1b[5;69~", .unknown }, .{ "\x1b[6;2~", .unknown },  .{ "\x1b[4;5~", .unknown },
+        .{ "\x1b[8;3~", .unknown },  .{ "\x1b[1;5A", .unknown },  .{ "\x1b[1;7D", .unknown },
+        .{ "\x1b[1;6C", .unknown },
+    };
+    for (cases) |case| try expectSequence(case[0], case[1]);
 }
 
 test "KeyParser: lock bits make no key of a sequence that has none, and no paste marker" {
@@ -2338,10 +2506,10 @@ test "KeyParser: 同批到达的 ESC CR(/terminal-setup 绑定发的 Meta+Return
     try testing.expect(p.feedQueued('\r', false).? == .shift_enter);
     try testing.expect(p.drain() == null);
     try testing.expect(!p.pendingEsc());
-    // ESC LF 不是这个绑定:照旧 Esc + Enter 两键。
+    // ESC LF 不是这个绑定:同批到达是 Alt 组合键,整个丢掉,不拆成 Esc + Enter。
     try testing.expect(p.feedQueued(0x1b, true) == null);
-    try testing.expect(p.feedQueued('\n', false).? == .esc);
-    try testing.expect(p.drain().? == .enter);
+    try testing.expect(p.feedQueued('\n', false).? == .unknown);
+    try testing.expect(p.drain() == null);
 }
 
 test "KeyParser: 人按的 Esc 再按 Enter(分两次到达)仍是 Esc + Enter" {
@@ -2360,11 +2528,98 @@ test "KeyParser: 人按的 Esc 再按 Enter(分两次到达)仍是 Esc + Enter" 
     try testing.expect(p.drain().? == .enter);
     // 上一个 ESC 的"同批"不会粘到下一个 ESC 上。
     try testing.expect(p.feedQueued(0x1b, true) == null);
-    try testing.expect(p.feedQueued('x', false).? == .esc);
-    try testing.expectEqual(@as(u8, 'x'), p.drain().?.char);
+    try testing.expect(p.feedQueued('x', false).? == .unknown);
+    try testing.expect(p.drain() == null);
     try testing.expect(p.feed(0x1b) == null);
     try testing.expect(p.feed('\r').? == .esc);
     try testing.expect(p.drain().? == .enter);
+}
+
+test "KeyParser: ESC and the next byte written together are one Alt key, never Esc plus that key" {
+    var p = KeyParser{};
+    for ([_]u8{ 0x7f, 0x08 }) |backspace| {
+        try testing.expect(p.feedQueued(0x1b, true) == null);
+        try testing.expect(p.feedQueued(backspace, false).? == .ctrl_w);
+        try testing.expect(p.drain() == null);
+    }
+    for ("d.xk1") |b| {
+        try testing.expect(p.feedQueued(0x1b, true) == null);
+        try testing.expect(p.feedQueued(b, false).? == .unknown);
+        try testing.expect(p.drain() == null);
+        try testing.expect(!p.pendingEsc());
+    }
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('b', false).? == .alt_b);
+}
+
+test "KeyParser: typing goes on after an Alt key written together with its ESC" {
+    var p = KeyParser{};
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expectEqual(Key.ctrl_w, p.feedQueued(0x7f, false).?);
+    try testing.expect(!p.pendingEsc());
+    for ("abc") |b| try testing.expectEqual(Key{ .char = b }, p.feedQueued(b, false).?);
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expectEqual(Key.unknown, p.feedQueued('k', false).?);
+    for ("xy") |b| try testing.expectEqual(Key{ .char = b }, p.feedQueued(b, false).?);
+    try testing.expect(p.feedQueued(0x1b, false) == null);
+    try testing.expectEqual(Key.esc, p.flushEsc().?);
+    try testing.expectEqual(Key{ .char = 'z' }, p.feedQueued('z', false).?);
+    try testing.expect(p.drain() == null);
+}
+
+test "KeyParser: Esc and then Backspace or a letter, read apart, stay two keys" {
+    var p = KeyParser{};
+    try testing.expect(p.feedQueued(0x1b, false) == null);
+    try testing.expect(p.feedQueued(0x7f, false).? == .esc);
+    try testing.expect(p.drain().? == .backspace);
+    try testing.expect(p.feedQueued(0x1b, false) == null);
+    try testing.expect(p.feedQueued('k', false).? == .esc);
+    try testing.expectEqual(@as(u8, 'k'), p.drain().?.char);
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed(0x7f).? == .esc);
+    try testing.expect(p.drain().? == .backspace);
+}
+
+test "KeyParser: SS3 keys written together are one key, F1 to F4 included" {
+    var p = KeyParser{};
+    const cases = [_]struct { u8, Key }{
+        .{ 'A', .up },      .{ 'B', .down },    .{ 'C', .right },   .{ 'D', .left },
+        .{ 'H', .home },    .{ 'F', .end },     .{ 'P', .unknown }, .{ 'Q', .unknown },
+        .{ 'R', .unknown }, .{ 'S', .unknown },
+    };
+    for (cases) |case| {
+        try testing.expect(p.feedQueued(0x1b, true) == null);
+        try testing.expect(p.feedQueued('O', true) == null);
+        try testing.expectEqual(case[1], p.feedQueued(case[0], false).?);
+        try testing.expect(p.drain() == null);
+        try testing.expect(!p.pendingEsc());
+    }
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('O', false) == null);
+    try testing.expect(p.flushEsc() == null);
+    try testing.expect(!p.pendingEsc());
+}
+
+test "KeyParser: Alt+Backspace and Ctrl+Backspace delete a word in CSI u and modifyOtherKeys" {
+    try expectSequence("\x1b[127;3u", .ctrl_w);
+    try expectSequence("\x1b[127;5u", .ctrl_w);
+    try expectSequence("\x1b[127;67u", .ctrl_w);
+    try expectSequence("\x1b[27;3;127~", .ctrl_w);
+    try expectSequence("\x1b[27;5;127~", .ctrl_w);
+    try expectSequence("\x1b[127;7u", .unknown);
+}
+
+test "KeyParser: X10 mouse reports are dropped whole and type nothing" {
+    var out: [16]Key = undefined;
+    const keys = parseAll("\x1b[M *,\x1b[M@4,\x1b[M#4,ab", &out);
+    try testing.expectEqual(@as(usize, 5), keys.len);
+    for (keys[0..3]) |k| try testing.expect(k == .unknown);
+    try testing.expectEqual(@as(u8, 'a'), keys[3].char);
+    try testing.expectEqual(@as(u8, 'b'), keys[4].char);
+    var p = KeyParser{};
+    for ("\x1b[M ") |b| try testing.expect(p.feed(b) == null);
+    try testing.expect(p.flushEsc() == null);
+    try testing.expect(!p.pendingEsc());
 }
 
 test "readKey(Windows 控制台):ESC CR 同批读到是 Shift+Enter,ESC 读走后才到的 CR 是两个键" {
@@ -2689,11 +2944,74 @@ test "classifyKittyKeyboard:deny-list / 认得出 / 探测 分流矩阵" {
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("Apple_Terminal", "xterm-kitty", .none));
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("vscode", "xterm-ghostty", .none));
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("Hyper", "xterm-kitty", .other));
-    // tmux 照旧直接发;其它复用器照旧只看环境(答查询的是复用器自己,不问)。
+    // tmux 照旧直接发;其它复用器只认 TERM(答查询的是复用器自己,不问;TERM_PROGRAM 是外层继承来的)。
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard(null, "screen-256color", .tmux));
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("vscode", "tmux-256color", .tmux));
     try testing.expectEqual(KeyboardPolicy.disable, classifyKittyKeyboard(null, "screen-256color", .other));
-    try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("ghostty", t, .other));
+    for ([_][]const u8{ "ghostty", "iTerm.app", "WezTerm", "WarpTerminal" }) |outer| {
+        try testing.expectEqual(KeyboardPolicy.disable, classifyKittyKeyboard(outer, t, .other));
+        try testing.expectEqual(KeyboardPolicy.disable, classifyKittyKeyboard(outer, "screen-256color", .other));
+    }
+}
+
+test "keyboardPolicy: inside GNU screen an allow-listed outer terminal keeps the protocol off, and the hint is \\ + ⏎" {
+    defer recordNewlineBinding(false);
+    recordNewlineBinding(false);
+    const envs = [_]SavedEnv{
+        try SavedEnv.set("STY", "4242.pts-1.host"),
+        try SavedEnv.set("TMUX", null),
+        try SavedEnv.set("ZELLIJ", null),
+        try SavedEnv.set("TERM", "screen-256color"),
+        try SavedEnv.set("TERM_PROGRAM", "ghostty"),
+        try SavedEnv.set(no_keyboard_enhancement_env, null),
+    };
+    defer for (envs) |saved| saved.restore();
+    try testing.expect(insideGnuScreen());
+    try testing.expectEqual(KeyboardPolicy.disable, keyboardPolicy());
+    try testing.expect(!shouldEnableKittyKeyboard());
+    if (platform_term.keyRecordsTypeText()) return;
+    try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
+}
+
+test "rescueTerminal writes the off sequences once, only while armed" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const was_installed = g_rescue_installed.swap(true, .acq_rel);
+    defer g_rescue_installed.store(was_installed, .release);
+    const was_mouse = mouseSelectionOn();
+    defer recordMouseSelection(was_mouse);
+    defer disarmRescue();
+    const envs = [_]SavedEnv{
+        try SavedEnv.set("TERM", "xterm-kitty"),
+        try SavedEnv.set(no_keyboard_enhancement_env, null),
+    };
+    defer for (envs) |saved| saved.restore();
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const mode = std.mem.zeroes(platform_term.SavedMode);
+    var buf: [128]u8 = undefined;
+
+    recordMouseSelection(true);
+    armRescue(fds[1], mode);
+    rescueTerminal();
+    rescueTerminal();
+    const all = "\x1b[?2004l" ++ mouse_selection_disable ++ kbd_disable_seq;
+    try testing.expectEqual(@as(isize, all.len), std.c.read(fds[0], &buf, buf.len));
+    try testing.expectEqualStrings(all, buf[0..all.len]);
+    try testing.expectEqual(@as(c_int, 0), platform_term.waitReadable(fds[0], 0));
+
+    recordMouseSelection(false);
+    ppaths.setEnv(no_keyboard_enhancement_env, "1");
+    armRescue(fds[1], mode);
+    disarmRescue();
+    rescueTerminal();
+    try testing.expectEqual(@as(c_int, 0), platform_term.waitReadable(fds[0], 0));
+    rearmRescue();
+    rescueTerminal();
+    const paste_only = "\x1b[?2004l";
+    try testing.expectEqual(@as(isize, paste_only.len), std.c.read(fds[0], &buf, buf.len));
+    try testing.expectEqualStrings(paste_only, buf[0..paste_only.len]);
 }
 
 test "shouldEnableKittyKeyboard: 要探测的终端只在答了 Kitty flags 时才发,提示文案跟着走" {
@@ -2892,7 +3210,7 @@ test "KeyParser: a stream of legacy, CSI u and modifyOtherKeys keys decodes the 
         [_]Key{ .enter, .enter, .tab, .tab, .esc } ++
         [_]Key{.shift_enter} ** 3 ++ [_]Key{.{ .char = ' ' }} ** 2 ++
         [_]Key{ .shift_tab, .shift_tab, .ctrl_c, .alt_b, .alt_f, .esc, .down } ++
-        [_]Key{ .paste_begin, .{ .char = 'x' }, .paste_end, .{ .cursor_position = .{ .row = 12, .col = 40 } }, .unknown, .unknown, .{ .char = 'z' } };
+        [_]Key{ .paste_begin, .{ .char = 'x' }, .paste_end, .{ .cursor_position = .{ .row = 12, .col = 40 } }, .up, .unknown, .{ .char = 'z' } };
     var buf: [64]Key = undefined;
     try testing.expectEqualSlices(Key, &expected, parseChunks(stream, &.{}, &buf));
     try testing.expectEqualSlices(Key, &expected, parseAll(stream, &buf));

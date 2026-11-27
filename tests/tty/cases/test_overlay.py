@@ -90,16 +90,15 @@ def test_help_esc_repeated_no_border_accumulation(bin_path):
 
 def test_esc_then_char_not_swallowed(bin_path):
     # 回归:ESC 后紧跟普通字符,该字符不被吞(早期 bug:feed 在 esc_seen 态兑现 ESC 时丢字节)。
-    # 场景:先开 help(? ),再一次性发 ESC+'k'(raw 两字节连发,模拟终端把快速两次按键合批送来)。
+    # 场景:先开 help(? ),按 Esc,不到 200 ms 再按 'k'(两次写入,人连按两个键)。
     #   - ESC → 关 help(esc 在空框是 dispatch 消费);
     #   - 'k' → 进输入框(不能被吞)。
-    # raw:\x1bk 让两字节无 per_key_drain 间隔进内核缓冲,loop 逐字节 read:0x1b→esc_seen,
-    # 紧接读到 'k' 在 esc_seen 态兑现 ESC + pending 'k';drain 接线把 'k' 喂到 editor。
-    # (若间隔 >200ms 会先 flushEsc,测的就不是吞字符路径——故必须 raw 连发。)
+    # 'k' 到时 ESC 还在 esc_seen 态等后续字节:兑现 ESC + pending 'k',drain 接线把 'k' 喂到 editor。
+    # (若间隔 >200ms 会先 flushEsc,测的就不是吞字符路径。一次写进来的 ESC k 是 Alt+K,不是两个键。)
     raw = run(bin_path,
               ["sleep:0.8",
                "type:?", "sleep:0.4",   # 开 help
-               "raw:\\x1bk", "sleep:0.5"],  # ESC+k 连发:关 help + k 进框
+               "raw:\\x1b", "raw:k", "sleep:0.5"],  # Esc 再按 k(中间隔 per_key_drain):关 help + k 进框
               per_key_drain=0.1)
     a = TTYAssert(raw)
     text = _screen_text(a)
