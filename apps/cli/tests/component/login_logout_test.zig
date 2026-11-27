@@ -1962,57 +1962,91 @@ test "a stored default without a credential is passed over with one warning, and
     try testing.expectEqual(@as(usize, 1), gateway.requestCount());
 }
 
-test "a stored default on a model only the Metask gateway lists: login status names the sign-in the TUI starts on, and -p stops sending nothing" {
+fn pinGatewayModel(case: *Case, origin: []const u8, model: []const u8) ![]const u8 {
+    const a = case.arena();
+    const pinned = cc.provider_ids.OfferId.derive(.{
+        .provider_id = cc.provider_ids.Slug.lit("metask"),
+        .channel_id = cc.provider_ids.Slug.lit("default"),
+        .protocol = "anthropic_messages",
+        .endpoint_url = try std.fmt.allocPrint(a, "{s}/v1/messages", .{origin}),
+        .request_model_id = model,
+    });
+    var store = try cc.provider_config_store.Store.initHome(a, case.state);
+    defer store.deinit();
+    _ = try cc.provider_config_store.setGlobalSelection(&store, cc.provider_selection.RuntimeSelection.pinned(pinned, 1, .global), null, null);
+    return std.fmt.allocPrint(a, "offer {s}", .{&pinned.render()});
+}
+
+test "a stored default on a model only the Metask gateway lists is found in the list the start fetches with the session, and runs there" {
     var case: Case = undefined;
     try case.init();
     defer case.deinit();
     const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
     try case.enter();
     const a = case.arena();
-    var gateway = try harness.MockServer.startCassette(&.{ANTHROPIC_SSE}, 0);
+    var gateway = try harness.MockServer.startCassette(&.{ GATEWAY_MODELS, GATEWAY_MODELS, ANTHROPIC_SSE }, 0);
     defer gateway.stop();
     const origin = try originOf(a, gateway);
-    const pinned = cc.provider_ids.OfferId.derive(.{
-        .provider_id = cc.provider_ids.Slug.lit("metask"),
-        .channel_id = cc.provider_ids.Slug.lit("default"),
-        .protocol = "anthropic_messages",
-        .endpoint_url = try std.fmt.allocPrint(a, "{s}/v1/messages", .{origin}),
-        .request_model_id = "glm-5-air",
-    });
-    var store = try cc.provider_config_store.Store.initHome(a, case.state);
-    defer store.deinit();
-    _ = try cc.provider_config_store.setGlobalSelection(&store, cc.provider_selection.RuntimeSelection.pinned(pinned, 1, .global), null, null);
-    const pin = try std.fmt.allocPrint(a, "offer {s}", .{&pinned.render()});
-    const stops = try std.fmt.allocPrint(a, "error: the stored selection pins {s}, which the current catalog does not offer;", .{pin});
-
+    const pin = try pinGatewayModel(&case, origin, "glm-5-air");
     try case.storeSession(origin, SESSION_TOKEN);
+
     var out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
     errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
     try testing.expectEqual(@as(i32, 0), out.exit_code);
-    try expectContains(out.stderr, "This start uses Metask, signed in.");
-    try expectContains(out.stderr, "Level 5 of 7 decided");
-    try expectContains(out.stderr, try std.fmt.allocPrint(a, "  4 stored default: {s}, which no model list on this machine has: passed over by the TUI for the Metask sign-in, -p and the rest stop\n", .{pin}));
-    try expectContains(out.stderr, "> 5 Metask sign-in: the session (");
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "This start looks for the default stored with /model ({s}) in Metask's model list, which it fetches first, and stops if it is not there.\n", .{pin}));
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "> 4 stored default: {s}, which no model list on this machine has: a start fetches Metask's model list and looks for it there, and stops if it is not there\n", .{pin}));
     try expectAbsent(out.stderr, "stored default: set");
-
-    for ([_][]const []const u8{ &.{ "-p", "hi" }, &.{} }) |args| {
-        out = try runCli(&case, cli, &.{}, args);
-        try testing.expectEqual(@as(i32, 2), out.exit_code);
-        try expectContains(out.stderr, stops);
-        try expectAbsent(out.stderr, "cannot be found right now");
-    }
     try testing.expectEqual(@as(usize, 0), gateway.requestCount());
+
+    out = try runCli(&case, cli, &.{}, &.{ "-p", "hi" });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    try testing.expectEqual(@as(usize, 3), gateway.requestCount());
+    for (0..2) |index| {
+        const listing = gateway.requestAt(index).?;
+        try testing.expect(std.mem.startsWith(u8, requestLine(listing), "GET /v1/models"));
+        try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(listing, "authorization").?);
+    }
+    const turn = gateway.requestAt(2).?;
+    try testing.expect(std.mem.startsWith(u8, requestLine(turn), "POST /v1/messages "));
+    try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(turn, "authorization").?);
+    try testing.expectEqualStrings("\"glm-5-air\"", turn.jsonField("model").?);
+    try expectContains(try case.tmp.dir.readFileAlloc(testing.io, "state/config.json", a, .limited(1 << 20)), "global_selection");
+}
+
+test "a stored default Metask's list does not have, or that no list can be fetched for, stops with the ways out, as without a session" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer gateway.stop();
+    const origin = try originOf(a, gateway);
+    const pin = try pinGatewayModel(&case, origin, "glm-6-gone");
+    const config_path = try std.fs.path.join(a, &.{ case.state, "config.json" });
+    try case.storeSession(origin, SESSION_TOKEN);
+
+    var out = try runCli(&case, cli, &.{}, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 2), out.exit_code);
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the default model stored with /model ({s}) is in neither the built-in models nor Metask's model list; `", .{pin}));
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, " --provider metask` starts on your Metask sign-in without it, or remove \"global_selection\" from {s}\n", .{config_path}));
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+    try testing.expect(std.mem.startsWith(u8, requestLine(gateway.requestAt(0).?), "GET /v1/models"));
+
+    try case.storeSession("http://127.0.0.1:9", NEW_SESSION_TOKEN);
+    out = try runCli(&case, cli, &.{}, &.{ "-p", "hi" });
+    try testing.expectEqual(@as(i32, 2), out.exit_code);
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched (no connection); `", .{pin}));
 
     try case.tmp.dir.deleteFile(testing.io, "state/oauth/metask.json");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
-    try testing.expectEqual(@as(i32, 0), out.exit_code);
     try expectContains(out.stderr, try std.fmt.allocPrint(a, "This start stops: the default stored with /model ({s}) is in no model list on this machine.\n", .{pin}));
-    try expectContains(out.stderr, "Level 4 of 7 decided");
     try expectContains(out.stderr, try std.fmt.allocPrint(a, "> 4 stored default: {s}, which no model list on this machine has: a start stops and says why\n", .{pin}));
     out = try runCli(&case, cli, &.{}, &.{ "-p", "hi" });
     try testing.expectEqual(@as(i32, 2), out.exit_code);
-    try expectContains(out.stderr, stops);
-    try testing.expectEqual(@as(usize, 0), gateway.requestCount());
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the stored selection pins {s}, which the current catalog does not offer;", .{pin}));
 }
 
 test "--provider naming a provider without a key stops -p with its help, sending nothing (#485)" {

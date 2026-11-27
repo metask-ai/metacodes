@@ -263,7 +263,7 @@ def _pin_gateway_model(mock, state, model="glm-5-air"):
     return offer
 
 
-def test_a_stored_default_on_a_gateway_model_starts_the_tui_on_the_metask_sign_in(bin_path):
+def test_a_stored_default_on_a_gateway_model_is_found_in_the_list_the_start_fetches(bin_path):
     with MetaskMock() as mock:
         home, state, env = _case(mock)
         mock.write_session(state)
@@ -271,10 +271,9 @@ def test_a_stored_default_on_a_gateway_model_starts_the_tui_on_the_metask_sign_i
         work = case_tmpdir("cc-tty-unfound-default-work-")
         raw = run(bin_path, submit("hello", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(30, 220))
         a = TTYAssert(raw, rows=30, cols=220)
-        a.assert_prose_contains(f"The default model stored with /model (offer {offer}) cannot be found right now, "
-                                f"so this session started on your Metask sign-in: {MODEL} · Metask. Choose again with /model.")
+        a.assert_prose_contains("glm-5-air · Metask")
         assert b"which the current catalog does not offer" not in raw, _screen(a)
-        assert mock.messages == [(f"Bearer {ACCESS_TOKEN}", MODEL)], mock.messages
+        assert mock.messages == [(f"Bearer {ACCESS_TOKEN}", "glm-5-air")], mock.messages
         with open(os.path.join(state, "config.json")) as f:
             assert json.load(f)["global_selection"]["target"]["offer_id"] == offer
 

@@ -169,17 +169,6 @@ pub fn decide(read: Facts) Decision {
     };
 }
 
-pub fn passOverUnresolved(read: Facts) ?Decision {
-    if (read.stored_default != .unresolved) return null;
-    var below = read;
-    below.stored_default = .none;
-    const decision = decide(below);
-    return switch (decision) {
-        .metask_key, .metask_session => decision,
-        else => null,
-    };
-}
-
 /// The presets config.json does not define that the start must report
 /// (#489), by the level that names them: the one named at start always (it
 /// was asked for by name, whatever decides), the directory's and the file's
@@ -254,16 +243,11 @@ test "a stored default without a credential, or unreadable, is passed over" {
     try testing.expect(!(StoredDefault{ .lacks_credential = "x" }).consulted());
 }
 
-test "a stored default no model list has decides level 4, and yields only to a Metask sign-in" {
+test "a stored default no model list has still decides level 4, above a Metask sign-in" {
     const pin: StoredDefault = .{ .unresolved = "offer offer-46ba33844a6b37c91ac2c46a2039a211" };
     try testing.expect(pin.consulted());
     try testing.expectEqual(Decision.stored_default, decide(factsWith(.{ .stored_default = pin, .metask_session = true })));
-    try testing.expectEqual(Decision.metask_session, passOverUnresolved(factsWith(.{ .stored_default = pin, .metask_session = true })).?);
-    try testing.expectEqual(Decision.metask_key, passOverUnresolved(factsWith(.{ .stored_default = pin, .metask_key = true, .metask_session = true })).?);
-    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = pin, .local = deepseek_file })));
-    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = pin })));
-    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = pin, .metask_session = true, .metask_key_requested = true })));
-    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = usableDefault(), .metask_session = true })));
+    try testing.expectEqual(Decision.stored_default, decide(factsWith(.{ .stored_default = pin, .metask_key = true, .local = deepseek_file })));
 }
 
 test "asking for the historical path sets the session aside, but not the file's provider" {

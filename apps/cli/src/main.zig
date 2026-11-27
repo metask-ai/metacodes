@@ -493,6 +493,16 @@ fn applyProviderRoute(
 /// than the one the user chose, which is the exact substitution the offer model
 /// exists to prevent.
 pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.Allocator) bool {
+    return applyStoredSelection(config, allocator, null);
+}
+
+const MetaskListing = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    session: *?provider_oauth_mod.Session,
+};
+
+fn applyStoredSelection(config: *types.Config, allocator: std.mem.Allocator, metask: ?MetaskListing) bool {
     var store = provider_config_store.Store.initHome(allocator, config.state_root) catch return false;
     defer store.deinit();
 
@@ -527,8 +537,47 @@ pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.A
             .timed_out => failMissingOpenRouterListing(allocator, null),
         }
     }
+    if (outcome == .failure and outcome.failure == .unresolved_selection) if (metask) |listing| {
+        if (adoptMetaskListing(allocator, host, config.state_root, listing)) |why| failMissingMetaskDefault(allocator, selection, store.path, why);
+        outcome = resolveStoredSelection(allocator, host, selection);
+        if (outcome == .failure and outcome.failure == .unresolved_selection) failMissingMetaskDefault(allocator, selection, store.path, null);
+    };
     applyStartupOutcome(config, allocator, outcome);
     return true;
+}
+
+fn adoptMetaskListing(allocator: std.mem.Allocator, host: *provider_host.Host, state_root: []const u8, listing: MetaskListing) ?[]const u8 {
+    const session = loadStartupMetask(listing.session, listing.gpa, state_root) catch return "the Metask session cannot be read";
+    const bearer = resolveMetaskBearer(session, listing.io) catch return "the Metask session could not be renewed";
+    defer provider_oauth_mod.secureFree(listing.gpa, bearer);
+    const gateway = (metask_oauth_mod.modelGateway(session.tokens.?.gateway_url) catch null) orelse return "the Metask session names no gateway";
+    const url = std.fmt.allocPrint(allocator, "{s}/v1/models", .{gateway}) catch return "out of memory";
+    const fetched = api_catalog_fetch.fetchModelPages(allocator, listing.io, .{
+        .url = url,
+        .bearer = bearer,
+        .timeout_ms = models_cache.STARTUP_WAIT_MS,
+    }) catch |err| return switch (err) {
+        error.Unauthorized => "the session was refused",
+        error.RateLimited => "rate limited",
+        error.TimedOut => std.fmt.comptimePrint("no answer within {d} s", .{models_cache.STARTUP_WAIT_MS / 1000}),
+        error.HttpError => "server error",
+        error.TooLarge => "list too large",
+        else => "no connection",
+    };
+    defer allocator.free(fetched.body);
+    host.ingestMetask(gateway, fetched.body, .messages_and_chat) catch return "not a model list";
+    return null;
+}
+
+fn failMissingMetaskDefault(allocator: std.mem.Allocator, selection: provider_selection.RuntimeSelection, config_path: []const u8, fetch_failure: ?[]const u8) noreturn {
+    const pin = storedPin(allocator, selection.target) catch "it";
+    const command = invokedCommand(allocator);
+    if (fetch_failure) |why| {
+        std.debug.print("error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched ({s}); `{s} --provider metask` starts on your Metask sign-in without it, or remove \"global_selection\" from {s}\n", .{ pin, why, command, config_path });
+    } else {
+        std.debug.print("error: the default model stored with /model ({s}) is in neither the built-in models nor Metask's model list; `{s} --provider metask` starts on your Metask sign-in without it, or remove \"global_selection\" from {s}\n", .{ pin, command, config_path });
+    }
+    std.process.exit(2);
 }
 
 fn resolveStoredSelection(
@@ -960,39 +1009,6 @@ fn skippedDefaultNotice(arena: std.mem.Allocator, label: []const u8, instead: ?S
     var buf: [256]u8 = undefined;
     const line = route_state_mod.modelLine(&buf, .{ .bound = route.origin }, route.model);
     return std.fmt.allocPrint(arena, "The default model, {s}, has no key or sign-in; this session uses {s}.", .{ label, line }) catch null;
-}
-
-fn unfoundDefault(allocator: std.mem.Allocator, config: types.Config, facts: startup_order.Facts, at_terminal: bool) ?[]const u8 {
-    const pin = switch (facts.stored_default) {
-        .unresolved => |value| value,
-        else => return null,
-    };
-    if (startup_order.passOverUnresolved(facts) == null) return null;
-    if (!(at_terminal and interactiveRepl(config))) return null;
-    if (storedDefaultFoundInDownload(allocator, config)) return null;
-    return pin;
-}
-
-fn storedDefaultFoundInDownload(allocator: std.mem.Allocator, config: types.Config) bool {
-    switch (fetchMissingOpenRouterListing(allocator, config)) {
-        .kept => {},
-        .skipped, .failed, .timed_out => return false,
-    }
-    var store = provider_config_store.Store.initHome(allocator, config.state_root) catch return false;
-    defer store.deinit();
-    var document = store.load() catch return false;
-    defer document.deinit();
-    const selection = document.global_selection orelse return false;
-    const host = buildProviderHost(allocator) orelse return false;
-    defer host.destroy();
-    return resolveStoredSelection(allocator, host, selection) == .route;
-}
-
-fn unfoundDefaultNotice(arena: std.mem.Allocator, pin: []const u8, instead: ?StartRoute) ?[]const u8 {
-    const route = instead orelse return std.fmt.allocPrint(arena, "The default model stored with /model ({s}) cannot be found right now. Choose a model with /model.", .{pin}) catch null;
-    var buf: [256]u8 = undefined;
-    const line = route_state_mod.modelLine(&buf, .{ .bound = route.origin }, route.model);
-    return std.fmt.allocPrint(arena, "The default model stored with /model ({s}) cannot be found right now, so this session started on your Metask sign-in: {s}. Choose again with /model.", .{ pin, line }) catch null;
 }
 
 /// Level 5 of the startup order: a Metask sign-in the historical path would
@@ -1527,13 +1543,12 @@ pub fn main(init: std.process.Init) !void {
     // resolution), or nowhere — never only some of them (localSignInKey).
     const local_metask_key = localSignInKey(allocator, &local_config, &preset_facts);
     const startup_facts = startupFacts(allocator, config, &local_config, local_metask_key, &preset_facts);
-    const unfound_default = unfoundDefault(allocator, config, startup_facts, platform_term.isatty(0));
-    const startup_decision = if (unfound_default != null) startup_order.passOverUnresolved(startup_facts).? else startup_order.decide(startup_facts);
+    const startup_decision = startup_order.decide(startup_facts);
     const metask_legacy_requested = startup_facts.metask_key_requested;
     // Level 4 (#485): a stored default counts only while its provider has a
     // credential; one that lacks it is passed over for the levels below, and
     // the start says so once (`skipped_default_notice`).
-    const stored_default: StoredDefault = if (unfound_default != null) .none else startup_facts.stored_default;
+    const stored_default: StoredDefault = startup_facts.stored_default;
     // Whether a flag, the shell or a preset named the route: then nothing
     // below is a "default" the start chose for the user.
     const named_at_start = startup_facts.named or startup_decision.byPreset();
@@ -1604,7 +1619,11 @@ pub fn main(init: std.process.Init) !void {
         // An offer id names its own provider; requiring `--provider` beside it
         // would make a copied offer id unusable on its own.
         applyProviderRoute(&config, allocator, null);
-    } else if (stored_default.consulted() and applyPersistedGlobalSelection(&config, allocator)) {
+    } else if (stored_default.consulted() and applyStoredSelection(&config, allocator, if (startup_facts.metask_session and !metask_legacy_requested) .{
+        .io = init.io,
+        .gpa = init.gpa,
+        .session = &startup_metask,
+    } else null)) {
         stored_default_applied = true;
     } else {
         config.provider_kind = inferProviderKind(config.model);
@@ -1843,10 +1862,6 @@ pub fn main(init: std.process.Init) !void {
         else => null,
     };
     if (skipped_default_notice) |notice| if (!interactive_tui) std.debug.print("warning: {s}\n", .{notice});
-    const unfound_default_notice: ?[]const u8 = if (unfound_default) |pin| unfoundDefaultNotice(allocator, pin, if (unbound != null) null else .{
-        .model = config.model,
-        .origin = credential_origin,
-    }) else null;
     // A subscription plan is licensed for a person in a coding tool
     // (`ProviderProfile.subscription_plan`). Said once when nobody is at the
     // keyboard: `-p`, `serve`, a resumed suspension, the REPL reading a pipe.
@@ -1879,7 +1894,7 @@ pub fn main(init: std.process.Init) !void {
             else => null,
         };
     };
-    const startup_notice: ?[]const u8 = joinNotices(allocator, &.{ preset_notice, skipped_default_notice, unfound_default_notice, shadowed_local_notice, unchosen_local_notice });
+    const startup_notice: ?[]const u8 = joinNotices(allocator, &.{ preset_notice, skipped_default_notice, shadowed_local_notice, unchosen_local_notice });
 
     // The session runs on the general-purpose allocator, never on the process
     // arena `allocator` above: an arena frees nothing, and a session allocates
@@ -4019,7 +4034,8 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     const preset_facts = presetFacts(arena, config, &local_config, true);
     const local_metask_key = localSignInKey(arena, &local_config, &preset_facts);
     const facts = startupFacts(arena, config, &local_config, local_metask_key, &preset_facts);
-    const decision = startup_order.passOverUnresolved(facts) orelse startup_order.decide(facts);
+    const decision = startup_order.decide(facts);
+    const fetches_metask_list = facts.metask_session and !facts.metask_key_requested;
 
     // Level 5's two stores: the session (#527) and auth.json.
     const session_text: ?[]const u8 = session: {
@@ -4064,7 +4080,10 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
                 std.debug.print("This start uses the default stored with /model: {s}.\n", .{name})
             else
                 std.debug.print("This start uses the default stored with /model.\n", .{}),
-            .unresolved => |pin| std.debug.print("This start stops: the default stored with /model ({s}) is in no model list on this machine.\n", .{pin}),
+            .unresolved => |pin| if (fetches_metask_list)
+                std.debug.print("This start looks for the default stored with /model ({s}) in Metask's model list, which it fetches first, and stops if it is not there.\n", .{pin})
+            else
+                std.debug.print("This start stops: the default stored with /model ({s}) is in no model list on this machine.\n", .{pin}),
             else => {},
         },
         .metask_key => std.debug.print("This start uses Metask with {s}{s}.\n", .{ metaskKeySource(config.auth_precedence, local_metask_key, stored, auth_error), metask_model }),
@@ -4131,7 +4150,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
         .unresolved => |pin| std.debug.print("{s}4 stored default: {s}, which no model list on this machine has: {s}\n", .{
             mark.at(4, decision),
             pin,
-            if (decision.level() == 5) "passed over by the TUI for the Metask sign-in, -p and the rest stop" else "a start stops and says why",
+            if (fetches_metask_list) "a start fetches Metask's model list and looks for it there, and stops if it is not there" else "a start stops and says why",
         }),
     }
     // 5. A Metask sign-in: the historical path's key, else the session.

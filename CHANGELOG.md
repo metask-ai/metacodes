@@ -1191,19 +1191,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
-- **A default model kept with `/model` that no model list has at startup no
-  longer stops the terminal UI of someone signed in to Metask.** A model the
-  Metask sign-in lists (its gateway's models, which the terminal UI fetches
-  only once it has started) kept for every future session pins an offer the
-  startup catalog does not have, so the next `metacodes` printed `the stored
-  selection pins offer …, which the current catalog does not offer` and
-  exited. When the terminal UI starts with a Metask sign-in, it now starts on
-  that sign-in instead and says once under the banner that the stored default
-  cannot be found right now; `/model` chooses again, and `config.json` is left
-  as it is. Without a Metask sign-in, and for `-p`, `serve`, `--web` and a REPL
-  reading a pipe, the start still stops with the same error.
-  `metacodes login status` no longer calls such a default `set`: it says that
-  no model list on this machine has it and which level the start uses.
+- **A default model kept with `/model` from Metask's own list no longer stops
+  the next start.** The models a Metask session's gateway lists are fetched
+  only once the terminal UI has started, so one of them kept for every future
+  session pinned an offer the start did not have yet: the next `metacodes`
+  printed `the stored selection pins offer …, which the current catalog does
+  not offer` and exited. With a Metask session, a start whose stored default
+  is not among the built-in models now fetches the gateway's model list first
+  (within the 5 s the terminal UI already waits for it) and runs on the stored
+  default when it is there, as OpenRouter's list is downloaded for an
+  OpenRouter default (#622). When the list does not have it, or cannot be
+  fetched, the start stops and names the ways out: `--provider metask`, or
+  removing `global_selection` from `config.json`. `metacodes login status` no
+  longer calls such a default `set`: it says that no model list on this
+  machine has it and that a start looks for it in Metask's list.
 
 - **A `204` or `304` answer no longer holds a request until the server
   closes the connection** (#579). Zig 0.16's HTTP client reads the body of a
