@@ -1494,9 +1494,10 @@ pub const App = struct {
 
     pub fn teammateKey(app: *App) ?[]const u8 {
         const handed = app.handed_key orelse return null;
+        if (handed.len == 0 or handed.len > @import("metacodes-internal").swarm.teammate_process.max_handed_key_bytes) return null;
         if (app.unbound() != null or !std.mem.eql(u8, app.api_key, handed)) return null;
         const owner = app.handed_key_owner orelse return null;
-        const named = app.teammateRoute().provider orelse return null;
+        const named = app.leadRoute().provider orelse return null;
         return if (owner.eqlText(named)) handed else null;
     }
 
@@ -1506,6 +1507,12 @@ pub const App = struct {
     }
 
     fn teammateRoute(app: *App) teammate_route.Route {
+        var route = app.leadRoute();
+        if (app.teammateKey() != null) route.base_url = app.teammateBaseUrl();
+        return route;
+    }
+
+    fn leadRoute(app: *App) teammate_route.Route {
         const effort = app.config.reasoning_effort;
         var route: teammate_route.Route = .{
             .provider = app.config.resolved_provider_id orelse app.config.provider_profile,
@@ -1519,7 +1526,6 @@ pub const App = struct {
                 if (found) |offer| route = .ofOffer(offer, effort);
             }
         }
-        route.base_url = app.teammateBaseUrl();
         return route;
     }
 

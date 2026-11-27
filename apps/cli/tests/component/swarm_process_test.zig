@@ -482,7 +482,8 @@ const LeadHost = struct {
 
     fn append(ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
         const self: *LeadHost = @ptrCast(@alignCast(ctx));
-        try out.appendSlice(arena, &.{ "--base-url", try arena.dupe(u8, self.base_url), "--model", "lead-model", "--reasoning-effort", "low" });
+        if (self.key != null) try out.appendSlice(arena, &.{ "--base-url", try arena.dupe(u8, self.base_url) });
+        try out.appendSlice(arena, &.{ "--model", "lead-model", "--reasoning-effort", "low" });
     }
 
     fn handedKey(ctx: *anyopaque) ?[]const u8 {
@@ -673,6 +674,10 @@ test "L2: a METACODES_API_KEY_FD left in the lead's environment does not reach a
     var real: RealTeammate = undefined;
     try real.start(&buf, "cc-zig-sw6-stale-fd", "987", "sk-env-teammate-key");
     defer real.stop();
+    const url = try real.server.urlOwned(real.arena_state.allocator());
+    const url_z = try real.arena_state.allocator().dupeZ(u8, url);
+    const env_endpoint = try EnvGuard.set("METACODES_BASE_URL", url_z.ptr);
+    defer env_endpoint.restore();
     var sw = swctx.SwarmContext{ .allocator = std.testing.allocator, .session = test_session, .state_root = real.home, .team_sanitized = try std.testing.allocator.dupe(u8, "proj") };
     defer sw.deinit();
     var host: LeadHost = .{ .base_url = "", .key = null };
@@ -773,11 +778,49 @@ test "L2: a process teammate gets the lead's command-line --base-url and start k
     defer app.config.resolved_provider_id = started_on;
     app.config.resolved_provider_id = "prov-other";
     try std.testing.expect(app.teammateKey() == null);
+    args.clearRetainingCapacity();
+    try app.appendTeammateRouteArgs(arena, &args);
+    for (args.items) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--base-url"));
     const profile = app.config.provider_profile;
     defer app.config.provider_profile = profile;
     app.config.resolved_provider_id = null;
     app.config.provider_profile = null;
     try std.testing.expect(app.teammateKey() == null);
+    args.clearRetainingCapacity();
+    try app.appendTeammateRouteArgs(arena, &args);
+    for (args.items) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--base-url"));
+}
+
+test "L2: a start key longer than a teammate's descriptor takes is not handed, and its --base-url stays with it" {
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-long-key");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    const guards = [_]EnvGuard{
+        try EnvGuard.set("HOME", home.ptr),
+        try EnvGuard.set("METACODES_NO_PROBE", "1"),
+        try EnvGuard.set("METACODES_KG_AUTOSTART", "0"),
+    };
+    defer for (guards) |guard| guard.restore();
+    var io_runtime = @import("platform").signal.threadedIo(std.testing.allocator, .{});
+    defer io_runtime.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const url = "http://127.0.0.1:9/v1";
+    const long_key = [_]u8{'k'} ** (tp.max_handed_key_bytes + 1);
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--provider", "metask", "--base-url", url, "--model", "flag-model" }, arena);
+    config.state_root = home;
+    config.resolved_provider_id = "metask";
+    const app = try cc.app_module.App.initWithOptions(std.testing.allocator, io_runtime.io(), config, &long_key, .{
+        .command_line_base_url = url,
+        .handed_key = &long_key,
+    });
+    defer app.deinit();
+
+    try std.testing.expect(app.teammateKey() == null);
+    var args: std.ArrayList([]const u8) = .empty;
+    try app.appendTeammateRouteArgs(arena, &args);
+    for (args.items) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--base-url"));
 }
 
 const BareRouteHost = struct {

@@ -780,6 +780,23 @@ pub fn storedDefaultOn(
     return if (providerSignInStored(arena, config.state_root, profile)) .{ .usable = usable } else .{ .lacks_credential = label };
 }
 
+pub fn baseUrlFollowsFlag(final: ?[]const u8, flag: ?[]const u8) bool {
+    const url = final orelse return false;
+    const base = metaskEndpointBase(flag orelse return false);
+    if (base.len == 0 or !std.mem.startsWith(u8, url, base)) return false;
+    return url.len == base.len or url[base.len] == '/';
+}
+
+test "baseUrlFollowsFlag: an endpoint built from --base-url follows it, another provider's endpoint does not" {
+    try std.testing.expect(baseUrlFollowsFlag("https://relay.example/v1", "https://relay.example/v1"));
+    try std.testing.expect(baseUrlFollowsFlag("https://relay.example/v1/messages", "https://relay.example/v1/"));
+    try std.testing.expect(baseUrlFollowsFlag("https://relay.example", "https://relay.example/v1/messages"));
+    try std.testing.expect(!baseUrlFollowsFlag("https://api.provider-p.example/v1/messages", "https://relay.example"));
+    try std.testing.expect(!baseUrlFollowsFlag("https://relay.example.evil/v1", "https://relay.example"));
+    try std.testing.expect(!baseUrlFollowsFlag(null, "https://relay.example"));
+    try std.testing.expect(!baseUrlFollowsFlag("https://relay.example", null));
+}
+
 fn keepRuntimeKeyFdFromChildren() void {
     const raw = std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) orelse return;
     const fd = std.fmt.parseInt(pfs.Fd, std.mem.span(raw), 10) catch return;
@@ -1905,7 +1922,7 @@ pub fn main(init: std.process.Init) !void {
         .local_route = local_route,
         .startup_notice = startup_notice,
         .command_name = invokedCommand(allocator),
-        .command_line_base_url = command_line_base_url,
+        .command_line_base_url = if (baseUrlFollowsFlag(config.base_url, command_line_base_url)) command_line_base_url else null,
         .handed_key = if (start_key_from_flag and unbound == null) api_key else null,
     };
     if (interactive_tui) {

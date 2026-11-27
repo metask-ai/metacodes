@@ -453,9 +453,12 @@ status, compatibility boundaries, and entry points are defined by
   closes before it starts anything else. The key is never in the arguments
   or the environment; the teammate uses it as `--api-key`, ahead of a
   Metask key in its environment or `.env`, and `METACODES_API_KEY_FD` no
-  longer reaches the teammate's environment. The lead adds `--base-url`
-  while it is on the endpoint that flag set, and the Task's `--model` and
-  `--reasoning-effort` follow the lead's. A Task that names a model is
+  longer reaches the teammate's environment. With the key, the lead also
+  passes its `--base-url` when the endpoint it is on came from that flag;
+  without the key it passes none, so a teammate on credentials of its own
+  never sends them to the lead's endpoint. A key longer than 4096 bytes is
+  not handed. The Task's `--model` and `--reasoning-effort` follow the
+  lead's. A Task that names a model is
   refused when the lead's route names neither a provider nor an endpoint,
   since the model's name alone would then choose the provider. Process
   teammates stay POSIX-only.
@@ -465,9 +468,11 @@ status, compatibility boundaries, and entry points are defined by
   `METACODES_PROVIDER` ignored the key on that descriptor: a named provider
   looked for its environment variables, saved key or sign-in, and
   `--provider metask` used the Metask sign-in. It now reads the descriptor
-  once and uses its key as it would `--api-key`. Passing it together with
-  `--api-key`, or with `METASK_API_KEY` set, is refused as ambiguous, as on
-  the historical Metask path. A provider that a preset, the directory's
+  once and uses its key as it would `--api-key`. On a provider other than
+  Metask, passing it with `--api-key` or with `METASK_API_KEY` set is
+  refused as ambiguous; on Metask, a key given with `--api-key` or in
+  `METASK_API_KEY` comes first and the descriptor is left unread. A
+  provider that a preset, the directory's
   preset or the stored default chose keeps its own key and leaves the
   descriptor unread, and a descriptor the start does not read is closed on
   exec, so no tool, MCP server or language server it starts inherits it.
