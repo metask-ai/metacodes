@@ -285,7 +285,7 @@ test "EnterWorktree and ExitWorktree ask in default, acceptEdits and auto, are d
     for (calls) |call| for (cases) |case| {
         const ctx = createContext(case.mode, std.testing.allocator);
         try std.testing.expectEqual(case.want, checkPermission(&ctx, call.name, call.args));
-        try std.testing.expectEqual(case.want, checkPermissionClassified(&ctx, call.name, call.args, .write));
+        try std.testing.expectEqual(case.want, checkPermissionClassified(&ctx, call.name, call.args, .execute));
     };
 }
 
