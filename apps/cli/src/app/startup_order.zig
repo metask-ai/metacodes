@@ -59,11 +59,12 @@ pub const StoredDefault = union(enum) {
     /// config.json cannot be read: the start says so when it consults it,
     /// and the levels below decide.
     unreadable,
-    /// Stored, and its provider has a credential (or it does not resolve,
-    /// which the start reports as it always has). See `Usable`.
+    /// Stored, and its provider has a credential (or its route cannot be
+    /// built, which the start reports as it always has). See `Usable`.
     usable: Usable,
     /// Stored, but its provider has no credential: passed over. Its name.
     lacks_credential: []const u8,
+    unresolved: []const u8,
 
     /// A `usable` default: its name (`DeepSeek · deepseek-v4-pro`) and the id
     /// of its provider, both null when it does not resolve. The provider's key
@@ -76,7 +77,7 @@ pub const StoredDefault = union(enum) {
 
     /// Whether the start consults it (`applyPersistedGlobalSelection`).
     pub fn consulted(self: StoredDefault) bool {
-        return self == .usable or self == .unreadable;
+        return self == .usable or self == .unreadable or self == .unresolved;
     }
 };
 
@@ -157,7 +158,7 @@ pub fn decide(read: Facts) Decision {
     if (read.preset == .found) return .preset;
     if (read.directory_preset == .found) return .directory_preset;
     if (!read.global_default) return if (read.metask_key_handed) .metask_key else .directory_unchosen;
-    if (read.stored_default == .usable) return .stored_default;
+    if (read.stored_default == .usable or read.stored_default == .unresolved) return .stored_default;
     if (read.metask_key) return .metask_key;
     if (read.metask_session and !read.metask_key_requested) return .metask_session;
     if (read.local_preset == .found) return .local_preset;
@@ -165,6 +166,17 @@ pub fn decide(read: Facts) Decision {
         .provider => .local_provider,
         .several => .local_unchosen,
         .none => .nothing,
+    };
+}
+
+pub fn passOverUnresolved(read: Facts) ?Decision {
+    if (read.stored_default != .unresolved) return null;
+    var below = read;
+    below.stored_default = .none;
+    const decision = decide(below);
+    return switch (decision) {
+        .metask_key, .metask_session => decision,
+        else => null,
     };
 }
 
@@ -240,6 +252,18 @@ test "a stored default without a credential, or unreadable, is passed over" {
     const unreadable: StoredDefault = .unreadable;
     try testing.expect(unreadable.consulted());
     try testing.expect(!(StoredDefault{ .lacks_credential = "x" }).consulted());
+}
+
+test "a stored default no model list has decides level 4, and yields only to a Metask sign-in" {
+    const pin: StoredDefault = .{ .unresolved = "offer offer-46ba33844a6b37c91ac2c46a2039a211" };
+    try testing.expect(pin.consulted());
+    try testing.expectEqual(Decision.stored_default, decide(factsWith(.{ .stored_default = pin, .metask_session = true })));
+    try testing.expectEqual(Decision.metask_session, passOverUnresolved(factsWith(.{ .stored_default = pin, .metask_session = true })).?);
+    try testing.expectEqual(Decision.metask_key, passOverUnresolved(factsWith(.{ .stored_default = pin, .metask_key = true, .metask_session = true })).?);
+    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = pin, .local = deepseek_file })));
+    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = pin })));
+    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = pin, .metask_session = true, .metask_key_requested = true })));
+    try testing.expectEqual(@as(?Decision, null), passOverUnresolved(factsWith(.{ .stored_default = usableDefault(), .metask_session = true })));
 }
 
 test "asking for the historical path sets the session aside, but not the file's provider" {
