@@ -60,13 +60,17 @@ const Home = struct {
     root: []const u8,
     guards: [4]EnvGuard,
 
-    fn init(self: *Home) !void {
+    fn init(self: *Home, settings: ?[]const u8) !void {
         const a = std.testing.allocator;
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
         const len = try self.tmp.dir.realPath(std.testing.io, &self.root_buffer);
         self.root = self.root_buffer[0..len];
         try self.tmp.dir.createDirPath(std.testing.io, ".metacodes");
+        if (settings) |json| {
+            try self.tmp.dir.createDirPath(std.testing.io, ".claude");
+            try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".claude/settings.json", .data = json });
+        }
         const home_z = try a.dupeZ(u8, self.root);
         defer a.free(home_z);
         self.guards = .{
@@ -197,21 +201,34 @@ const MonitorCase = struct {
     asks: bool,
     runs: bool,
     refusal: ?[]const u8 = null,
+    command: []const u8 = "touch <marker>",
+    settings: ?[]const u8 = null,
 };
 
 const DECLINED = "user declined 'Monitor' via prompt";
 const DENIED_BY_MODE = "tool 'Monitor' denied by permission rule or permission mode";
+const ALLOW_MONITOR = "{\"permissions\":{\"allow\":[\"Monitor\"]}}";
+const READS_KEYCHAIN = ": security find-generic-password -s none -w; touch <marker>";
+
+fn monitorJobs(app: *cc.app_module.App) usize {
+    const registry = if (app.jobs) |*jobs| jobs else return 0;
+    _ = registry.mu.lock();
+    defer _ = registry.mu.unlock();
+    return registry.jobs.items.len;
+}
 
 fn expectMonitorCase(case: MonitorCase) !void {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var home: Home = undefined;
-    try home.init();
+    try home.init(case.settings);
     defer home.deinit();
 
     var marker_buf: [std.fs.max_path_bytes]u8 = undefined;
     const marker = try home.markerPath(&marker_buf);
-    const input = try std.fmt.allocPrint(a, "{{\\\"command\\\":\\\"touch {s}\\\",\\\"description\\\":\\\"x\\\"}}", .{marker});
+    const command = try std.mem.replaceOwned(u8, a, case.command, "<marker>", marker);
+    defer a.free(command);
+    const input = try std.fmt.allocPrint(a, "{{\\\"command\\\":\\\"{s}\\\",\\\"description\\\":\\\"x\\\"}}", .{command});
     defer a.free(input);
     const monitor_sse = try toolUseSse(a, "tu_monitor", "Monitor", input);
     defer a.free(monitor_sse);
@@ -230,11 +247,13 @@ fn expectMonitorCase(case: MonitorCase) !void {
     var host = Host{ .home = &home, .answers = &answers };
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, try session.turn(&host));
     const ran = if (case.runs) try home.waitForCommand() else try home.commandRan();
-    errdefer std.debug.print("mode={s} answer={s}: asked {d} time(s), command ran={}\n", .{
+    const jobs = monitorJobs(session.app);
+    errdefer std.debug.print("mode={s} answer={s}: asked {d} time(s), command ran={}, jobs={d}\n", .{
         case.mode,
         @tagName(case.answer),
         host.asked,
         ran,
+        jobs,
     });
 
     try std.testing.expectEqual(@as(usize, if (case.asks) 1 else 0), host.asked);
@@ -243,6 +262,7 @@ fn expectMonitorCase(case: MonitorCase) !void {
         try std.testing.expect(!host.ran_before_answer);
     }
     try std.testing.expectEqual(case.runs, ran);
+    if (!case.runs) try std.testing.expectEqual(@as(usize, 0), jobs);
 
     try std.testing.expect(server.requestCount() >= 2);
     const second = server.requestAt(1).?.body();
@@ -278,6 +298,18 @@ test "L2 bypassPermissions runs Monitor without asking" {
     try expectMonitorCase(.{ .mode = "bypassPermissions", .asks = false, .runs = true });
 }
 
+test "L2 an allow rule for Monitor still asks before a command that reads a credential store" {
+    try expectMonitorCase(.{ .mode = "default", .settings = ALLOW_MONITOR, .command = READS_KEYCHAIN, .asks = true, .runs = false, .refusal = DECLINED });
+}
+
+test "L2 bypassPermissions still asks before a Monitor command that reads a credential store" {
+    try expectMonitorCase(.{ .mode = "bypassPermissions", .command = READS_KEYCHAIN, .asks = true, .runs = false, .refusal = DECLINED });
+}
+
+test "L2 an allow rule for Monitor runs a command that reads no credential store without asking" {
+    try expectMonitorCase(.{ .mode = "default", .settings = ALLOW_MONITOR, .asks = false, .runs = true });
+}
+
 const WorktreeCase = struct {
     mode: [*:0]const u8,
     then_exit: bool,
@@ -290,7 +322,7 @@ fn expectWorktreeCase(case: WorktreeCase) !void {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var home: Home = undefined;
-    try home.init();
+    try home.init(null);
     defer home.deinit();
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;

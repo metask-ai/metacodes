@@ -267,7 +267,7 @@ pub fn checkClassified(
         log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
         return resolveImported(ctx, tool_name, args, .core_safety_ask);
     }
-    if (bashReachesCredentialStore(ctx, tool_name, args)) {
+    if (commandReachesCredentialStore(ctx, tool_name, args)) {
         log.debug("permission", "credential store read tool={s} -> ask", .{tool_name});
         return resolveImported(ctx, tool_name, args, .core_safety_ask);
     }
@@ -420,14 +420,35 @@ fn bashAutoAllowed(ctx: *const Context, args: []const u8) bool {
     return true;
 }
 
-fn bashReachesCredentialStore(ctx: *const Context, tool_name: []const u8, args: []const u8) bool {
-    if (!std.mem.eql(u8, tool_name, "Bash")) return false;
+fn commandReachesCredentialStore(ctx: *const Context, tool_name: []const u8, args: []const u8) bool {
+    if (!std.mem.eql(u8, tool_name, "Bash") and !std.mem.eql(u8, tool_name, "Monitor")) return false;
     var fallback_buf: [bash_readonly.MAX_COMMAND_BYTES]u8 = undefined;
     var fallback = std.heap.FixedBufferAllocator.init(&fallback_buf);
     const scratch = ctx.path_check_allocator orelse fallback.allocator();
     const command = bash_readonly.commandFromInput(scratch, args) orelse return credential_store.mentions(scratch, args);
     defer scratch.free(command);
     return credential_store.mentions(scratch, command);
+}
+
+test "a Monitor command that reads a credential store asks, over an allow rule and in every mode" {
+    const alloc = std.testing.allocator;
+    const src = "{\"permissions\":{\"allow\":[\"Monitor\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const keychain = "{\"command\":\"security find-generic-password -s example -w\",\"description\":\"x\"}";
+    const spliced = "{\"command\":\"tail -f log; security find-generic-pass'word' -s example -w\",\"description\":\"x\"}";
+    for ([_]@import("mode.zig").Mode{ .default, .accept_edits, .auto, .bypass_permissions }) |mode| {
+        const allowed = Context{ .mode = mode, .settings = &ms, .path_check_allocator = alloc };
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Monitor", keychain));
+        try std.testing.expectEqual(Decision.ask, check(&allowed, "Monitor", spliced));
+        try std.testing.expectEqual(Decision.allow, check(&allowed, "Monitor", "{\"command\":\"tail -f build.log\",\"description\":\"x\"}"));
+    }
 }
 
 test "a Bash command that reads a credential store asks, over an allow rule and in every mode" {
