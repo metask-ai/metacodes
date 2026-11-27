@@ -101,9 +101,13 @@ status, compatibility boundaries, and entry points are defined by
   interactive TUI reports the mouse; releasing a left-button drag copies the
   text under it through OSC 52 (and `pbcopy` in a local macOS session) and
   the prompt shows `Copied to clipboard`, like Claude Code's fullscreen
-  mode. The wheel no longer scrolls the scrollback while the TUI waits for
-  input, and the terminal's own selection needs its modifier key (Shift, or
-  Option in iTerm2).
+  mode. The wheel no longer scrolls the terminal's scrollback while the TUI
+  runs, at the prompt and during a reply, and the terminal's own selection
+  needs the key that skips mouse reporting: Shift in most terminals, Option
+  in iTerm2, and in VS Code and Cursor on macOS Option once
+  `terminal.integrated.macOptionClickForcesSelection` is on. Apple documents
+  no such key for Terminal; turn mouse reporting off there with ⌘R
+  ([Terminal setup](doc/TERMINAL_SETUP.md#selecting-text-with-the-mouse)).
 - **File references in replies open with Cmd/Ctrl+click.** The TUI renders a
   Markdown link (`[notes.txt](/abs/notes.txt)`, `[x](src/a.zig:42)`,
   `[docs](https://…)`) as an underlined OSC 8 hyperlink showing only its
