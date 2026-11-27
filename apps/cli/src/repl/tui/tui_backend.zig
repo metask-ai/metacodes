@@ -229,9 +229,13 @@ pub const TuiBackend = struct {
                     self.continue_assistant = false;
                 } else self.region.beginGenAssistant();
             },
-            .text_chunk => |t| self.region.writeGenAssistantText(t),
-            .thinking_chunk => |t| self.region.writeGenAssistantText(t), // TUI 暂与 text 同渲染(后续可折叠)
+            .text_chunk => |t| {
+                self.region.endGenThinking(util_time.nowMs());
+                self.region.writeGenAssistantText(t);
+            },
+            .thinking_chunk => |t| self.region.writeGenThinking(t, util_time.nowMs()),
             .tool_start => |s| {
+                self.region.endGenThinking(util_time.nowMs());
                 // backend 据 tool_card 分类自决渲染(层泄漏修复:agent_loop 无条件发,不碰 tool_card)。
                 if (tool_card.usesDynamicCard(s.name)) {
                     // WebSearch(progress 卡)+ 类A(Bash/Read/Grep/Glob,执行期动态卡):
@@ -357,6 +361,7 @@ pub const TuiBackend = struct {
                 self.region.writeGenText(s);
             },
             .stream_done => {
+                self.region.endGenThinking(util_time.nowMs());
                 // 结束助手文本行(幂等):半行补 \n,已在行首 no-op。
                 // 旧版无条件 writeGenText("\n") 在文本已以 \n 结尾时多吐空行 → 多批次 tool 卡间冒空行。
                 self.region.endScrollLine();

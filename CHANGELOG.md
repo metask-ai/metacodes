@@ -389,6 +389,14 @@ status, compatibility boundaries, and entry points are defined by
   has its own test step (`zig build test:base` ... `test:teamwork`), and
   `zig build test:lib` runs one sharded binary per package.
 
+- **The TUI folds a model's thinking into one line.** Thinking was printed
+  into the conversation as if it were the answer. It now scrolls, dim, in
+  the live area above the spinner (its last three lines), and when the
+  answer or a tool call starts it leaves one dim line in its place,
+  `✻ Thought for 12s`. A reply that only thinks keeps that line too, and a
+  resumed session shows `✻ Thought`. Ctrl+X Ctrl+O shows the whole thinking;
+  it used to stop after three lines. Line mode and `-p` do not change.
+
 - **Zig source API: tool-result reduction moved out of `Conversation`, and
   the packages no longer form a cycle.** `Conversation.microcompactToolResults`,
   `microcompactToolResultsByRecentResults`, `truncateLargeToolResults` and
