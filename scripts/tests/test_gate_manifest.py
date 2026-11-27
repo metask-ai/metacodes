@@ -3,8 +3,11 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,6 +88,54 @@ SCRIPT_SUITES_RUN_ELSEWHERE = {
 
 
 class GateManifestTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "WorkBuddy provisioning runs on Linux and macOS")
+    def test_workbuddy_provisioning_isolates_repeated_jobs_with_stale_runner_temp(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job.get("steps", [])
+            if step.get("name") == "Provision the pinned WorkBuddy-Bench checkout"
+        ]
+        self.assertGreater(len(steps), 0)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner_temp = root / "runner temp"
+            stale = runner_temp / "workbuddy-bench"
+            stale.mkdir(parents=True)
+            sentinel = stale / "prior-job"
+            sentinel.write_text("preserve", encoding="utf-8")
+            provision = root / "scripts/eval/workbuddy/provision_checkout.sh"
+            provision.parent.mkdir(parents=True)
+            provision.write_text(
+                '#!/usr/bin/env bash\n'
+                'set -euo pipefail\n'
+                '[[ -d $1 && -z $(ls -A "$1") ]]\n'
+                'touch "$1/provisioned"\n'
+                'printf "%s\\n" "$1"\n',
+                encoding="utf-8",
+            )
+            provision.chmod(0o755)
+            github_env = root / "github-env"
+            env = dict(os.environ, RUNNER_TEMP=str(runner_temp), GITHUB_ENV=str(github_env))
+            for step in steps:
+                for _ in range(2):
+                    result = subprocess.run(
+                        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+                        cwd=root, env=env, capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            paths = [
+                Path(line.removeprefix("METACODES_WORKBUDDY_CHECKOUT="))
+                for line in github_env.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(paths), len(steps) * 2)
+            self.assertEqual(len(set(paths)), len(paths))
+            for path in paths:
+                self.assertEqual(path.parent, runner_temp)
+                self.assertTrue((path / "provisioned").is_file())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
     def test_eval_preflight_reports_the_python_that_needs_repair(self):
         script = str(ROOT / "scripts/check_eval_python.py")
         good = subprocess.run([sys.executable, script], capture_output=True, text=True)

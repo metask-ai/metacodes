@@ -257,7 +257,7 @@ pub const Catalog = struct {
                 // built-ins. The extra gate exists only to keep Host and
                 // unselected entries out of the prefetch path.
                 .prefetch_safe = true,
-                .category = permission_category.getToolCategory(builtin.name),
+                .category = builtin.category,
                 .replay = builtin.replay,
             });
         }
@@ -1234,6 +1234,16 @@ test "Host stream equal bytes render cache-stable envelopes across artifact root
     try std.testing.expect(std.mem.indexOf(u8, first_rendered.bytes, first_root) == null);
     try std.testing.expect(std.mem.indexOf(u8, first_rendered.bytes, second_root) == null);
     try std.testing.expect(std.mem.indexOf(u8, first_rendered.bytes, "ReadArtifact") != null);
+}
+
+test "builtin catalog and selection retain every registry permission category" {
+    for (tools.registry) |builtin| {
+        var catalog = try Catalog.init(std.testing.allocator, &.{builtin.name}, &.{});
+        defer catalog.deinit();
+        var selection = try Selection.init(std.testing.allocator, &catalog, &.{builtin.name});
+        defer selection.deinit();
+        try std.testing.expectEqual(builtin.category, selection.dispatcher().category(builtin.name).?);
+    }
 }
 
 test "Host sync names cannot duplicate built-ins or each other" {
