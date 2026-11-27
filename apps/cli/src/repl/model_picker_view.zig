@@ -377,9 +377,29 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
             if (route.preferred) w.writeAll("   preferred") catch {};
             w.print("{s}", .{th.reset}) catch {};
         },
+        .more => |more| {
+            paint(w, th, selected, false);
+            w.print("All models{s}{s} · {d} more · enter to {s}{s}", .{
+                th.reset,
+                th.dim,
+                more.hidden,
+                if (more.open) "hide" else "show",
+                th.reset,
+            }) catch {};
+        },
+        .vendor => |vendor| {
+            const name = vendorName(picker.offers.items[vendor.offer_index]);
+            w.print("    {s}{s}{s}", .{ th.dim, clip(name, layout.cols -| 5), th.reset }) catch {};
+        },
     }
     newline(w);
     return 1;
+}
+
+fn vendorName(offer: picker_mod.OfferSummary) []const u8 {
+    if (std.mem.indexOf(u8, offer.display_name, ": ")) |at| return offer.display_name[0..at];
+    const vendor = picker_mod.vendorOf(picker_mod.canonicalKey(offer));
+    return if (vendor.len > 0) vendor else "Other";
 }
 
 /// The controls of the focused route, a line each: the vocabulary after
@@ -1180,6 +1200,48 @@ test "a filter keeps the headings, so a match says which route it goes through a
         }
         for (rows) |row| try testing.expect(textWidth(row) < cols);
     }
+}
+
+test "a long OpenRouter list opens on its latest models, folds the rest, and names their vendors once shown" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [44][32]u8 = undefined;
+    var offers: [46]control_plane.OfferSummary = undefined;
+    offers[0] = offerOf("openrouter", "auto", "~anthropic/claude-sonnet-latest", "openai_chat");
+    offers[0].display_name = "Anthropic: Claude Sonnet Latest";
+    offers[1] = offerOf("openrouter", "auto", "~z-ai/glm-latest", "openai_chat");
+    offers[1].display_name = "Z.ai: GLM Latest";
+    for (offers[2..], 0..) |*slot, index| {
+        const odd = index % 2 == 1;
+        const id = std.fmt.bufPrint(&names[index], "{s}/model-{d:0>2}", .{ if (odd) "anthropic" else "qwen", index }) catch unreachable;
+        slot.* = offerOf("openrouter", "auto", id, "openai_chat");
+        slot.display_name = try std.fmt.allocPrint(arena, "{s}: Model {d:0>2}", .{ if (odd) "Anthropic" else "Qwen", index });
+    }
+    try seed(&picker, &offers, null);
+    const notes = [_]picker_mod.ProviderNote{picker_mod.ProviderNote.init(ids.Slug.lit("openrouter"), "OpenRouter", .environment)};
+    var ready: [46]bool = undefined;
+    @memset(&ready, true);
+    try picker.setReadiness(&ready, &notes);
+    picker.page_rows = 80;
+
+    const folded = try visibleRows(arena, drawAt(&picker, try arena.alloc(u8, 64 * 1024), 100));
+    try testing.expectEqualStrings("  OpenRouter · key from shell · billed to your OpenRouter account", folded[1]);
+    try testing.expect(std.mem.startsWith(u8, folded[2], "  >  Anthropic: Claude Sonnet Latest"));
+    try testing.expect(std.mem.startsWith(u8, folded[3], "     Z.ai: GLM Latest"));
+    try testing.expectEqualStrings("     All models · 44 more · enter to show", folded[4]);
+    for (folded) |row| try testing.expect(std.mem.indexOf(u8, row, "Model 0") == null);
+
+    _ = picker.onKey(.end);
+    _ = picker.onKey(.enter);
+    const open = try visibleRows(arena, drawAt(&picker, try arena.alloc(u8, 64 * 1024), 100));
+    try testing.expectEqualStrings("  >  All models · 44 more · enter to hide", open[4]);
+    try testing.expectEqualStrings("    Anthropic", open[5]);
+    try testing.expect(std.mem.startsWith(u8, open[6], "     Anthropic: Model 01"));
+    try testing.expectEqualStrings("    Qwen", open[5 + 1 + 22]);
+    for (open) |row| try testing.expect(textWidth(row) < 100);
 }
 
 test "a window scrolled into a group opens with that group's heading, never over the cursor (#600)" {

@@ -408,6 +408,14 @@ status, compatibility boundaries, and entry points are defined by
   now lists only the routes of the key's site; a key from the environment or
   `.env`, whose site is not known, still lists both.
 
+- **A long OpenRouter list opens on the models you would pick.** `/model`
+  listed all of OpenRouter's 300-odd models in one list. A provider listing
+  more than 40 models that marks its own latest ones (OpenRouter's
+  `~vendor/…-latest` ids, such as `~anthropic/claude-sonnet-latest`) now
+  opens on the model in use and those, with the rest folded under `All
+  models · N more`. Enter there shows them grouped by vendor, and Esc folds
+  them again. Typing still searches every model.
+
 - **Bench profiles replace batches.** A profile (评测配置) is one frozen
   metacodes version with a fixed set of advanced features, and every run
   belongs to one; the same version with the same features is always the same
