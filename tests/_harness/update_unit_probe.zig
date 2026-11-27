@@ -9,7 +9,6 @@
 //!   - `install …` runs the real installer (apps/cli/src/app/install.zig) from the unit
 //!     around this executable, without the `doctor --strict` self check, unless
 //!     `METACODES_UPDATE_PROBE_EXIT` asks for a failure exit first;
-//!   - `sleep <ms>` stands for a session: it runs from the prefix and waits;
 //!   - `kgd` stands for this install's TinyKG service: it starts the prefix's
 //!     `vendor/tinykg/tinykgd wait-stdin` on a pipe and waits, and
 //!     `wait-stdin` exits when its stdin closes, as tinykgd does when its
@@ -62,14 +61,8 @@ pub fn main(init: std.process.Init) !u8 {
         try writeStdout(init.io, "  update [--check] [--version X.Y.Z]\n");
         return 0;
     }
-    if (a.len == 2 and std.mem.eql(u8, a[0], "sleep")) {
-        try std.Io.sleep(init.io, .fromMilliseconds(try std.fmt.parseInt(i64, a[1], 10)), .awake);
-        return 0;
-    }
     if (a.len == 1 and std.mem.eql(u8, a[0], "wait-stdin")) {
-        var buf: [256]u8 = undefined;
-        var reader = std.Io.File.stdin().reader(init.io, &buf);
-        _ = reader.interface.discardRemaining() catch {};
+        waitForStdin(init.io);
         return 0;
     }
     if (a.len == 1 and std.mem.eql(u8, a[0], "kgd")) {
@@ -78,8 +71,8 @@ pub fn main(init: std.process.Init) !u8 {
         const prefix = root.state_root.prefixOf(exe) orelse return error.NotInAUnit;
         const daemon = try std.fs.path.join(arena, &.{ prefix, "vendor", "tinykg", if (@import("builtin").os.tag == .windows) "tinykgd.exe" else "tinykgd" });
         var child = try std.process.spawn(init.io, .{ .argv = &.{ daemon, "wait-stdin" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
-        _ = &child;
-        try std.Io.sleep(init.io, .fromSeconds(120), .awake);
+        defer child.kill(init.io);
+        waitForStdin(init.io);
         return 0;
     }
     if (a.len == 0 or !std.mem.eql(u8, a[0], "install")) return 0;
@@ -119,6 +112,12 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     return 0;
+}
+
+fn waitForStdin(io: std.Io) void {
+    var buf: [256]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io, &buf);
+    _ = reader.interface.discardRemaining() catch {};
 }
 
 fn writeStdout(io: std.Io, bytes: []const u8) !void {

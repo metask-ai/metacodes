@@ -137,7 +137,7 @@ def check_shared_models(binary, root, config, binary_dir):
 
                     run(str(binary), turns(), cwd=str(root), base_url=None, per_key_drain=.04,
                         extra_args=['--state-dir', str(gateway.state), '--provider', 'metask', '--model', 'session-model'],
-                        env={**env, 'METASK_SITE_URL': gateway.url, 'METASK_GATEWAY_URL': gateway.url,
+                        env={**env, 'TERM': 'xterm-256color', 'METASK_SITE_URL': gateway.url, 'METASK_GATEWAY_URL': gateway.url,
                              'METACODES_OAUTH_DIR': str(gateway.state / 'oauth'), 'METASK_API_KEY': None})
                     status, = (peer / 'bench/jobs').glob('*/relay-statuses.json')
                     assert json.loads(status.read_bytes()) == [200] and len(gateway.refreshes) == 1

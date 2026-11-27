@@ -163,10 +163,11 @@ def run_w0(workbuddy: Path, zig: Path, bash: Path, uv: Path) -> Dict[str, object
     extra = final.get("extra") or {}
     control = extra.get("control_metrics") or {}
     if (
-        final.get("total_prompt_tokens") != 120
+        final.get("total_prompt_tokens") != 210
         or final.get("total_completion_tokens") != 30
         or final.get("total_cached_tokens") != 80
         or extra.get("cache_creation_input_tokens") != 10
+        or extra.get("prompt_tokens_include_cache") is not True
         or extra.get("metacodes_stop_reason") != "end_turn"
         or control.get("schema_version")
         != CONTROL_METRICS_SCHEMA

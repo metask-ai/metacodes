@@ -2792,6 +2792,8 @@ pub fn build(b: *std.Build) void {
     const product_test_step = b.step("test:product", "Run the built product end to end: evaluation harness, smokes, daemon (part of `test`)");
     const product_runtime_step = b.step("test:product-runtime", "Run product runtime smokes for a change outside the evaluation harness");
     const eval_test_step = b.step("test:eval", "Test the harness evaluation framework");
+    const bench_test_step = b.step("test:bench", "Run the Bench/Harbor Python unit suites");
+    const bench_smoke_step = b.step("test:bench-smoke", "Run the Bench CLI smoke against the built binary");
     product_test_step.dependOn(product_runtime_step);
     product_test_step.dependOn(eval_test_step);
     test_step.dependOn(units_test_step);
@@ -3389,6 +3391,15 @@ pub fn build(b: *std.Build) void {
         eval_test_step.dependOn(&eval_test_cmd.step);
         slot.* = eval_test_cmd;
     }
+    const bench_unit_cmd = b.addSystemCommand(&.{
+        eval_python_exe,
+        "scripts/eval/tests/run_shard.py",
+        "--bench-only",
+        "--jobs",
+        "4",
+        "-v",
+    });
+    bench_test_step.dependOn(&bench_unit_cmd.step);
     const runtime_tests_can_execute_target =
         target.result.os.tag == @import("builtin").os.tag and
         target.result.cpu.arch == @import("builtin").cpu.arch;
@@ -3397,6 +3408,7 @@ pub fn build(b: *std.Build) void {
         bench_cli_smoke.addArtifactArg(exe);
         eval_test_step.dependOn(&bench_cli_smoke.step);
         product_runtime_step.dependOn(&bench_cli_smoke.step);
+        bench_smoke_step.dependOn(&bench_cli_smoke.step);
         if (staged_tinykg) |tinykg| {
             // Native Python cases discover the installed TinyKG by path.  On
             // a clean checkout they must wait for installation; otherwise

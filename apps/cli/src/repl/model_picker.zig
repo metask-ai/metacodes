@@ -25,8 +25,11 @@
 //!   one in use first), each saying where its credential comes from and who
 //!   bills it, filtered or not.
 //! - A model served on several routes shows them under it while the cursor is
-//!   on it. Enter on the model takes its preferred route (the one in use, else
-//!   the first in catalog order); Enter on a route takes that route.
+//!   on it, one per site where the routes name their region (the route in use
+//!   there, else its first); with the cursor on a site's route, all of that
+//!   site's routes are listed. Enter on the model takes its preferred route
+//!   (the one in use, else the first in catalog order); Enter on a route takes
+//!   that route.
 //! - The controls the focused route declares (in practice the reasoning
 //!   effort) are a line under the list, changed with ←/→ from any row. The
 //!   value is remembered as the one wanted, and each model shows and commits
@@ -61,6 +64,8 @@ pub const MAX_GROUP_KEY: usize = 128;
 pub const MAX_LOCAL_CONFIG_PATH: usize = 1024;
 /// Room for a provider's display name in its heading.
 pub const MAX_PROVIDER_NAME: usize = 64;
+
+pub const LONG_LIST: usize = 40;
 
 pub const Stage = enum {
     /// Every configured provider's models, on one screen.
@@ -210,9 +215,14 @@ pub const Row = union(enum) {
     /// One route of the model above it, listed while the cursor is on that
     /// model or one of its routes.
     route: struct { offer_index: usize, is_current: bool, preferred: bool, last: bool },
+    more: struct { offer_index: usize, hidden: usize, open: bool },
+    vendor: struct { offer_index: usize },
 
     pub fn focusable(self: Row) bool {
-        return self != .heading;
+        return switch (self) {
+            .heading, .vendor => false,
+            .model, .route, .more => true,
+        };
     }
 };
 
@@ -304,7 +314,7 @@ const RowId = struct {
     key_len: usize = 0,
     offer: ?OfferId = null,
 
-    const Kind = enum { none, model, route };
+    const Kind = enum { none, model, route, more };
 
     fn key(self: *const RowId) []const u8 {
         return self.key_buffer[0..self.key_len];
@@ -316,6 +326,7 @@ const RowId = struct {
             .none => true,
             .model => sameSlug(self.provider, other.provider) and std.mem.eql(u8, self.key(), other.key()),
             .route => if (self.offer) |mine| (if (other.offer) |theirs| mine.eql(theirs) else false) else false,
+            .more => sameSlug(self.provider, other.provider),
         };
     }
 };
@@ -372,6 +383,8 @@ pub const Picker = struct {
     expanded_provider: ?Slug = null,
     expanded_key_buffer: [MAX_GROUP_KEY]u8 = undefined,
     expanded_key_len: usize = 0,
+    open_site: ?OfferId = null,
+    open_more: ?Slug = null,
     /// Set when the picker is (re)opened: the cursor goes to the model in use
     /// as soon as there is a snapshot to find it in.
     focus_current: bool = true,
@@ -542,6 +555,7 @@ pub const Picker = struct {
         self.cursor = 0;
         self.window_top = 0;
         self.collapse();
+        self.open_more = null;
         self.intents = .{};
         self.scope = .session;
         self.setup = null;
@@ -696,24 +710,94 @@ pub const Picker = struct {
                 .is_current = current,
             } });
         }
+        if (tier == null and self.filter_len == 0) try self.foldLongList(buffer, start);
         const expanded = self.expanded_provider orelse return;
         if (!expanded.eql(provider)) return;
         const at = findModel(buffer.list.items[start..], self.expandedKey()) orelse return;
         const group = buffer.list.items[start + at].model;
         if (group.offer_count < 2) return;
-        var insert_at = start + at + 1;
-        var listed: usize = 0;
-        for (self.offers.items, 0..) |offer, index| {
+        var shown: std.ArrayList(usize) = .empty;
+        defer shown.deinit(buffer.gpa);
+        for (self.offers.items, 0..) |*offer, index| {
             if (!offer.provider_id.eql(provider) or !self.isReady(index)) continue;
-            if (!std.mem.eql(u8, canonicalKey(offer), group.label)) continue;
-            listed += 1;
+            if (!std.mem.eql(u8, canonicalKey(offer.*), group.label)) continue;
+            const site = for (shown.items, 0..) |seen, at_site| {
+                if (sameSite(&self.offers.items[seen], offer)) break at_site;
+            } else null;
+            if (site) |at_site| {
+                if (self.isCurrent(offer.*)) shown.items[at_site] = index;
+                continue;
+            }
+            try shown.append(buffer.gpa, index);
+        }
+        var listed: std.ArrayList(usize) = .empty;
+        defer listed.deinit(buffer.gpa);
+        const open = self.openSiteOffer();
+        for (shown.items) |representative| {
+            const site_open = if (open) |opened| sameSite(opened, &self.offers.items[representative]) else false;
+            if (!site_open) {
+                try listed.append(buffer.gpa, representative);
+                continue;
+            }
+            for (self.offers.items, 0..) |*offer, index| {
+                if (!offer.provider_id.eql(provider) or !self.isReady(index)) continue;
+                if (!std.mem.eql(u8, canonicalKey(offer.*), group.label)) continue;
+                if (sameSite(offer, &self.offers.items[representative])) try listed.append(buffer.gpa, index);
+            }
+        }
+        var insert_at = start + at + 1;
+        for (listed.items, 1..) |index, count| {
             try buffer.list.insert(buffer.gpa, insert_at, .{ .route = .{
                 .offer_index = index,
-                .is_current = self.isCurrent(offer),
+                .is_current = self.isCurrent(self.offers.items[index]),
                 .preferred = index == group.offer_index,
-                .last = listed == group.offer_count,
+                .last = count == listed.items.len,
             } });
             insert_at += 1;
+        }
+    }
+
+    fn openSiteOffer(self: *const Picker) ?*const OfferSummary {
+        const id = self.open_site orelse return null;
+        for (self.offers.items) |*offer| {
+            if (offer.offer_id.eql(id)) return offer;
+        }
+        return null;
+    }
+
+    fn foldLongList(self: *const Picker, buffer: *RowBuffer, start: usize) error{OutOfMemory}!void {
+        const models = buffer.list.items[start..];
+        if (models.len <= LONG_LIST) return;
+        const marks_its_own = for (models) |row| {
+            if (isLatestAlias(self.offers.items[row.model.offer_index])) break true;
+        } else false;
+        if (!marks_its_own) return;
+        var shown: std.ArrayList(Row) = .empty;
+        defer shown.deinit(buffer.gpa);
+        var rest: std.ArrayList(Row) = .empty;
+        defer rest.deinit(buffer.gpa);
+        for (models) |row| if (row.model.is_current) try shown.append(buffer.gpa, row);
+        for (models) |row| {
+            if (row.model.is_current) continue;
+            const list = if (isLatestAlias(self.offers.items[row.model.offer_index])) &shown else &rest;
+            try list.append(buffer.gpa, row);
+        }
+        if (rest.items.len == 0) return;
+        const first_offer = models[0].model.offer_index;
+        const provider = self.offers.items[first_offer].provider_id;
+        const open = if (self.open_more) |slug| slug.eql(provider) else false;
+        buffer.list.shrinkRetainingCapacity(start);
+        try buffer.list.appendSlice(buffer.gpa, shown.items);
+        try buffer.list.append(buffer.gpa, .{ .more = .{ .offer_index = first_offer, .hidden = rest.items.len, .open = open } });
+        if (!open) return;
+        std.sort.insertion(Row, rest.items, {}, vendorBefore);
+        var previous: ?[]const u8 = null;
+        for (rest.items) |row| {
+            const vendor = vendorOf(row.model.label);
+            const same = if (previous) |seen| std.ascii.eqlIgnoreCase(seen, vendor) else false;
+            if (!same) try buffer.list.append(buffer.gpa, .{ .vendor = .{ .offer_index = row.model.offer_index } });
+            previous = vendor;
+            try buffer.list.append(buffer.gpa, row);
         }
     }
 
@@ -782,6 +866,11 @@ pub const Picker = struct {
                 id.kind = .route;
                 id.offer = self.offers.items[route.offer_index].offer_id;
             },
+            .more => |more| {
+                id.kind = .more;
+                id.provider = self.offers.items[more.offer_index].provider_id;
+            },
+            .vendor => {},
         }
         return id;
     }
@@ -799,6 +888,7 @@ pub const Picker = struct {
     fn collapse(self: *Picker) void {
         self.expanded_provider = null;
         self.expanded_key_len = 0;
+        self.open_site = null;
     }
 
     /// Put the cursor on the row `id` names: a model lists its routes, a
@@ -811,8 +901,9 @@ pub const Picker = struct {
                 const key = id.key();
                 @memcpy(self.expanded_key_buffer[0..key.len], key);
                 self.expanded_key_len = key.len;
+                self.open_site = null;
             },
-            .route => {},
+            .route => self.open_site = id.offer,
             else => self.collapse(),
         }
         var buffer = RowBuffer.init(self.allocator);
@@ -882,7 +973,7 @@ pub const Picker = struct {
         return switch (list[@min(self.cursor, list.len - 1)]) {
             .model => |group| &self.offers.items[group.offer_index],
             .route => |route| &self.offers.items[route.offer_index],
-            .heading => null,
+            .heading, .more, .vendor => null,
         };
     }
 
@@ -1090,15 +1181,26 @@ pub const Picker = struct {
             self.focus(keep);
             return .redraw;
         }
+        if (self.open_more) |provider| {
+            self.open_more = null;
+            self.focus(.{ .kind = .more, .provider = provider });
+            return .redraw;
+        }
         return .closed;
     }
 
     fn advance(self: *Picker, visible: []const Row) Outcome {
         if (visible.len == 0) return .ignored;
-        return switch (visible[@min(self.cursor, visible.len - 1)]) {
-            .heading => .ignored,
-            .model, .route => self.commitNow(),
-        };
+        const row = visible[@min(self.cursor, visible.len - 1)];
+        switch (row) {
+            .heading, .vendor => return .ignored,
+            .model, .route => return self.commitNow(),
+            .more => |more| {
+                self.open_more = if (more.open) null else self.offers.items[more.offer_index].provider_id;
+                self.focus(self.idOf(row));
+                return .redraw;
+            },
+        }
     }
 
     /// ←/→: the previous / next value of the focused route's first control,
@@ -1159,6 +1261,29 @@ pub const Picker = struct {
 /// legitimately share.
 pub fn canonicalKey(offer: OfferSummary) []const u8 {
     return offer.canonical_model_id orelse offer.request_model_id;
+}
+
+fn sameSite(a: *const OfferSummary, b: *const OfferSummary) bool {
+    const left = a.region orelse return false;
+    const right = b.region orelse return false;
+    if (!std.mem.eql(u8, left, right)) return false;
+    const left_account = a.credential_ref orelse return b.credential_ref == null;
+    const right_account = b.credential_ref orelse return false;
+    return left_account.eql(right_account);
+}
+
+pub fn isLatestAlias(offer: OfferSummary) bool {
+    return std.mem.startsWith(u8, offer.request_model_id, "~");
+}
+
+pub fn vendorOf(key: []const u8) []const u8 {
+    const bare = if (std.mem.startsWith(u8, key, "~")) key[1..] else key;
+    const slash = std.mem.indexOfScalar(u8, bare, '/') orelse return "";
+    return bare[0..slash];
+}
+
+fn vendorBefore(_: void, left: Row, right: Row) bool {
+    return std.ascii.lessThanIgnoreCase(vendorOf(left.model.label), vendorOf(right.model.label));
 }
 
 fn findModel(existing: []const Row, key: []const u8) ?usize {
@@ -1338,6 +1463,8 @@ fn shape(picker: *const Picker, out: []u8) ![]const u8 {
         .heading => 'H',
         .model => 'M',
         .route => 'R',
+        .more => 'A',
+        .vendor => 'V',
     };
     return out[0..list.len];
 }
@@ -1505,6 +1632,149 @@ test "the list holds every model however large the catalog, and Home/End reach b
     try testing.expect(outcome.commit.offer_id.eql(offers[count - 1].offer_id));
 }
 
+fn longListWithLatestAliases(names: *[44][32]u8, offers: *[46]OfferSummary) void {
+    offers[0] = fixtureOffer("openrouter", "auto", "Anthropic: Claude Sonnet Latest", null, "~anthropic/claude-sonnet-latest", "openai_chat");
+    offers[1] = fixtureOffer("openrouter", "auto", "Z.ai: GLM Latest", null, "~z-ai/glm-latest", "openai_chat");
+    const vendors = [_][]const u8{ "qwen", "anthropic", "openai", "z-ai" };
+    for (offers[2..], 0..) |*slot, index| {
+        const id = std.fmt.bufPrint(&names[index], "{s}/model-{d:0>2}", .{ vendors[index % vendors.len], index }) catch unreachable;
+        slot.* = fixtureOffer("openrouter", "auto", id, null, id, "openai_chat");
+    }
+}
+
+test "a long list that marks its own latest models opens on them and the model in use, the rest folded under All models" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [44][32]u8 = undefined;
+    var offers: [46]OfferSummary = undefined;
+    longListWithLatestAliases(&names, &offers);
+    try loadFixture(&picker, &offers, offers[5].offer_id);
+    picker.restart();
+    var buffer = Picker.RowBuffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    var list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 5), list.len);
+    try testing.expect(list[0] == .heading);
+    try testing.expectEqualStrings("z-ai/model-03", list[1].model.label);
+    try testing.expect(list[1].model.is_current);
+    try testing.expectEqualStrings("~anthropic/claude-sonnet-latest", list[2].model.label);
+    try testing.expectEqualStrings("~z-ai/glm-latest", list[3].model.label);
+    try testing.expectEqual(@as(usize, 43), list[4].more.hidden);
+    try testing.expect(!list[4].more.open);
+
+    try testing.expect(picker.onKey(.end) == .redraw);
+    try testing.expectEqual(@as(usize, 4), picker.cursor);
+    try testing.expect(picker.focusedOffer() == null);
+    try testing.expect(picker.onKey(.enter) == .redraw);
+    list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 4), picker.cursor);
+    try testing.expect(list[4].more.open);
+    var vendors: usize = 0;
+    var models: usize = 0;
+    var last_vendor: []const u8 = "";
+    for (list[5..]) |row| switch (row) {
+        .vendor => |vendor| {
+            const name = vendorOf(canonicalKey(picker.offers.items[vendor.offer_index]));
+            try testing.expect(std.ascii.lessThanIgnoreCase(last_vendor, name));
+            last_vendor = name;
+            vendors += 1;
+        },
+        .model => |group| {
+            try testing.expectEqualStrings(last_vendor, vendorOf(group.label));
+            models += 1;
+        },
+        else => {},
+    };
+    try testing.expect(list[5] == .vendor);
+    try testing.expectEqual(@as(usize, 4), vendors);
+    try testing.expectEqual(@as(usize, 43), models);
+    _ = picker.onKey(.down);
+    _ = picker.onKey(.down);
+    try testing.expect(picker.focusedOffer() != null);
+
+    try testing.expect(picker.onKey(.escape) == .redraw);
+    try testing.expectEqual(@as(usize, 5), (try picker.rows(&buffer)).len);
+    try testing.expectEqual(@as(usize, 4), picker.cursor);
+    try testing.expect(picker.onKey(.escape) == .closed);
+}
+
+test "a filter finds the models a long list folds away" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [44][32]u8 = undefined;
+    var offers: [46]OfferSummary = undefined;
+    longListWithLatestAliases(&names, &offers);
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    for ("model-40") |byte| _ = picker.onKey(.{ .char = byte });
+    var buffer = Picker.RowBuffer.init(testing.allocator);
+    defer buffer.deinit();
+    const list = try picker.rows(&buffer);
+    try testing.expect(list.len >= 2);
+    try testing.expectEqualStrings("qwen/model-40", list[1].model.label);
+    for (list) |row| try testing.expect(row != .more and row != .vendor);
+}
+
+test "a long list that marks none of its models stays one list" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [44][32]u8 = undefined;
+    var offers: [46]OfferSummary = undefined;
+    longListWithLatestAliases(&names, &offers);
+    offers[0] = fixtureOffer("openrouter", "auto", "plain-a", null, "anthropic/plain-a", "openai_chat");
+    offers[1] = fixtureOffer("openrouter", "auto", "plain-b", null, "z-ai/plain-b", "openai_chat");
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    try testing.expectEqual(@as(usize, 47), picker.rowCount());
+}
+
+test "a site's routes are listed once until the cursor is on one of them, the one in use standing for it; another account on the site is its own route" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var offers = [_]OfferSummary{
+        fixtureOffer("kimi-code", "cn-responses", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_responses"),
+        fixtureOffer("kimi-code", "cn-chat", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_chat"),
+        fixtureOffer("kimi-code", "global-responses", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_responses"),
+        fixtureOffer("kimi-code", "global-chat", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_chat"),
+    };
+    for (offers[0..2]) |*offer| offer.region = "cn";
+    for (offers[2..4]) |*offer| offer.region = "global";
+    var buffer = Picker.RowBuffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    var list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 4), list.len);
+    try testing.expectEqual(@as(usize, 4), list[1].model.offer_count);
+    try testing.expect(picker.offers.items[list[2].route.offer_index].channel_id.eqlText("cn-responses"));
+    try testing.expect(picker.offers.items[list[3].route.offer_index].channel_id.eqlText("global-responses"));
+    try testing.expect(list[3].route.last);
+
+    try testing.expect(picker.onKey(.down) == .redraw);
+    list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 5), list.len);
+    try testing.expect(picker.offers.items[list[picker.cursor].route.offer_index].channel_id.eqlText("cn-responses"));
+    try testing.expect(picker.offers.items[list[3].route.offer_index].channel_id.eqlText("cn-chat"));
+    try testing.expect(picker.offers.items[list[4].route.offer_index].channel_id.eqlText("global-responses"));
+    try testing.expect(picker.onKey(.down) == .redraw);
+    try testing.expect(picker.focusedOffer().?.channel_id.eqlText("cn-chat"));
+
+    try loadFixture(&picker, &offers, offers[3].offer_id);
+    picker.restart();
+    list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 4), list.len);
+    try testing.expect(picker.offers.items[list[3].route.offer_index].channel_id.eqlText("global-chat"));
+    try testing.expect(list[3].route.is_current and list[3].route.preferred);
+
+    offers[1].credential_ref = Slug.lit("second");
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 5), list.len);
+}
+
 test "scope is session unless the user explicitly cycles it" {
     var picker = Picker.init(testing.allocator);
     defer picker.deinit();
@@ -1655,7 +1925,7 @@ test "a filter lists a model OpenRouter resells under OpenRouter's heading, apar
         const offer = switch (row) {
             .heading => |heading| picker.offers.items[heading.offer_index],
             .model => |group| picker.offers.items[group.offer_index],
-            .route => unreachable,
+            .route, .more, .vendor => unreachable,
         };
         const seen = if (row == .heading) offer.provider_id.slice() else offer.display_name;
         try testing.expectEqualStrings(want, seen);

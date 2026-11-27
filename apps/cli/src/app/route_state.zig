@@ -251,14 +251,14 @@ fn writeList(w: *std.Io.Writer, items: []const []const u8) std.Io.Writer.Error!v
 /// makes the choice the default of later starts (level 4 of the startup
 /// order), which no longer stop here.
 ///
-///     .env has keys for DeepSeek and OpenAI. Choose one with /model; Tab there applies it to every future session.
+///     .env has keys for DeepSeek and OpenAI. Choose one with /model; press Tab there for "from now on" to keep it.
 pub fn writeUnchosenLocalNotice(w: *std.Io.Writer, providers: []const []const u8) std.Io.Writer.Error!void {
     try w.writeAll(".env has keys for ");
     for (providers, 0..) |name, index| {
         if (index > 0) try w.writeAll(if (index + 1 == providers.len) " and " else ", ");
         try w.writeAll(name);
     }
-    try w.writeAll(". Choose one with /model; Tab there applies it to every future session.");
+    try w.writeAll(". Choose one with /model; press Tab there for \"from now on\" to keep it.");
 }
 
 /// The provider key variables `env` sets among `profiles`' declared aliases,
@@ -363,7 +363,7 @@ test "the banner notice for .env keys of several providers names them and where 
     var buffer: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buffer);
     try writeUnchosenLocalNotice(&w, &.{ "DeepSeek", "OpenAI" });
-    try testing.expectEqualStrings(".env has keys for DeepSeek and OpenAI. Choose one with /model; Tab there applies it to every future session.", w.buffered());
+    try testing.expectEqualStrings(".env has keys for DeepSeek and OpenAI. Choose one with /model; press Tab there for \"from now on\" to keep it.", w.buffered());
     w = .fixed(&buffer);
     try writeUnchosenLocalNotice(&w, &.{ "DeepSeek", "OpenAI", "Moonshot Kimi" });
     try testing.expect(std.mem.startsWith(u8, w.buffered(), ".env has keys for DeepSeek, OpenAI and Moonshot Kimi. "));

@@ -240,7 +240,7 @@ def make_handler(workbench: Workbench, public_url=None):
                 else:
                     self.send_json(workbench.login_status())
             elif path == "/api/profile":
-                value = workbench.profile(query.get("id"))
+                value = workbench.profile(query.get("id"), price=query.get("price"))
                 if value is None:
                     self.send_json({"error": "no such profile"}, 404)
                     return
@@ -248,17 +248,17 @@ def make_handler(workbench: Workbench, public_url=None):
             elif path == "/api/store":
                 self.send_json(workbench.store_status(self.authorized()))
             elif path == "/api/leaderboard":
-                self.send_found(workbench.leaderboard(query.get("suite")), "no published board for this suite")
+                self.send_found(workbench.leaderboard(query.get("suite"), price=query.get("price")), "no published board for this suite")
             elif path == "/api/run":
                 self.send_found(workbench.run(query.get("name"), worker_log=query.get("log") == "1"), "no such run")
             elif path == "/api/jobs":
-                self.send_json({**workbench.jobs(query.get("profile") or "all"), "can_run": self.authorized()})
+                self.send_json({**workbench.jobs(query.get("profile") or "all", price=query.get("price")), "can_run": self.authorized()})
             elif path == "/api/job":
-                self.send_found(workbench.job(query.get("name", "")), "no such job")
+                self.send_found(workbench.job(query.get("name", ""), price=query.get("price")), "no such job")
             elif path == "/api/trial":
-                self.send_found(workbench.trial(query.get("job", ""), query.get("trial", "")), "no such trial")
+                self.send_found(workbench.trial(query.get("job", ""), query.get("trial", ""), price=query.get("price")), "no such trial")
             elif path == "/api/job.csv":
-                view = workbench.job(query.get("name", ""))
+                view = workbench.job(query.get("name", ""), price=query.get("price"))
                 if view is None:
                     self.send_json({"error": "no such job"}, 404)
                     return
