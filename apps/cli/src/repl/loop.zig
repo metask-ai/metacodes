@@ -3672,17 +3672,40 @@ fn handleLogout(app: *app_mod.App, rest: []const u8) void {
     if (done.default_cleared) cmd_output.print("Forgot the default model, which was a Metask one.\n", .{});
     switch (done.session) {
         .kept => {},
-        .switched => |switched| if (switched.origin.label()) |origin|
+        .switched => |switched| if (switched.preset) |preset| {
+            if (switched.origin.label()) |origin|
+                cmd_output.print("Switched to the preset {s} ({s}): {s} · {s}\n", .{ preset, origin, switched.name, app.activeModel() })
+            else
+                cmd_output.print("Switched to the preset {s}: {s} · {s}\n", .{ preset, switched.name, app.activeModel() });
+        } else if (switched.origin.label()) |origin|
             cmd_output.print("Switched to {s} ({s}) · {s}\n", .{ switched.name, origin, app.activeModel() })
         else
             cmd_output.print("Switched to {s} · {s}\n", .{ switched.name, app.activeModel() }),
         .unbound => cmd_output.print("{s}No model is set up now: /login, or configure .env{s}\n", .{ th.warn, th.reset }),
+        .missing_key => |missing| printMissingKey(app, missing),
     }
     if (done.key_in_shell) cmd_output.print("{s}METASK_API_KEY is still set in your shell: the next start signs in with it.{s}\n", .{ th.warn, th.reset });
     if (done.key_in_local_config) {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}{c}.env", .{ app.stateRoot(), std.fs.path.sep }) catch ".env";
         cmd_output.print("{s}METASK_API_KEY is still set in {s}; remove it there to stay signed out.{s}\n", .{ th.warn, path, th.reset });
+    }
+}
+
+fn printMissingKey(app: *app_mod.App, missing: app_mod.App.SignOut.MissingKey) void {
+    const th = app.theme;
+    if (missing.preset) |preset|
+        cmd_output.print("{s}No model is set up now: the preset {s} needs a key for {s}.{s}\n", .{ th.warn, preset, missing.name, th.reset })
+    else
+        cmd_output.print("{s}No model is set up now: {s} has no key.{s}\n", .{ th.warn, missing.name, th.reset });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}{c}.env", .{ app.stateRoot(), std.fs.path.sep }) catch ".env";
+    if (missing.login and missing.variable != null) {
+        cmd_output.print("  /login {s}, or set {s} in {s}\n", .{ missing.provider.slice(), missing.variable.?, path });
+    } else if (missing.login) {
+        cmd_output.print("  /login {s}\n", .{missing.provider.slice()});
+    } else if (missing.variable) |variable| {
+        cmd_output.print("  Set {s} in {s}\n", .{ variable, path });
     }
 }
 

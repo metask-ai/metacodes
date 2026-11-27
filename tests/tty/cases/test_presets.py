@@ -88,13 +88,13 @@ def test_under_a_metask_sign_in_the_notice_names_the_env_preset_and_logout_moves
                          f"HOUSE_RELAY_TOKEN={RELAY_KEY}\nPROV_B_TOKEN={PRESET_KEY}\n"
                          "METACODES_PROVIDER=house-relay\nMETACODES_PRESET=fast\n")
         work = case_tmpdir("cc-tty-preset-work-")
-        raw = run(bin_path, submit("hi", "METASK_MOCK_REPLY") + submit("/logout", "Switched to Prov B (from .env)")
+        raw = run(bin_path, submit("hi", "METASK_MOCK_REPLY") + submit("/logout", "Switched to the preset fast (from .env)")
                   + submit("again", "RELAY_REPLY"), env=env, base_url=None, cwd=work, term_size=(30, 140))
         a = TTYAssert(raw, rows=30, cols=140)
         screen = _screen(a)
         a.assert_prose_contains(PRESET_NOTICE)
         assert b".env configures House relay" not in re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw)
-        assert "Switched to Prov B (from .env) · b-model\n" in screen + "\n", screen
+        assert "Switched to the preset fast (from .env): Prov B · b-model\n" in screen + "\n", screen
         assert mock.messages == [(f"Bearer {ACCESS_TOKEN}", MODEL)], mock.messages
         assert preset_relay.requests == [("/relay/v1/chat/completions", f"Bearer {PRESET_KEY}", "b-model")], preset_relay.requests
         assert relay.requests == [], relay.requests
@@ -107,13 +107,28 @@ def test_a_preset_alone_in_env_is_named_under_a_metask_sign_in_and_logout_moves_
     with MetaskMock() as mock, _Relay() as relay, _Relay() as preset_relay:
         env = _signed_in(mock, relay, preset_relay, "METACODES_PRESET=fast\n", {"PROV_B_TOKEN": PRESET_KEY})
         work = case_tmpdir("cc-tty-preset-work-")
-        raw = run(bin_path, submit("/logout", "Switched to Prov B (from shell)") + submit("again", "RELAY_REPLY"),
+        raw = run(bin_path, submit("/logout", "Switched to the preset fast (from shell)") + submit("again", "RELAY_REPLY"),
                   env=env, base_url=None, cwd=work, term_size=(30, 140))
         a = TTYAssert(raw, rows=30, cols=140)
         a.assert_prose_contains(PRESET_NOTICE)
-        assert "Switched to Prov B (from shell) · b-model\n" in _screen(a) + "\n", _screen(a)
+        assert "Switched to the preset fast (from shell): Prov B · b-model\n" in _screen(a) + "\n", _screen(a)
         assert preset_relay.requests == [("/relay/v1/chat/completions", f"Bearer {PRESET_KEY}", "b-model")], preset_relay.requests
         assert relay.requests == [] and mock.messages == [], (relay.requests, mock.messages)
+
+
+def test_logout_onto_a_preset_without_its_key_says_which_key_and_where(bin_path):
+    with MetaskMock() as mock, _Relay() as relay, _Relay() as preset_relay:
+        env = _signed_in(mock, relay, preset_relay, "METACODES_PRESET=fast\n")
+        state = os.path.join(env["HOME"], ".metacodes")
+        work = case_tmpdir("cc-tty-preset-work-")
+        raw = run(bin_path, submit("/logout", "No model is set up now"), env=env, base_url=None, cwd=work,
+                  term_size=(30, 160))
+        screen = _screen(TTYAssert(raw, rows=30, cols=160))
+        assert "No model is set up now: the preset fast needs a key for Prov B." in screen, screen
+        assert f"Set PROV_B_TOKEN in {os.path.join(state, '.env')}" in screen, screen
+        assert "Switched to" not in screen, screen
+        assert preset_relay.requests == [] and relay.requests == [] and mock.messages == [], \
+            (preset_relay.requests, relay.requests, mock.messages)
 
 
 UNCHOSEN = "No model is chosen for this directory: it remembers no preset, and global_default is off."

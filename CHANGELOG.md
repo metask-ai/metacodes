@@ -476,6 +476,16 @@ status, compatibility boundaries, and entry points are defined by
   Metask and OpenRouter; a custom provider that declares its own OAuth
   client gets the same pointer.
 
+- **`/logout` names the preset it moves onto, and the key a preset lacks.**
+  Signing out of Metask moves the session to what `.env` chooses; for a
+  preset the line said only `Switched to DeepSeek (from .env) ·
+  deepseek-v4-pro`, and now reads `Switched to the preset fast (from .env):
+  DeepSeek · deepseek-v4-pro`. When the preset's provider has no key the
+  session was left without a model under a generic `/login, or configure
+  .env`; it now says `No model is set up now: the preset fast needs a key
+  for DeepSeek.` and where the key goes (`/login deepseek`, or the variable
+  in this install's `.env`).
+
 - **Choosing a model for every future session in `/model` makes it this
   session's current route too.** The route the session started on stayed
   recorded as the session's own choice, which outranks the default, so

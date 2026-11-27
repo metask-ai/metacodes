@@ -2058,6 +2058,7 @@ pub const App = struct {
             switched: Switched,
             /// Nothing to fall back to: unbound (`signed_out`).
             unbound,
+            missing_key: MissingKey,
         };
 
         pub const Switched = struct {
@@ -2065,6 +2066,15 @@ pub const App = struct {
             name: []const u8,
             /// Where the key it runs on came from.
             origin: route_state_mod.CredentialOrigin,
+            preset: ?[]const u8 = null,
+        };
+
+        pub const MissingKey = struct {
+            preset: ?[]const u8,
+            name: []const u8,
+            provider: provider_ids_mod.Slug,
+            variable: ?[]const u8,
+            login: bool,
         };
     };
 
@@ -2111,12 +2121,17 @@ pub const App = struct {
             if (app.local_route) |local| {
                 if (app.bindLocalRoute(host, local)) |switched| {
                     session = .{ .switched = switched };
-                } else |err| switch (local) {
-                    .provider => |chosen| @import("metacodes-internal").util.log.warn("provider", "the .env provider {s} could not be used: {s}", .{ chosen.name, @errorName(err) }),
-                    .preset => |preset| @import("metacodes-internal").util.log.warn("provider", "the .env preset {s} could not be used: {s}", .{ preset.name, @errorName(err) }),
+                } else |err| {
+                    switch (local) {
+                        .provider => |chosen| @import("metacodes-internal").util.log.warn("provider", "the .env provider {s} could not be used: {s}", .{ chosen.name, @errorName(err) }),
+                        .preset => |preset| @import("metacodes-internal").util.log.warn("provider", "the .env preset {s} could not be used: {s}", .{ preset.name, @errorName(err) }),
+                    }
+                    if (err == error.MissingCredentials) {
+                        if (app.missingLocalKey(host, local)) |missing| session = .{ .missing_key = missing };
+                    }
                 }
             }
-            if (session == .unbound) app.unbindRoute(.signed_out);
+            if (session == .unbound or session == .missing_key) app.unbindRoute(.signed_out);
         }
         return .{
             .removed = removed,
@@ -2386,6 +2401,29 @@ pub const App = struct {
                 .bound => |origin| origin,
                 .unbound => .unknown,
             },
+            .preset = presetName(local),
+        };
+    }
+
+    fn presetName(local: LocalRoute) ?[]const u8 {
+        return switch (local) {
+            .preset => |preset| preset.name,
+            .provider => null,
+        };
+    }
+
+    fn missingLocalKey(app: *App, host: *provider_host_mod.Host, local: LocalRoute) ?SignOut.MissingKey {
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const resolved = (presets_mod.resolveLocal(arena_state.allocator(), &host.registry, local) catch return null) orelse return null;
+        const profile = host.registry.findById(resolved.route.provider_id) orelse return null;
+        const setup = providerSetup(host, profile.id);
+        return .{
+            .preset = presetName(local),
+            .name = profile.display_name,
+            .provider = profile.id,
+            .variable = setup.variable,
+            .login = setup.sign_in or profile.api_key_setup != null,
         };
     }
 

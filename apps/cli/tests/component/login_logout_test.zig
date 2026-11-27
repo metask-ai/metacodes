@@ -478,6 +478,7 @@ test "/logout: a preset alone in .env is used with its provider's key from the s
         const done = try app.signOutOfMetask();
         try testing.expect(done.session == .switched);
         try testing.expectEqualStrings("Prov B", done.session.switched.name);
+        try testing.expectEqualStrings("fast", done.session.switched.preset orelse return error.NoPreset);
         try testing.expectEqual(cc.app_route_state.CredentialOrigin.environment, done.session.switched.origin);
         try sendOneTurn(app);
         const captured = preset_relay.lastRequest() orelse return error.NoRequestCaptured;
@@ -498,7 +499,12 @@ test "/logout: a preset alone in .env is used with its provider's key from the s
     const app = try signedInAppFallingBackTo(&case, io_runtime.io(), try originOf(a, gateway), &layer, local_route);
     defer app.deinit();
     const done = try app.signOutOfMetask();
-    try testing.expect(done.session == .unbound);
+    try testing.expect(done.session == .missing_key);
+    const missing = done.session.missing_key;
+    try testing.expectEqualStrings("fast", missing.preset orelse return error.NoPreset);
+    try testing.expectEqualStrings("Prov B", missing.name);
+    try testing.expect(missing.provider.eqlText("prov-b"));
+    try testing.expectEqualStrings(PRESET_ENV, missing.variable orelse return error.NoVariable);
     try testing.expect(app.unbound().? == .signed_out);
     try testing.expectEqual(@as(usize, 0), relay.requestCount());
     try testing.expectEqual(@as(usize, 1), preset_relay.requestCount());
