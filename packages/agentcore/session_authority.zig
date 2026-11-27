@@ -5,7 +5,7 @@
 //! the internal describe/restore vocabulary. None of these types are wire DTOs.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const session_permission = @import("session_permission.zig");
 const session_budget = @import("session_budget.zig");
 
@@ -187,7 +187,7 @@ pub const McpToolDescription = struct {
     server_binding_identity: [32]u8,
     schema_fingerprint: [32]u8,
     permission_binding: [32]u8,
-    era: @import("metacodes-core").mcp_canonical.Era,
+    era: @import("core_imports.zig").mcp_canonical.Era,
 };
 
 /// Internal canonical restore result. Exact C/Rust/Zig DTOs are deliberately

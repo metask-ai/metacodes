@@ -6,7 +6,7 @@
 //! source-free SDK and are imported here as the single wire-schema truth.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const public = @import("metask_agentcore_protocol");
 
 fn repairUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {

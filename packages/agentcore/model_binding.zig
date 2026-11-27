@@ -1,7 +1,7 @@
 //! AgentCore owns the Session model binding. Skill activation may only inherit
 //! that binding; an override here means the shared admission contract regressed.
 
-const activation = @import("metacodes-core").skills_runtime.activation;
+const activation = @import("core_imports.zig").skills_runtime.activation;
 
 pub const Error = error{
     AgentCoreModelBindingViolation,

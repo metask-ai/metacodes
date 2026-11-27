@@ -8,7 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const rng = @import("platform").rng;
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const catalog = core.skills_runtime.catalog;
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;

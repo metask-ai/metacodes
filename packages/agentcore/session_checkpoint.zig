@@ -4,7 +4,7 @@
 //! responsibilities. This module owns only the bounded canonical envelope.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const Conversation = core.conversation.Conversation;
 const message = core.message;
 const SessionId = core.session_id.SessionId;

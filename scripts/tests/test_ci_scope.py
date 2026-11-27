@@ -421,7 +421,8 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(layout.violations, {})
         for package in layout.products:
             self.assertIn(f"test:{package}", layout.test_steps)
-        # A change confined to the cli package, sources or tests, runs test:cli.
+        # A change confined to the cli package, sources or tests, runs test:cli
+        # and skips the unrelated AgentCore SDK job.
         for path in ("apps/cli/src/repl/tui/widget/status_bar.zig", "apps/cli/tests/component/ui_render_test.zig"):
             with self.subTest(path=path):
                 changes = [("M", path)]
@@ -429,13 +430,47 @@ class LayoutTest(unittest.TestCase):
                 self.assertEqual(scope, "packages", reason)
                 chosen = ci_scope.select(scope, changes, layout)
                 self.assertEqual((chosen.packages, chosen.package_tests), (("cli",), ("test:cli",)))
-                self.assertTrue(chosen.product and chosen.tty)
-        for path, expected in (
-            ("packages/agentcore/abi_v1.zig", ("agentcore", "cli")),
-            ("src/lib.zig", ("facade", "agentcore", "cli")),
-            ("packages/teamwork/src/root.zig", ("teamwork", "facade", "agentcore", "cli")),
-            ("packages/coding/src/core/agent_loop.zig", ("coding", "session", "teamwork", "facade", "agentcore", "cli")),
-            ("packages/ai/src/root.zig", ("ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli")),
+                self.assertTrue(chosen.product and chosen.tty and chosen.integration and chosen.release)
+                self.assertFalse(chosen.sdk)
+        # AgentCore and its non-version SDK files narrow to test:agentcore and
+        # SDK bindings, skipping CLI integration, product, release and TTY.
+        for path in (
+            "packages/agentcore/abi_v1.zig",
+            "sdk/python/src/metacodes/client.py",
+            "sdk/node/index.js",
+            "sdk/rust/src/lib.rs",
+            "sdk/metask/agentcore.h",
+            "sdk/zig/protocol.zig",
+            "sdk/zig/root.zig",
+            "sdk/zig/build.zig",
+        ):
+            with self.subTest(path=path):
+                scope, reason = ci_scope.classify([path], layout=layout)
+                self.assertEqual(scope, "packages", reason)
+                chosen = ci_scope.select(scope, [("M", path)], layout)
+                self.assertEqual((chosen.packages, chosen.package_tests), (("agentcore",), ("test:agentcore",)))
+                self.assertTrue(chosen.sdk and chosen.units)
+                self.assertFalse(chosen.tty or chosen.integration or chosen.product or chosen.release or chosen.offline_eval)
+                self.assertEqual(ci_scope.local_commands(scope, chosen, "zig"),
+                                 [["zig", "build", "test:agentcore", "test:contract"]])
+        # AgentCore plus a TTY case still runs TTY while skipping CLI integration/product.
+        mixed_ac_tty = [("M", "packages/agentcore/abi_v1.zig"), ("M", "tests/tty/cases/test_layout.py")]
+        scope, _ = ci_scope.classify([p for _, p in mixed_ac_tty], layout=layout)
+        self.assertEqual(scope, "packages")
+        chosen = ci_scope.select(scope, mixed_ac_tty, layout)
+        self.assertTrue(chosen.sdk and chosen.tty)
+        self.assertFalse(chosen.integration or chosen.product or chosen.release)
+        # sdk/zig/types.zig is imported by build.zig and release_manifest.zig;
+        # fixtures and release metadata stay full.
+        for path in ("sdk/zig/types.zig", "sdk/fixtures/skill-rsi-v1.json", "sdk/VERSION", "sdk/agentcore-releases.json", "sdk/README.md"):
+            with self.subTest(path=path):
+                self.assertEqual(ci_scope.classify([path], layout=layout)[0], "full")
+        for path, expected, expect_sdk in (
+            ("src/lib.zig", ("facade", "cli"), False),
+            ("packages/teamwork/src/root.zig", ("teamwork", "facade", "cli"), False),
+            ("packages/session/src/root.zig", ("session", "facade", "agentcore", "cli"), True),
+            ("packages/coding/src/core/agent_loop.zig", ("coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/ai/src/root.zig", ("ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
         ):
             with self.subTest(path=path):
                 scope, reason = ci_scope.classify([path], layout=layout)
@@ -443,6 +478,8 @@ class LayoutTest(unittest.TestCase):
                 chosen = ci_scope.select(scope, [("M", path)], layout)
                 self.assertEqual(chosen.packages, expected)
                 self.assertEqual(chosen.package_tests, tuple(f"test:{pkg}" for pkg in expected))
+                self.assertEqual(chosen.sdk, expect_sdk)
+                self.assertTrue(chosen.tty and chosen.integration and chosen.product and chosen.release)
         scope, reason = ci_scope.classify(["packages/base/src/platform/process.zig"], layout=layout)
         self.assertEqual(scope, "full", reason)
         self.assertIn("every product package", reason)
@@ -1068,7 +1105,7 @@ class WorkflowTest(unittest.TestCase):
         # run keeps it safe to make one.
         spec = self.jobs["sdk-bindings"]
         self.assertEqual(spec["if"], "${{ !cancelled() }}")
-        self.assertEqual(spec["env"]["SDK"], "${{ needs.scope.outputs.tty }}")
+        self.assertEqual(spec["env"]["SDK"], "${{ needs.scope.outputs.sdk }}")
         for step in spec["steps"]:
             label = step_label(step)
             if label in ECHO_STEPS:
@@ -1080,13 +1117,13 @@ class WorkflowTest(unittest.TestCase):
                     self.assertEqual(step.get("if"), "env.SDK != 'false'")
 
     def test_the_selection_outputs_reach_the_suite_steps(self) -> None:
-        for name in ("units", "product", "packages", "package_tests", "script_tests", "complete"):
+        for name in ("sdk", "units", "integration", "product", "release", "packages", "package_tests", "script_tests", "complete"):
             self.assertEqual(self.jobs["scope"]["outputs"][name], "${{ steps.decide.outputs.%s }}" % name)
-        for job, names in (("gates-linux", ("units", "product", "package_tests", "script_tests", "complete")),
-                           ("gates-macos", ("units", "product", "package_tests", "script_tests", "complete")),
-                           ("gates-macos-vm", ("units", "product", "package_tests", "script_tests", "complete")),
-                           ("windows-gates", ("units", "product", "package_tests")),
-                           ("windows-gates-vm", ("units", "product", "package_tests"))):
+        for job, names in (("gates-linux", ("units", "integration", "product", "release", "package_tests", "script_tests", "complete")),
+                           ("gates-macos", ("units", "integration", "product", "release", "package_tests", "script_tests", "complete")),
+                           ("gates-macos-vm", ("units", "integration", "product", "release", "package_tests", "script_tests", "complete")),
+                           ("windows-gates", ("units", "integration", "product", "release", "package_tests")),
+                           ("windows-gates-vm", ("units", "integration", "product", "release", "package_tests"))):
             for name in names:
                 with self.subTest(job=job, output=name):
                     self.assertEqual(self.jobs[job]["env"][name.upper()], "${{ needs.scope.outputs.%s }}" % name)
@@ -1115,7 +1152,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(core["if"].endswith("&& env.PACKAGE_TESTS == ''"))
         integration = next(step for step in self.jobs["windows-gates"]["steps"]
                            if step.get("name") == "Offline test suite (integration)")
-        self.assertTrue(integration["if"].endswith("&& env.UNITS != 'false'"))
+        self.assertTrue(integration["if"].endswith("&& env.UNITS != 'false' && env.INTEGRATION != 'false'"))
         changed = next(step for step in self.jobs["gates-linux"]["steps"] if step.get("name") == "Changed script unit suites")
         self.assertTrue(changed["if"].startswith("matrix.checks &&"))
         self.assertTrue(changed["if"].endswith("&& env.SCRIPT_TESTS != ''"))
@@ -1132,8 +1169,13 @@ class WorkflowTest(unittest.TestCase):
             env = dict(os.environ, PATH=f"{tmp}{os.pathsep}{os.environ['PATH']}",
                        PACKAGE_TESTS="test:mid test:top", ZIG_BUILD_JOBS="4")
             proc = subprocess.run([*BASH, step["run"]], env=env, capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.splitlines()[:4], ["build", "test:mid", "test:top", "test:integration"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[:4], ["build", "test:mid", "test:top", "test:integration"])
+            proc_no_int = subprocess.run([*BASH, step["run"]], env=dict(env, INTEGRATION="false"),
+                                         capture_output=True, text=True)
+        self.assertEqual(proc_no_int.returncode, 0, proc_no_int.stderr)
+        self.assertEqual(proc_no_int.stdout.splitlines()[:3], ["build", "test:mid", "test:top"])
+        self.assertNotIn("test:integration", proc_no_int.stdout.splitlines())
 
     def test_only_a_complete_run_records_and_keeps_its_test_ids(self) -> None:
         steps = {step_label(step): step for step in self.jobs["gates-linux"]["steps"]}

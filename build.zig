@@ -89,6 +89,15 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 }
 
 const lower_packages = [_][]const u8{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" };
+const lower_package_deps = [lower_packages.len][]const []const u8{
+    &.{},
+    &.{"base"},
+    &.{ "base", "ai" },
+    &.{ "base", "ai", "kernel" },
+    &.{ "base", "ai", "kernel", "guard" },
+    &.{ "base", "ai", "kernel", "guard", "coding" },
+    &.{ "base", "ai", "kernel", "guard", "coding" },
+};
 const PackageModules = [lower_packages.len]*std.Build.Module;
 var g_package_modules: [2]?PackageModules = .{ null, null };
 
@@ -122,8 +131,10 @@ fn wirePackageFile(
     lower: []const *std.Build.Module,
     evaluation_shadow: bool,
 ) void {
-    for (lower, lower_packages[0..lower.len]) |dependency, name| {
-        mod.addImport(b.fmt("metacodes-{s}", .{name}), dependency);
+    for (lower_package_deps[index]) |dep_name| {
+        const dep_index = packageIndex(dep_name);
+        std.debug.assert(dep_index < lower.len);
+        mod.addImport(b.fmt("metacodes-{s}", .{dep_name}), lower[dep_index]);
     }
     addPlatform(b, mod);
     const name = lower_packages[index];
@@ -142,6 +153,14 @@ fn addPackageFileImports(b: *std.Build, mod: *std.Build.Module, package: []const
 fn addPackages(b: *std.Build, mod: *std.Build.Module, evaluation_shadow: bool) void {
     const modules = packageModules(b, evaluation_shadow);
     for (modules, lower_packages) |dependency, name| {
+        mod.addImport(b.fmt("metacodes-{s}", .{name}), dependency);
+    }
+}
+
+fn addAgentCorePackages(b: *std.Build, mod: *std.Build.Module) void {
+    const modules = packageModules(b, false);
+    for (modules, lower_packages) |dependency, name| {
+        if (std.mem.eql(u8, name, "teamwork")) continue;
         mod.addImport(b.fmt("metacodes-{s}", .{name}), dependency);
     }
 }
@@ -861,7 +880,6 @@ const AgentCoreAbiModuleOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     strip: bool,
-    core_mod: *std.Build.Module,
     types_mod: *std.Build.Module,
     protocol_mod: *std.Build.Module,
 };
@@ -878,7 +896,7 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
         .link_libc = true,
     });
     addHl(b, mod);
-    mod.addImport("metacodes-core", options.core_mod);
+    addAgentCorePackages(b, mod);
     mod.addImport("metask_agentcore_types", options.types_mod);
     mod.addImport("metask_agentcore_protocol", options.protocol_mod);
     if (options.target.result.os.tag == .windows)
@@ -1717,7 +1735,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = false,
-        .core_mod = core_mod,
         .types_mod = agentcore_types_mod,
         .protocol_mod = agentcore_protocol_mod,
     });
@@ -1725,7 +1742,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = agentcore_strip,
-        .core_mod = core_mod,
         .types_mod = agentcore_types_mod,
         .protocol_mod = agentcore_protocol_mod,
     });
