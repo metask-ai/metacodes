@@ -136,6 +136,91 @@ class GateManifestTest(unittest.TestCase):
                 self.assertTrue((path / "provisioned").is_file())
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
 
+    def test_release_verification_isolates_repeated_jobs_with_stale_runner_temp(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        release_step_names = {
+            "Default install prefix",
+            "Built project kernel provenance is accepted by doctor",
+            "Stage Lean kernels for the release layout",
+            "Release layout prefix",
+            "Install the release unit with scripts/install.sh",
+            "Install the release unit with scripts/install.ps1",
+            "Release archive is reproducible",
+            "macOS release executables need no more than their targets",
+        }
+        stale_fixed_paths = (
+            "$RUNNER_TEMP/install-prefix",
+            "$RUNNER_TEMP/release-prefix",
+            "$RUNNER_TEMP/installed",
+            "$RUNNER_TEMP/dist-1",
+            "$RUNNER_TEMP/dist-2",
+            "$RUNNER_TEMP/unpacked-1",
+            "$RUNNER_TEMP/unpacked-2",
+            "$RUNNER_TEMP/baseline-",
+            r"%RUNNER_TEMP%\install-prefix",
+            r"%RUNNER_TEMP%\release-prefix",
+            r"%RUNNER_TEMP%\installed",
+            r"%RUNNER_TEMP%\dist-1",
+            r"%RUNNER_TEMP%\dist-2",
+        )
+        posix_create_steps = []
+        posix_cleanup_steps = []
+        for job_id in ("gates-linux", "gates-macos", "gates-macos-vm", "windows-gates", "windows-gates-vm"):
+            steps = workflow["jobs"][job_id]["steps"]
+            names = [step.get("name") for step in steps]
+            create_idx = names.index("Create a private temporary directory for release verification")
+            cleanup_idx = names.index("Clean up release verification directory")
+            self.assertLess(create_idx, cleanup_idx, job_id)
+            self.assertIn("always()", steps[cleanup_idx].get("if", ""), job_id)
+            self.assertIn("env.RELEASE_WORK_DIR != ''", steps[cleanup_idx].get("if", ""), job_id)
+            if not job_id.startswith("windows-"):
+                posix_create_steps.append(steps[create_idx])
+                posix_cleanup_steps.append(steps[cleanup_idx])
+            for idx, step in enumerate(steps):
+                if step.get("name") not in release_step_names:
+                    continue
+                self.assertGreater(idx, create_idx, (job_id, step["name"]))
+                self.assertLess(idx, cleanup_idx, (job_id, step["name"]))
+                run_text = step["run"]
+                self.assertIn("RELEASE_WORK_DIR", run_text, (job_id, step["name"]))
+                for forbidden in stale_fixed_paths:
+                    self.assertNotIn(forbidden, run_text, (job_id, step["name"], forbidden))
+        if os.name == "nt":
+            return
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner_temp = root / "runner temp"
+            stale = runner_temp / "installed"
+            stale.mkdir(parents=True)
+            sentinel = stale / "prior-job"
+            sentinel.write_text("preserve", encoding="utf-8")
+            github_env = root / "github-env"
+            env = dict(os.environ, RUNNER_TEMP=str(runner_temp), GITHUB_ENV=str(github_env))
+            for _ in range(2):
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", posix_create_steps[0]["run"]],
+                    cwd=root, env=env, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            paths = [
+                Path(line.removeprefix("RELEASE_WORK_DIR="))
+                for line in github_env.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(paths), 2)
+            self.assertEqual(len(set(paths)), 2)
+            for path in paths:
+                self.assertEqual(path.parent, runner_temp)
+                self.assertTrue(path.is_dir())
+                self.assertEqual(list(path.iterdir()), [])
+                cleanup_result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", posix_cleanup_steps[0]["run"]],
+                    cwd=root, env=dict(env, RELEASE_WORK_DIR=str(path)),
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(cleanup_result.returncode, 0, cleanup_result.stderr)
+                self.assertFalse(path.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
     def test_eval_preflight_reports_the_python_that_needs_repair(self):
         script = str(ROOT / "scripts/check_eval_python.py")
         good = subprocess.run([sys.executable, script], capture_output=True, text=True)
