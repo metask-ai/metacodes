@@ -623,6 +623,14 @@ status, compatibility boundaries, and entry points are defined by
   run out the failure reads `API 错误帧(重试 N 次后放弃): …`, as the HTTP
   path does. This holds for `-p`, the TUI, `serve`/`--web` and AgentCore
   sessions.
+- **iTerm2 is recognized over SSH.** SSH does not carry `TERM_PROGRAM`, so
+  a session reached from iTerm2 asked the terminal at startup whether it
+  speaks the Kitty keyboard protocol; on a link slower than the 120 ms the
+  question waits, the answer came too late, the protocol stayed off and
+  Shift+Enter submitted. `LC_TERMINAL=iTerm2`, which iTerm2 sets and the
+  default `ssh` configuration passes on, now names iTerm2 when
+  `TERM_PROGRAM` is missing.
+
 - **Ctrl-C stops a request that is waiting for its answer or whose stream
   went quiet.** The interrupt only set a flag that was read when the next
   byte arrived, so `-p` (and any caller that did not also cancel the
