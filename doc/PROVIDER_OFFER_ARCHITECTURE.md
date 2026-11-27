@@ -470,7 +470,11 @@ Session scope is narrower, so on resume it wins: a resumed session continues on
 the route it was using, not on whatever became global in the meantime. A stored
 selection that no longer resolves is reported — as a startup error for global,
 as a warning that leaves the current route alone for session — and never
-silently replaced with a different vendor.
+silently replaced with a different vendor. Before a global selection is
+reported, a start looks for it in the model lists it does not hold yet:
+OpenRouter's, downloaded when it is not on the machine (#622), and, with a
+Metask session, the list the session's gateway serves, whose routes `/model`
+offers once the terminal UI has fetched it. Found there, it is used as stored.
 
 ## Credentials
 

@@ -1237,6 +1237,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A default model kept with `/model` from Metask's own list no longer stops
+  the next start.** The models a Metask session's gateway lists are fetched
+  only once the terminal UI has started, so one of them kept for every future
+  session pinned an offer the start did not have yet: the next `metacodes`
+  printed `the stored selection pins offer …, which the current catalog does
+  not offer` and exited. With a Metask session, a start whose stored default
+  is not among the built-in models now fetches the gateway's model list first
+  and runs on the stored default when it is there, as OpenRouter's list is
+  downloaded for an OpenRouter default (#622). Each request of that fetch
+  waits at most 5 s, as the terminal UI's own fetch of the list does (a list
+  in pages gets 5 s a page, and renewing the session's token first is not
+  part of it), and a `401` renews the session once, as a request does. When
+  the list does not have the model, or cannot be fetched, the start stops,
+  says why, and names the ways out: `--provider/--model` (`--provider metask`
+  starts on the Metask sign-in without it), removing `global_selection` from
+  `config.json`, or signing in again when the sign-in has expired.
+  `metacodes login status` no longer calls such a default `set`: it says that
+  no model list on this machine has it and that a start looks for it in
+  Metask's list.
+
 - **A `204` or `304` answer no longer holds a request until the server
   closes the connection** (#579). Zig 0.16's HTTP client reads the body of a
   1xx, 204 or 304 answer, which has none, to the end of the connection, and

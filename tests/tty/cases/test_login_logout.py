@@ -254,6 +254,44 @@ def test_a_browser_sign_in_serves_a_stored_metask_default_at_the_next_start(bin_
         assert mock.messages[-1] == (f"Bearer {ACCESS_TOKEN}", "claude-sonnet-4-6"), mock.messages
 
 
+def _pin_gateway_model(mock, state, model="glm-5-air"):
+    offer = _metask_offer_id(model, endpoint=f"{mock.origin}/v1/messages")
+    with open(os.path.join(state, "config.json"), "w") as f:
+        json.dump({"global_selection": {
+            "target": {"kind": "pinned_offer", "offer_id": offer, "offer_revision": 1},
+            "scope": "global"}}, f)
+    return offer
+
+
+def test_a_stored_default_on_a_gateway_model_is_found_in_the_list_the_start_fetches(bin_path):
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        mock.write_session(state)
+        offer = _pin_gateway_model(mock, state)
+        work = case_tmpdir("cc-tty-unfound-default-work-")
+        raw = run(bin_path, submit("hello", "METASK_MOCK_REPLY"), env=env, base_url=None, cwd=work, term_size=(30, 220))
+        a = TTYAssert(raw, rows=30, cols=220)
+        a.assert_prose_contains("glm-5-air · Metask")
+        assert b"which the current catalog does not offer" not in raw, _screen(a)
+        assert mock.messages == [(f"Bearer {ACCESS_TOKEN}", "glm-5-air")], mock.messages
+        with open(os.path.join(state, "config.json")) as f:
+            assert json.load(f)["global_selection"]["target"]["offer_id"] == offer
+
+
+def test_a_stored_default_on_a_gateway_model_still_stops_the_tui_without_a_metask_sign_in(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the ConPTY driver waits for the TUI's first frame, and this start stops before it draws one")
+    with MetaskMock() as mock:
+        home, state, env = _case(mock)
+        offer = _pin_gateway_model(mock, state)
+        work = case_tmpdir("cc-tty-unfound-default-work-")
+        raw = run(bin_path, ["sleep:3"], env=env, base_url=None, cwd=work, term_size=(30, 220))
+        a = TTYAssert(raw, rows=30, cols=220)
+        a.assert_prose_contains(f"error: the stored selection pins offer {offer}, which the current catalog does not offer")
+        assert b"cannot be found right now" not in raw, _screen(a)
+        assert mock.messages == [], mock.messages
+
+
 def test_cli_login_in_the_browser_forgets_a_stored_default(bin_path):
     # `metacodes login` is the most recent explicit choice, as /login is: a
     # stored /model default, which would outrank the sign-in at the next

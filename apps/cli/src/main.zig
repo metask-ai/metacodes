@@ -493,6 +493,16 @@ fn applyProviderRoute(
 /// than the one the user chose, which is the exact substitution the offer model
 /// exists to prevent.
 pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.Allocator) bool {
+    return applyStoredSelection(config, allocator, null);
+}
+
+const MetaskListing = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    session: *?provider_oauth_mod.Session,
+};
+
+fn applyStoredSelection(config: *types.Config, allocator: std.mem.Allocator, metask: ?MetaskListing) bool {
     var store = provider_config_store.Store.initHome(allocator, config.state_root) catch return false;
     defer store.deinit();
 
@@ -527,8 +537,96 @@ pub fn applyPersistedGlobalSelection(config: *types.Config, allocator: std.mem.A
             .timed_out => failMissingOpenRouterListing(allocator, null),
         }
     }
+    if (outcome == .failure and outcome.failure == .unresolved_selection) if (metask) |listing| {
+        if (adoptMetaskListing(allocator, host, config.state_root, listing)) |why| failMissingMetaskDefault(allocator, selection, store.path, why);
+        outcome = resolveStoredSelection(allocator, host, selection);
+        if (outcome == .failure and outcome.failure == .unresolved_selection) failMissingMetaskDefault(allocator, selection, store.path, null);
+    };
     applyStartupOutcome(config, allocator, outcome);
     return true;
+}
+
+const ListingMiss = struct {
+    reason: []const u8,
+    sign_in_again: bool = false,
+};
+
+fn adoptMetaskListing(allocator: std.mem.Allocator, host: *provider_host.Host, state_root: []const u8, listing: MetaskListing) ?ListingMiss {
+    const session = loadStartupMetask(listing.session, listing.gpa, state_root) catch
+        return .{ .reason = "the Metask session cannot be read", .sign_in_again = true };
+    const bearer = resolveMetaskBearer(session, listing.io) catch |err| return sessionMiss(err);
+    defer provider_oauth_mod.secureFree(listing.gpa, bearer);
+    const stored_gateway = (metask_oauth_mod.modelGateway(session.tokens.?.gateway_url) catch null) orelse
+        return .{ .reason = "the Metask session names no model gateway", .sign_in_again = true };
+    const gateway = allocator.dupe(u8, stored_gateway) catch return .{ .reason = "out of memory" };
+    const url = std.fmt.allocPrint(allocator, "{s}/v1/models", .{gateway}) catch return .{ .reason = "out of memory" };
+    var fetched = fetchMetaskListing(allocator, listing.io, url, bearer);
+    if (fetched == .refused) {
+        var site_buf: [1024]u8 = undefined;
+        const token_url = metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf) catch
+            return .{ .reason = "the Metask sign-in was refused", .sign_in_again = true };
+        var exchange = oauth_exchange_mod.MetaskHttpExchange{ .allocator = session.allocator, .io = listing.io, .token_url = token_url };
+        const renewed = session.refreshIfStale(@import("metacodes-internal").util.time.nowUnix(), exchange.exchange(), bearer) catch |err| return sessionMiss(err);
+        defer provider_oauth_mod.secureFree(session.allocator, renewed);
+        fetched = fetchMetaskListing(allocator, listing.io, url, renewed);
+    }
+    const body = switch (fetched) {
+        .body => |value| value,
+        .refused => return .{ .reason = "the Metask sign-in was refused", .sign_in_again = true },
+        .failed => |reason| return .{ .reason = reason },
+    };
+    defer allocator.free(body);
+    host.ingestMetask(gateway, body, .messages_and_chat) catch return .{ .reason = "the answer was not a model list" };
+    return null;
+}
+
+const MetaskListingFetch = union(enum) {
+    body: []u8,
+    refused,
+    failed: []const u8,
+};
+
+fn fetchMetaskListing(allocator: std.mem.Allocator, io: std.Io, url: []const u8, bearer: []const u8) MetaskListingFetch {
+    const fetched = api_catalog_fetch.fetchModelPages(allocator, io, .{
+        .url = url,
+        .bearer = bearer,
+        .timeout_ms = models_cache.STARTUP_WAIT_MS,
+    }) catch |err| return switch (err) {
+        error.Unauthorized => .refused,
+        error.RateLimited => .{ .failed = "rate limited" },
+        error.TimedOut => .{ .failed = std.fmt.comptimePrint("no answer within {d} s", .{models_cache.STARTUP_WAIT_MS / 1000}) },
+        error.HttpError => .{ .failed = "server error" },
+        error.TooLarge => .{ .failed = "the list is too large" },
+        else => .{ .failed = "no connection" },
+    };
+    return .{ .body = fetched.body };
+}
+
+fn sessionMiss(err: MetaskSessionError) ListingMiss {
+    return switch (err) {
+        error.NoSession, error.NoTokens => .{ .reason = "the Metask session holds no token", .sign_in_again = true },
+        error.RefreshRejected => .{ .reason = "the Metask sign-in has expired", .sign_in_again = true },
+        error.GatewayChanged => .{ .reason = "Metask's model gateway changed; start again to use the saved session" },
+        error.RefreshFailed => .{ .reason = "no connection while renewing the Metask session" },
+        error.MalformedTokenResponse => .{ .reason = "Metask's answer to renewing the session was not understood" },
+        error.OutOfMemory, error.PersistFailed, error.NoHome, error.PathTooLong => .{ .reason = "the renewed Metask session could not be saved" },
+    };
+}
+
+fn failMissingMetaskDefault(allocator: std.mem.Allocator, selection: provider_selection.RuntimeSelection, config_path: []const u8, miss: ?ListingMiss) noreturn {
+    const pin = storedPin(allocator, selection.target) catch "it";
+    const command = invokedCommand(allocator);
+    if (miss) |why| {
+        std.debug.print("error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched: {s}.\n", .{ pin, why.reason });
+        if (why.sign_in_again) {
+            std.debug.print("Sign in again with `{s} login`, pass --provider/--model to choose another route, or remove \"global_selection\" from {s}\n", .{ command, config_path });
+            std.process.exit(2);
+        }
+    } else {
+        std.debug.print("error: the default model stored with /model ({s}) is in neither the built-in models nor Metask's model list.\n", .{pin});
+    }
+    std.debug.print("Pass --provider/--model to choose another route (`{s} --provider metask` starts on your Metask sign-in without it), or remove \"global_selection\" from {s}\n", .{ command, config_path });
+    std.process.exit(2);
 }
 
 fn resolveStoredSelection(
@@ -748,7 +846,10 @@ pub fn storedDefaultOn(
 ) StoredDefault {
     const outcome = provider_startup.resolveSelection(arena, registry, selection) catch return .{ .usable = .{} };
     const route = switch (outcome) {
-        .failure => return .{ .usable = .{} },
+        .failure => |failure| return switch (failure) {
+            .unresolved_selection => |target| .{ .unresolved = storedPin(arena, target) catch return .{ .usable = .{} } },
+            else => .{ .usable = .{} },
+        },
         .route => |value| value,
     };
     const provider_name = if (registry.findById(route.provider_id)) |profile| profile.display_name else route.provider_id.slice();
@@ -778,6 +879,13 @@ pub fn storedDefaultOn(
         return .{ .usable = usable };
     } else |err| if (err != error.MissingCredentials) return .{ .usable = usable };
     return if (providerSignInStored(arena, config.state_root, profile)) .{ .usable = usable } else .{ .lacks_credential = label };
+}
+
+fn storedPin(arena: std.mem.Allocator, target: provider_selection.SelectionTarget) ![]const u8 {
+    return switch (target) {
+        .pinned_offer => |pin| std.fmt.allocPrint(arena, "offer {s}", .{&pin.offer_id.render()}),
+        .auto_route => |route| std.fmt.allocPrint(arena, "'{s}'", .{route.selector.slice()}),
+    };
 }
 
 /// `METACODES_AUTH_PRECEDENCE`, which overrides `--auth-precedence`. A start
@@ -1560,7 +1668,11 @@ pub fn main(init: std.process.Init) !void {
         // An offer id names its own provider; requiring `--provider` beside it
         // would make a copied offer id unusable on its own.
         applyProviderRoute(&config, allocator, null);
-    } else if (stored_default.consulted() and applyPersistedGlobalSelection(&config, allocator)) {
+    } else if (stored_default.consulted() and applyStoredSelection(&config, allocator, if (startup_facts.metask_session and !metask_legacy_requested) .{
+        .io = init.io,
+        .gpa = init.gpa,
+        .session = &startup_metask,
+    } else null)) {
         stored_default_applied = true;
     } else {
         config.provider_kind = inferProviderKind(config.model);
@@ -3972,6 +4084,7 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
     const local_metask_key = localSignInKey(arena, &local_config, &preset_facts);
     const facts = startupFacts(arena, config, &local_config, local_metask_key, &preset_facts);
     const decision = startup_order.decide(facts);
+    const fetches_metask_list = facts.metask_session and !facts.metask_key_requested;
 
     // Level 5's two stores: the session (#527) and auth.json.
     const session_text: ?[]const u8 = session: {
@@ -4016,6 +4129,10 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
                 std.debug.print("This start uses the default stored with /model: {s}.\n", .{name})
             else
                 std.debug.print("This start uses the default stored with /model.\n", .{}),
+            .unresolved => |pin| if (fetches_metask_list)
+                std.debug.print("This start looks for the default stored with /model ({s}) in Metask's model list, which it fetches first, and stops if it is not there.\n", .{pin})
+            else
+                std.debug.print("This start stops: the default stored with /model ({s}) is in no model list on this machine.\n", .{pin}),
             else => {},
         },
         .metask_key => std.debug.print("This start uses Metask with {s}{s}.\n", .{ metaskKeySource(config.auth_precedence, local_metask_key, stored, auth_error), metask_model }),
@@ -4079,6 +4196,11 @@ fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
         .unreadable => std.debug.print("{s}4 stored default: config.json cannot be read\n", .{mark.at(4, decision)}),
         .usable => |usable| std.debug.print("{s}4 stored default: {s}\n", .{ mark.at(4, decision), usable.label orelse "set" }),
         .lacks_credential => |label| std.debug.print("{s}4 stored default: {s}, which has no key or sign-in: passed over\n", .{ mark.at(4, decision), label }),
+        .unresolved => |pin| std.debug.print("{s}4 stored default: {s}, which no model list on this machine has: {s}\n", .{
+            mark.at(4, decision),
+            pin,
+            if (fetches_metask_list) "a start fetches Metask's model list and looks for it there, and stops if it is not there" else "a start stops and says why",
+        }),
     }
     // 5. A Metask sign-in: the historical path's key, else the session.
     std.debug.print("{s}5 Metask sign-in: {s}\n", .{ mark.at(5, decision), session_text orelse "no session" });
