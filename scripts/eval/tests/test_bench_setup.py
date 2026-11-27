@@ -1646,9 +1646,8 @@ class SshRunTest(SetupFixture):
         self.assertEqual(json.loads(done.stdout)["result"], "upgraded", done.stderr)
         run_dir = self.remote_home / "runs/mid"
         # This test is driver C.
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn = self.handoff_connection(run_dir)
         self.addCleanup(conn.close)
-        conn.connect(remote.handoff_socket(run_dir))
         conn.sendall(json.dumps({"handoff": remote.HANDOFF}).encode() + b"\n")
         data, fds, _flags, _address = socket.recv_fds(conn, 65536, 4)
         reader = conn.makefile("rb")
@@ -1673,20 +1672,54 @@ class SshRunTest(SetupFixture):
             self.assertEqual(through.recv(16), b"b")
         conn.sendall(b'{"tunnel": true}\n')
 
-    def test_a_failed_driver_upgrade_leaves_the_run_to_its_driver(self):
-        relay, process = self.start_driver(grace=60, delay=4)
-        path = remote.handoff_socket(self.remote_home / "runs/eof")
+    def handoff_connection(self, run_dir):
+        path = remote.handoff_socket(run_dir)
         deadline = time.monotonic() + 10
-        while not os.path.exists(path):
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.05)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.connect(path)
+        while True:
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.settimeout(max(0.001, deadline - time.monotonic()))
+            try:
+                conn.connect(path)
+                return conn
+            except (FileNotFoundError, ConnectionRefusedError):
+                conn.close()
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+            except BaseException:
+                conn.close()
+                raise
+
+    def test_handoff_connection_waits_for_binding_and_listening(self):
+        run_dir = self.root / "handoff-ready"
+        path = remote.handoff_socket(run_dir)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+
+        def advance_readiness(_delay):
+            if not os.path.exists(path):
+                listener.bind(path)
+            else:
+                listener.listen(4)
+
+        with patch(__name__ + ".time.sleep", side_effect=advance_readiness) as wait:
+            with self.handoff_connection(run_dir) as conn:
+                conn.sendall(b"ready")
+                accepted, _ = listener.accept()
+                with accepted:
+                    self.assertEqual(accepted.recv(5), b"ready")
+            self.assertEqual(wait.call_count, 2)
+
+    def test_a_failed_driver_upgrade_leaves_the_run_to_its_driver(self):
+        release = self.root / "release-handoff"
+        relay, process = self.start_driver(grace=60, delay=0, env={"FAKE_BENCH_RELEASE_FILE": str(release)})
+        run_dir = self.remote_home / "runs/eof"
+        with self.handoff_connection(run_dir) as conn:
             conn.sendall(b'{"handoff": 0}\n')
             self.assertIn("refused", json.loads(conn.makefile("rb").readline()))
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        with self.handoff_connection(run_dir) as conn:
             # A new driver that dies once it has the run's state.
-            conn.connect(path)
             conn.sendall(json.dumps({"handoff": remote.HANDOFF}).encode() + b"\n")
             state, fds, _flags, _address = socket.recv_fds(conn, 65536, 4)
             for fd in fds:
@@ -1700,6 +1733,7 @@ class SshRunTest(SetupFixture):
         done = subprocess.run(executors.node_argv(relay, "upgrade", "runs/old/spec.json"), stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60)
         self.assertEqual(json.loads(done.stdout), {"run": "old", "result": "unsupported"}, done.stderr)
+        release.touch()
         events = [json.loads(line) for line in process.stdout]
         self.assertNotIn("handoff", [e["event"] for e in events])
         self.assertEqual(events[-1], {"event": "exit", "code": 0, "cancelled": False})
