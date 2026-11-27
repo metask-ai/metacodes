@@ -676,6 +676,23 @@ class VersionGateStepTest(unittest.TestCase):
             self.assertIn("labels=[unset] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)
             self.assertEqual(calls, [], job)
 
+    def test_posix_release_leg_runs_rehearsal_on_full_path(self):
+        """When release_fast_path falls back to the full path on a release PR,
+        split POSIX release legs must still rehearse the local tag before
+        `zig build release:verify` runs `release-manifest`."""
+        try:
+            import yaml
+        except ImportError:  # requirements-dev.txt
+            self.skipTest("PyYAML is not installed")
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        for job in ("gates-linux", "gates-macos"):
+            step = next(s for s in workflow["jobs"][job]["steps"] if s.get("name") == self.STEP)
+            cond = step.get("if", "")
+            self.assertIn("matrix.checks", cond, job)
+            self.assertIn("matrix.release", cond, job)
+            self.assertIn("env.FAST_PATH != 'true'", cond, job)
+            self.assertIn("env.RELEASE != 'false'", cond, job)
+
 
 if __name__ == "__main__":
     unittest.main()
