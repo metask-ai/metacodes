@@ -45,7 +45,8 @@ pub fn getToolCategory(tool_name: []const u8) ToolCategory {
     // KgRemember 是持久写(跨会话 store);按 read 分类会被 auto 等模式静默放行(M5)。
     // KgRecall/KgContext 是只读检索/遍历 → read。
     if (std.mem.eql(u8, tool_name, "KgRemember")) return .write;
-    if (std.mem.eql(u8, tool_name, "Bash")) return .execute;
+    if (std.mem.eql(u8, tool_name, "EnterWorktree") or std.mem.eql(u8, tool_name, "ExitWorktree")) return .execute;
+    if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Monitor")) return .execute;
     return .read;
 }
 
@@ -72,12 +73,23 @@ test "getToolCategory execute tools" {
     try std.testing.expect(getToolCategory("Bash") == .execute);
 }
 
+test "getToolCategory: Monitor starts a shell command, so it is execute with high risk like Bash" {
+    try std.testing.expect(getToolCategory("Monitor") == .execute);
+    try std.testing.expect(getRiskLevel("Monitor") == .high);
+}
+
 test "getToolCategory: KgRemember=write,KgRecall/KgContext=read" {
     // M5:KgRemember 是持久跨会话写,plan 模式(只读探索)decision 走 cat==.read→allow 的
     // 分支时它必须落到非 read,否则 plan 下静默写盘。
     try std.testing.expect(getToolCategory("KgRemember") == .write);
     try std.testing.expect(getToolCategory("KgRecall") == .read);
     try std.testing.expect(getToolCategory("KgContext") == .read);
+}
+
+test "getToolCategory: EnterWorktree and ExitWorktree run git worktree and move the working root, so they are execute" {
+    try std.testing.expect(getToolCategory("EnterWorktree") == .execute);
+    try std.testing.expect(getToolCategory("ExitWorktree") == .execute);
+    try std.testing.expect(getRiskLevel("EnterWorktree") == .high);
 }
 
 test "getToolCategory unknown defaults to read" {

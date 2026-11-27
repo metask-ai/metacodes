@@ -254,6 +254,41 @@ test "shim createContext + check dont_ask" {
     try std.testing.expect(checkPermission(&ctx, "Bash", "{\"command\":\"ls\"}") == .deny);
 }
 
+test "Monitor asks in default, acceptEdits and auto, is denied in dontAsk and runs in bypassPermissions" {
+    const args = "{\"command\":\"tail -f build.log\",\"description\":\"build log\"}";
+    const cases = [_]struct { mode: types.PermissionMode, want: PermissionResult }{
+        .{ .mode = .default, .want = .ask },
+        .{ .mode = .accept_edits, .want = .ask },
+        .{ .mode = .auto, .want = .ask },
+        .{ .mode = .dont_ask, .want = .deny },
+        .{ .mode = .bypass_permissions, .want = .allow },
+    };
+    for (cases) |case| {
+        const ctx = createContext(case.mode, std.testing.allocator);
+        try std.testing.expectEqual(case.want, checkPermission(&ctx, "Monitor", args));
+        try std.testing.expectEqual(case.want, checkPermissionClassified(&ctx, "Monitor", args, .execute));
+    }
+}
+
+test "EnterWorktree and ExitWorktree ask in default, acceptEdits and auto, are denied in dontAsk and run in bypassPermissions" {
+    const calls = [_]struct { name: []const u8, args: []const u8 }{
+        .{ .name = "EnterWorktree", .args = "{\"path\":\"/srv/checkout\"}" },
+        .{ .name = "ExitWorktree", .args = "{\"action\":\"remove\",\"discard_changes\":true}" },
+    };
+    const cases = [_]struct { mode: types.PermissionMode, want: PermissionResult }{
+        .{ .mode = .default, .want = .ask },
+        .{ .mode = .accept_edits, .want = .ask },
+        .{ .mode = .auto, .want = .ask },
+        .{ .mode = .dont_ask, .want = .deny },
+        .{ .mode = .bypass_permissions, .want = .allow },
+    };
+    for (calls) |call| for (cases) |case| {
+        const ctx = createContext(case.mode, std.testing.allocator);
+        try std.testing.expectEqual(case.want, checkPermission(&ctx, call.name, call.args));
+        try std.testing.expectEqual(case.want, checkPermissionClassified(&ctx, call.name, call.args, .execute));
+    };
+}
+
 test "optional decision override is inert by default and receives imported action" {
     const Probe = struct {
         var calls: usize = 0;
