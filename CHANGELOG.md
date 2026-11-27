@@ -508,6 +508,12 @@ status, compatibility boundaries, and entry points are defined by
   claude-sonnet-4-20250514`, the placeholder the clients are built with; it
   says `no model set`.
 
+- **Ctrl+C during a reply closes an open `/model` first.** With the picker
+  open over a running reply, Ctrl+C interrupted the reply and cleared the
+  queued draft while the picker stayed open. It now closes the picker, as it
+  already did at the prompt (#607); the next Ctrl+C interrupts the reply.
+  Ctrl+D is still never taken by the picker.
+
 - **`/login metask` without the TUI moves the session to the new
   sign-in.** With standard input not a terminal, `/login metask` stored a
   second Metask sign-in and revoked the first (#561), but the session went

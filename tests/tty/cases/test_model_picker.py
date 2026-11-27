@@ -180,6 +180,24 @@ def test_picker_ctrl_d_during_a_reply_leaves_the_queued_draft_alone(bin_path):
     assert not any("queued raft" in sc for sc in frames), "Ctrl+D 删掉了回复期草稿里的字:\n" + text
 
 
+def test_picker_ctrl_c_during_a_reply_closes_the_picker_before_it_interrupts(bin_path):
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    with SlowMockServer([slow_text_then_end(n_chunks=60, delay=0.4)]) as srv:
+        raw = run(
+            bin_path,
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "type:queued draft", "sleep:0.3",
+             "key:ctrl_o", wait_for(OPEN), "key:ctrl_c", wait_for("kept "), "strictsleep:0.6"],
+            base_url=srv.url,
+            startup_drain=0.8,
+            per_key_drain=0.08,
+        )
+    _, text = _screen(raw)
+    assert "kept claude" in text, "回复期间 Ctrl+C 没有先关掉 picker:\n" + text
+    assert "esc to interrupt" in text, "第一下 Ctrl+C 打断了回复:\n" + text
+    assert "queued draft" in text, "第一下 Ctrl+C 清掉了回复期草稿:\n" + text
+
+
 def test_picker_takes_a_paste_at_the_prompt_as_its_filter_and_leaves_the_draft(bin_path):
     # #650: at the prompt the paste went into the draft under the picker.
     raw = run(
