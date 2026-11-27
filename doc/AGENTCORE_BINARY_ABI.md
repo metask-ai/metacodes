@@ -545,12 +545,14 @@ No other path emits it (see "Stream retry budget").
 `stream_done` means only that one Provider stream ended; it neither closes nor
 classifies an output segment. Hosts must not reconstruct final-output semantics
 from Tool boundaries or Provider stop edges. Usage events are exact deltas and
-must use checked arithmetic. Providers report a response's usage as running
-totals — Anthropic's cumulative `message_delta` after a `message_start` that
-already counted part of it, OpenAI-compatible usage objects repeated on several
-chunks, repeated Gemini `usageMetadata` — and AgentCore emits only what each
-report adds, so a Run's `usage` events sum to the provider's per-response
-totals, not to the sum of its reports.
+must use checked arithmetic. Providers report a response's usage as provisional
+running snapshots — Anthropic's `message_start` followed by cumulative
+`message_delta` (whose counters may decrease once cached tokens are split out),
+OpenAI-compatible usage objects repeated on several chunks, repeated Gemini
+`usageMetadata`, and Bedrock Converse `metadata` — and AgentCore reconciles
+them into a single `usage` event when the response finishes, so a Run's `usage`
+events sum to the provider's authoritative per-response totals, not to the sum
+or per-counter maximum of provisional snapshots.
 
 `file_changes` is emitted once for each typed file-tool call that changed or
 attempted files, and once for each `Bash` call whose observed workspace changed

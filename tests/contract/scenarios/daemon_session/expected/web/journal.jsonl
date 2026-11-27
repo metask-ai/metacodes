@@ -4,9 +4,8 @@
 {"v":1,"type":"diag_turn_begin","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":1}}
 {"v":1,"type":"stream_begin","run_id":1,"data":null}
 {"v":1,"type":"output_segment_begin","run_id":1,"data":{"index":0,"turn":1,"group":0}}
-{"v":1,"type":"usage","run_id":1,"data":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"v":1,"type":"text_chunk","run_id":1,"data":"Reading the notes."}
-{"v":1,"type":"usage","run_id":1,"data":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+{"v":1,"type":"usage","run_id":1,"data":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"v":1,"type":"diag_model_request","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":1,"attempt":0,"elapsed_ms":<N>,"outcome":"success"}}
 {"v":1,"type":"stream_done","run_id":1,"data":null}
 {"v":1,"type":"output_segment_end","run_id":1,"data":{"index":0,"turn":1,"group":0,"disposition":"commentary","bytes":18}}
@@ -21,9 +20,8 @@
 {"v":1,"type":"diag_turn_begin","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":2}}
 {"v":1,"type":"stream_begin","run_id":1,"data":null}
 {"v":1,"type":"output_segment_begin","run_id":1,"data":{"index":1,"turn":2,"group":1}}
-{"v":1,"type":"usage","run_id":1,"data":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"v":1,"type":"text_chunk","run_id":1,"data":"The notes say alpha."}
-{"v":1,"type":"usage","run_id":1,"data":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+{"v":1,"type":"usage","run_id":1,"data":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"v":1,"type":"diag_model_request","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":2,"attempt":0,"elapsed_ms":<N>,"outcome":"success"}}
 {"v":1,"type":"stream_done","run_id":1,"data":null}
 {"v":1,"type":"diag_turn_end","run_id":1,"data":{"trace_id":"<ID>","depth":0,"turn":2,"tool_calls":1}}

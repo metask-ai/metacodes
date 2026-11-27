@@ -1,7 +1,6 @@
 {"type":"turn_begin","turn":1}
 {"type":"output_segment_begin","index":0,"turn":1,"group":0}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"output_segment_end","index":0,"turn":1,"group":0,"disposition":"commentary","bytes":0}
 {"type":"tool_start","id":"toolu_01","name":"Write","input":"{\"file_path\":\"new.txt\",\"content\":\"x\\n\"}","input_bytes":39}
 {"type":"tool_start","id":"toolu_02","name":"Bash","input":"{\"command\":\"ls\",\"description\":\"List files\"}","input_bytes":43}
@@ -10,9 +9,8 @@
 {"type":"turn_end","turn":1,"tool_calls":2}
 {"type":"turn_begin","turn":2}
 {"type":"output_segment_begin","index":1,"turn":2,"group":1}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"text","text":"Neither the write nor ls was allowed."}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"turn_end","turn":2,"tool_calls":2}
 {"type":"output_segment_end","index":1,"turn":2,"group":1,"disposition":"final","bytes":37}
 {"type":"run_end","turns":2,"tool_calls":2,"stop_reason":"end_turn"}
