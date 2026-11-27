@@ -24,14 +24,91 @@ const REFRESH_S = 10;
 const PROFILE_COLORS = ['#6a9dd9', '#71b69e', '#d8af65', '#a99be0', '#eb7c8e', '#5cb8c8', '#c76f5e'];
 const profileColor = (index) => PROFILE_COLORS[index % PROFILE_COLORS.length];
 
+const PRICE_SCHEDULES = [
+  ['openrouter', 'OpenRouter 报价'],
+  ['baseten', 'Baseten 挂牌价'],
+  ['recorded', '运行记录原价'],
+];
+const BOARD_PRICE_SCHEDULES = [['auto', '跟随榜单口径'], ...PRICE_SCHEDULES];
+const PRICE_LABELS = Object.fromEntries(BOARD_PRICE_SCHEDULES);
+const COST_VIEWS = new Set(['overview', 'profile', 'task', 'job', 'trial', 'leaderboard', 'compare']);
+
 const state = { auto: true, countdown: REFRESH_S, timer: null, busy: false, overviewDirty: false, live: false,
 
   jobFilter: 'all', jobSearch: '', suite: null, comparisons: new Map(), sort: { key: 'task', dir: 1 }, selected: new Set(),
   suitePick: null, profileSuite: 'all', profileModel: 'all', taskFilter: 'all', taskSearch: '', taskSort: 'default',
   profileId: null, profileExpanded: false, selectedTaskKey: null, drawerClosed: false,
   overviewFilter: 'all', overviewSearch: '', overviewSort: 'recent',
+  priceSchedule: 'openrouter', boardPriceSchedule: 'auto',
   boardModel: {}, boardExpanded: {}, boardSelected: {}, boardPareto: {},
   compareBaseline: null, compareFilter: 'all', compareSearch: '' };
+
+function priceParam(isBoard) {
+  const value = isBoard ? state.boardPriceSchedule : state.priceSchedule;
+  const fallback = isBoard ? 'auto' : 'openrouter';
+  return value && value !== fallback ? 'price=' + encodeURIComponent(value) : '';
+}
+function withPrice(url, isBoard = false) {
+  const param = priceParam(isBoard);
+  if (!param) return url;
+  return url + (url.includes('?') ? '&' : '?') + param;
+}
+function rateSummary(rate) {
+  if (!rate || rate.input === undefined || rate.output === undefined) return '';
+  const parts = [`入 $${rate.input}`, `出 $${rate.output}`];
+  if (rate.cached_input !== undefined) parts.push(`缓存读 $${rate.cached_input}`);
+  if (rate.cache_write !== undefined) parts.push(`缓存写 $${rate.cache_write}`);
+  return `${rate.model_id ? rate.model_id + ' · ' : ''}${parts.join(' / ')} / MTok`;
+}
+function costsTooltip(costs, key) {
+  if (!costs || typeof costs !== 'object') return null;
+  const parts = PRICE_SCHEDULES.map(([id, label]) => {
+    const raw = costs[id];
+    const value = raw && typeof raw === 'object' ? raw[key] : raw;
+    return `${label} ${usd(value)}`;
+  });
+  return parts.join(' · ');
+}
+function priceStrip(costs, activeSchedule, key, showRate = false, isBoard = false) {
+  if (!costs || typeof costs !== 'object') return null;
+  const hasAny = PRICE_SCHEDULES.some(([id]) => {
+    const raw = costs[id];
+    const value = raw && typeof raw === 'object' ? raw[key] : raw;
+    return value !== null && value !== undefined;
+  });
+  if (!hasAny) return null;
+  return h('div', { class: 'price-strip', role: 'group', 'aria-label': '多口径成本对照' },
+    PRICE_SCHEDULES.map(([id, label]) => {
+      const entry = costs[id] || {};
+      const value = typeof entry === 'object' ? entry[key] : entry;
+      const rateText = showRate && typeof entry === 'object' ? rateSummary(entry.rate) : '';
+      return h('button', {
+        type: 'button',
+        class: 'price-pill' + (activeSchedule === id ? ' active' : ''),
+        'aria-pressed': String(activeSchedule === id),
+        title: rateText || label,
+        onclick: () => {
+          if (isBoard) state.boardPriceSchedule = id;
+          else state.priceSchedule = id;
+          render();
+        },
+      }, h('span', { text: label }), h('b', { text: usd(value) }), rateText ? h('small', { text: rateText }) : null);
+    }));
+}
+function syncPriceControl(view) {
+  const box = $('#price-control');
+  const sel = $('#price-schedule');
+  if (!box || !sel) return;
+  const visible = COST_VIEWS.has(view);
+  box.hidden = !visible;
+  if (!visible) return;
+  const isBoard = view === 'leaderboard';
+  const options = isBoard ? BOARD_PRICE_SCHEDULES : PRICE_SCHEDULES;
+  const current = isBoard ? state.boardPriceSchedule : state.priceSchedule;
+  sel.dataset.mode = isBoard ? 'board' : 'global';
+  sel.replaceChildren(...options.map(([id, label]) => h('option', { value: id, selected: id === current, text: label })));
+  sel.value = current;
+}
 
 // ------------------------------------------------------------ DOM helpers
 function h(tag, props, ...children) {
@@ -186,6 +263,7 @@ async function render() {
   const r = route();
   try {
     $('#create-run').hidden = true;
+    syncPriceControl(r.view);
     let node;
     if (r.view === 'settings') node = await renderSettings(r.tab);
     else if (r.view === 'monitor') node = await renderMonitor(r.executor);
@@ -514,7 +592,7 @@ async function renderOverview() {
   navCurrent('overview');
   $('#title').textContent = 'Profiles';
   crumbs([]);
-  const { profiles, jobs, runs, can_run: canRun } = await api('/api/jobs');
+  const { profiles, jobs, runs, can_run: canRun, pricing } = await api(withPrice('/api/jobs'));
   state.live = profiles.some(profileActive) || jobs.some((j) => j.running) || runs.some((r) => ['queued', 'starting', 'running', 'cancelling'].includes(r.status));
   $('#create-run').hidden = !canRun;
   const knownIds = new Set(profiles.map((p) => p.id));
@@ -612,7 +690,7 @@ async function renderOverview() {
               h('span', { class: 'mono muted', style: 'font-size:11.5px', text: `${int(s.first_passed)} / ${int(s.first_valid)} 首次有效` })),
             h('div', { style: 'margin-top:8px' }, outcomeBar(s.counts, s.trials))),
           h('div', { class: 'pcard-stats' },
-            h('div', {}, h('span', { text: '每题成本' }), h('b', { text: usd(s.cost_per_task) })),
+            h('div', { title: costsTooltip(p.costs_by_schedule, 'cost_per_task') }, h('span', { text: `每题成本（${pricing?.label || PRICE_LABELS[state.priceSchedule]}）` }), h('b', { text: usd(s.cost_per_task) })),
             h('div', {}, h('span', { text: '初始 Token' }), h('b', { text: compact(s.initial_input_tokens_mean) })),
             h('div', {}, h('span', { text: '作业数' }), h('b', { text: groupedItems(p).length + ' 作业' }))),
           h('div', { class: 'pcard-foot' },
@@ -639,7 +717,7 @@ function attemptStrip(t, href) {
 
 async function renderProfile(id) {
   navCurrent('overview');
-  const b = await api('/api/profile?id=' + encodeURIComponent(id));
+  const b = await api(withPrice('/api/profile?id=' + encodeURIComponent(id)));
   if (state.profileId !== b.id) {
     state.profileId = b.id;
     state.selectedTaskKey = null;
@@ -705,10 +783,11 @@ async function renderProfile(id) {
           outcomeBar(scopedCounts, scopedTasks.length, true),
           statusPills),
         h('div', { class: 'profile-banner-meta' },
-          h('div', {}, h('span', { text: '每题平均成本' }), h('strong', { text: usd(s.cost_per_task) })),
-          h('div', {}, h('span', { text: '每次通过成本' }), h('strong', { text: usd(s.cost_per_pass) })),
+          h('div', { title: costsTooltip(b.costs_by_schedule, 'cost_per_task') }, h('span', { text: `每题平均成本 · ${b.pricing?.label || PRICE_LABELS[state.priceSchedule]}` }), h('strong', { text: usd(s.cost_per_task) })),
+          h('div', { title: costsTooltip(b.costs_by_schedule, 'cost_per_pass') }, h('span', { text: '每次通过成本' }), h('strong', { text: usd(s.cost_per_pass) })),
           h('div', {}, h('span', { text: '初始 Token 均值' }), h('strong', { text: compact(s.initial_input_tokens_mean) })),
-          h('div', {}, h('span', { text: '缓存命中率' }), h('strong', { text: pct(s.cache_hit_rate) })))));
+          h('div', {}, h('span', { text: '缓存命中率' }), h('strong', { text: pct(s.cache_hit_rate) }))),
+        priceStrip(b.costs_by_schedule, b.pricing?.schedule || state.priceSchedule, 'cost_per_task')));
 
     const jobsStrip = h('section', { class: 'jobs-strip' },
       h('div', { class: 'jobs-strip-left' },
@@ -1018,7 +1097,7 @@ function modelsPanel(b, onChange = render) {
 
 async function renderProfileTask(profileId, jobName, taskName, trialName) {
   navCurrent('overview');
-  const b = await api('/api/profile?id=' + encodeURIComponent(profileId));
+  const b = await api(withPrice('/api/profile?id=' + encodeURIComponent(profileId)));
   const ordered = b.tasks.filter((t) => t.job);
   const index = ordered.findIndex((t) => t.job === jobName && t.task === taskName);
   const group = ordered[index] || await historyGroup(b, jobName, taskName);
@@ -1049,7 +1128,7 @@ async function renderProfileTask(profileId, jobName, taskName, trialName) {
     h('span', { class: 'num muted', text: `${compact(a.total_tokens)} · ${dur(a.elapsed_s)}` })))) : null;
   const parts = [panel('各次尝试', `${group.attempts.length} 次 · 通过 ${group.passed} / 有效 ${group.valid}${group.model ? ' · ' + group.model : ''}`, h('div', {}, cards, compare, history), nav)];
   if (chosen) {
-    const t = await api(`/api/trial?job=${encodeURIComponent(jobName)}&trial=${encodeURIComponent(chosen.trial)}`);
+    const t = await api(withPrice(`/api/trial?job=${encodeURIComponent(jobName)}&trial=${encodeURIComponent(chosen.trial)}`));
     state.live = t.row.status === 'running' || profileActive(b);
     parts.push(...trialBody(t));
   } else {
@@ -1062,7 +1141,7 @@ async function renderProfileTask(profileId, jobName, taskName, trialName) {
 async function historyGroup(b, jobName, taskName) {
   const item = b.items.find((i) => i.run === jobName);
   if (!item) return null;
-  const job = await api('/api/job?name=' + encodeURIComponent(jobName));
+  const job = await api(withPrice('/api/job?name=' + encodeURIComponent(jobName)));
   const attempts = (job.rows || []).filter((r) => r.task === taskName).sort((x, y) => (x.attempt_number || 0) - (y.attempt_number || 0));
   if (!attempts.length) return null;
   return { task: taskName, job: jobName, suite: item.suite, suite_name: item.suite_name, model: item.model, attempts,
@@ -1559,7 +1638,7 @@ function resultLocation(value) {
 
 async function renderJob(name) {
   navCurrent('overview');
-  const job = await api('/api/job?name=' + encodeURIComponent(name));
+  const job = await api(withPrice('/api/job?name=' + encodeURIComponent(name)));
   state.live = job.running;
   $('#title').textContent = job.name;
   crumbs([{ text: 'Profiles', href: '#/' }, job.profile ? { text: 'Profile ' + job.profile, href: '#/profile/' + encodeURIComponent(job.profile) } : null, { text: job.name }].filter(Boolean));
@@ -1575,6 +1654,7 @@ async function renderJob(name) {
   const identity = h('div', { class: 'panel-body' },
     resultLocation(job),
     h('div', { class: 'muted' }, `${job.suite_name ? '评测集 ' + job.suite_name + '（' + job.category_name + '） · ' : ''}${job.metacodes?.label ? 'metacodes ' + job.metacodes.label + (job.metacodes.frozen ? '（Profile冻结）' : '') + ' · ' : ''}模型 ${job.model || '—'} · agent ${job.agent || '—'} · 数据集 ${job.dataset || '—'} · 每题 ${job.attempts ?? '—'} 次 · 并发 ${job.concurrency ?? '—'}${job.judge ? ' · ' + judgeText(job.judge) : ''}`),
+    priceStrip(job.costs_by_schedule, job.pricing?.schedule || state.priceSchedule, 'cost_per_task', true),
     outcomeBar(s.counts, s.trials, true), legend(s.counts));
 
   const timed = job.rows.some((r) => r.lifecycle) ? PREPARE_PARTS.map(([, l, cls]) => [cls, l]) : [];
@@ -1628,7 +1708,7 @@ async function renderJob(name) {
     return [h('div', { class: 'panel-body toolbar' }, filters, search),
       h('div', { class: 'table-scroll' }, h('table', {}, h('thead', {}, head), tbody)), keys];
   });
-  const csv = h('a', { class: 'button', href: '/api/job.csv?name=' + encodeURIComponent(job.name), text: '下载 CSV' });
+  const csv = h('a', { class: 'button', href: withPrice('/api/job.csv?name=' + encodeURIComponent(job.name)), text: '下载 CSV' });
   return h('div', {}, metrics, panel('概况', null, identity), panel('逐题结果', `${job.rows.length} 个 trial`, table, csv));
 }
 
@@ -1822,9 +1902,11 @@ function trialBody(t) {
       r.initial_composition ? stackBar(compositionSegments(r.initial_composition), true) : null),
     metric('TPS（生成）', tps(r.tps)),
     metric('TTFT（均值）', ttft(r.ttft_ms), `P50 ${ttft(r.ttft_p50_ms)} · P95 ${ttft(r.ttft_p95_ms)}`),
-    metric('估算成本', usd(r.cost_usd)),
+    metric('估算成本', usd(r.cost_usd), t.pricing?.label || PRICE_LABELS[state.priceSchedule]),
     metric('用时', dur(r.lifecycle ? r.lifecycle.total_s : r.elapsed_s), timeTitle(r)));
   const parts = [metrics];
+  const breakdown = priceStrip(t.costs_by_schedule, t.pricing?.schedule || state.priceSchedule, 'cost_usd', true);
+  if (breakdown) parts.push(panel('多口径成本对照', t.pricing?.label || null, h('div', { class: 'panel-body' }, breakdown)));
   if (t.exception_message) parts.push(h('div', { class: 'callout', text: `${r.exception}: ${t.exception_message}` }));
   if (r.initial_composition) {
     const c = r.initial_composition;
@@ -1850,7 +1932,7 @@ function trialBody(t) {
 
 async function renderTrial(jobName, trialName) {
   navCurrent('overview');
-  const t = await api(`/api/trial?job=${encodeURIComponent(jobName)}&trial=${encodeURIComponent(trialName)}`);
+  const t = await api(withPrice(`/api/trial?job=${encodeURIComponent(jobName)}&trial=${encodeURIComponent(trialName)}`));
   const r = t.row;
   state.live = r.status === 'running';
   $('#title').textContent = r.task;
@@ -1897,7 +1979,7 @@ async function renderCompare(names, profileId) {
     state.live = false;
     return panel('对比', null, h('div', { class: 'empty', text: '从首页或榜单勾选 2 个以上 Profile，或从 Profile 详情进入作业对比。' }));
   }
-  const loaded = await Promise.all(uniqueNames.map((n) => api('/api/job?name=' + encodeURIComponent(n))));
+  const loaded = await Promise.all(uniqueNames.map((n) => api(withPrice('/api/job?name=' + encodeURIComponent(n)))));
   state.live = loaded.some((j) => j.running);
   const prefix = profileId ? profileHref({ id: profileId }) + '/compare/' : '#/compare/';
   return localView((redraw) => {
@@ -1940,6 +2022,7 @@ async function renderCompare(names, profileId) {
     const ctrlBar = h('div', { class: 'cmp-ctrl' },
       h('div', { class: 'cmp-chips' }, h('span', { class: 'muted', style: 'font-size:12px', text: '对比对象：' }), ...chips),
       h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' },
+        h('span', { class: 'tag', text: '价格：' + (jobs[0]?.pricing?.label || PRICE_LABELS[state.priceSchedule]) }),
         modelsAcrossJobs.size > 1 ? h('span', { class: 'tag warn', text: `含 ${modelsAcrossJobs.size} 个不同模型` }) : null,
         suiteName ? h('span', { class: 'tag', text: '评测集：' + suiteName }) : null, exportBtn));
 
@@ -2400,6 +2483,11 @@ function boardPanel(board, suiteId, selectedSet, ourColorMap, onChange = render)
   const picker = models.length ? h('select', { class: 'board-model', 'aria-label': '模型', onchange: (e) => { state.boardModel[key] = e.target.value; redraw(e); } },
     models.map((m) => h('option', { value: m, selected: m === model, text: m === board.default_model ? '全部模型' : m }))) : null;
   const sourceLink = h('a', { class: 'board-link', href: src.url, target: '_blank', rel: 'noopener noreferrer', title: `${src.name} · ${src.retrieved}`, text: '来源 ↗' });
+  const pricingBadge = board.pricing ? h('span', {
+    class: 'board-pricing' + (board.pricing.aligned ? ' aligned' : ''),
+    title: board.pricing.source || board.pricing.label,
+    text: `成本口径：${board.pricing.label}${board.pricing.aligned ? '（已对齐榜单）' : ''}`,
+  }) : null;
   const expanded = Boolean(state.boardExpanded[key]);
   const shown = expanded ? rows : rows.filter((r, i) => i < BOARD_TOP || r.ours);
   const top = Math.max(...rows.map((r) => r.score), 1);
@@ -2431,7 +2519,7 @@ function boardPanel(board, suiteId, selectedSet, ourColorMap, onChange = render)
     h('td', { class: 'muted' }, h('span', { class: 'harness' }, harness && !r.ours ? glyph(lookOf(r)) : null, r.model || '—')),
     h('td', {}, h('div', { class: 'score-cell' }, h('span', { class: 'score-bar' }, h('span', { style: `width:${Math.max(r.score / top * 100, 1)}%;background:${col || 'var(--control)'}` })),
       h('span', { class: 'num', text: score(r.score) }))),
-    priced ? h('td', { class: 'num muted', text: usd(r.cost_per_task_usd) }) : null,
+    priced ? h('td', { class: 'num muted', title: r.ours ? costsTooltip(r.ours.costs_by_schedule) : null, text: usd(r.cost_per_task_usd) }) : null,
     showDelta ? h('td', { class: 'num mono' }, deltaText) : null)];
   }));
   focus.on((active) => { for (const [r, tr] of rowNodes) tr.classList.toggle('active', r === active); });
@@ -2442,14 +2530,14 @@ function boardPanel(board, suiteId, selectedSet, ourColorMap, onChange = render)
     h('thead', {}, h('tr', {}, heads.map((t, i) => h('th', { class: [0, 4, 5].includes(i) ? 'num' : null, text: t })))),
     h('tbody', {}, [...rowNodes.values()])), more);
   return panel(board.title, null, h('div', { class: 'panel-body' }, leaderCards(rows, published), harnessNote, scatter || (harness ? scoreBars : modelDots)(rows, focus, lookOf), table),
-    h('div', { class: 'board-actions' }, paretoToggle, picker, sourceLink));
+    h('div', { class: 'board-actions' }, pricingBadge, paretoToggle, picker, sourceLink));
 }
 
 async function renderLeaderboard(suiteId) {
   state.live = false;
   navCurrent('leaderboard');
   $('#title').textContent = '公开榜单';
-  const d = await api('/api/leaderboard' + (suiteId ? '?suite=' + encodeURIComponent(suiteId) : ''));
+  const d = await api(withPrice('/api/leaderboard' + (suiteId ? '?suite=' + encodeURIComponent(suiteId) : ''), true));
   crumbs([{ text: 'Profiles', href: '#/' }, { text: '公开榜单' }, { text: d.suite_name }]);
   const suitePicker = h('label', { class: 'scope', style: 'padding:0' }, '评测集',
     h('select', { onchange: (e) => { location.hash = '#/leaderboard/' + encodeURIComponent(e.target.value); } },
@@ -2998,6 +3086,14 @@ function tick() {
 }
 document.addEventListener('DOMContentLoaded', () => {
   $('#create-run').addEventListener('click', openRunDialog);
+  const pricePicker = $('#price-schedule');
+  if (pricePicker) {
+    pricePicker.addEventListener('change', (e) => {
+      if (e.currentTarget.dataset.mode === 'board') state.boardPriceSchedule = e.currentTarget.value;
+      else state.priceSchedule = e.currentTarget.value;
+      render();
+    });
+  }
   $('#refresh').addEventListener('click', () => { state.countdown = REFRESH_S; render(); });
   $('#auto').addEventListener('click', (e) => { state.auto = !state.auto; e.currentTarget.setAttribute('aria-pressed', String(state.auto)); tick(); });
   window.addEventListener('hashchange', (event) => {

@@ -282,28 +282,31 @@ class EquivalenceTest(StoreCase):
             with urllib.request.urlopen(base + path, timeout=10) as response:
                 return response.read()
 
+        def strip_pricing(document):
+            return {k: v for k, v in document.items() if k not in ("pricing", "costs_by_schedule")}
+
         def labelled(view):
             # The service adds suite/category display fields (bench-suites)
             # and the profile and metacodes version of the launch (none here).
             return {**view, **suites.label(suites.infer(view.get("dataset"))), "profile": None, "metacodes": None}
 
         jobs = json.loads(get("/api/jobs"))
-        self.assertEqual(jobs["jobs"], [labelled(view) for view in expected["overview"]])
+        self.assertEqual([strip_pricing(view) for view in jobs["jobs"]], [labelled(view) for view in expected["overview"]])
         self.assertIn("terminal-bench-2.1", {view.get("suite") for view in jobs["jobs"]})
         self.assertEqual(jobs["summary"], expected["summary"])
         self.assertEqual(jobs["storage"]["format"], "SQLite")
         self.assertEqual(jobs["storage"]["database"]["location"], str(self.temp / "bench.sqlite3"))
         shutil.rmtree(self.root / "metrics-job")  # served from the store now
-        self.assertEqual(json.loads(get("/api/job?name=metrics-job")), labelled(expected["jobs"]["metrics-job"]))
+        self.assertEqual(strip_pricing(json.loads(get("/api/job?name=metrics-job"))), labelled(expected["jobs"]["metrics-job"]))
         self.assertEqual(get("/api/job.csv?name=metrics-job").decode(), expected["csv"]["metrics-job"])
         shutil.rmtree(self.root / "glm-pilot")
         served = json.loads(get("/api/job?name=glm-pilot"))
-        self.assertEqual(served, labelled(expected["jobs"]["glm-pilot"]))
+        self.assertEqual(strip_pricing(served), labelled(expected["jobs"]["glm-pilot"]))
         self.assertEqual({r["trial"]: (r["lifecycle"] or {}).get("ready_wait_s") for r in served["rows"]}["kv-store__aaa"], 79)
         self.assertEqual(json.loads(get("/api/trial?job=glm-pilot&trial=compressor__bbb"))["row"]["lifecycle"]["prepare_running_s"], 10)
         detail = json.loads(get("/api/trial?job=metrics-job&trial=one__aaa"))
         file_row = next(r for r in expected["jobs"]["metrics-job"]["rows"] if r["trial"] == "one__aaa")
-        self.assertEqual(detail, {**expected["trials"]["metrics-job|one__aaa"], "row": file_row})
+        self.assertEqual(strip_pricing(detail), {**expected["trials"]["metrics-job|one__aaa"], "row": file_row})
 
 
     def test_workbuddy_nested_runs_are_stored_identically(self):
