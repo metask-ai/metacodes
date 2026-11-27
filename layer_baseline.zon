@@ -1,9 +1,5 @@
 .{
-    .upward = .{
-    },
     .deep = .{
-    },
-    .cycles = .{
     },
     .wiring = .{
     },
