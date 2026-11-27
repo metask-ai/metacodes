@@ -1492,6 +1492,83 @@ pub const App = struct {
         };
     }
 
+    pub fn writeStatus(app: *App, w: *std.Io.Writer) !void {
+        try w.writeAll("Status\n");
+        if (app.unbound() != null) {
+            try w.print("  Model:       {s}\n", .{route_state_mod.not_set_line});
+            return;
+        }
+        try w.print("  Model:       {s}\n", .{app.activeModel()});
+        const host: ?*provider_host_mod.Host = app.providerHost() catch null;
+        const offer = if (host) |found| if (found.kernel.currentOfferId()) |id| found.kernel.catalogSnapshot().find(id) else null else null;
+        if (offer) |current| {
+            const profile = host.?.registry.findById(current.provider_id);
+            try w.print("  Provider:    {s}\n", .{if (profile) |built| built.display_name else current.provider_id.slice()});
+            try w.print("  Route:       {s} · {s}\n", .{ current.channel_id.slice(), current.protocol });
+            try w.print("  Endpoint:    {s}\n", .{current.endpoint_ref});
+        }
+        const origin: ?[]const u8 = switch (app.route_state) {
+            .bound => |bound| bound.label(),
+            .unbound => null,
+        };
+        try w.print("  Credential:  {s}\n", .{origin orelse "unknown"});
+        if (app.config.reasoning_effort) |effort| if (effort.active()) try w.print("  Reasoning:   {s}\n", .{effort.name()});
+        const window = app.api_client.resolveMaxInputTokens();
+        const used = app.contextTokens();
+        var used_buf: [16]u8 = undefined;
+        var window_buf: [16]u8 = undefined;
+        try w.print("  Context:     about {s} of {s} tokens ({d}%)\n", .{
+            shortTokens(&used_buf, used),
+            shortTokens(&window_buf, window),
+            if (window == 0) 0 else @min(100, used * 100 / window),
+        });
+    }
+
+    pub fn contextTokens(app: *const App) usize {
+        const conversation_mod = @import("metacodes-internal").core.conversation;
+        const estimate = conversation_mod.Conversation.estimateTokens;
+        const anchor = app.conversation.usageAnchor() orelse return app.conversation.totalTokens();
+        var total: usize = anchor.context_tokens;
+        for (app.conversation.messages.items[anchor.msg_count..]) |message| {
+            total += 8;
+            for (message.blocks) |block| {
+                total += 12;
+                switch (block) {
+                    .text => |text| total += estimate(text),
+                    .tool_use => |use| total += estimate(use.name) + estimate(use.input),
+                    .tool_result => |result| total += if (@import("metacodes-internal").json.extractImageResult(result.content) != null)
+                        conversation_mod.IMAGE_TOKEN_ESTIMATE
+                    else
+                        estimate(result.content),
+                    .thinking => {},
+                    .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
+                    .reasoning_item => total += conversation_mod.REASONING_ITEM_TOKEN_ESTIMATE,
+                }
+            }
+        }
+        return total;
+    }
+
+    fn shortTokens(buf: []u8, tokens: usize) []const u8 {
+        if (tokens >= 1_000_000) return std.fmt.bufPrint(buf, "{d:.1}M", .{@as(f64, @floatFromInt(tokens)) / 1_000_000.0}) catch "?";
+        if (tokens >= 1_000) return std.fmt.bufPrint(buf, "{d:.1}K", .{@as(f64, @floatFromInt(tokens)) / 1_000.0}) catch "?";
+        return std.fmt.bufPrint(buf, "{d}", .{tokens}) catch "?";
+    }
+
+    pub fn writeFirstStartNotice(app: *App, w: *std.Io.Writer) !void {
+        const state_env = @import("app/state_env.zig");
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const root = app.stateRoot();
+        const env_path: []const u8 = if (root.len == 0) "" else try std.fs.path.join(arena_state.allocator(), &.{ root, state_env.file_name });
+        try route_state_mod.writeFirstStart(w, env_path, state_env.guide_url);
+    }
+
+    pub fn startsUnconfigured(app: *const App) bool {
+        const reason = app.unbound() orelse return false;
+        return reason == .nothing_configured and app.unchosen_local_providers.len == 0;
+    }
+
     /// The unbound reminder (#484) for this install: its `.env` (and the
     /// template beside it when an install wrote one), the provider keys the
     /// environment sets (names only), the providers `.env` names none of.
@@ -2058,6 +2135,7 @@ pub const App = struct {
             switched: Switched,
             /// Nothing to fall back to: unbound (`signed_out`).
             unbound,
+            missing_key: MissingKey,
         };
 
         pub const Switched = struct {
@@ -2065,6 +2143,15 @@ pub const App = struct {
             name: []const u8,
             /// Where the key it runs on came from.
             origin: route_state_mod.CredentialOrigin,
+            preset: ?[]const u8 = null,
+        };
+
+        pub const MissingKey = struct {
+            preset: ?[]const u8,
+            name: []const u8,
+            provider: provider_ids_mod.Slug,
+            variable: ?[]const u8,
+            login: bool,
         };
     };
 
@@ -2111,12 +2198,17 @@ pub const App = struct {
             if (app.local_route) |local| {
                 if (app.bindLocalRoute(host, local)) |switched| {
                     session = .{ .switched = switched };
-                } else |err| switch (local) {
-                    .provider => |chosen| @import("metacodes-internal").util.log.warn("provider", "the .env provider {s} could not be used: {s}", .{ chosen.name, @errorName(err) }),
-                    .preset => |preset| @import("metacodes-internal").util.log.warn("provider", "the .env preset {s} could not be used: {s}", .{ preset.name, @errorName(err) }),
+                } else |err| {
+                    switch (local) {
+                        .provider => |chosen| @import("metacodes-internal").util.log.warn("provider", "the .env provider {s} could not be used: {s}", .{ chosen.name, @errorName(err) }),
+                        .preset => |preset| @import("metacodes-internal").util.log.warn("provider", "the .env preset {s} could not be used: {s}", .{ preset.name, @errorName(err) }),
+                    }
+                    if (err == error.MissingCredentials) {
+                        if (app.missingLocalKey(host, local)) |missing| session = .{ .missing_key = missing };
+                    }
                 }
             }
-            if (session == .unbound) app.unbindRoute(.signed_out);
+            if (session == .unbound or session == .missing_key) app.unbindRoute(.signed_out);
         }
         return .{
             .removed = removed,
@@ -2386,6 +2478,29 @@ pub const App = struct {
                 .bound => |origin| origin,
                 .unbound => .unknown,
             },
+            .preset = presetName(local),
+        };
+    }
+
+    fn presetName(local: LocalRoute) ?[]const u8 {
+        return switch (local) {
+            .preset => |preset| preset.name,
+            .provider => null,
+        };
+    }
+
+    fn missingLocalKey(app: *App, host: *provider_host_mod.Host, local: LocalRoute) ?SignOut.MissingKey {
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const resolved = (presets_mod.resolveLocal(arena_state.allocator(), &host.registry, local) catch return null) orelse return null;
+        const profile = host.registry.findById(resolved.route.provider_id) orelse return null;
+        const setup = providerSetup(host, profile.id);
+        return .{
+            .preset = presetName(local),
+            .name = profile.display_name,
+            .provider = profile.id,
+            .variable = setup.variable,
+            .login = setup.sign_in or profile.api_key_setup != null,
         };
     }
 
@@ -3373,9 +3488,11 @@ pub const App = struct {
         return .{
             .provider = profile.id,
             .variable = variable,
-            // Metask, and a provider whose site creates the key (OpenRouter):
-            // `/login` is the way in, a variable the other.
-            .sign_in = profile.id.eqlText("metask") or profile.key_grant != null,
+            // Metask, a provider whose site creates the key (OpenRouter), and
+            // one that signs in with a client of its own (ChatGPT): `/login`
+            // is the way in, a variable the other.
+            .sign_in = profile.id.eqlText("metask") or profile.key_grant != null or
+                (profile.declaresInteractiveOAuth() and profile.oauth_client_id != null),
         };
     }
 

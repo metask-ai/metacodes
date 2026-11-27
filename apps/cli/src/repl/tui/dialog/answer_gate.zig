@@ -13,15 +13,19 @@ pub const Timing = struct {
 
 pub const Gate = struct {
     timing: Timing,
-    last_input_ns: util_time.Nanos,
+    last_input_ns: ?util_time.Nanos = null,
     open: bool = false,
 
-    pub fn init(timing: Timing, now_ns: util_time.Nanos) Gate {
-        return .{ .timing = timing, .last_input_ns = now_ns };
+    pub fn init(timing: Timing) Gate {
+        return .{ .timing = timing };
+    }
+
+    pub fn shown(self: *Gate, now_ns: util_time.Nanos) void {
+        if (!self.open) self.last_input_ns = now_ns;
     }
 
     pub fn admits(self: *Gate, now_ns: util_time.Nanos) bool {
-        if (!self.open) self.open = now_ns - self.last_input_ns >= @as(util_time.Nanos, self.timing.quiet_ms) * std.time.ns_per_ms;
+        if (!self.open) self.open = now_ns - (self.last_input_ns orelse now_ns) >= @as(util_time.Nanos, self.timing.quiet_ms) * std.time.ns_per_ms;
         self.last_input_ns = now_ns;
         return self.open;
     }
@@ -42,7 +46,8 @@ const testing = std.testing;
 const ms = std.time.ns_per_ms;
 
 test "answer gate: a key while the box opens or while typing goes on is not an answer, the first after a quiet spell is" {
-    var gate = Gate.init(.interactive, 1000 * ms);
+    var gate = Gate.init(.interactive);
+    gate.shown(1000 * ms);
     try testing.expect(!gate.admits(1000 * ms));
     try testing.expect(!gate.admits(1350 * ms));
     try testing.expect(!gate.admits(1700 * ms));
@@ -51,7 +56,8 @@ test "answer gate: a key while the box opens or while typing goes on is not an a
 }
 
 test "answer gate: closing it asks for another quiet spell, and a key refused meanwhile starts the spell again" {
-    var gate = Gate.init(.interactive, 0);
+    var gate = Gate.init(.interactive);
+    gate.shown(0);
     try testing.expect(gate.admits(500 * ms));
     gate.close(600 * ms);
     try testing.expect(!gate.admits(900 * ms));
@@ -59,8 +65,29 @@ test "answer gate: closing it asks for another quiet spell, and a key refused me
     try testing.expect(gate.admits(1650 * ms));
 }
 
+test "answer gate: a key before the first frame is never an answer, and the quiet spell counts from the end of the frame" {
+    var gate = Gate.init(.interactive);
+    try testing.expect(!gate.admits(5000 * ms));
+    gate.shown(6000 * ms);
+    try testing.expect(!gate.admits(6010 * ms));
+    gate.shown(6011 * ms);
+    try testing.expect(gate.admits(6500 * ms));
+}
+
+test "answer gate: a frame drawn while the gate is closed starts its spell again, one drawn while it is open leaves it open" {
+    var gate = Gate.init(.interactive);
+    gate.shown(0);
+    try testing.expect(!gate.admits(300 * ms));
+    gate.shown(800 * ms);
+    try testing.expect(!gate.admits(1000 * ms));
+    gate.shown(1000 * ms);
+    try testing.expect(gate.admits(1500 * ms));
+    gate.shown(5000 * ms);
+    try testing.expect(gate.admits(5000 * ms));
+}
+
 test "answer gate: the immediate timing admits every key and never waits for a paste" {
-    var gate = Gate.init(.immediate, 0);
+    var gate = Gate.init(.immediate);
     try testing.expect(gate.admits(0));
     gate.close(0);
     try testing.expect(gate.admits(0));
@@ -74,7 +101,7 @@ test "answer gate: bytes already waiting, or arriving within the paste gap, are 
     try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
-    const gate = Gate.init(.interactive, 0);
+    const gate = Gate.init(.interactive);
     var parser = input_mod.KeyParser{};
     try testing.expect(!gate.pasteFollows(fds[0], &parser));
     _ = std.c.write(fds[1], "y", 1);

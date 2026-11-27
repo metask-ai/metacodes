@@ -60,6 +60,13 @@ status, compatibility boundaries, and entry points are defined by
   notice. Event text is XML-escaped and labelled as command output, not
   instructions. Off by default; with it off Monitor is unchanged
   ([API.md](doc/API.md#preview-features)).
+- **`/status` shows what the session runs on.** The model, its provider,
+  route (channel and wire) and endpoint, where its credential comes from,
+  the reasoning level, and about how much of the context window the
+  conversation fills (the provider's measured prompt tokens of the last
+  request plus an estimate of the messages since); `not set` when the
+  session has no model.
+
 - **Bench has a 监控 page for the execution machine.** It shows the machine's
   CPU, load, memory, disks and network rate, whether Docker Hub, ghcr.io,
   GitHub, PyPI, Hugging Face, astral.sh and every configured mirror answer
@@ -330,6 +337,24 @@ status, compatibility boundaries, and entry points are defined by
   other mistyped name. Web and daemon hosts that send `/vim` through
   `POST /command` are not affected.
 
+- **`/login` marks an unofficial sign-in in its list.** ChatGPT's sign-in
+  said it is unofficial only once it started; its entry in the `/login`
+  list now reads `ChatGPT (Codex) · browser sign-in · unofficial`.
+
+- **`/login` scrolls its provider list.** Past the 12 providers it shows at
+  once, the list said `N more not shown: /login <provider> (…)`, and ↑/↓
+  stopped at the twelfth. ↑/↓ now scroll the rest into view, with `↑ N
+  more` and `↓ N more` for what lies past either end, and Esc from a
+  provider's page returns to it in the list. Only providers past the 64 a
+  dialog holds are still counted under the list.
+
+- **A first start says where to begin.** With nothing set up, the terminal
+  UI showed only `not set — /login, or configure .env` in its banner; the
+  path of this install's `.env` and the guide came only once a message was
+  refused. It now says under the banner, before anything is typed: `To
+  start: /login signs in to Metask, or put your own provider key in
+  <state root>/.env and restart.` and the guide's address.
+
 - **API failure notices are in English.** The line under `API request
   failed` mixed Chinese into an English screen, e.g. `HTTP 429(重试 4 次后放弃):
   …`. It now reads `HTTP 429 (gave up after 4 attempts): …`, and the named
@@ -363,6 +388,14 @@ status, compatibility boundaries, and entry points are defined by
   imports (from 1815), 0 package cycles and 0 wide module roots. Each package
   has its own test step (`zig build test:base` ... `test:teamwork`), and
   `zig build test:lib` runs one sharded binary per package.
+
+- **The TUI folds a model's thinking into one line.** Thinking was printed
+  into the conversation as if it were the answer. It now scrolls, dim, in
+  the live area above the spinner (its last three lines), and when the
+  answer or a tool call starts it leaves one dim line in its place,
+  `✻ Thought for 12s`. A reply that only thinks keeps that line too, and a
+  resumed session shows `✻ Thought`. Ctrl+X Ctrl+O shows the whole thinking;
+  it used to stop after three lines. Line mode and `-p` do not change.
 
 - **Zig source API: tool-result reduction moved out of `Conversation`, and
   the packages no longer form a cycle.** `Conversation.microcompactToolResults`,
@@ -498,6 +531,23 @@ status, compatibility boundaries, and entry points are defined by
   new sign-in is for the gateway the session runs on, the session now lets
   go of the sign-in it held and the next turn sends the new one; when it is
   for another gateway, `/login` says so and points to `/model` or a restart.
+
+- **`/model` says how to sign in to ChatGPT.** A route that needs ChatGPT's
+  sign-in, reached without it (a stored default after `/logout
+  chatgpt-codex`), showed `chatgpt-codex not configured` and only the
+  `.env` guide. It now says `Sign in: /login chatgpt-codex`, as it does for
+  Metask and OpenRouter; a custom provider that declares its own OAuth
+  client gets the same pointer.
+
+- **`/logout` names the preset it moves onto, and the key a preset lacks.**
+  Signing out of Metask moves the session to what `.env` chooses; for a
+  preset the line said only `Switched to DeepSeek (from .env) ·
+  deepseek-v4-pro`, and now reads `Switched to the preset fast (from .env):
+  DeepSeek · deepseek-v4-pro`. When the preset's provider has no key the
+  session was left without a model under a generic `/login, or configure
+  .env`; it now says `No model is set up now: the preset fast needs a key
+  for DeepSeek.` and where the key goes (`/login deepseek`, or the variable
+  in this install's `.env`).
 
 - **Choosing a model for every future session in `/model` makes it this
   session's current route too.** The route the session started on stayed
@@ -786,6 +836,26 @@ status, compatibility boundaries, and entry points are defined by
   abort signal is set, within a quarter of a second, for every provider
   protocol and entry point. An interrupt while the answer is awaited no
   longer prints an error line.
+
+- **A paste without bracketed paste markers is typed as text, not as
+  keys that open or pick from menus.** In a terminal that sends pastes
+  unmarked (GNU screen 4, for one), a paste starting with `?` opened the
+  shortcut panel and lost the `?`, a Tab in it ran completion (and was
+  dropped during a reply), and once its text opened the `/` or `@` menu
+  the next line break in it picked the highlighted command or file:
+  pasting `/he` and a second line ran `/help`, `/c` and a line ran
+  `/clear`. The keys of such a paste, text that arrives together, now go
+  into the input box as a marked paste would: `?` and Tab stay in the
+  text, line breaks break the line, and the Enter that ends a one-line
+  paste sends what was pasted. Keys typed one at a time open the panel,
+  complete and pick from the menus as before.
+
+- **A dialog drawn on a slow terminal no longer takes a key typed while it
+  appeared as its answer.** The permission and AskUserQuestion dialogs
+  started their 400 ms wait before their box was written, so when the
+  terminal took longer than that to show it, a key typed in the meantime
+  answered the dialog. The wait now starts when the box is on screen, and
+  a redraw while the dialog is still waiting starts it again.
 
 - **Signing in over SSH no longer waits forever for a browser that cannot come
   back** (#722). `metacodes login` and `/login` sent the browser back to

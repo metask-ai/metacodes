@@ -105,10 +105,9 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
                     }
                 },
                 .thinking => |t| {
-                    // 思考块:头标 + 折叠内容(前 3 行)
                     const head = try std.fmt.allocPrint(allocator, "  {s}{s} thinking{s}", .{ th.role_thinking, th.icon_thinking, th.reset });
                     try lines.append(allocator, head);
-                    try appendWrappedFolded(allocator, &lines, t, "    ", th.dim, th.reset, 3);
+                    try appendDimLines(allocator, &lines, t, "    ", th.dim, th.reset);
                 },
                 .image => |img| {
                     // 终端不内联渲图:显示元信息行(类型 + base64 字节数)。
@@ -163,33 +162,17 @@ fn appendUserText(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8), tex
     }
 }
 
-/// 带折叠的 wrapped:超过 max_lines 后,后续行省略,加 "… N more lines"。
-fn appendWrappedFolded(
+fn appendDimLines(
     allocator: std.mem.Allocator,
     lines: *std.ArrayList([]u8),
     text: []const u8,
     prefix: []const u8,
     color: []const u8,
     reset: []const u8,
-    max_lines: u16,
 ) !void {
-    // 先算总行数
-    var total: u32 = 0;
-    {
-        var it = std.mem.splitScalar(u8, text, '\n');
-        while (it.next()) |_| total += 1;
-    }
-    var emitted: u32 = 0;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |seg| {
-        if (emitted >= max_lines) break;
         const line = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ prefix, color, seg, reset });
-        try lines.append(allocator, line);
-        emitted += 1;
-    }
-    if (total > max_lines) {
-        const more = total - max_lines;
-        const line = try std.fmt.allocPrint(allocator, "{s}{s}… {d} more lines{s}", .{ prefix, color, more, reset });
         try lines.append(allocator, line);
     }
 }
@@ -376,6 +359,28 @@ test "renderToLines: user=❯前缀 / assistant=⏺前缀+markdown(无角色头,
     try testing.expect(has_asst_prefix);
     try testing.expect(has_found);
     try testing.expect(!has_role_header); // 关键:无角色头(对齐 cc,渲染等效主区)
+}
+
+test "renderToLines: a thinking block is shown whole, every line of it" {
+    const a = testing.allocator;
+    const msg = @import("metacodes-internal").core.message;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    const blocks = try a.alloc(msg.Block, 2);
+    blocks[0] = .{ .thinking = try a.dupe(u8, "step one\nstep two\nstep three\nstep four\nstep five") };
+    blocks[1] = .{ .text = try a.dupe(u8, "Done.") };
+    try conv.append(.{ .role = .assistant, .blocks = blocks });
+
+    const lines = try renderToLines(a, &conv);
+    defer freeLines(a, lines);
+    for ([_][]const u8{ "step one", "step two", "step three", "step four", "step five", "Done." }) |want| {
+        var found = false;
+        for (lines) |l| {
+            if (std.mem.indexOf(u8, l, want) != null) found = true;
+        }
+        try testing.expect(found);
+    }
+    for (lines) |l| try testing.expect(std.mem.indexOf(u8, l, "more lines") == null);
 }
 
 test "renderToLines: assistant markdown 渲染(粗体→SGR,非源码)" {

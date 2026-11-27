@@ -174,6 +174,12 @@ pub fn writeReminder(w: *std.Io.Writer, r: Reminder) std.Io.Writer.Error!void {
     try w.print("  How to: {s}\n", .{r.guide_url});
 }
 
+pub fn writeFirstStart(w: *std.Io.Writer, env_path: []const u8, guide_url: []const u8) std.Io.Writer.Error!void {
+    try w.writeAll("To start: /login signs in to Metask");
+    if (env_path.len > 0) try w.print(", or put your own provider key in {s} and restart", .{env_path});
+    try w.print(".\nHow to: {s}\n", .{guide_url});
+}
+
 /// The provider the user named has no credential: say which, and where its
 /// key goes, rather than offering another provider first.
 ///
@@ -287,6 +293,16 @@ fn reminderText(r: Reminder) ![]u8 {
     errdefer out.deinit();
     try writeReminder(&out.writer, r);
     return out.toOwnedSlice();
+}
+
+test "a first start names the sign-in, this install's .env and the guide" {
+    var buffer: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    try writeFirstStart(&w, "/home/u/.local/opt/metacodes/state/.env", "https://example.test/guide");
+    try testing.expectEqualStrings(
+        "To start: /login signs in to Metask, or put your own provider key in /home/u/.local/opt/metacodes/state/.env and restart.\nHow to: https://example.test/guide\n",
+        w.buffered(),
+    );
 }
 
 test "the banner names the origin after the model, and says not set when unbound" {

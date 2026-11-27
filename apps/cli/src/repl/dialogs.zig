@@ -591,9 +591,8 @@ fn maskFor(buffer: []u8, count: usize) []const u8 {
 }
 
 pub const LoginDialog = struct {
-    /// Providers the list shows. The pane neither scrolls nor filters yet, so
-    /// the ones past it are named under the list instead (`unlistedCount`),
-    /// and `/login <id>` starts any of them.
+    /// Providers the list shows at once; ↑/↓ scroll the rest into view, and
+    /// `/login <id>` starts any of them.
     pub const MAX_PROVIDERS = 12;
     /// Providers a dialog holds: the listed ones, and the ones past them that
     /// `/login <id>` starts directly.
@@ -640,6 +639,7 @@ pub const LoginDialog = struct {
     /// still says how many it leaves out.
     dropped: usize = 0,
     sel: usize = 0,
+    top: usize = 0,
     stage: Stage = .choose,
     worker: ?*login_worker_mod.LoginWorker = null,
     pasted: PastedAddress = .{},
@@ -699,7 +699,13 @@ pub const LoginDialog = struct {
 
     /// How many offered providers the list leaves out.
     pub fn unlistedCount(self: *const LoginDialog) usize {
-        return self.choices_len - self.listedLen() + self.dropped;
+        return self.dropped;
+    }
+
+    fn scrollToSel(self: *LoginDialog) void {
+        const window = self.listedLen();
+        if (self.sel < self.top) self.top = self.sel;
+        if (self.sel >= self.top + window) self.top = self.sel + 1 - window;
     }
 
     /// The provider the dialog last signed in to or stored a key for.
@@ -714,30 +720,17 @@ pub const LoginDialog = struct {
         self.begin();
     }
 
-    /// Back to the list. A provider started past it (`/login <id>`) has no
-    /// row to point at, so the pointer goes to the first.
+    /// Back to the list, on the provider it left.
     fn backToList(self: *LoginDialog) void {
-        if (self.sel >= self.listedLen()) self.sel = 0;
+        if (self.sel >= self.choices_len) self.sel = 0;
+        self.scrollToSel();
         self.stage = .choose;
     }
 
-    /// `3 more not shown: /login <provider> (my-relay, local-vllm, …)`: the
-    /// ids `/login` takes for the providers past the list, as many as fit.
-    fn unlistedLine(self: *const LoginDialog, buffer: []u8, count: usize) []const u8 {
-        var w: std.Io.Writer = .fixed(buffer);
-        w.print("{d} more not shown: /login <provider> (", .{count}) catch return "More providers: /login <provider>";
-        const reserve = ", …)".len;
-        var written: usize = 0;
-        for (self.choices[self.listedLen()..self.choices_len]) |*choice| {
-            const id = choice.profile.id.slice();
-            if (w.end + id.len + 2 + reserve > buffer.len) break;
-            if (written > 0) w.writeAll(", ") catch break;
-            w.writeAll(id) catch break;
-            written += 1;
-        }
-        if (written < count) w.writeAll(if (written == 0) "…" else ", …") catch {};
-        w.writeAll(")") catch {};
-        return w.buffered();
+    /// `3 more not shown: /login <provider>`: the providers past what the
+    /// dialog holds.
+    fn unlistedLine(buffer: []u8, count: usize) []const u8 {
+        return std.fmt.bufPrint(buffer, "{d} more not shown: /login <provider>", .{count}) catch "More providers: /login <provider>";
     }
 
     /// Ends any sign-in still owned here, waiting for its thread.
@@ -991,16 +984,29 @@ pub const LoginDialog = struct {
                 try p.blank();
                 try p.text("Select a provider:");
                 try p.blank();
-                for (self.choices[0..self.listedLen()], 0..) |*choice, i| {
-                    try p.option(i + 1, i == self.sel, label(choice), method(choice));
+                self.scrollToSel();
+                const window = self.listedLen();
+                if (self.top > 0) {
+                    var above_buf: [32]u8 = undefined;
+                    try p.dim(std.fmt.bufPrint(&above_buf, "  ↑ {d} more", .{self.top}) catch "  ↑ more");
                 }
-                // The pane cannot scroll the rest into view: they are named,
-                // never silently left out.
+                for (self.choices[self.top .. self.top + window], self.top..) |*choice, i| {
+                    var how_buf: [64]u8 = undefined;
+                    const how = if (choice.profile.oauth_support == .unofficial)
+                        std.fmt.bufPrint(&how_buf, "{s} · unofficial", .{method(choice)}) catch method(choice)
+                    else
+                        method(choice);
+                    try p.option(i + 1, i == self.sel, label(choice), how);
+                }
+                if (self.top + window < self.choices_len) {
+                    var below_buf: [32]u8 = undefined;
+                    try p.dim(std.fmt.bufPrint(&below_buf, "  ↓ {d} more", .{self.choices_len - self.top - window}) catch "  ↓ more");
+                }
                 const unlisted = self.unlistedCount();
                 if (unlisted > 0) {
-                    var more_buf: [512]u8 = undefined;
+                    var more_buf: [128]u8 = undefined;
                     try p.blank();
-                    try p.paragraph(p.th.dim, self.unlistedLine(&more_buf, unlisted));
+                    try p.paragraph(p.th.dim, unlistedLine(&more_buf, unlisted));
                 }
                 try p.blank();
                 try p.footer("↑/↓ to select · Enter to sign in · Esc to cancel");
@@ -1160,15 +1166,17 @@ pub const LoginDialog = struct {
             .choose => switch (k) {
                 .esc, .ctrl_c => return .done,
                 .up => {
-                    const n = self.listedLen();
+                    const n = self.choices_len;
                     if (n == 0) return .none;
                     self.sel = if (self.sel == 0) n - 1 else self.sel - 1;
+                    self.scrollToSel();
                     return .redraw;
                 },
                 .down => {
-                    const n = self.listedLen();
+                    const n = self.choices_len;
                     if (n == 0) return .none;
                     self.sel = (self.sel + 1) % n;
+                    self.scrollToSel();
                     return .redraw;
                 },
                 .enter => {
@@ -1180,7 +1188,7 @@ pub const LoginDialog = struct {
                     // Number keys pick a provider, as in Claude Code's selects.
                     if (c < '1' or c > '9') return .none;
                     const index: usize = c - '1';
-                    if (index >= self.listedLen()) return .none;
+                    if (index >= self.choices_len) return .none;
                     self.sel = index;
                     self.begin();
                     return .redraw;
@@ -2202,6 +2210,28 @@ test "login: the list wraps, numbers are shown, Esc interrupts" {
     try testing.expect(dialog.outcome == .interrupted);
 }
 
+test "login: an unofficial sign-in says so in the list" {
+    const kinds = [_]provider_profile.CredentialKind{.openai_oauth};
+    const profile = provider_profile.ProviderProfile{
+        .id = @import("metacodes-internal").provider.ids.Slug.lit("dialog-test"),
+        .implementation_id = @import("metacodes-internal").provider.ids.Slug.lit("dialog-test"),
+        .display_name = "Dialog Test",
+        .channels = &.{},
+        .accepted_credential_kinds = &kinds,
+        .oauth_token_url = "http://127.0.0.1:1/token",
+        .oauth_authorize_url = "http://127.0.0.1:1/authorize",
+        .oauth_client_id = "dialog-client",
+        .oauth_support = .unofficial,
+    };
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined };
+    defer dialog.deinit();
+    const flow = try provider_login.prepareFlow(&profile, .{ .state_root = "", .open_browser = false, .port = 0 }, null);
+    dialog.add(.{ .profile = &profile, .method = .{ .flow = flow } });
+    const plain = try renderPlain(&dialog, 80);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "> 1. Dialog Test · browser sign-in · unofficial") != null);
+}
+
 /// `count` key providers `p1`…`p<count>` (the GLM Coding Plan's setup).
 fn manyKeyProviders(comptime count: usize) [count]provider_profile.ProviderProfile {
     comptime {
@@ -2215,35 +2245,39 @@ fn manyKeyProviders(comptime count: usize) [count]provider_profile.ProviderProfi
     }
 }
 
-test "login: past the rows it shows, the list names the rest, and /login <id> still starts one" {
+test "login: past the rows it shows, the list scrolls, and /login <id> still starts one" {
     const many = comptime manyKeyProviders(14);
     var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
     defer dialog.deinit();
     for (many[0..13]) |*profile| dialog.add(.{ .profile = profile, .method = .api_key });
-    // `/login p14`: the 14th, past the 12 rows.
     const named = dialog.addNamed(.{ .profile = &many[13], .method = .api_key });
     try testing.expectEqual(@as(usize, 13), named);
     try testing.expectEqual(@as(usize, LoginDialog.MAX_PROVIDERS), dialog.listedLen());
-    try testing.expectEqual(@as(usize, 2), dialog.unlistedCount());
+    try testing.expectEqual(@as(usize, 0), dialog.unlistedCount());
 
-    const listed = try renderPlain(&dialog, 160);
-    defer testing.allocator.free(listed);
-    try testing.expect(std.mem.indexOf(u8, listed, "12. Z.AI GLM Coding Plan") != null);
-    try testing.expect(std.mem.indexOf(u8, listed, "13. ") == null);
-    try testing.expect(std.mem.indexOf(u8, listed, "2 more not shown: /login <provider> (p13, p14)") != null);
-    // The keys move over the listed rows only.
+    const top = try renderPlain(&dialog, 160);
+    defer testing.allocator.free(top);
+    try testing.expect(std.mem.indexOf(u8, top, "12. Z.AI GLM Coding Plan") != null);
+    try testing.expect(std.mem.indexOf(u8, top, "13. ") == null);
+    try testing.expect(std.mem.indexOf(u8, top, "↓ 2 more") != null);
+    try testing.expect(std.mem.indexOf(u8, top, "not shown") == null);
+
     try testing.expectEqual(Step.redraw, dialog.key(.up));
-    try testing.expectEqual(@as(usize, LoginDialog.MAX_PROVIDERS - 1), dialog.sel);
+    try testing.expectEqual(@as(usize, 13), dialog.sel);
+    const bottom = try renderPlain(&dialog, 160);
+    defer testing.allocator.free(bottom);
+    try testing.expect(std.mem.indexOf(u8, bottom, "↑ 2 more") != null);
+    try testing.expect(std.mem.indexOf(u8, bottom, "> 14. Z.AI GLM Coding Plan") != null);
+    try testing.expect(std.mem.indexOf(u8, bottom, " 2. ") == null);
     try testing.expectEqual(Step.redraw, dialog.key(.down));
     try testing.expectEqual(@as(usize, 0), dialog.sel);
 
-    // `/login p14` starts it; Esc leaves it for the list, pointing at a row.
     dialog.startAt(named);
     try testing.expectEqual(LoginDialog.Stage.key_page, dialog.stage);
     try testing.expectEqualStrings("p14", dialog.current().profile.id.slice());
     try testing.expectEqual(Step.redraw, dialog.key(.esc));
     try testing.expectEqual(LoginDialog.Stage.choose, dialog.stage);
-    try testing.expectEqual(@as(usize, 0), dialog.sel);
+    try testing.expectEqual(@as(usize, 13), dialog.sel);
 }
 
 test "login: past what a dialog holds, the providers are counted and the named one still gets in" {
@@ -2253,14 +2287,10 @@ test "login: past what a dialog holds, the providers are counted and the named o
     for (many[0 .. LoginDialog.CAPACITY + 2]) |*profile| dialog.add(.{ .profile = profile, .method = .api_key });
     const named = dialog.addNamed(.{ .profile = &many[LoginDialog.CAPACITY + 2], .method = .api_key });
     try testing.expectEqual(@as(usize, LoginDialog.CAPACITY - 1), named);
-    // Offered: CAPACITY + 3; listed: 12.
-    try testing.expectEqual(@as(usize, LoginDialog.CAPACITY + 3 - LoginDialog.MAX_PROVIDERS), dialog.unlistedCount());
-    // Wide enough that the line is one row.
+    try testing.expectEqual(@as(usize, 3), dialog.unlistedCount());
     const listed = try renderPlain(&dialog, 400);
     defer testing.allocator.free(listed);
-    // The ids it holds, then an ellipsis for the ones it only counted.
-    try testing.expect(std.mem.indexOf(u8, listed, "55 more not shown: /login <provider> (p13, p14,") != null);
-    try testing.expect(std.mem.indexOf(u8, listed, "p67, …)") != null);
+    try testing.expect(std.mem.indexOf(u8, listed, "3 more not shown: /login <provider>") != null);
     dialog.startAt(named);
     try testing.expectEqualStrings("p67", dialog.current().profile.id.slice());
 }

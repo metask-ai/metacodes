@@ -235,8 +235,11 @@ the default is Metask. To use DeepSeek: /model, or /logout`; for the file's
 preset, `.env configures the preset fast (DeepSeek · deepseek-v4-pro); the
 default is Metask. To use it: /model, or /logout`). `/logout` signs you out of
 Metask and switches the session to what this file chooses, as step 6 does: its
-preset, else its provider (`Switched to DeepSeek (from .env)`); later starts
-use it too.
+preset (`Switched to the preset fast (from .env): DeepSeek ·
+deepseek-v4-pro`), else its provider (`Switched to DeepSeek (from .env)`);
+later starts use it too. A preset whose provider has no key leaves the
+session without a model, and the line says which key it needs and where it
+goes.
 
 `metacodes login status` shows this decision without starting anything: the
 provider a plain start in the current directory uses, the step that decided,
