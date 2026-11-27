@@ -49,8 +49,9 @@ h2{font-size:15px;font-weight:600}h2 small{font-size:12px;font-weight:400;color:
 .rail nav a[aria-current=page]:after{content:'';position:absolute;right:0;top:11px;bottom:11px;width:1px;background:var(--accent)}
 .canvas{margin-left:56px;padding:24px var(--pad) 20px;max-width:1800px}
 .header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px}
+.header>div:first-child{min-width:0}
 .brand{font-size:12px;margin-bottom:4px}.brand span{color:var(--muted);margin-left:6px}
-.crumbs{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:8px;flex-wrap:wrap}
+.crumbs{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:8px;flex-wrap:wrap;overflow-wrap:anywhere}
 .crumbs a{color:var(--accent)}
 .header-actions{display:flex;gap:12px;align-items:center;flex:none}
 .button{border:1px solid var(--control);border-radius:var(--radius);height:32px;padding:0 12px;font-size:12px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
@@ -316,11 +317,11 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .index-controls select,.task-sort{height:30px;padding:0 9px;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:4px;font-size:12px}
 .compare-dock{display:flex;flex-direction:column;gap:10px;padding:12px 16px;border-radius:var(--radius);background:rgba(106,157,217,.1);border:1px solid rgba(106,157,217,.45);margin-bottom:16px}
 .compare-dock-top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-.compare-dock-left{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.compare-dock-left{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0;overflow-wrap:anywhere}
 .compare-dock-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .compare-dock-picks{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:10px}
-.compare-dock-pick{display:grid;gap:4px;font-size:11.5px;color:var(--muted)}
-.compare-dock-pick span{display:inline-flex;align-items:center;gap:5px;color:var(--text)}
+.compare-dock-pick{display:grid;gap:4px;font-size:11.5px;color:var(--muted);min-width:0}
+.compare-dock-pick span{display:inline-flex;align-items:center;gap:5px;color:var(--text);min-width:0;overflow-wrap:anywhere}
 .compare-dock select{height:28px;padding:0 9px;background:var(--ground);color:var(--text);border:1px solid var(--control);border-radius:5px;font-size:12px;max-width:100%;width:100%}
 .compare-dock-right select{width:auto}
 .card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,410px),1fr));gap:16px;margin-bottom:var(--gap)}
@@ -328,15 +329,17 @@ footer{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-s
 .pcard:hover{border-color:var(--control)}
 .pcard.selected{border-color:rgba(106,157,217,.55);box-shadow:inset 0 0 0 1px rgba(106,157,217,.22)}
 .pcard-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.pcard-head>div:first-child{min-width:0;overflow-wrap:anywhere}
 .pcard-title{font:600 15px/1.3 var(--mono);color:var(--text);display:flex;align-items:center;gap:7px;overflow-wrap:anywhere}
-.pcard-tags{display:flex;gap:6px;flex-wrap:wrap}
+.pcard-tags{display:flex;gap:6px;flex-wrap:wrap;min-width:0}
+.pcard-tags .tag{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 .pcard-rate{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .pcard-rate strong{font:400 28px/1.15 var(--mono);letter-spacing:-.6px}
 .pcard-rate strong.good{color:var(--positive)}
 .pcard-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:10px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule)}
 .pcard-stats span{display:block;font-size:11px;color:var(--faint)}
 .pcard-stats b{display:block;font:500 13.5px/1.4 var(--mono);margin-top:2px;font-weight:500}
-.pcard-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:11.5px;color:var(--muted)}
+.pcard-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:auto;font-size:11.5px;color:var(--muted)}
 .pcard-check{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
 .pcard-check input{accent-color:var(--accent);width:15px;height:15px;margin:0;cursor:pointer}
 

@@ -570,7 +570,9 @@ async function renderOverview() {
             h('label', { class: 'pcard-check', onclick: (e) => e.stopPropagation() }, box))),
         h('div', { class: 'pcard-tags' },
           h('span', { class: 'tag mono', text: p.metacodes?.label || '—' }),
-          h('span', { class: 'tag mono', text: featList.length ? featList.join(', ') : '默认功能' })),
+          ...(featList.length
+            ? featList.map((feat) => h('span', { class: 'tag mono', text: feat }))
+            : [h('span', { class: 'tag mono', text: '默认功能' })])),
         h('div', {},
           h('div', { class: 'pcard-rate' },
             h('div', {}, h('strong', { class: rateGood ? 'good' : null, text: pct(s.first_pass_rate) }), ' ', h('span', { class: 'muted', style: 'font-size:11.5px', text: '首轮满分' })),
