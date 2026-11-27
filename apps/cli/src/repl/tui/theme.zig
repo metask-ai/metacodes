@@ -13,7 +13,7 @@ const std = @import("std");
 const ansi = @import("ansi.zig");
 const term = @import("term.zig");
 
-/// 语法高亮语义色(10 组)。复用 ansi.syntax_palette.Syntax 为单一真相源。
+/// 语法高亮语义色(10 组)和 markdown 的标题、链接、代码块底色。复用 ansi.syntax_palette.Syntax 为单一真相源。
 /// 由 select() 按 ColorCapability 填(b16/256/truecolor),basic_16 用历史色保兼容。
 pub const SyntaxTheme = ansi.syntax_palette.Syntax;
 
@@ -54,7 +54,7 @@ pub const Theme = struct {
     /// 空串 = 不画背景(basic_16/mono 退回纯前景)。由 select 按 ColorCapability 注入。
     diff_add_bg: []const u8 = "",
     diff_del_bg: []const u8 = "",
-    /// 语法高亮语义色(代码 diff + markdown 代码块)。默认 b16(const dark/light 烤入),
+    /// 语法高亮语义色(代码 diff + markdown)。默认 b16(const dark/light 烤入),
     /// select() 对 256/truecolor 升级;monochrome 留空。空组 = 不上色。
     syntax: SyntaxTheme = ansi.syntax_palette.b16,
 
@@ -365,6 +365,22 @@ test "select: 语法高亮色按 ColorCapability 升级" {
     // monochrome → 全空(none cap)。
     const mono = select(.dark, .none);
     try testing.expectEqualStrings("", mono.syntax.keyword);
+}
+
+test "markdown colors: the colorless and monochrome themes leave them empty, colored themes keep the 16 colors" {
+    for ([_]Theme{ select(.auto, .none), select(.dark, .none), select(.monochrome, .truecolor) }) |th| {
+        try testing.expectEqualStrings("", th.syntax.heading);
+        try testing.expectEqualStrings("", th.syntax.link);
+        try testing.expectEqualStrings("", th.syntax.code);
+    }
+    for ([_]term.ColorCapability{ .basic_16, .extended_256, .truecolor }) |cap| {
+        for ([_]Variant{ .dark, .light }) |variant| {
+            const th = select(variant, cap);
+            try testing.expectEqualStrings(ansi.sgr.fg_cyan, th.syntax.heading);
+            try testing.expectEqualStrings(ansi.sgr.fg_blue, th.syntax.link);
+            try testing.expectEqualStrings(ansi.sgr.fg_bright_black, th.syntax.code);
+        }
+    }
 }
 
 test "const dark 烤入 b16 syntax(独立用 theme_mod.dark 时高亮可用)" {

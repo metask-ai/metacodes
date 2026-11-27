@@ -22,6 +22,7 @@ const pfs = @import("metacodes-internal").platform.fs;
 const input = @import("input.zig");
 const Conversation = @import("metacodes-internal").core.conversation.Conversation;
 const Overlay = @import("tui/overlay.zig").Overlay;
+const remote = @import("tui/remote.zig");
 
 /// 把整个对话渲染成可显示的行(owned;caller free 每行 + 数组)。
 /// 每条 message 前加 role 头;tool_use/tool_result 用缩进 + 标记区分。
@@ -130,7 +131,7 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
 /// 不做列宽软折(transcript 终端自己软换行;主区软折是为固定区,viewer 全屏可不折)。
 fn appendAssistantMarkdown(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8), text: []const u8, th: @import("tui/theme.zig").Theme) !void {
     const md_render = @import("render.zig");
-    var st: md_render.StreamState = .{};
+    var st: md_render.StreamState = .{ .file_host = remote.linkHost() };
     var first = true;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |seg| {
