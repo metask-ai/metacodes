@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = @import("metacodes-ai").json;
 const util_json = @import("metacodes-base").util.json;
+const permission_category = @import("metacodes-guard").permission.category;
 
 const code_map_tool = @import("tools/code_map.zig");
 const find_symbol_tool = @import("tools/find_symbol.zig");
@@ -101,6 +102,7 @@ pub const RuntimeDependency = enum {
 
 pub const ToolEntry = struct {
     name: []const u8,
+    category: permission_category.ToolCategory,
     /// 静态短描述。describe_fn 为 null 时用它（简单工具）。
     description: []const u8,
     /// 动态长描述生成器。非 null 时优先于 description（核心工具用，支持动态耦合）。
@@ -161,6 +163,7 @@ const MONITOR_EVENTS_PROP_SPECS: []const json.PropSpec = &.{
 pub const registry: []const ToolEntry = &.{
     .{
         .name = "Read",
+        .category = .read,
         .description = "Read a file from the local filesystem.",
         .describe_fn = descriptions.describeRead,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -174,6 +177,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Write",
+        .category = .write,
         .description = "Write a file to the local filesystem.",
         .describe_fn = descriptions.describeWrite,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -185,6 +189,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Edit",
+        .category = .write,
         .description = "Performs exact string replacements in files.",
         .describe_fn = descriptions.describeEdit,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -198,6 +203,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ApplyPatch",
+        .category = .write,
         .description = "Apply a codex-style patch envelope to add/delete/update/rename one or more files in a single call. The patch format uses '*** Begin Patch' / '*** End Patch' with '*** Add File:', '*** Delete File:', '*** Update File:' (and optional '*** Move to:') sections; update hunks use '@@' context markers plus ' '/'-'/'+' lines (no line numbers — context is located fuzzily). Transactional: if any hunk fails to apply, no files are written.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "patch", .type = "string", .description = "The full patch text, from '*** Begin Patch' to '*** End Patch'." },
@@ -207,6 +213,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CodeMap",
+        .category = .read,
         .deferred = true,
         .description = "Produce a structural outline of source code: functions, types, classes, " ++
             "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
@@ -225,6 +232,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "FindSymbol",
+        .category = .read,
         .deferred = true,
         .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
             "Returns definitions with " ++
@@ -243,6 +251,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Bash",
+        .category = .execute,
         .description = "Run shell commands for workspace searches, builds, tests, and Git.",
         .describe_fn = descriptions.describeBash,
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -256,6 +265,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "BashOutput",
+        .category = .read,
         .deferred = true,
         .description = "A backgrounded job's exit is announced to you automatically; you do not need to call this in a loop. Read stdout/stderr and status of a backgrounded Bash job by job_id. Returns stdout/stderr chunks plus status (running|exited|killed). On a running job the call waits (default 30 seconds, maximum 600 seconds) until the job exits, or returns at once when unread output already fills the result (returned_on \"backlog\": page on with the cursors). until=\"output\" returns on the first unread byte instead (to stream a Monitor), until=\"quiet\" once output pauses for quiet_ms, until=\"pattern\" once output past the cursor contains pattern (pattern_match gives the channel and byte offset; pass it as *_since_byte to read from there; if the search could not reach the end in time, pattern_searched_to says where to resume it). Set wait_ms to 0 for a snapshot. returned_on names what ended the call. Back-to-back waiting polls that keep returning only a few bytes of a still-running job (a progress ticker) engage poll_guard: later waits ignore progress output and may run up to poll_guard.min_wait_ms even when wait_ms is shorter, and a page smaller than 256 bytes (a tiny max_bytes) no longer counts as full; page through a backlog with wait_ms 0. A pattern match ends any wait, guarded or not, and clears the guard's count. Omit stdout_since_byte/stderr_since_byte to continue from the last read, or pass an explicit offset to override it. Do not re-poll in a loop or sleep between polls: one BashOutput call waits for it. max_bytes caps a single read; omit it to get as much as the context budget allows (maximum 262144, and a large explicit value may still be reduced to fit that budget). To follow a long job, pass the previous stdout_next_offset/stderr_next_offset as the next stdout_since_byte/stderr_since_byte — those are the resume cursors. stdout_total_bytes/stderr_total_bytes report the file's current size, NOT a cursor: using them as one skips everything between what was shown and the end of the file. NOTE: if the command used shell redirection (>/>>/2>), the redirected output went to the file you named and BashOutput will not show it — Read that file directly.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -275,6 +285,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ReadArtifact",
+        .category = .read,
         .description = "Read a bounded byte range from a recoverable tool-result artifact. Use this whenever a tool result reports it was truncated and names an artifact_id — re-running the tool costs a full round-trip and still will not return the omitted bytes. offset is zero-based bytes; limit is capped at 32768 and may be reduced further to fit the context budget, in which case next_offset carries the remainder. The result is always bounded and never spills recursively. A turn has a recovery allowance of half its result budget; calls beyond it return recovery_allowance_exhausted with the offset to resume from in the next turn.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "artifact_id", .type = "string", .description = "Content-addressed id in sha256:<64 lowercase hex> form" },
@@ -286,6 +297,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KillShell",
+        .category = .read,
         .deferred = true,
         .description = "Terminate a running backgrounded Bash job by job_id",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -295,6 +307,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Monitor",
+        .category = .read,
         .deferred = true,
         .description = "Start a background monitor that runs a command and streams stdout line-by-line. Its exit is announced to you automatically. Use to watch logs, poll status, or react to file changes mid-conversation. Each stdout line is collected into a ring buffer readable via BashOutput(job_id, until=\"output\") as lines arrive; a plain BashOutput waits up to wait_ms for the monitor to exit. Stop with KillShell(job_id). Args: command (required), description (required, e.g. 'errors in /var/log/app.log'). Optional: persistent (default false; if true, no timeout).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -306,6 +319,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "NotebookEdit",
+        .category = .write,
         .description = "Modify a Jupyter notebook (.ipynb) cell. Modes: replace (default) overwrites the cell's source; insert adds a new cell after target (or at start if no cell_id); delete removes the target cell. Args: notebook_path (required), new_source (required, may be empty for delete), cell_id (required for replace/delete; optional for insert), cell_type ('code' or 'markdown', required for insert), edit_mode.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "notebook_path", .type = "string", .description = "The absolute path to the .ipynb file" },
@@ -319,6 +333,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "EnterWorktree",
+        .category = .read,
         .description = "Enter an isolated git worktree. Pass `path` to switch into an existing worktree, OR pass `name` (and optional `base` branch) to create a new worktree under .metacodes/worktrees/<name>/. Changes the session's working directory. Returns {worktree, branch, entered, created}.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "Name for a new worktree to create" },
@@ -329,6 +344,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ExitWorktree",
+        .category = .read,
         .description = "Exit the current worktree and return to the original directory. Args: action='keep' (leaves worktree and branch intact) or 'remove' (also deletes the worktree). Optional discard_changes=true to force-remove even with uncommitted changes.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "action", .type = "string", .description = "keep leaves worktree intact; remove deletes it", .enum_values = &.{ "keep", "remove" } },
@@ -338,6 +354,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ListMcpResourcesTool",
+        .category = .read,
         .description = "List resources exposed by all connected MCP servers. Optional server arg to filter to a single server. Returns aggregated list of {server, uri, name, description, mimeType}. A server whose listing exceeds the result budget appears as {server, resource_list_artifact}, carrying the artifact envelope.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "server", .type = "string", .description = "Optional: filter to a single MCP server name" },
@@ -347,6 +364,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ReadMcpResourceTool",
+        .category = .read,
         .description = "Read a specific MCP resource by URI. Required: uri. Optional: server (hint for which connected server to query first; otherwise tries all). Returns the resource content as JSON. Content above the result budget is returned as an artifact envelope rather than inline; local storage failures (for example, a full session quota) are returned as structured errors with category `system_error` instead of `resource_not_found`. A `resource_not_found` response carries `last_err` plus a bounded `last_error_detail` from the last server.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "uri", .type = "string", .description = "The URI of the MCP resource to read" },
@@ -357,6 +375,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "PushNotification",
+        .category = .read,
         .description = "Send a desktop notification to pull the user's attention back to the session — e.g. a long task finished, or you need a decision before continuing. Use sparingly: only when there's a real chance the user stepped away. Keep message under 200 chars, one line. Args: message (required).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "message", .type = "string", .description = "The notification body, under 200 chars, one line" },
@@ -365,6 +384,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ScheduleWakeup",
+        .category = .read,
         .description = "Schedule the next one-shot check-in for a requested task in this live session. Choose a delay from 60 to 3600 seconds, explain it, and pass the prompt to resume. A new call replaces the pending wakeup. Set stop to cancel it. Fixed schedules are managed separately with CronCreate, CronList and CronDelete via ToolSearch.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "delaySeconds", .type = "integer", .description = "Delay in seconds, clamped to 60..3600. Required unless stopping." },
@@ -377,6 +397,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CronCreate",
+        .category = .read,
         .deferred = true,
         .description = "Schedule a prompt to fire at a future time. Recurring (cron) or one-shot (delaySeconds). Args: cron (5-field 'M H DoM Mon DoW') OR delaySeconds; prompt (required); recurring (default true). Session-scoped, fires when you return to the prompt. Returns job id.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -389,6 +410,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CronDelete",
+        .category = .read,
         .deferred = true,
         .description = "Cancel a scheduled cron job by id.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -398,6 +420,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "CronList",
+        .category = .read,
         .deferred = true,
         .description = "List all scheduled cron jobs in this session.",
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
@@ -405,6 +428,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "WebFetch",
+        .category = .read,
         .description = "Fetch a URL and return its text content (HTML stripped). Use for reading web pages, API docs, articles.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "url", .type = "string", .description = "The URL to fetch content from" },
@@ -415,6 +439,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "AskUserQuestion",
+        .category = .read,
         .description = "Ask the user a multiple-choice question. This is a possibly-unavailable interactive channel; if it fails, continue with a sensible default and explain. Use only when a decision genuinely belongs to the user and cannot be inferred from the request, code, or a reasonable default.",
         .input_schema = .{
             .type = "object",
@@ -449,6 +474,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KgRemember",
+        .category = .write,
         .description = "Persist a durable memory into the knowledge graph (survives across sessions). Use for SHORT ATOMIC facts: decisions made, user preferences/corrections, non-obvious project facts. Keep it short and structured; do NOT log transient task state. For long-form narrative use a memory markdown file instead (auto-imported into the same graph) — never store the same content both ways. Memories written while a task is in_progress are automatically linked to that task (provenance). The type taxonomy is a living ontology: as your understanding of the project deepens, prefer recording sharper type-specific facts over piling generic observations.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "text", .type = "string", .description = "The fact to remember. Short, self-contained; include Why when it is a correction or decision." },
@@ -460,6 +486,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KgRecall",
+        .category = .read,
         .description = kg_retrieval.TOOL_DESCRIPTION,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "query", .type = "string", .description = kg_retrieval.QUERY_DESCRIPTION },
@@ -490,6 +517,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KgContext",
+        .category = .read,
         .description = kg_retrieval.CONTEXT_DESCRIPTION,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "node_id", .type = "integer", .description = "Candidate node_id returned by KgRecall or a prior KgContext graph." },
@@ -502,6 +530,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "FormalAuditTask",
+        .category = .read,
         .description = "Run a read-only, machine-checked audit of one bounded TinyKG task subgraph. Zig validates and hashes the real snapshot, invokes the deployment-pinned precompiled Lean kernel, verifies every verdict binding, and persists an engineering receipt. This does not mutate the graph and does not claim that reobserve/CAS/rollback are implemented. The checker path and SHA-256 are host configuration, never model arguments.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "root_task_id", .type = "integer", .description = "TinyKG root task id whose bounded task subgraph will be audited" },
@@ -512,6 +541,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskCreate",
+        .category = .read,
         .deferred = true,
         .description = "Create a task in the in-session task list. Returns the new task id. Use for multi-step work you want to track across turns.",
         .describe_fn = descriptions.describeTaskCreate,
@@ -524,6 +554,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskGet",
+        .category = .read,
         .deferred = true,
         .description = "Fetch a task by id. For persistent kg-* tasks this also returns a bounded TinyKG task_packet with parent objective, dependencies, evidence, truncation diagnostics and continuations. Call it after restart/compaction or whenever claim could not return a packet; do not work from the title alone.",
         .describe_fn = descriptions.describeTaskGet,
@@ -534,6 +565,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskList",
+        .category = .read,
         .deferred = true,
         .description = "List the live task frontier. For kg-* tasks select only an open, ready, unclaimed leaf; then claim it with TaskUpdate status=in_progress before work. This is a summary/projection, so use TaskGet/task_packet for full recovery context.",
         .describe_fn = descriptions.describeTaskList,
@@ -542,6 +574,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskUpdate",
+        .category = .read,
         .deferred = true,
         .description = "Update a task's status (pending/in_progress/completed/failed/deleted) and/or fields. For persistent kg-* tasks: claim with in_progress before work (the successful response contains the bounded task_packet); completed/failed are terminal while preserving the stable id; deleted is only a compatibility alias for failed. Close every claimed task with a verified conclusion and actual acts_on/uses/produces when known, then inspect the returned frontier.",
         .describe_fn = descriptions.describeTaskUpdate,
@@ -563,6 +596,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskStop",
+        .category = .read,
         .deferred = true,
         .description = "Stop a task by id. For a backgrounded agent job (agent_* id, or agent_job_id arg), requests termination of the running subagent. For a todo task id, marks it completed (shortcut for TaskUpdate status=completed).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -573,6 +607,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskOutput",
+        .category = .read,
         .deferred = true,
         .description = "Read a backgrounded Task subagent by agent_job_id. Omit since_byte to start at offset 0 and wait up to 30 seconds for the first output or terminal status; pass since_byte = previous output_next_offset to wait for incremental output. output_total_bytes is retained as the next cursor for compatibility; output_size_bytes reports the current total. When done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -584,6 +619,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "Task",
+        .category = .read,
         .description = "Launch a subagent in an isolated context to handle a side task. Each subagent starts with a fresh context — it cannot see this conversation, only the prompt you pass. Use for: high-volume operations (running tests, processing logs), parallel research, isolating exploration that would flood your context. Args: subagent_type (Explore/Plan/general-purpose/<custom>), description (3-5 word UI label), prompt (the delegation message). Optional: max_turns, model, run_in_background (true returns an agent_job_id immediately; poll with TaskOutput, stop with TaskStop).",
         .describe_fn = descriptions.describeTask,
         // 工具 name 必须保持 "Task"——这是模型 SFT 训练时学到的工具标识符,改名会降低
@@ -604,6 +640,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskBatch",
+        .category = .read,
         .description = "Fan out a batch of subagents in parallel: one subagent per item, each running the same prompt template with the item's fields substituted. Use `{field}` placeholders in prompt_template (e.g. \"Review the file {path} for {concern}\") and pass items as an array of objects. Prefer this over emitting many individual Task calls when running the SAME task over a list of inputs — it guarantees parallel fan-out, avoids repeating the prompt, and returns aggregated results. Runs up to 8 concurrently; max 32 items. Results are returned inline (not persisted); for long-running detached work use Task with run_in_background.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "prompt_template", .type = "string", .description = "Prompt with {field} placeholders substituted per item. {{ }} are literal braces." },
@@ -617,6 +654,7 @@ pub const registry: []const ToolEntry = &.{
         // 兼容别名:某些上下文可能用 "Agent"。路由到同一 execute。主工具 name 是 "Task"
         // (SFT 锚点)。
         .name = "Agent",
+        .category = .read,
         .description = "Alias for Task. Use Task with subagent_type instead. Routes to Task (subagent_type defaults to general-purpose).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "prompt", .type = "string", .description = "The task/delegation message for the subagent" },
@@ -629,6 +667,7 @@ pub const registry: []const ToolEntry = &.{
     // 广告。模型按 query 检索完整 schema 并激活，下一轮该 deferred 工具才进入 tools。
     .{
         .name = "ToolSearch",
+        .category = .read,
         .description = "Fetches schemas only for deferred tools whose names appear under # Deferred tools. NEVER call ToolSearch for a tool whose full schema is already present in the current tools list (including KgRecall); call that tool directly. Pass keywords to find a deferred tool, or `select:<deferred_tool_name>` to fetch a listed deferred tool by exact name. Returns matched deferred schemas; once returned, each is callable like a core tool.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "query", .type = "string", .description = "Keywords to find deferred tools, or `select:<deferred_tool_name>` for an exact name listed under # Deferred tools. Do not select an already-visible core tool." },
@@ -640,6 +679,7 @@ pub const registry: []const ToolEntry = &.{
     // 主请求只暴露此规整 schema——避免 server-tool 异形毒化后端。deferred(按需激活)。
     .{
         .name = "WebSearch",
+        .category = .read,
         .description = "Searches the web and returns matching results. allowed_domains narrows the search scope; blocked_domains filters final returned results.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "query", .type = "string", .description = "The search query to use." },
@@ -653,6 +693,7 @@ pub const registry: []const ToolEntry = &.{
     //    的 ToolContext.swarm=null → execute 返 SwarmUnavailable。deferred=false(lead 常驻)。
     .{
         .name = "TeamCreate",
+        .category = .read,
         .description = "Create a team so you can delegate work to teammate agents that run in parallel and coordinate through a shared task list and mailbox. You become the team lead (not a teammate). One team per lead. After creating a team, spawn a teammate by calling the Task tool with a `name` argument (the team is implicit — one team per lead), then talk to teammates with SendMessage. Args: name (team name), description (optional).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "Team name" },
@@ -663,6 +704,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TeamDelete",
+        .category = .read,
         .description = "Delete the current team and clean up its directory. Refuses while any teammate is still active — shut teammates down first (SendMessage a shutdown request and wait for approval). Takes no arguments.",
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
         .execute = .{ .legacy_inline = swarm_tools.executeTeamDelete },
@@ -670,6 +712,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "SendMessage",
+        .category = .read,
         .description = "Send a message to a teammate (or the team lead). Plain prose is delivered to the recipient's mailbox and injected into their turn. Args: to (teammate name, or \"*\" to broadcast to all teammates), message (the text), summary (optional 5-10 word preview). Your plain assistant text is NOT visible to teammates — you MUST use this tool to communicate with them.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "to", .type = "string", .description = "Recipient teammate name, or \"*\" to broadcast" },
@@ -685,6 +728,7 @@ pub const registry: []const ToolEntry = &.{
         // catalog), so the team surface offers this Session-owned tool. It
         // records a spawn request; the embedding Host creates the teammate.
         .name = "SpawnTeammate",
+        .category = .read,
         .description = "Delegate work to a teammate agent that runs in parallel and coordinates through the shared mailbox. You are the team lead. The teammate is created by the host, joins the team, works on the task, then idles waiting for SendMessage. Args: name (the teammate's name), prompt (the task), agent_type (optional role). Talk to it afterwards with SendMessage.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "The teammate's name" },
@@ -696,6 +740,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ExecuteCode",
+        .category = .read,
         .preview_feature = .execute_code,
         .description = "Execute JavaScript in a persistent per-session context. Use top-level await tools.ToolName(args) to call tools from the current tools list, e.g. var data = await tools.Read({file_path:'/absolute/path'}); data. Tools retain all permission, hook, sandbox and budget checks. Calls return Promises; await every call. JSON tool results become JS values; text stays a string; tool errors reject with Error.result. Global var/let/const declarations persist across successful calls. The last expression and console.log output are returned; intermediate values stay in the VM. No filesystem, process, network, imports, timers or TypeScript runtime. Up to 128 calls, 64 MiB heap and 64 KiB output. Calls are dispatched sequentially, including Promise.all. Use AskUserQuestion outside scripts. Failed evaluations reset the VM before its next use; tool side effects are retained. timeout_ms bounds JS and time between tools; running tools retain their own timeout/cancellation.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -722,6 +767,11 @@ pub fn displayName(name: []const u8) []const u8 {
         if (t.display_name) |d| return d;
     }
     return name;
+}
+
+pub fn builtinCategory(name: []const u8) ?permission_category.ToolCategory {
+    const tool = getTool(name) orelse return null;
+    return tool.category;
 }
 
 pub fn getTool(name: []const u8) ?*const ToolEntry {
@@ -1363,6 +1413,69 @@ test "isConcurrencySafeInput: 非 Bash 工具沿用名单" {
     try std.testing.expect(isConcurrencySafeInput("ReadArtifact", "{}"));
     try std.testing.expect(!isConcurrencySafeInput("Write", "{\"file_path\":\"/x\",\"content\":\"y\"}"));
     try std.testing.expect(!isConcurrencySafeInput("Edit", "{\"file_path\":\"/x\"}"));
+}
+
+test "builtin permission categories cover the registry and preserve legacy behavior" {
+    const expected = std.StaticStringMap(permission_category.ToolCategory).initComptime(.{
+        .{ "Read", .read },
+        .{ "Write", .write },
+        .{ "Edit", .write },
+        .{ "ApplyPatch", .write },
+        .{ "CodeMap", .read },
+        .{ "FindSymbol", .read },
+        .{ "Bash", .execute },
+        .{ "BashOutput", .read },
+        .{ "ReadArtifact", .read },
+        .{ "KillShell", .read },
+        .{ "Monitor", .read },
+        .{ "NotebookEdit", .write },
+        .{ "EnterWorktree", .read },
+        .{ "ExitWorktree", .read },
+        .{ "ListMcpResourcesTool", .read },
+        .{ "ReadMcpResourceTool", .read },
+        .{ "PushNotification", .read },
+        .{ "ScheduleWakeup", .read },
+        .{ "CronCreate", .read },
+        .{ "CronDelete", .read },
+        .{ "CronList", .read },
+        .{ "WebFetch", .read },
+        .{ "AskUserQuestion", .read },
+        .{ "KgRemember", .write },
+        .{ "KgRecall", .read },
+        .{ "KgContext", .read },
+        .{ "FormalAuditTask", .read },
+        .{ "TaskCreate", .read },
+        .{ "TaskGet", .read },
+        .{ "TaskList", .read },
+        .{ "TaskUpdate", .read },
+        .{ "TaskStop", .read },
+        .{ "TaskOutput", .read },
+        .{ "Task", .read },
+        .{ "TaskBatch", .read },
+        .{ "Agent", .read },
+        .{ "ToolSearch", .read },
+        .{ "WebSearch", .read },
+        .{ "TeamCreate", .read },
+        .{ "TeamDelete", .read },
+        .{ "SendMessage", .read },
+        .{ "SpawnTeammate", .read },
+        .{ "ExecuteCode", .read },
+    });
+    try std.testing.expectEqual(@as(usize, 43), registry.len);
+    try std.testing.expectEqual(expected.keys().len, registry.len);
+    for (registry) |entry| {
+        const category = expected.get(entry.name) orelse return error.UnexpectedBuiltin;
+        try std.testing.expectEqual(category, entry.category);
+        try std.testing.expectEqual(category, builtinCategory(entry.name).?);
+        try std.testing.expectEqual(permission_category.getToolCategory(entry.name), entry.category);
+    }
+    try std.testing.expectEqual(@as(?permission_category.ToolCategory, null), builtinCategory("UnknownTool"));
+    try std.testing.expectEqual(@as(?permission_category.ToolCategory, null), builtinCategory("write"));
+    inline for (@typeInfo(ToolEntry).@"struct".fields) |field| {
+        if (comptime std.mem.eql(u8, field.name, "category")) {
+            try std.testing.expect(field.default_value_ptr == null);
+        }
+    }
 }
 
 test "getTool by name" {

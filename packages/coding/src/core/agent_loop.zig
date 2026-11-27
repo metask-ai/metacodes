@@ -1370,6 +1370,46 @@ fn unansweredPromptJson(cause: permission_mod.PromptUnanswered, tool: []const u8
     };
 }
 
+fn legacyToolCategory(registry: ?*const @import("../tools/dynamic.zig").DynRegistry, canonical_name: []const u8) ?permission_mod.ToolCategory {
+    if (registry) |dynamic| {
+        if (dynamic.category(canonical_name)) |category| return category;
+    }
+    return tools_mod.builtinCategory(canonical_name);
+}
+
+test "CLI permission classification uses builtin metadata after dynamic lookup" {
+    var registry = @import("../tools/dynamic.zig").DynRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    for (tools_mod.registry) |entry| {
+        try std.testing.expectEqual(entry.category, legacyToolCategory(null, entry.name).?);
+        try std.testing.expectEqual(entry.category, legacyToolCategory(&registry, entry.name).?);
+        inline for (@typeInfo(types.PermissionMode).@"enum".fields) |field| {
+            const pc = permission_mod.PermissionContext{
+                .allocator = std.testing.allocator,
+                .mode = std.atomic.Value(types.PermissionMode).init(@enumFromInt(field.value)),
+            };
+            try std.testing.expectEqual(
+                permission_mod.checkPermissionClassified(&pc, entry.name, "{}", null),
+                permission_mod.checkPermissionClassified(&pc, entry.name, "{}", legacyToolCategory(&registry, entry.name)),
+            );
+        }
+    }
+    try std.testing.expectEqual(@as(?permission_mod.ToolCategory, null), legacyToolCategory(&registry, "UnknownTool"));
+    const Probe = struct {
+        fn execute(ctx: *const tools_mod.ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+            return ctx.allocator.dupe(u8, "{}");
+        }
+    };
+    try registry.register("Write", "unclassified dynamic tool", &.{}, Probe.execute, null, false);
+    try std.testing.expectEqual(permission_mod.ToolCategory.write, legacyToolCategory(&registry, "Write").?);
+    try registry.registerBorrowedDefinition(.{
+        .name = "Read",
+        .description = "dynamic override",
+        .input_schema = .{ .type = "object" },
+    }, Probe.execute, null, .execute);
+    try std.testing.expectEqual(permission_mod.ToolCategory.execute, legacyToolCategory(&registry, "Read").?);
+}
+
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
@@ -1529,10 +1569,8 @@ const ToolAdmission = struct {
         const not_offered = opts.tool_dispatcher != null and offered_category == null;
         const classified = if (opts.tool_dispatcher != null)
             offered_category orelse .execute
-        else if (opts.dyn_registry) |registry|
-            registry.category(canonical_name)
         else
-            null;
+            legacyToolCategory(opts.dyn_registry, canonical_name);
         var perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, canonical_name, eff_input, classified);
         // A confirmation demanded from outside the chain (sealed `confirm:
         // true`) only tightens: an allow becomes an ask whose prompt skips

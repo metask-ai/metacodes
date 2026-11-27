@@ -9695,6 +9695,7 @@ metacodes-core.tools.RuntimeDependency: enum
 metacodes-core.tools.RuntimeDependency.ripgrep
 metacodes-core.tools.ToolEntry: struct
 metacodes-core.tools.ToolEntry.name: []const u8
+metacodes-core.tools.ToolEntry.category: permission_category.ToolCategory
 metacodes-core.tools.ToolEntry.description: []const u8
 metacodes-core.tools.ToolEntry.describe_fn: ?DescribeFn = null
 metacodes-core.tools.ToolEntry.input_schema: json.InputSchema
@@ -9709,8 +9710,9 @@ metacodes-core.tools.ToolEntry.preview_feature: ?@import("preview.zig").Feature 
 metacodes-core.tools.ToolEntry.runtime_dependency: ?RuntimeDependency = null
 metacodes-core.tools.ToolEntry.run: fn run(self: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody
 metacodes-core.tools.ToolEntry.previewAllowed: fn previewAllowed(self: *const ToolEntry, features: @import("preview.zig").Features) bool
-metacodes-core.tools.registry: const []const ToolEntry = <43076 bytes, sha256 830c538fc02f>
+metacodes-core.tools.registry: const []const ToolEntry = <43901 bytes, sha256 b937b8655934>
 metacodes-core.tools.displayName: fn displayName(name: []const u8) []const u8
+metacodes-core.tools.builtinCategory: fn builtinCategory(name: []const u8) ?permission_category.ToolCategory
 metacodes-core.tools.getTool: fn getTool(name: []const u8) ?*const ToolEntry
 metacodes-core.tools.toolSchemaJson: fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8
 metacodes-core.tools.toToolDefinitions: fn toToolDefinitions(allocator: std.mem.Allocator) ![]json.ToolDefinition
