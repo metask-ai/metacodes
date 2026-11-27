@@ -695,6 +695,7 @@ pub const TuiBackend = struct {
 
         while (!self.input_stop.load(.acquire)) {
             _ = input.reconcileAfterResume(fd);
+            _ = input.adoptLateKeyboardAnswer(fd);
             // ESC 待决时用短超时(40ms)→ 孤立 ESC 快速兑现为中断;否则常规 100ms tick。
             const timeout_ms: i32 = if (parser.pendingEsc()) 40 else 100;
             const rc = platform_term.waitReadable(fd, timeout_ms); // 可移植 poll

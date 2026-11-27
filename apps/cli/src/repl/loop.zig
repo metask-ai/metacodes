@@ -2024,6 +2024,7 @@ fn readLineRaw(
         if (synthetic_key == null) while (true) {
             if (app_mod.terminateRequested()) return error.TerminateRequested;
             _ = input.reconcileAfterResume(fd);
+            if (input.adoptLateKeyboardAnswer(fd)) redraw(region, &editor, app);
             if (g_winch.swap(false, .acquire)) {
                 redraw(region, &editor, app); // resize → 重测宽度重画
             }

@@ -304,9 +304,10 @@ together and count as a newline (see the start of this page).
 `TERM_PROGRAM` does not travel over SSH, so on the remote side metacodes asks
 the terminal about the keyboard protocol at startup instead of knowing it by
 name; the question goes through SSH to the terminal you see. On a slow link
-the answer can come too late, and the protocol then stays off for the
-session: the footer says `\ + ⏎ for newline`. Drag-to-copy reaches your
-clipboard only through OSC 52 (see above).
+the answer can come after metacodes stopped waiting for it at startup
+(120 ms); the protocol is turned on when it arrives, and until then
+Shift+Enter submits and the footer says `\ + ⏎ for newline`. Drag-to-copy
+reaches your clipboard only through OSC 52 (see above).
 
 ## Stopping it and dumb terminals
 
