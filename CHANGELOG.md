@@ -358,6 +358,34 @@ status, compatibility boundaries, and entry points are defined by
   bytes and transcripts are unchanged; AgentCore consumers are not affected.
   `layer:check` now reports 0 upward imports and 0 package cycles.
 
+- **The permission dialog shows a call's whole arguments and says what
+  each answer covers.** It cut the arguments to 60 columns; they are now
+  wrapped in full, and folded after ten lines behind
+  `tab to show all N lines` (Tab again folds them). The answers read as if
+  they were about this one call, while `Yes, always` allowed the whole tool
+  and `Don't ask again` denied it. They now say what they do:
+  - `[y] Yes, once`
+  - `[a] Yes, and allow <tool> in this project from now on`: the tool is
+    remembered for the session and written to the project's
+    `.claude/settings.local.json`; without a project directory it is
+    written to `~/.claude/settings.json` and the answer says
+    `everywhere from now on`
+  - `[n] No`
+  - `[d] No, and deny <tool> for the rest of this session`
+  - A shell command that is hard to undo gets no `[a]` and starts on No:
+    any part of it, with `timeout`, `env`, `xargs` and the like looked
+    through, that deletes files (`rm`, `rmdir`, `unlink`, `shred`,
+    `truncate`, `dd` with `of=`, `mkfs`, `find -delete` or `-exec rm`,
+    `git clean`, `git rm`), discards changes (`git reset --hard`,
+    `git checkout --` and `.`, `git restore`, `git stash drop` and `clear`,
+    `git branch -D`), pushes or publishes (`git push`,
+    `npm`/`pnpm`/`yarn publish`, `cargo publish`, `twine upload`,
+    `gem push`, `docker push`), reaches the network (`curl`, `wget`, `ssh`,
+    `scp`, `sftp`, `rsync`, `nc`, `ncat`, `netcat`, `telnet`, `ftp`) or runs
+    under `sudo` or `doas`. Other tools keep their four answers.
+  - A call the permission gate refused shows as
+    `Did not run 1 shell command` rather than `Ran 1 shell command`.
+
 - **Bench concurrency is set only on the profile page.** The 评测 page no
   longer has a 并发数 field and `POST /api/profiles/run` no longer takes
   `concurrency`. A profile has one concurrency (10 when it is created); its

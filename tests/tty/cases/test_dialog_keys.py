@@ -170,3 +170,30 @@ def test_question_dialog_takes_a_paste_into_other_with_its_line_breaks_as_spaces
 
 def test_question_dialog_does_not_pick_an_option_from_pasted_text(bin_path):
     _expect_answer(bin_path, ["raw:\\x1b[200~2\\x1b[201~", "strictsleep:0.6", "key:enter"], "Teal")
+
+
+def test_a_command_that_is_hard_to_undo_offers_no_always_and_enter_refuses_it(bin_path):
+    target = os.path.join(case_tmpdir("cc-tty-dialog-keys-rm-"), "keep.txt")
+    with open(target, "w") as f:
+        f.write("keep")
+    a, result = _answer_dialog(bin_path, "Bash", json.dumps({"command": f"rm {target}"}), "Permission required", ["key:enter"])
+    if result is None:
+        a._fail("the permission dialog never answered, no tool_result reached the model")
+    if not os.path.exists(target) or not result.get("is_error") or "declined" not in _result_text(result):
+        a._fail(f"Enter on rm should have refused it: tool_result={_result_text(result)!r}")
+    asked = [sc for sc in a.screens_with("Permission required")]
+    if any(sc.find_row("[a]") is not None for sc in asked):
+        a._fail("rm was offered an always answer")
+    if a.final.find_row("Did not run 1 shell command") is None:
+        a._fail("the refused command is not shown as not run")
+
+
+def test_the_dialog_says_what_always_and_dont_ask_again_cover(bin_path):
+    target = os.path.join(case_tmpdir("cc-tty-dialog-keys-labels-"), "answer.txt")
+    a, result = _answer_dialog(
+        bin_path, "Write", json.dumps({"file_path": target, "content": "x"}), "Permission required", ["type:n"])
+    asked = a.screens_with("Permission required")
+    for label in ("[a] Yes, and allow Write in this project from now on",
+                  "[d] No, and deny Write for the rest of this session"):
+        if not any(sc.find_row(label) is not None for sc in asked):
+            a._fail(f"the dialog does not show {label!r}")

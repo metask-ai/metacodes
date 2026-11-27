@@ -248,7 +248,7 @@ def test_T14_resize_during_permission_prompt_keeps_waiting(bin_path):
         json.dumps({"file_path": target, "content": "x"}),
         "Permission required",
         ["type:y", idle_footer("? for shortcuts")],
-        "[a] Yes, always",
+        "[a] Yes, and allow Write",
     )
     text = _tool_result_text(result)
     if result.get("is_error") or "declined" in text:

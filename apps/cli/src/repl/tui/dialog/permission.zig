@@ -4,8 +4,10 @@
 //!
 //! 功能:
 //! - 边框 + 标题 "Permission required"
-//! - 工具名 + 关键参数预览(长 JSON 截断)
-//! - 4 选项:[y] Yes once / [a] Yes always / [n] No / [d] Don't ask again
+//! - 工具名 + 参数(按框宽折行,超过 10 行折叠,Tab 展开/收起)
+//! - 选项:[y] 允许一次 / [a] 以后都允许这个工具(文字按 guard 写规则的位置说范围) / [n] 拒绝 /
+//!   [d] 本会话里一律拒绝这个工具;
+//!   难回滚的 Bash 命令(hard_to_undo.zig)不给 [a],默认停在 [n]
 //! - 键盘选择(y/a/n/d 直接选 + ↑↓ 移动高亮 + Enter 确认)
 //! - 返回 PermissionChoice
 //!
@@ -24,69 +26,121 @@ const reflow = @import("../reflow.zig");
 const input_mod = @import("../../input.zig");
 const util_time = @import("metacodes-internal").util.time;
 const answer_gate = @import("answer_gate.zig");
+const hard_to_undo = @import("hard_to_undo.zig");
 const Theme = theme_mod.Theme;
 
 /// PermissionChoice 已移到中立协议位置(core/protocol/);此处 re-export 保 UI 端引用兼容。
 pub const PermissionChoice = @import("metacodes-internal").core.protocol.permission_choice.PermissionChoice;
 
 pub const Option = struct {
-    key: u8, // 'y' / 'a' / 'n' / 'd'
-    label: []const u8,
+    key: u8,
     choice: PermissionChoice,
 };
 
-pub const options = [_]Option{
-    .{ .key = 'y', .label = "Yes once", .choice = .allow_once },
-    .{ .key = 'a', .label = "Yes, always", .choice = .allow_always },
-    .{ .key = 'n', .label = "No", .choice = .deny_once },
-    .{ .key = 'd', .label = "Don't ask again", .choice = .deny_tool_session },
+const every_option = [_]Option{
+    .{ .key = 'y', .choice = .allow_once },
+    .{ .key = 'a', .choice = .allow_always },
+    .{ .key = 'n', .choice = .deny_once },
+    .{ .key = 'd', .choice = .deny_tool_session },
 };
 
-/// 参数预览的最大显示宽度
-const MAX_ARG_PREVIEW = 60;
+const options_without_always = [_]Option{
+    .{ .key = 'y', .choice = .allow_once },
+    .{ .key = 'n', .choice = .deny_once },
+    .{ .key = 'd', .choice = .deny_tool_session },
+};
 
-/// 渲染权限对话框为字符串。selected = 当前高亮选项 index(0..3)。
-/// caller free。
-pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8, selected: usize) ![]u8 {
-    // 构造内容:工具名 + 参数预览行 + 空行 + 选项行
+pub fn optionsFor(always_offered: bool) []const Option {
+    return if (always_offered) &every_option else &options_without_always;
+}
+
+pub fn firstSelected(always_offered: bool) usize {
+    return if (always_offered) 0 else 1;
+}
+
+pub const AlwaysScope = enum { project, everywhere, session };
+
+pub fn optionLabel(buf: []u8, choice: PermissionChoice, tool_name: []const u8, always: AlwaysScope) []const u8 {
+    return switch (choice) {
+        .allow_once => "Yes, once",
+        .allow_always => switch (always) {
+            .project => std.fmt.bufPrint(buf, "Yes, and allow {s} in this project from now on", .{tool_name}) catch "Yes, and allow it in this project from now on",
+            .everywhere => std.fmt.bufPrint(buf, "Yes, and allow {s} everywhere from now on", .{tool_name}) catch "Yes, and allow it everywhere from now on",
+            .session => std.fmt.bufPrint(buf, "Yes, and allow {s} for the rest of this session", .{tool_name}) catch "Yes, and allow it for the rest of this session",
+        },
+        .deny_once => "No",
+        .deny_tool_session => std.fmt.bufPrint(buf, "No, and deny {s} for the rest of this session", .{tool_name}) catch "No, and deny it for the rest of this session",
+    };
+}
+
+pub const max_folded_arg_lines = 10;
+
+const arg_cols = 60;
+
+const dialog_chrome_rows = 12;
+
+pub const View = struct {
+    selected: usize = 0,
+    expanded: bool = false,
+    always_offered: bool = true,
+    always_scope: AlwaysScope = .project,
+    rows: u16 = 24,
+};
+
+/// 渲染权限对话框为字符串。caller free。
+pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8, view: View) ![]u8 {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
 
-    // 工具名(加色)
     try content.appendSlice(alloc, th.role_tool);
     try content.appendSlice(alloc, tool_name);
     try content.appendSlice(alloc, th.reset);
     try content.append(alloc, '\n');
 
-    // 参数预览(截断,dim)。truncate 不超长返回 borrow(==args),超长返回 owned。
-    const preview = try layout.truncate(alloc, args, MAX_ARG_PREVIEW, "…");
-    defer if (preview.ptr != args.ptr) alloc.free(@constCast(preview));
-    try content.appendSlice(alloc, th.dim);
-    try content.appendSlice(alloc, preview);
-    try content.appendSlice(alloc, th.reset);
-    try content.append(alloc, '\n');
+    const arg_lines = try layout.wrapLines(alloc, args, arg_cols);
+    defer alloc.free(arg_lines);
+    const room = @max(max_folded_arg_lines, @as(usize, view.rows) -| dialog_chrome_rows);
+    const shown = @min(arg_lines.len, if (view.expanded) room else max_folded_arg_lines);
+    for (arg_lines[0..shown]) |line| {
+        try content.appendSlice(alloc, th.dim);
+        try content.appendSlice(alloc, line);
+        try content.appendSlice(alloc, th.reset);
+        try content.append(alloc, '\n');
+    }
+    if (arg_lines.len > max_folded_arg_lines) {
+        try content.appendSlice(alloc, th.dim);
+        if (!view.expanded) {
+            try content.print(alloc, "tab to show all {d} lines", .{arg_lines.len});
+        } else if (shown < arg_lines.len) {
+            try content.print(alloc, "… {d} more lines · tab to show less", .{arg_lines.len - shown});
+        } else {
+            try content.appendSlice(alloc, "tab to show less");
+        }
+        try content.appendSlice(alloc, th.reset);
+        try content.append(alloc, '\n');
+    }
     try content.append(alloc, '\n');
 
-    // 选项行:高亮 selected
-    for (options, 0..) |opt, i| {
-        if (i == selected) {
+    const opts = optionsFor(view.always_offered);
+    for (opts, 0..) |opt, i| {
+        if (i == view.selected) {
             try content.appendSlice(alloc, th.accent);
             try content.appendSlice(alloc, th.icon_arrow);
             try content.append(alloc, ' ');
         } else {
-            // 用空格对齐(arrow 宽度 + 1)
             const arrow_w = term.displayWidth(th.icon_arrow);
             var p: usize = 0;
             while (p < arrow_w + 1) : (p += 1) try content.append(alloc, ' ');
         }
-        try content.print(alloc, "[{c}] {s}", .{ opt.key, opt.label });
-        if (i == selected) try content.appendSlice(alloc, th.reset);
-        if (i + 1 < options.len) try content.append(alloc, '\n');
+        var label_buf: [192]u8 = undefined;
+        try content.print(alloc, "[{c}] {s}", .{ opt.key, optionLabel(&label_buf, opt.choice, tool_name, view.always_scope) });
+        if (i == view.selected) try content.appendSlice(alloc, th.reset);
+        if (i + 1 < opts.len) try content.append(alloc, '\n');
     }
 
     return try layout.drawBox(alloc, th, content.items, .{
         .title = "Permission required",
-        .width = MAX_ARG_PREVIEW + 4,
+        .width = arg_cols + 4,
         .padding = 1,
     });
 }
@@ -98,25 +152,33 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 /// 重画用 render 实际行数(不再硬编码 8——参数长会折行变多行,硬编码会错位)。
 /// 回顶按终端现在的宽度数上一帧占的行:框比终端宽时画的那一刻就折了行,终端变窄后
 /// 又会把每行重排成多行(reflow.zig);回顶后 ED 0 清掉旧帧多出的行。
-pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8) ?PermissionChoice {
-    return promptLoopTimed(alloc, th, in_fd, out_fd, tool_name, args, .interactive);
+pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, always_scope: AlwaysScope) ?PermissionChoice {
+    return answerLoop(alloc, th, in_fd, out_fd, tool_name, args, always_scope, .interactive);
 }
 
 fn promptLoopTimed(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, timing: answer_gate.Timing) ?PermissionChoice {
-    var selected: usize = 0;
+    return answerLoop(alloc, th, in_fd, out_fd, tool_name, args, .project, timing);
+}
+
+fn answerLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, always_scope: AlwaysScope, timing: answer_gate.Timing) ?PermissionChoice {
+    const always_offered = !hard_to_undo.isHardToUndo(alloc, tool_name, args);
+    const choices = optionsFor(always_offered);
+    var view: View = .{ .selected = firstSelected(always_offered), .always_offered = always_offered, .always_scope = always_scope };
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
     var parser = input_mod.KeyParser{};
     var gate = answer_gate.Gate.init(timing, util_time.nowNs());
     while (true) {
-        const cols: u16 = if (term.getSize(out_fd)) |size| size.cols else 80;
+        const size = term.getSize(out_fd);
+        const cols: u16 = if (size) |known| known.cols else 80;
+        view.rows = if (size) |known| known.rows else 24;
         if (drawn) |anchor| {
             var up_buf: [16]u8 = undefined;
             writeAll(out_fd, ansi.cursor.up(anchor.climb(cols, reflows), &up_buf));
             writeAll(out_fd, "\r");
             writeAll(out_fd, ansi.clear.to_end_of_screen);
         }
-        const frame = render(alloc, th, tool_name, args, selected) catch return .deny_once;
+        const frame = render(alloc, th, tool_name, args, view) catch return .deny_once;
         defer alloc.free(frame);
         writeAll(out_fd, frame);
         drawn = reflow.Anchor.atEnd(frame, cols);
@@ -145,15 +207,16 @@ fn promptLoopTimed(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_
         switch (key) {
             .char => |c| switch (c) {
                 'y', 'Y' => return .allow_once,
-                'a', 'A' => return .allow_always,
+                'a', 'A' => if (always_offered) return .allow_always else gate.close(util_time.nowNs()),
                 'n', 'N' => return .deny_once,
                 'd', 'D' => return .deny_tool_session,
                 else => gate.close(util_time.nowNs()),
             },
             .backspace => gate.close(util_time.nowNs()),
-            .enter => return options[selected].choice,
-            .up => selected = if (selected == 0) options.len - 1 else selected - 1,
-            .down => selected = (selected + 1) % options.len,
+            .enter => return choices[view.selected].choice,
+            .up => view.selected = if (view.selected == 0) choices.len - 1 else view.selected - 1,
+            .down => view.selected = (view.selected + 1) % choices.len,
+            .tab => view.expanded = !view.expanded,
             else => {},
         }
     }
@@ -200,60 +263,198 @@ fn writeAll(fd: c_int, bytes: []const u8) void {
 const testing = std.testing;
 const capture = @import("../test_capture.zig");
 
-test "render: monochrome 含标题/工具名/4 选项/无 ANSI" {
+test "render: the title, the tool, its arguments and the four answers saying what they allow, with no ANSI in monochrome" {
     const th = theme_mod.monochrome;
-    const s = try render(testing.allocator, th, "Bash", "{\"command\":\"git status\"}", 0);
+    const s = try render(testing.allocator, th, "Bash", "{\"command\":\"git status\"}", .{});
     defer testing.allocator.free(s);
 
     try capture.expectContains(s, "Permission required");
     try capture.expectContains(s, "Bash");
     try capture.expectContains(s, "git status");
-    try capture.expectContains(s, "[y] Yes once");
-    try capture.expectContains(s, "[a] Yes, always");
+    try capture.expectContains(s, "[y] Yes, once");
+    try capture.expectContains(s, "[a] Yes, and allow Bash in this project from now on");
     try capture.expectContains(s, "[n] No");
-    try capture.expectContains(s, "[d] Don't ask again");
-    try capture.expectNoAnsi(s); // monochrome 无颜色
+    try capture.expectContains(s, "[d] No, and deny Bash for the rest of this session");
+    try testing.expect(std.mem.indexOf(u8, s, "tab to show") == null);
+    try capture.expectNoAnsi(s);
+}
+
+test "render: the always answer names where the rule goes: this project, everywhere, or only this session" {
+    const th = theme_mod.monochrome;
+    const cases = [_]struct { scope: AlwaysScope, label: []const u8 }{
+        .{ .scope = .project, .label = "[a] Yes, and allow Edit in this project from now on" },
+        .{ .scope = .everywhere, .label = "[a] Yes, and allow Edit everywhere from now on" },
+        .{ .scope = .session, .label = "[a] Yes, and allow Edit for the rest of this session" },
+    };
+    for (cases) |c| {
+        const s = try render(testing.allocator, th, "Edit", "{\"file_path\":\"/x\"}", .{ .always_scope = c.scope });
+        defer testing.allocator.free(s);
+        try capture.expectContains(s, c.label);
+    }
+    const everywhere = try render(testing.allocator, th, "Edit", "{}", .{ .always_scope = .everywhere });
+    defer testing.allocator.free(everywhere);
+    try testing.expect(std.mem.indexOf(u8, everywhere, "in this project") == null);
 }
 
 test "render: dark 含 ANSI + 高亮箭头" {
     const th = theme_mod.dark;
-    const s = try render(testing.allocator, th, "Write", "{\"file_path\":\"/x\"}", 0);
+    const s = try render(testing.allocator, th, "Write", "{\"file_path\":\"/x\"}", .{});
     defer testing.allocator.free(s);
-    // dark 主题应含 ANSI
     try testing.expect(std.mem.indexOf(u8, s, "\x1b") != null);
-    // selected=0 时第一个选项前有箭头 →
     try capture.expectContains(s, "→ [y]");
 }
 
 test "render: selected=2 高亮第三项 No" {
     const th = theme_mod.monochrome;
-    const s = try render(testing.allocator, th, "Bash", "rm", 2);
+    const s = try render(testing.allocator, th, "Bash", "rm", .{ .selected = 2 });
     defer testing.allocator.free(s);
-    // monochrome 箭头是 "->"
     try capture.expectContains(s, "-> [n] No");
 }
 
-test "render: 长参数被截断" {
+test "render: long arguments are shown whole, wrapped at the box width" {
     const th = theme_mod.monochrome;
-    const long = "{\"command\":\"this is a very long command that definitely exceeds sixty columns for sure yes\"}";
-    const s = try render(testing.allocator, th, "Bash", long, 0);
+    const long = "{\"command\":\"this is a very long command that definitely exceeds sixty columns for sure yes, and then some more\"}";
+    const s = try render(testing.allocator, th, "Bash", long, .{});
     defer testing.allocator.free(s);
-    try capture.expectContains(s, "…"); // 省略号
+    try testing.expect(std.mem.indexOf(u8, s, "…") == null);
+    try capture.expectContains(s, "for sure yes");
+    try capture.expectContains(s, "then some more");
 }
 
-test "options 表完整" {
-    try testing.expectEqual(@as(usize, 4), options.len);
-    try testing.expectEqual(PermissionChoice.allow_once, options[0].choice);
-    try testing.expectEqual(PermissionChoice.allow_always, options[1].choice);
-    try testing.expectEqual(PermissionChoice.deny_once, options[2].choice);
-    try testing.expectEqual(PermissionChoice.deny_tool_session, options[3].choice);
+fn argsOfLines(buf: []u8, n: usize) []const u8 {
+    var len: usize = 0;
+    for (0..n) |i| {
+        const line = std.fmt.bufPrint(buf[len..], "{d:0>2}{s}", .{ i, "-" ** 58 }) catch unreachable;
+        len += line.len;
+    }
+    return buf[0..len];
+}
+
+test "render: more than ten lines of arguments fold behind a tab hint, and expanding shows them all when the screen holds them" {
+    const th = theme_mod.monochrome;
+    var buf: [60 * 30]u8 = undefined;
+    const args = argsOfLines(&buf, 25);
+    const folded = try render(testing.allocator, th, "Bash", args, .{ .rows = 50 });
+    defer testing.allocator.free(folded);
+    try capture.expectContains(folded, "09-");
+    try testing.expect(std.mem.indexOf(u8, folded, "10-") == null);
+    try capture.expectContains(folded, "tab to show all 25 lines");
+
+    const expanded = try render(testing.allocator, th, "Bash", args, .{ .rows = 50, .expanded = true });
+    defer testing.allocator.free(expanded);
+    try capture.expectContains(expanded, "24-");
+    try capture.expectContains(expanded, "tab to show less");
+    try testing.expect(std.mem.indexOf(u8, expanded, "more lines") == null);
+
+    const short_screen = try render(testing.allocator, th, "Bash", args, .{ .rows = 24, .expanded = true });
+    defer testing.allocator.free(short_screen);
+    try capture.expectContains(short_screen, "11-");
+    try testing.expect(std.mem.indexOf(u8, short_screen, "12-") == null);
+    try capture.expectContains(short_screen, "… 13 more lines · tab to show less");
+}
+
+test "render: a call that is hard to undo offers no always and starts on No" {
+    const th = theme_mod.monochrome;
+    const s = try render(testing.allocator, th, "Bash", "{\"command\":\"rm -rf build\"}", .{ .always_offered = false, .selected = firstSelected(false) });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "[a]") == null);
+    try capture.expectContains(s, "-> [n] No");
+    try capture.expectContains(s, "[d] No, and deny Bash for the rest of this session");
+}
+
+test "options: four answers, or three without always, each with its choice" {
+    try testing.expectEqual(@as(usize, 4), optionsFor(true).len);
+    try testing.expectEqual(PermissionChoice.allow_once, optionsFor(true)[0].choice);
+    try testing.expectEqual(PermissionChoice.allow_always, optionsFor(true)[1].choice);
+    try testing.expectEqual(PermissionChoice.deny_once, optionsFor(true)[2].choice);
+    try testing.expectEqual(PermissionChoice.deny_tool_session, optionsFor(true)[3].choice);
+    try testing.expectEqual(@as(usize, 3), optionsFor(false).len);
+    for (optionsFor(false)) |opt| try testing.expect(opt.choice != .allow_always);
+    try testing.expectEqual(PermissionChoice.deny_once, optionsFor(false)[firstSelected(false)].choice);
+    try testing.expectEqual(PermissionChoice.allow_once, optionsFor(true)[firstSelected(true)].choice);
 }
 
 test "VISUAL demo (打印到 stderr,看真实渲染)" {
     if (std.c.getenv("TUI_DEMO") == null) return error.SkipZigTest;
-    const s = try render(testing.allocator, theme_mod.dark, "Bash", "{\"command\":\"rm -rf /tmp/build\",\"timeout\":30000}", 0);
+    const s = try render(testing.allocator, theme_mod.dark, "Bash", "{\"command\":\"rm -rf /tmp/build\",\"timeout\":30000}", .{});
     defer testing.allocator.free(s);
     std.debug.print("\n{s}\n", .{s});
+}
+
+test "promptLoop: a call that is hard to undo answers Enter with No, has no a, and Up reaches Yes, once" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const sink = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    try testing.expect(sink >= 0);
+    defer _ = pfs.close(sink);
+    const Later = struct {
+        fn send(fd: c_int, bytes: []const u8) void {
+            @import("metacodes-internal").platform.sync.sleepMs(300);
+            _ = pfs.writeAll(fd, bytes);
+            _ = std.c.close(fd);
+        }
+    };
+    const cases = [_]struct { now: []const u8, later: []const u8, choice: PermissionChoice }{
+        .{ .now = "\r", .later = "", .choice = .deny_once },
+        .{ .now = "a", .later = "y", .choice = .allow_once },
+        .{ .now = "\x1b[A\r", .later = "", .choice = .allow_once },
+        .{ .now = "\x1b[B\r", .later = "", .choice = .deny_tool_session },
+    };
+    for (cases) |c| {
+        var fds: [2]std.c.fd_t = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        defer _ = std.c.close(fds[0]);
+        try testing.expect(pfs.writeAll(fds[1], c.now));
+        const thread = try std.Thread.spawn(.{}, Later.send, .{ fds[1], c.later });
+        const got = promptLoopTimed(testing.allocator, theme_mod.monochrome, fds[0], sink, "Bash", "{\"command\":\"git push origin main\"}", .immediate);
+        thread.join();
+        try testing.expectEqual(c.choice, got.?);
+    }
+}
+
+test "promptLoop: Tab shows the rest of long arguments, and Tab again folds them" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const sync = @import("metacodes-internal").platform.sync;
+    const Screen = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn take(self: *@This(), fd: c_int) void {
+            var chunk: [4096]u8 = undefined;
+            while (true) {
+                const n = pfs.read(fd, &chunk);
+                if (n == 0) return;
+                if (n < 0) continue;
+                self.bytes.appendSlice(testing.allocator, chunk[0..@intCast(n)]) catch return;
+            }
+        }
+        fn typeKeys(fd: c_int) void {
+            for ([_][]const u8{ "\t", "\t", "n" }) |key| {
+                sync.sleepMs(150);
+                _ = pfs.writeAll(fd, key);
+            }
+            sync.sleepMs(300);
+            _ = std.c.close(fd);
+        }
+    };
+    var out: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&out));
+    defer _ = std.c.close(out[0]);
+    var keys: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&keys));
+    defer _ = std.c.close(keys[0]);
+    var screen: Screen = .{};
+    defer screen.bytes.deinit(testing.allocator);
+    const reader = try std.Thread.spawn(.{}, Screen.take, .{ &screen, out[0] });
+    const typist = try std.Thread.spawn(.{}, Screen.typeKeys, .{keys[1]});
+    var buf: [60 * 30]u8 = undefined;
+    const got = promptLoopTimed(testing.allocator, theme_mod.monochrome, keys[0], out[1], "Write", argsOfLines(&buf, 25), .immediate);
+    _ = std.c.close(out[1]);
+    typist.join();
+    reader.join();
+    try testing.expectEqual(PermissionChoice.deny_once, got.?);
+    const written = screen.bytes.items;
+    const first = std.mem.indexOf(u8, written, "tab to show all") orelse return error.TestUnexpectedResult;
+    const shown = std.mem.indexOfPos(u8, written, first, "tab to show less") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOfPos(u8, written, shown, "tab to show all") != null);
+    try testing.expect(std.mem.indexOfPos(u8, written, first, "11-") != null);
 }
 
 test "promptLoop 读 Windows 控制台送来的按键记录:y、n、Ctrl+C 各是一个回答" {
@@ -354,4 +555,5 @@ test "promptLoop answers only a key that follows a quiet spell: keys typed as th
 
 test {
     _ = answer_gate;
+    _ = hard_to_undo;
 }

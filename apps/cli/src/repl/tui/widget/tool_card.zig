@@ -192,6 +192,18 @@ pub fn toolDoneTitle(alloc: std.mem.Allocator, tool_name: []const u8, args: []co
     return try alloc.dupe(u8, displayName(tool_name));
 }
 
+pub fn toolNotRunTitle(alloc: std.mem.Allocator, tool_name: []const u8) ![]u8 {
+    if (std.mem.eql(u8, tool_name, "Bash")) return try alloc.dupe(u8, "Did not run 1 shell command");
+    if (std.mem.eql(u8, tool_name, "Read")) return try alloc.dupe(u8, "Did not read 1 file");
+    if (std.mem.eql(u8, tool_name, "Grep")) return try alloc.dupe(u8, "Did not search for 1 pattern");
+    if (std.mem.eql(u8, tool_name, "Glob")) return try alloc.dupe(u8, "Did not look for files");
+    return try std.fmt.allocPrint(alloc, "{s} did not run", .{displayName(tool_name)});
+}
+
+fn deniedBeforeRunning(content: []const u8) bool {
+    return std.mem.indexOf(u8, content, "\"code\":\"permission_denied\"") != null;
+}
+
 /// 从 Glob 结果 content 数匹配文件数。Glob 结果是 JSON(含 matches 数组或换行分隔路径)。
 /// 数 content 里的 `\n`(每路径一行)。数不出返 0。
 fn countGlobMatches(content: []const u8) usize {
@@ -403,7 +415,7 @@ pub fn renderLiveDone(
     // 行1:⏺ <done title>。**不显右对齐耗时**——对齐 cc 2.1.165:committed scrollback 卡
     // 只有 `⏺ Ran 1 shell command` 标题,无 `✓ 0.1s`(耗时仅在运行中动态卡/spinner 上,
     // 不进历史)。kind 的成功/失败由 ⎿ body 体现(错误结果走 renderResultBody 红字)。
-    const title = try toolDoneTitle(alloc, tool_name, input, content);
+    const title = if (kind == .err and deniedBeforeRunning(content)) try toolNotRunTitle(alloc, tool_name) else try toolDoneTitle(alloc, tool_name, input, content);
     defer alloc.free(title);
     try out.appendSlice(alloc, th.accent);
     try out.appendSlice(alloc, th.icon_act);
@@ -2422,6 +2434,27 @@ test "renderResult: auto_backgrounded 头部中性 + ▶ 提示不裸吐 JSON(#4
     // body:▶ 后台提示 + job id,且不裸吐 auto_backgrounded JSON。
     try testing.expect(std.mem.indexOf(u8, s, "moved to background job abc123") != null);
     try testing.expect(std.mem.indexOf(u8, s, "auto_backgrounded") == null);
+}
+
+test "renderLiveDone: a call the permission gate denied says it did not run; a command that ran and failed still says it ran" {
+    const th = theme_mod.monochrome;
+    const denied = "{\"error\":{\"code\":\"permission_denied\",\"category\":\"safety\",\"detail\":\"user declined 'Bash' via prompt\",\"recoverable\":false}}";
+    const s = try renderLiveDone(testing.allocator, th, "Bash", "{\"command\":\"rm -rf build\"}", denied, .err, 0, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try capture.expectContains(s, "Did not run 1 shell command");
+    try capture.expectContains(s, "rm -rf build");
+    try testing.expect(std.mem.indexOf(u8, s, "Ran 1 shell command") == null);
+
+    const failed = "{\"error\":{\"code\":\"execution_failed\",\"category\":\"system_error\",\"detail\":\"exit 1\",\"recoverable\":true}}";
+    const ran = try renderLiveDone(testing.allocator, th, "Bash", "{\"command\":\"false\"}", failed, .err, 0, .{ .cols = 80 });
+    defer testing.allocator.free(ran);
+    try capture.expectContains(ran, "Ran 1 shell command");
+
+    for ([_][2][]const u8{ .{ "Read", "Did not read 1 file" }, .{ "Grep", "Did not search for 1 pattern" }, .{ "Glob", "Did not look for files" }, .{ "Skill", "Skill did not run" } }) |pair| {
+        const title = try toolNotRunTitle(testing.allocator, pair[0]);
+        defer testing.allocator.free(title);
+        try testing.expectEqualStrings(pair[1], title);
+    }
 }
 
 test "renderLiveDone: auto_backgrounded committed 卡显 ▶ 转后台提示(#4 真 e2e 路径)" {
