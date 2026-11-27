@@ -324,9 +324,18 @@ The rules that keep the split from dropping coverage:
   are never skipped, and pass only if every need's result is `success`. A
   failed, cancelled or skipped leg fails the check. `TTY (Windows)` is not
   required, but it reports the same way so that it can become required.
-- **The TTY shards partition the cases.** `run_tty_tests.py --shard K/N`
-  (or `TTY_SHARD`) runs the cases whose index in the sorted list is `K-1`
-  modulo `N`; a TTY case checks that the shards cover the list exactly once.
+- **The TTY shards partition the cases.** `tests/tty/domains.json` groups every
+  `tests/tty/cases/test_*.py` module into domains (`smoke`, `runner`, `mcp`,
+  `kg`, `teamwork`, `provider`, `tui`, `e2e`). `run_tty_tests.py --domains`
+  (or `TTY_DOMAINS`, empty = all domains) narrows the run before sharding, so
+  subsystem-local changes (`lsp`, `jev`, `telemetry`, `teamwork`, `mcp`, `kg`,
+  model picker, or single-domain TTY case edits) run only their domains while
+  unreachable CLI transports (`apps/cli/src/web/`, `apps/cli/src/daemon/`) skip
+  TTY. `run_tty_tests.py --shard K/N`
+  (or `TTY_SHARD`) runs the cases whose index in the filtered sorted list is `K-1`
+  modulo `N`; a shard past the end of a narrowed domain list exits 0 after
+  reporting 0 cases, and a TTY case checks both domain coverage and that the
+  shards cover the list exactly once.
   In CI, shards run on separate runners, not concurrently on one, because
   the cases assert pty timing. Locally, `run_tty_tests.py --jobs N` runs N
   of these shards at once on one machine and merges their results (#588):

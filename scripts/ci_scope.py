@@ -84,8 +84,15 @@ LAYER_BASELINE = "layer_baseline.zon"
 BUILD = "build.zig"
 SCRIPT_TESTS = "scripts/tests/"
 TTY_TESTS = "tests/tty/"
+TTY_DOMAINS = "tests/tty/domains.json"
 TESTS_PACKAGE = "tests"
 TEST_PACKAGES = ("testing", TESTS_PACKAGE)
+CLI_NO_TTY_PREFIXES = ("apps/cli/src/web/", "apps/cli/src/daemon/")
+CLI_PROVIDER_TTY_FILES = (
+    "apps/cli/src/repl/model_picker.zig",
+    "apps/cli/src/repl/model_picker_view.zig",
+    "apps/cli/src/repl/next_step.zig",
+)
 AGENTCORE_SDK_PREFIXES = ("sdk/python/", "sdk/node/", "sdk/rust/")
 AGENTCORE_SDK_FILES = (
     "sdk/metask/agentcore.h",
@@ -303,6 +310,48 @@ def classify(paths: Sequence[str], deleted: Sequence[str] = (), *,
 
 
 @dataclass(frozen=True)
+class TtyDomains:
+    domains: Dict[str, Tuple[str, ...]]
+    by_module: Dict[str, Tuple[str, ...]]
+
+
+def load_tty_domains(read: Callable[[str], str]) -> TtyDomains:
+    data = json.loads(read(TTY_DOMAINS))
+    if not isinstance(data, dict) or data.get("schema") != "metacodes.tty-domains/v1":
+        raise ValueError(f"invalid tty domains schema in {TTY_DOMAINS}")
+    raw = data.get("domains")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"invalid tty domains mapping in {TTY_DOMAINS}")
+    domains: Dict[str, Tuple[str, ...]] = {}
+    by_module: Dict[str, List[str]] = {}
+    for name, modules in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(modules, list) or not modules:
+            raise ValueError(f"invalid tty domain entry: {name!r}")
+        if not all(isinstance(mod, str) and mod.startswith("test_") for mod in modules):
+            raise ValueError(f"invalid module name in tty domain {name!r}")
+        if len(modules) != len(set(modules)):
+            raise ValueError(f"duplicate module in tty domain {name!r}")
+        domains[name] = tuple(modules)
+        for mod in modules:
+            by_module.setdefault(mod, []).append(name)
+    return TtyDomains(
+        domains=domains,
+        by_module={mod: tuple(sorted(names)) for mod, names in by_module.items()},
+    )
+
+
+def read_optional_tty_domains(root: Path, rev: Optional[str]) -> Optional[TtyDomains]:
+    if rev is None:
+        if not (root / TTY_DOMAINS).is_file():
+            return None
+    else:
+        listed = git_bytes(root, "ls-tree", "--name-only", rev, "--", TTY_DOMAINS).decode("utf-8").strip()
+        if not listed:
+            return None
+    return load_tty_domains(tree_reader(root, rev))
+
+
+@dataclass(frozen=True)
 class Selection:
     """What a scope runs. `package_tests`, when set, replaces `test:units`."""
     suites: bool
@@ -315,6 +364,7 @@ class Selection:
     packages: Tuple[str, ...] = ()
     package_tests: Tuple[str, ...] = ()
     script_tests: Tuple[str, ...] = ()
+    tty_domains: Tuple[str, ...] = ()
     offline_eval: bool = True
 
     @property
@@ -325,8 +375,73 @@ class Selection:
                 and self.release and self.offline_eval and not self.package_tests)
 
 
+def path_tty_domains(
+    status: str,
+    path: str,
+    kind: str,
+    layout: Layout,
+    tty_domains: Optional[TtyDomains],
+) -> Optional[Tuple[str, ...]]:
+    if kind in ("docs", "script-test"):
+        return ()
+    if kind == "tty-test":
+        if status != "D" and tty_domains is not None:
+            rest = path[len(TTY_TESTS + "cases/"):]
+            if "/" not in rest and rest.startswith("test_") and rest.endswith(".py"):
+                stem = rest[:-3]
+                if stem in tty_domains.by_module:
+                    return tty_domains.by_module[stem]
+        return None
+    if kind in ("suite-test", "eval"):
+        return None
+    if kind == "package":
+        package = layout.package(path)
+        if package == "agentcore":
+            return ()
+        if package == "cli" and path.startswith(CLI_NO_TTY_PREFIXES):
+            return ()
+        if package in ("lsp", "jev", "telemetry"):
+            return ("smoke",)
+        if package == "teamwork" or path == "apps/cli/src/repl/teamwork.zig":
+            return ("smoke", "teamwork")
+        if package == "coding" and path.startswith("packages/coding/src/mcp/"):
+            return ("mcp", "smoke")
+        if package == "coding" and path.startswith("packages/coding/src/kg/"):
+            return ("kg", "smoke")
+        if package == "cli" and path in CLI_PROVIDER_TTY_FILES:
+            return ("provider", "smoke")
+        return None
+    return None
+
+
+def _resolve_tty(
+    changes: Sequence["Change"],
+    kinds: Dict[str, str],
+    layout: Layout,
+    tty_domains: Optional[TtyDomains],
+) -> Tuple[bool, Tuple[str, ...]]:
+    if not changes:
+        return True, ()
+    selected = set()
+    full_tty = False
+    for status, path in changes:
+        domains = path_tty_domains(status, path, kinds[path], layout, tty_domains)
+        if domains is None:
+            full_tty = True
+            break
+        selected.update(domains)
+    if full_tty:
+        return True, ()
+    if not selected:
+        return False, ()
+    if tty_domains is not None and selected.issubset(tty_domains.domains):
+        return True, tuple(sorted(selected))
+    return True, ()
+
+
 def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout] = None,
-           release_sources: Sequence[str] = RELEASE_DOCS) -> Selection:
+           release_sources: Sequence[str] = RELEASE_DOCS,
+           tty_domains: Optional[TtyDomains] = None) -> Selection:
     if scope == "docs":
         return Selection(suites=False, tty=False, sdk=False, units=False,
                          integration=False, product=False, release=False, offline_eval=False)
@@ -346,16 +461,17 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
     suites = any(kind in ("suite-test", "eval") for kind in kinds.values())
     units = suites or bool(modules & layout.build_suites)
     if scope == "tests":
-        tty = any(kind in ("tty-test", "suite-test") for kind in kinds.values())
-        chosen = Selection(suites=True, tty=tty, sdk=suites, units=units,
+        tty_changes = [(status, path) for status, path in changes if kinds[path] in ("tty-test", "suite-test")]
+        tty, selected_domains = _resolve_tty(tty_changes, kinds, layout, tty_domains) if tty_changes else (False, ())
+        chosen = Selection(suites=True, tty=tty, tty_domains=selected_domains, sdk=suites, units=units,
                            integration=units, product=suites, release=suites)
     else:
         affected = layout.affected(sorted({layout.package(path) for path, kind in kinds.items() if kind == "package"}))
         package_tests = () if units else tuple(f"test:{package}" for package in affected)
         cli_affected = suites or ("cli" in affected) or ("cli" not in layout.products)
         sdk_affected = suites or ("agentcore" in affected) or ("agentcore" not in layout.products)
-        tty = cli_affected or any(kind == "tty-test" for kind in kinds.values())
-        chosen = Selection(suites=True, tty=tty, sdk=sdk_affected, units=True,
+        tty, selected_domains = _resolve_tty(changes, kinds, layout, tty_domains)
+        chosen = Selection(suites=True, tty=tty, tty_domains=selected_domains, sdk=sdk_affected, units=True,
                            integration=cli_affected, product=cli_affected, release=cli_affected,
                            packages=affected, package_tests=package_tests)
     offline_eval = chosen.product and any(
@@ -499,6 +615,7 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
 
     chosen = selection or select(scope)
     units = ("Run: " + " ".join(chosen.package_tests) + " instead of test:units") if chosen.units and chosen.package_tests else run(chosen.units)
+    tty_label = ("Run (domains: " + ", ".join(chosen.tty_domains) + ")") if chosen.tty and chosen.tty_domains else run(chosen.tty)
     lines = ["### CI change attribution", "", f"Scope: **{scope}**", "", cell(reason), "",
              f"Event: {cell(event)}; base: {cell(base or '(none)')}; candidate: {cell(candidate)}", "",
              f"Packages: {cell(', '.join(chosen.packages) or '(none)')}", "",
@@ -513,7 +630,7 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
              f"| Release layout | {run(chosen.suites and chosen.release)} |",
              f"| Offline evaluation | {run(chosen.offline_eval)} |",
              f"| Changed script suites | {cell(' '.join(chosen.script_tests)) or 'None'} |",
-             f"| TTY | {run(chosen.tty)} |",
+             f"| TTY | {tty_label} |",
              f"| SDK bindings | {run(chosen.sdk)} |"]
     lines.extend(["", "| Status | Changed path | Path scope |", "|---|---|---|"])
     for status, path in changes[:200]:
@@ -558,12 +675,19 @@ def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: 
         commands.append([zig, "build", "windows:tty", "-Dtarget=x86_64-windows-gnu"])
     elif selection.tty:
         commands.append([zig, "build", "dev", "test:harness"])
-        commands.append([sys.executable, "tests/tty/run_tty_tests.py", "--bin", "zig-out/bin/metacodes-debug"])
+        tty_cmd = [sys.executable, "tests/tty/run_tty_tests.py", "--bin", "zig-out/bin/metacodes-debug"]
+        if selection.tty_domains:
+            tty_cmd.extend(["--domains", ",".join(selection.tty_domains)])
+        commands.append(tty_cmd)
     return commands
 
 
 def run_local(root: Path, scope: str, selection: Selection, zig: str, scripts: Sequence[str] = ()) -> int:
     env = dict(os.environ, TTY_SKIP_MODEL="1")
+    if selection.tty_domains:
+        env["TTY_DOMAINS"] = ",".join(selection.tty_domains)
+    else:
+        env.pop("TTY_DOMAINS", None)
     for command in local_commands(scope, selection, zig, windows=os.name == "nt", scripts=scripts):
         print("+ " + " ".join(command), flush=True)
         status = subprocess.run(command, cwd=str(root), env=env, check=False).returncode
@@ -798,7 +922,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         inputs = DocumentInputs(frozenset(RELEASE_DOCS), frozenset())
         doc_references, release_docs = True, True
     try:
-        selection = select(scope, observed, layouts[-1] if layouts else None, inputs.release_sources)
+        tty_domains = read_optional_tty_domains(root, candidate) if scope in ("tests", "packages") else None
+        selection = select(scope, observed, layouts[-1] if layouts else None, inputs.release_sources, tty_domains)
     except Exception as exc:
         scope, reason = "full", f"full scope: the test selection failed: {exc}"
         selection = select(scope)
@@ -812,6 +937,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(args.github_output, "a", encoding="utf-8") as handle:
             handle.write(
                 f"scope={scope}\nsuites={flag(selection.suites)}\ntty={flag(selection.tty)}\n"
+                f"tty_domains={','.join(selection.tty_domains)}\n"
                 f"sdk={flag(selection.sdk)}\n"
                 f"units={flag(selection.units)}\nintegration={flag(selection.integration)}\n"
                 f"product={flag(selection.product)}\nrelease={flag(selection.release)}\n"
