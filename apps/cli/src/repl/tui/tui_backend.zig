@@ -832,6 +832,14 @@ pub const TuiBackend = struct {
                 self.region.redrawGen(app);
                 return;
             },
+            .suspend_process => {
+                if (@import("builtin").os.tag == .windows) return;
+                self.region.enterExclusiveOverlay();
+                input.stopSelf();
+                _ = input.reconcileAfterResume(snap.fd);
+                self.region.exitExclusiveOverlay(app);
+                return;
+            },
             .redraw_screen => {
                 self.region.resetScreen(); // draws the region again in the same frame
                 return;
@@ -901,7 +909,7 @@ pub const TuiBackend = struct {
         // 走到这:dispatch 未消费该键(pass_to_editor,无弹层激活)。按键类型决定生成期语义。
         switch (key) {
             // 只有 Enter 入队,行尾是 `\` 时和输入期一样续行(LineEditor.handle)。Shift+Enter(CSI-u
-            // 13;2u、同批到达的 ESC CR、Windows 带 Shift 的 Enter 记录)落到 else,由 LineEditor 插换行,
+            // 13;2u、Ctrl+Enter、同批到达的 ESC CR、Windows 带 Shift 的 Enter 记录)落到 else,由 LineEditor 插换行,
             // 和输入期一样(#456)。
             .enter => {
                 if ((ed.handle(.enter) catch return) != .commit) {
@@ -920,8 +928,6 @@ pub const TuiBackend = struct {
                 self.region.redrawGen(app);
                 return;
             },
-            // Ctrl+Enter:真 cc 实测无效键(不换行/不提交)→ 生成期同样 no-op,不入队不重画。
-            .ctrl_enter => return,
             .esc => {
                 // 无弹层的 esc → 中断推理。框里已打的字先入队(不丢,中断后自动续发),再 abort。
                 const v = ed.view();

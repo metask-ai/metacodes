@@ -1,19 +1,31 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process = @import("metacodes-internal").platform.process;
+const platform_thread = @import("metacodes-internal").platform.thread;
+const CopyNotice = @import("ui_state.zig").CopyNotice;
 const input = @import("../input.zig");
 const mirror = @import("screen_mirror.zig");
 const remote = @import("remote.zig");
+const tui_config = @import("config.zig");
 const RenderRegion = @import("render_region.zig").RenderRegion;
 
 pub const cursor_query = "\x1b[6n";
 
-pub const Outcome = enum { not_mine, consumed, copied };
+pub const Outcome = union(enum) { not_mine, consumed, copied: CopyNotice };
 
-pub fn enable(fd: c_int) void {
-    if (builtin.os.tag == .windows or input.insideGnuScreen()) return;
+pub const no_mouse_env = "METACODES_NO_MOUSE";
+
+pub fn enable(gpa: std.mem.Allocator, state_root: []const u8, fd: c_int) void {
+    if (builtin.os.tag == .windows or input.insideGnuScreen() or turnedOff(gpa, state_root)) return;
     input.recordMouseSelection(true);
     mirror.enable(fd);
+    if (input.insideTmux()) askTmuxInBackground();
+}
+
+pub fn turnedOff(gpa: std.mem.Allocator, state_root: []const u8) bool {
+    if (std.c.getenv(no_mouse_env) != null) return true;
+    if (state_root.len == 0) return false;
+    return tui_config.loadMouse(gpa, state_root) == false;
 }
 
 pub const Drag = struct {
@@ -86,8 +98,7 @@ pub fn handle(gpa: std.mem.Allocator, region: *RenderRegion, key: input.Key) Out
             const osc = osc52(gpa, text) catch return .consumed;
             defer gpa.free(osc);
             region.emitTerminal(osc);
-            copyNative(gpa, text);
-            return .copied;
+            return .{ .copied = noticeFor(copyNative(gpa, text), g_tmux_clipboard.load(.acquire)) };
         },
     }
 }
@@ -102,16 +113,51 @@ pub fn osc52(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     return out;
 }
 
-fn copyNative(gpa: std.mem.Allocator, text: []const u8) void {
-    if (builtin.os.tag != .macos or remote.session()) return;
+fn copyNative(gpa: std.mem.Allocator, text: []const u8) bool {
+    if (builtin.os.tag != .macos or remote.session()) return false;
     const captured = process.capture(&.{ "/usr/bin/pbcopy", null }, gpa, .{
         .stdin_data = text,
         .timeout_ms = 2000,
         .inherit_env = true,
         .want_stderr = false,
-    }) catch return;
+    }) catch return false;
     gpa.free(captured.stdout);
     gpa.free(captured.stderr);
+    return captured.exit_code == 0;
+}
+
+pub const TmuxClipboard = enum(u8) { unknown, passes_on, drops };
+
+var g_tmux_clipboard = std.atomic.Value(TmuxClipboard).init(.unknown);
+
+pub fn noticeFor(copied_natively: bool, tmux: TmuxClipboard) CopyNotice {
+    if (copied_natively) return .system_clipboard;
+    return if (tmux == .drops) .tmux_dropped else .terminal_clipboard;
+}
+
+pub fn tmuxClipboard(set_clipboard: []const u8) TmuxClipboard {
+    const value = std.mem.trim(u8, set_clipboard, " \t\r\n");
+    if (std.mem.eql(u8, value, "on")) return .passes_on;
+    if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "external")) return .drops;
+    return .unknown;
+}
+
+fn askTmuxInBackground() void {
+    const thread = platform_thread.spawn(.waiter, askTmux, .{}) catch return;
+    thread.detach();
+}
+
+fn askTmux() void {
+    const gpa = std.heap.c_allocator;
+    const captured = process.capture(&.{ "/usr/bin/env", "tmux", "show-options", "-sv", "set-clipboard", null }, gpa, .{
+        .timeout_ms = 2000,
+        .inherit_env = true,
+        .want_stderr = false,
+    }) catch return;
+    defer gpa.free(captured.stdout);
+    defer gpa.free(captured.stderr);
+    if (captured.exit_code != 0) return;
+    g_tmux_clipboard.store(tmuxClipboard(captured.stdout), .release);
 }
 
 const testing = std.testing;
@@ -130,6 +176,22 @@ fn release(row: u16, col: u16) input.Key {
 
 fn cursorAt(row: u16) input.Key {
     return .{ .cursor_position = .{ .row = row, .col = 1 } };
+}
+
+test "the copy notice says where the text went: the system clipboard, the terminal, or a tmux that drops it" {
+    try testing.expectEqual(CopyNotice.system_clipboard, noticeFor(true, .drops));
+    try testing.expectEqual(CopyNotice.terminal_clipboard, noticeFor(false, .unknown));
+    try testing.expectEqual(CopyNotice.terminal_clipboard, noticeFor(false, .passes_on));
+    try testing.expectEqual(CopyNotice.tmux_dropped, noticeFor(false, .drops));
+}
+
+test "tmux's set-clipboard passes an application's OSC 52 on only when it is on; anything unreadable counts as passing" {
+    try testing.expectEqual(TmuxClipboard.passes_on, tmuxClipboard("on\n"));
+    try testing.expectEqual(TmuxClipboard.drops, tmuxClipboard("external\n"));
+    try testing.expectEqual(TmuxClipboard.drops, tmuxClipboard("off"));
+    try testing.expectEqual(TmuxClipboard.unknown, tmuxClipboard(""));
+    try testing.expectEqual(TmuxClipboard.unknown, tmuxClipboard("invalid option: set-clipboard"));
+    try testing.expectEqual(CopyNotice.terminal_clipboard, noticeFor(false, tmuxClipboard("")));
 }
 
 test "drag: press asks for the cursor, release with the answer selects anchor to focus" {

@@ -1,10 +1,11 @@
 //! <state_root>/config.json 的 TUI 相关读写。
 //!
-//! 现在管 2 个字段:
+//! 现在管 3 个字段:
 //! - `theme`("auto"/"dark"/"light"/"mono"):启动时 App 调 loadTheme(state_root),返回 ?Variant,
 //!   null = 文件不存在/无 theme 字段;/theme 命令调 saveTheme(state_root, variant),原子读改写
 //!   (保留其他字段)。
 //! - `startupAnimation`(bool,缺省开):REPL 启动 banner 前读 loadStartupAnimation,只读不写。
+//! - `mouse`(bool,缺省开):启动时 copy_select 读 loadMouse,false 不开鼠标上报,只读不写。
 //!
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
@@ -27,6 +28,13 @@ pub fn loadStartupAnimation(alloc: std.mem.Allocator, state_root: []const u8) ?b
     var parsed = loadObject(alloc, state_root) orelse return null;
     defer parsed.deinit();
     const v = parsed.value.object.get("startupAnimation") orelse return null;
+    return if (v == .bool) v.bool else null;
+}
+
+pub fn loadMouse(alloc: std.mem.Allocator, state_root: []const u8) ?bool {
+    var parsed = loadObject(alloc, state_root) orelse return null;
+    defer parsed.deinit();
+    const v = parsed.value.object.get("mouse") orelse return null;
     return if (v == .bool) v.bool else null;
 }
 
@@ -271,6 +279,30 @@ test "loadTheme + saveTheme 往返(临时 state_root)" {
     try saveTheme(testing.allocator, dir, .dark);
     const got2 = loadTheme(testing.allocator, dir).?;
     try testing.expectEqual(theme_mod.Variant.dark, got2);
+}
+
+test "loadMouse: unset is null, a bool is read, anything else counts as unset, and /theme keeps it" {
+    var dir_buf: [512]u8 = undefined;
+    const dir = @import("metacodes-internal").util.fs.testing.perPidDir(&dir_buf, "cc-zig-mouse");
+    _ = pfs.mkdir(dir.ptr, 0o755);
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/config.json", .{dir}) catch unreachable;
+    defer {
+        var p1_buf: [256]u8 = undefined;
+        const p1 = std.fmt.bufPrint(&p1_buf, "{s}\x00", .{path}) catch unreachable;
+        pfs.unlinkPath(@ptrCast(p1.ptr)) catch {};
+        _ = pfs.rmdir(dir.ptr);
+    }
+
+    try testing.expect(loadMouse(testing.allocator, dir) == null);
+    try writeFile(path, "{\"mouse\":false}");
+    try testing.expectEqual(@as(?bool, false), loadMouse(testing.allocator, dir));
+    try saveTheme(testing.allocator, dir, .light);
+    try testing.expectEqual(@as(?bool, false), loadMouse(testing.allocator, dir));
+    try writeFile(path, "{\"mouse\":true}");
+    try testing.expectEqual(@as(?bool, true), loadMouse(testing.allocator, dir));
+    try writeFile(path, "{\"mouse\":\"off\"}");
+    try testing.expect(loadMouse(testing.allocator, dir) == null);
 }
 
 test "loadStartupAnimation: 缺省 null、读 bool、非 bool 视为未设、/theme 写回不丢字段" {

@@ -74,7 +74,7 @@ ALLOWED_SINKS = {
     (Path("apps/cli/src/repl/input.zig"), "emitDisableSequences"): "keyboard protocol, bracketed paste and win32-input-mode off",
     (Path("apps/cli/src/repl/input.zig"), "rescueTerminal"): "keyboard protocol, bracketed paste and mouse off when the process dies or stops",
     (Path("apps/cli/src/repl/tui/bg_probe.zig"), "sendQuery"): "OSC 11, Kitty flags and DA1 queries at startup",
-    (Path("apps/cli/src/repl/tui/terminal_title.zig"), "writeAll"): "OSC 0 window title",
+    (Path("apps/cli/src/repl/tui/terminal_title.zig"), "writeAll"): "OSC 0 window title, and the title stack pushed at start and popped at exit",
     # Regular files, not the terminal.
     (Path("apps/cli/src/repl/history.zig"), "saveToFile"): "history file",
     (Path("apps/cli/src/repl/paste.zig"), "store"): "pasted-text file",

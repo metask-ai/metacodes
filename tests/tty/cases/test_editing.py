@@ -22,13 +22,14 @@ def test_T05_multiline_shift_enter(bin_path):
     a.assert_box_at_bottom()
 
 
-def test_T05b_ctrl_enter_does_not_newline(bin_path):
-    # 真 cc v2.1.172 实测:ctrl+enter(CSI-u 13;5u)**不换行**(整序列被吞,xxxyyy 同行);
-    # 只有 shift+enter 换行。cc-zig 对齐 → ctrl_enter no-op。
+def test_T05b_ctrl_enter_starts_a_new_line_like_shift_enter(bin_path):
     raw = run(bin_path, ["sleep:0.8", "type:xxx", "key:ctrl_enter", "type:yyy"])
     a = TTYAssert(raw)
-    a.assert_box_height(1)        # 仍单行(未换行)
-    a.assert_input_echo("xxxyyy")  # 同行拼接,无 \n
+    a.assert_box_height(2)
+    top = a.box_top_row()
+    a.assert_line_contains(top + 1, "xxx")
+    a.assert_line_contains(top + 2, "yyy")
+    a.assert_box_at_bottom()
 
 
 def test_T05c_bare_newline_does_not_exit(bin_path):
