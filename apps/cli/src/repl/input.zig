@@ -259,9 +259,10 @@ pub const KeyParser = struct {
             self.burst.text_only = true;
         }
         self.burst.pasting = false;
+        const starts_key = self.state == .normal;
         const key = self.feedBurstByte(b, fast, more_queued, lookahead) orelse return null;
         if (breaksPaste(key)) self.burst.text_only = false;
-        self.burst.pasting = self.burst.text_only and (fast or (key != .enter and lookahead.queuedAfter()));
+        self.burst.pasting = starts_key and self.burst.text_only and (fast or (key != .enter and lookahead.queuedAfter()));
         return if (self.burst.pasting) asPastedText(key) else key;
     }
 
@@ -3439,6 +3440,12 @@ test "paste burst: `?`, Tab and Enter typed one at a time are keys" {
     try expectPasted(&.{ .{ .bytes = "?", .after_ms = 1000 }, .{ .bytes = "\t", .after_ms = 200 }, .{ .bytes = "\r", .after_ms = 150 } }, &.{ .{ .char = '?' }, .tab, .enter }, &.{ false, false, false });
     try expectPasted(&.{ .{ .bytes = "/he", .after_ms = 1000 }, .{ .bytes = "\r", .after_ms = 11 } }, &.{ .{ .char = '/' }, .{ .char = 'h' }, .{ .char = 'e' }, .enter }, &.{ true, true, true, false });
     try expectPasted(&.{.{ .bytes = "\r\n", .after_ms = 1000 }}, &.{.enter}, &.{false});
+}
+
+test "paste burst: a key that comes as an escape sequence is a key, however close together its bytes are" {
+    try expectPasted(&.{ .{ .bytes = "@R", .after_ms = 1000 }, .{ .bytes = "\x1b[105;5u", .after_ms = 300 } }, &.{ .{ .char = '@' }, .{ .char = 'R' }, .tab }, &.{ true, true, false });
+    try expectPasted(&.{ .{ .bytes = "@R", .after_ms = 1000 }, .{ .bytes = "\x1b[27;5;105~", .after_ms = 300 } }, &.{ .{ .char = '@' }, .{ .char = 'R' }, .tab }, &.{ true, true, false });
+    try expectPasted(&.{ .{ .bytes = "ab", .after_ms = 1000 }, .{ .bytes = "\x1b[13;2u", .after_ms = 4 } }, &.{ .{ .char = 'a' }, .{ .char = 'b' }, .shift_enter }, &.{ true, true, false });
 }
 
 test "paste burst: a key no paste holds turns the rest of its burst back into keys, as a script sends them" {
