@@ -119,6 +119,7 @@ jobs:
       scope: ${{ steps.decide.outputs.scope }}
       suites: ${{ steps.decide.outputs.suites }}
       tty: ${{ steps.decide.outputs.tty }}
+      tty_domains: ${{ steps.decide.outputs.tty_domains }}
       sdk: ${{ steps.decide.outputs.sdk }}
       reason: ${{ steps.decide.outputs.reason }}
       doc_references: ${{ steps.decide.outputs.doc_references }}
@@ -1060,6 +1061,7 @@ jobs:
       # 'false' for a change confined to documentation and the evaluation
       # harness, which the TTY suites neither build nor read.
       TTY: ${{ needs.scope.outputs.tty }}
+      TTY_DOMAINS: ${{ needs.scope.outputs.tty_domains }}
       TTY_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     steps: &tty-steps
       - name: Release fast path
@@ -1129,6 +1131,7 @@ jobs:
     env:
       FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       TTY: ${{ needs.scope.outputs.tty }}
+      TTY_DOMAINS: ${{ needs.scope.outputs.tty_domains }}
       TTY_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     steps: *tty-steps
 

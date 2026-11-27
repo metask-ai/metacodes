@@ -4,6 +4,7 @@ CI 把 TTY 套件按 `--shard K/N` 拆到多台 runner(doc/CI_DESIGN.md §4)。�
 就是一个永远不跑却也不报错的用例,所以这里钉死:N 片恰好划分全表、互不重叠。
 `--jobs N` 在本机并行跑各片再合并结果(#588):同样钉死每条用例恰好跑一次、恰好计一次。
 """
+import ast
 import json
 import os
 import signal
@@ -14,7 +15,8 @@ import tempfile
 TTY_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, TTY_DIR)
 from run_tty_tests import (  # noqa: E402
-    load_cases, merge_results, parse_shard, plan_jobs, read_events, runs_alone, select_shard)
+    filter_domains, load_cases, load_domains, merge_results, parse_domains, parse_shard,
+    plan_jobs, read_events, runs_alone, select_shard)
 from tty_driver import runs_alone as mark_runs_alone  # noqa: E402
 from e2e_helpers import SkipTest  # noqa: E402
 
@@ -141,3 +143,63 @@ def test_case_timeout_interrupts_a_hung_case(bin_path):
         "    disarm()\n" % TTY_DIR)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
     assert out.stdout.strip() == "timed out", (out.stdout, out.stderr)
+
+
+def test_domains_manifest_covers_every_case_module(bin_path):
+    domains = load_domains()
+    cases_dir = os.path.join(TTY_DIR, "cases")
+    on_disk = {fn[:-3] for fn in os.listdir(cases_dir) if fn.startswith("test_") and fn.endswith(".py")}
+    listed = {mod for mods in domains.values() for mod in mods}
+    assert listed == on_disk, (sorted(on_disk - listed), sorted(listed - on_disk))
+
+    by_mod = {}
+    for domain, mods in domains.items():
+        for mod in mods:
+            by_mod.setdefault(mod, set()).add(domain)
+    for mod in sorted(on_disk):
+        path = os.path.join(cases_dir, f"{mod}.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), path)
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.Import):
+                targets = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                targets = [node.module.split(".")[0]]
+            for target in targets:
+                if target in on_disk and target != mod:
+                    assert by_mod[mod].issubset(by_mod[target]), (
+                        f"{mod} ({sorted(by_mod[mod])}) imports {target} ({sorted(by_mod[target])})"
+                    )
+
+
+def test_domain_filtering_and_empty_shard_exit_zero(bin_path):
+    domains = load_domains()
+    selected, unknown = parse_domains("kg, mcp, kg", domains)
+    assert selected == ("kg", "mcp") and unknown == []
+    empty, unknown = parse_domains(" , ", domains)
+    assert empty == () and unknown == []
+    _, unknown = parse_domains("mcp,no_such_domain", domains)
+    assert unknown == ["no_such_domain"]
+
+    cases = load_cases()
+    overlap = filter_domains(cases, ("provider", "tui"), domains)
+    overlap_names = [name for name, _ in overlap]
+    assert len(overlap_names) == len(set(overlap_names))
+
+    runner = os.path.join(TTY_DIR, "run_tty_tests.py")
+    env = dict(os.environ)
+    env.pop("TTY_SHARD", None)
+    env.pop("TTY_DOMAINS", None)
+    empty_shard = subprocess.run(
+        [sys.executable, runner, "--bin", sys.executable, "--domains", "kg", "--shard", "8/8"],
+        capture_output=True, encoding="utf-8", errors="replace", env=env, timeout=30,
+    )
+    assert empty_shard.returncode == 0, (empty_shard.returncode, empty_shard.stdout, empty_shard.stderr)
+    assert "0 个用例" in empty_shard.stdout, empty_shard.stdout
+
+    bad_domain = subprocess.run(
+        [sys.executable, runner, "--bin", sys.executable, "--domains", "no_such_domain"],
+        capture_output=True, encoding="utf-8", errors="replace", env=env, timeout=30,
+    )
+    assert bad_domain.returncode == 2, (bad_domain.returncode, bad_domain.stdout, bad_domain.stderr)

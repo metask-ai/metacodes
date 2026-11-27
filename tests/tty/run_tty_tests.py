@@ -44,6 +44,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+DOMAINS_PATH = os.path.join(HERE, "domains.json")
 sys.path.insert(0, HERE)  # 让 cases 能 import screen/asserts/tty_driver
 
 from asserts import AssertError  # noqa: E402
@@ -91,6 +92,50 @@ def parse_shard(text):
 def select_shard(cases, index, count):
     """第 index 片(1 起):下标 i % count == index-1 的用例。count 片恰好划分全表。"""
     return [case for i, case in enumerate(cases) if i % count == index - 1]
+
+
+def load_domains(path=DOMAINS_PATH):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or data.get("schema") != "metacodes.tty-domains/v1":
+        raise ValueError(f"invalid tty domains schema in {path}")
+    raw = data.get("domains")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"invalid tty domains mapping in {path}")
+    domains = {}
+    for name, modules in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(modules, list) or not modules:
+            raise ValueError(f"invalid tty domain entry: {name!r}")
+        if not all(isinstance(mod, str) and mod.startswith("test_") for mod in modules):
+            raise ValueError(f"invalid module name in tty domain {name!r}")
+        if len(modules) != len(set(modules)):
+            raise ValueError(f"duplicate module in tty domain {name!r}")
+        domains[name] = tuple(modules)
+    return domains
+
+
+def parse_domains(text, domains):
+    wanted = []
+    seen = set()
+    unknown = []
+    for part in text.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        if name not in domains:
+            if name not in unknown:
+                unknown.append(name)
+        elif name not in seen:
+            seen.add(name)
+            wanted.append(name)
+    return tuple(wanted), unknown
+
+
+def filter_domains(cases, selected, domains):
+    if not selected:
+        return cases
+    allowed = {mod for name in selected for mod in domains[name]}
+    return [case for case in cases if case[0].split(".", 1)[0] in allowed]
 
 
 # `--jobs` 下每条用例的默认时限(秒)。本机全量最慢的用例约 31s(#588),留足余量。
@@ -284,6 +329,7 @@ class _Job:
         argv = argv_base + ["--case-list", list_path, "--results", self.results]
         env = dict(os.environ)
         env.pop("TTY_SHARD", None)
+        env.pop("TTY_DOMAINS", None)
         self._log_file = open(self.log, "wb")
         # 自成进程组:看门狗杀片时连同它起的 pty 子进程一起杀
         kwargs = {"start_new_session": True} if os.name == "posix" else {}
@@ -409,6 +455,8 @@ def main():
     args = sys.argv[1:]
     bin_path = "zig-out/bin/metacodes-debug"
     kfilter = None
+    domains_text = os.environ.get("TTY_DOMAINS") or None
+    domains_arg = None
     shard_text = os.environ.get("TTY_SHARD") or None
     shard_arg = None
     jobs_text = None
@@ -423,6 +471,9 @@ def main():
             i += 2
         elif args[i] == "-k":
             kfilter = args[i + 1]
+            i += 2
+        elif args[i] == "--domains":
+            domains_arg = args[i + 1]
             i += 2
         elif args[i] == "--shard":
             shard_arg = args[i + 1]
@@ -446,6 +497,8 @@ def main():
             i += 1
     if shard_arg is not None:
         shard_text = shard_arg
+    if domains_arg is not None:
+        domains_text = domains_arg
 
     jobs = None
     if jobs_text is not None:
@@ -474,6 +527,20 @@ def main():
             print(f"[ERROR] 分片须为 K/N(1 ≤ K ≤ N): {shard_text}", file=sys.stderr)
             return 2
 
+    selected_domains = ()
+    domains_map = None
+    if domains_text and case_list is None:
+        try:
+            domains_map = load_domains()
+        except Exception as exc:
+            print(f"[ERROR] 读取域清单失败: {exc}", file=sys.stderr)
+            return 2
+        selected_domains, unknown = parse_domains(domains_text, domains_map)
+        if unknown:
+            known = ", ".join(sorted(domains_map))
+            print(f"[ERROR] 未知的 TTY 域: {', '.join(unknown)} (可选: {known})", file=sys.stderr)
+            return 2
+
     if not os.access(bin_path, os.X_OK):
         print(f"[ERROR] 二进制不存在/不可执行: {bin_path}", file=sys.stderr)
         return 2
@@ -488,13 +555,20 @@ def main():
             print(f"[ERROR] 用例表里没有: {', '.join(unknown)}", file=sys.stderr)
             return 2
         cases = [(name, by_name[name]) for name in wanted]
+    if selected_domains:
+        cases = filter_domains(cases, selected_domains, domains_map)
     if kfilter:
         cases = [(n, f) for n, f in cases if kfilter in n]
-    if shard is not None:
-        cases = select_shard(cases, *shard)
     if not cases:
         print("[ERROR] 没有匹配的用例", file=sys.stderr)
         return 2
+    pre_shard_count = len(cases)
+    if shard is not None:
+        cases = select_shard(cases, *shard)
+    if not cases:
+        domain_note = f",域 {','.join(selected_domains)}" if selected_domains else ""
+        _emit(f"=== TTY 测试:0 个用例,分片 {shard[0]}/{shard[1]}{domain_note} (共 {pre_shard_count} 条已由其余分片覆盖) ===")
+        return 0
 
     if jobs is not None:
         return run_jobs(cases, bin_path, jobs, case_timeout=case_timeout, verbose=verbose)
@@ -509,7 +583,8 @@ def main():
             results_file.flush()
 
     shard_note = f",分片 {shard[0]}/{shard[1]}" if shard is not None else ""
-    header = f"=== TTY 测试:{len(cases)} 个用例{shard_note},bin={bin_path} ===\n"
+    domain_note = f",域 {','.join(selected_domains)}" if selected_domains else ""
+    header = f"=== TTY 测试:{len(cases)} 个用例{shard_note}{domain_note},bin={bin_path} ===\n"
     try:
         return run_cases(cases, bin_path, header=header, case_timeout=case_timeout, record=record)
     finally:

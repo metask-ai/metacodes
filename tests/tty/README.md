@@ -13,6 +13,8 @@
 zig build dev
 zig build test:harness  # e2e cases that need mock_mcp_server/replay_server
 TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug
+# 按域过滤(见 tests/tty/domains.json;逗号分隔,空值/未设 = 全量;与 --shard/--jobs 兼容):
+TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --domains mcp,smoke
 # 单跑某用例 + dump(-k 是纯子串过滤,匹配 `文件名.函数名`):
 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 ```

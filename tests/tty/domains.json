@@ -1,0 +1,93 @@
+{
+  "schema": "metacodes.tty-domains/v1",
+  "domains": {
+    "smoke": [
+      "test_layout",
+      "test_mode_commit"
+    ],
+    "runner": [
+      "test_helpers_unit",
+      "test_pty_driver",
+      "test_runner_shards",
+      "test_screen_resize",
+      "test_sgr_color",
+      "test_vterm_parity"
+    ],
+    "mcp": [
+      "test_key_login",
+      "test_mcp_login",
+      "test_mcp_permission",
+      "test_mcp_startup"
+    ],
+    "kg": [
+      "test_kg_startup"
+    ],
+    "teamwork": [
+      "test_agent_switcher",
+      "test_teammate_process_route",
+      "test_teammate_wake"
+    ],
+    "provider": [
+      "test_catalog_wait",
+      "test_custom_providers",
+      "test_key_login",
+      "test_kitty_csi_u_keys",
+      "test_line_mode_login",
+      "test_login",
+      "test_login_logout",
+      "test_model_menu",
+      "test_model_paging",
+      "test_model_picker",
+      "test_next_step",
+      "test_openrouter_login",
+      "test_presets",
+      "test_unbound"
+    ],
+    "tui": [
+      "test_at_menu",
+      "test_autowrap_align",
+      "test_color_links",
+      "test_command_results",
+      "test_console_key_records",
+      "test_copy_on_select",
+      "test_dialog_keys",
+      "test_editing",
+      "test_generating",
+      "test_goal_loop_compact",
+      "test_keyboard_probe",
+      "test_kitty_csi_u_keys",
+      "test_overlay",
+      "test_pane_signals",
+      "test_paste_burst",
+      "test_paste_numbers",
+      "test_phase_ownership",
+      "test_prompt_keys",
+      "test_redraw_coalesce",
+      "test_resize_keys",
+      "test_resume",
+      "test_run_lease",
+      "test_shell_mode",
+      "test_shrink_jitter",
+      "test_slash_menu",
+      "test_startup_splash",
+      "test_startup_suggestion",
+      "test_stream_render",
+      "test_task_tab",
+      "test_terminal_behaviors",
+      "test_terminal_compat",
+      "test_tmux_wide_chars",
+      "test_ui_tools",
+      "test_wrap_resize"
+    ],
+    "e2e": [
+      "test_e2e_ask_question",
+      "test_e2e_codemap",
+      "test_e2e_dag_loop",
+      "test_e2e_hard_tools",
+      "test_e2e_memory",
+      "test_e2e_metask_device",
+      "test_e2e_tools",
+      "test_e2e_tui_bugs"
+    ]
+  }
+}
