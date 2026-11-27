@@ -1,11 +1,14 @@
-# Terminal setup: Shift+Enter for a newline
+# Terminal setup
 
 In the metacodes prompt, Enter submits and Shift+Enter starts a new line. A
 terminal can only report Shift+Enter when it tells it apart from Enter, and
 not every terminal does. When the footer says `\ + ⏎ for newline`, Shift+Enter
 submits in this terminal; ending a line with `\` and pressing Enter inserts the
 line break instead. `/terminal-setup` (or `metacodes terminal-setup`) fixes
-that where the terminal's own settings can.
+that where the terminal's own settings can. Further down: [selecting text with
+the mouse](#selecting-text-with-the-mouse) while metacodes runs, and
+[multiplexers and remote sessions](#multiplexers-and-remote-sessions) (tmux,
+GNU screen, Zellij, mosh, SSH).
 
 | Terminal | Shift+Enter without setup | What `/terminal-setup` does |
 | --- | --- | --- |
@@ -167,10 +170,12 @@ mods = "Shift"
 chars = "\u001b\r"
 ```
 
-Inside tmux, Shift+Enter reaches metacodes only when tmux forwards extended keys
-in CSI u form (see `extended-keys` and `extended-keys-format` in tmux(1)).
-metacodes cannot see that setting, so inside tmux the footer says
-`\ + ⏎ for newline` even when tmux forwards the keys.
+Inside tmux, Shift+Enter reaches metacodes only when tmux forwards modified
+keys: set `extended-keys on` (see [tmux](#tmux) below). metacodes reads both
+forms tmux sends them in, its default `ESC [27;2;13~` and the CSI u form
+`ESC [13;2u` of `extended-keys-format csi-u`. metacodes cannot see that
+setting, so inside tmux the footer says `\ + ⏎ for newline` even when tmux
+forwards the keys.
 
 ## Turning the keyboard protocol off
 
@@ -196,6 +201,101 @@ its own; or `/terminal-setup` mapped it in Apple Terminal, the Terminal running
 now is not the one that was running at setup (setup records it even when run
 from another terminal), and the mapping is still in one of the profiles it
 changed.
+
+## Selecting text with the mouse
+
+On macOS and Linux the interactive TUI turns on mouse reporting
+(`ESC [?1002h`, `ESC [?1006h`) for as long as it runs, so that dragging over
+text copies it: when the left button is released, metacodes copies the text
+under the drag through OSC 52 (and `pbcopy` in a local macOS session) and the
+prompt says `Copied to clipboard`. It stays off on Windows and inside GNU
+screen.
+
+While it is on, the terminal hands the mouse to metacodes:
+
+- The wheel does not scroll the terminal's scrollback, at the prompt or
+  during a reply. In the transcript viewer (Ctrl+X Ctrl+O) it scrolls the
+  transcript.
+- The terminal's own selection, with its own copy and context menu, needs the
+  key that makes the terminal skip mouse reporting:
+
+| Terminal | Select text while metacodes runs |
+| --- | --- |
+| iTerm2 | hold Option while dragging |
+| Ghostty, kitty, WezTerm, Alacritty, Warp, Zed | hold Shift while dragging |
+| VS Code, Cursor and other VS Code builds | Windows and Linux: hold Shift; macOS: hold Option, once `terminal.integrated.macOptionClickForcesSelection` is on (it is off by default) |
+| Apple Terminal | Apple documents no key for it: turn mouse reporting off for the window with View › Allow Mouse Reporting (⌘R), and on again afterwards |
+| tmux | the outer terminal's key above: tmux turns mouse reporting on in the outer terminal for metacodes whatever its `mouse` option says |
+
+The copied text reaches the clipboard only when the terminal takes OSC 52:
+Apple Terminal ignores it, iTerm2 takes it once Settings › General ›
+Selection › Applications in terminal may access clipboard is on, and tmux
+passes it on only with `set-clipboard on`. In a local macOS session `pbcopy`
+copies the text anyway; over SSH OSC 52 is the only way, and the prompt says
+`Copied to clipboard` either way.
+
+## Multiplexers and remote sessions
+
+### tmux
+
+Recommended in `~/.tmux.conf`:
+
+```tmux
+set -g extended-keys on
+set -as terminal-features 'xterm*:extkeys'
+set -g set-clipboard on
+set -as terminal-features 'xterm*:hyperlinks'
+```
+
+- `extended-keys on` lets Shift+Enter and the other modified keys through
+  (see [Other terminals](#other-terminals)); the `extkeys` feature tells tmux
+  that the outer terminal can send them, for a terminal tmux does not know.
+- `set-clipboard on` lets drag-to-copy reach the outer terminal's clipboard.
+- The `hyperlinks` feature keeps file references in replies clickable; tmux
+  drops OSC 8 links without it.
+
+metacodes turns the keyboard protocol on inside tmux without asking (tmux
+would answer for itself, not for the terminal outside it). tmux takes Ctrl+B
+as its prefix, so the hint to run an agent in the background says
+`ctrl+b ctrl+b`: the first Ctrl+B goes to tmux, the second reaches metacodes.
+
+### GNU screen
+
+Add `altscreen on` to `~/.screenrc`: without it, leaving the transcript viewer
+does not bring back what was on the screen.
+
+- Inside screen metacodes requests no keyboard protocol, which screen does not
+  forward, unless `TERM` names kitty or Ghostty. Shift+Enter therefore
+  submits: end the line with `\` and press Enter.
+- Mouse reporting and drag-to-copy stay off: screen 4 does not forward the
+  SGR mouse mode metacodes uses. Select text with the terminal as usual.
+- screen 4 does not pass 24-bit colour on, so text drawn in it comes out in
+  the default colour; screen 5 has `truecolor on`.
+- Ctrl+A is screen's prefix: press Ctrl+A and then `a` to send Ctrl+A (start of
+  line) to metacodes.
+
+### Zellij
+
+Inside Zellij metacodes requests the keyboard protocol only when `TERM` names
+kitty or Ghostty; elsewhere Shift+Enter submits, so end the line with `\` and
+press Enter. Zellij's default key bindings take Ctrl keys such as Ctrl+O and
+Ctrl+T for its own modes; in locked mode (Ctrl+G) every key goes to
+metacodes.
+
+### mosh
+
+mosh 1.4 and later pass OSC 52 copies and 24-bit colour on. mosh delivers
+keys in bursts, so an Esc and an Enter pressed in quick succession can arrive
+together and count as a newline (see the start of this page).
+
+### SSH
+
+`TERM_PROGRAM` does not travel over SSH, so on the remote side metacodes asks
+the terminal about the keyboard protocol at startup instead of knowing it by
+name; the question goes through SSH to the terminal you see. On a slow link
+the answer can come too late, and the protocol then stays off for the
+session: the footer says `\ + ⏎ for newline`. Drag-to-copy reaches your
+clipboard only through OSC 52 (see above).
 
 ## How this was established
 
