@@ -265,7 +265,7 @@ A file with keys of several providers and neither `METACODES_PRESET` nor
 `METACODES_PROVIDER` chooses none, and metacodes does not guess. The terminal UI opens without a model,
 as in step 7, and says once under its banner which providers the file has
 keys for (`.env has keys for DeepSeek and OpenAI. Choose one with /model;
-Tab there applies it to every future session.`); a message you send gets
+press Tab there for "from now on" to keep it.`); a message you send gets
 the red note, which points to `/model` with the same names. A route you
 choose there is this session's; press Tab first, to "from now on", and it
 is stored as the default of step 4, so later starts use it without

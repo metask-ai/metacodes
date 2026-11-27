@@ -394,6 +394,12 @@ status, compatibility boundaries, and entry points are defined by
   only through Fn. The keys still work, and the `?` shortcuts now list them
   (`pgup / pgdn, home / end in lists`).
 
+- **The banner calls `/model`'s lasting choice by the name the picker uses.**
+  With keys of several providers in `.env` and none named, the notice under
+  the banner (and the `-p` refusal) said "Tab there applies it to every
+  future session", while the picker's header calls that choice "from now
+  on". It now says `press Tab there for "from now on" to keep it`.
+
 - **Bench profiles replace batches.** A profile (评测配置) is one frozen
   metacodes version with a fixed set of advanced features, and every run
   belongs to one; the same version with the same features is always the same
