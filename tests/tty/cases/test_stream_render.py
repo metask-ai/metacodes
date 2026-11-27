@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from screen import Screen  # noqa: E402
 from slow_mock_server import SlowMockServer, _json_str  # noqa: E402
-from tty_driver import run  # noqa: E402
+from tty_driver import IDLE, READY, idle_footer, run, wait_for  # noqa: E402
 
 
 def _streamed_turn(chunks, delay):
@@ -39,14 +39,16 @@ def _is_region_row(text):
 
 
 def test_narrow_terminal_footer_never_pushes_the_box_into_scrollback(bin_path):
-    # 40 columns: the bypass-mode footer (` ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to
-    # interrupt`, 65 columns) used to wrap on a real (autowrapping) terminal. With the box at the
+    # 40 columns: the auto-mode footer (` ⏵⏵ auto mode on (shift+tab to cycle) · esc to
+    # interrupt`, 56 columns) used to wrap on a real (autowrapping) terminal. With the box at the
     # bottom, every redraw then pushed its spinner, border and prompt rows into the scrollback.
     rows, cols = 12, 40
     chunks = ["line %02d of the reply\nline %02d of the reply\n" % (2 * i, 2 * i + 1) for i in range(12)]
     with SlowMockServer([_streamed_turn(chunks, 0.25)]) as srv:
-        raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter", "sleep:5.0"],
-                  base_url=srv.url, startup_drain=0.8, per_key_drain=0.06, term_size=(rows, cols))
+        raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("line 23 of the reply", 20),
+                             idle_footer("⏵⏵ auto mode on (shift+tab to cycle)")],
+                  base_url=srv.url, permission="auto", startup_drain=0.8,
+                  per_key_drain=0.06, term_size=(rows, cols))
     sc = Screen(rows, cols, autowrap=True)
     sc.feed(raw)
     history = ["".join(c.ch for c in cells if not c.cont).rstrip() for cells, _ in sc.history]
@@ -76,7 +78,7 @@ def test_streamed_code_block_is_highlighted_for_its_fence_language(bin_path):
     # Python-only keywords (lambda) were left plain while common ones (return) were coloured.
     chunks = ["Here:\n", "```python\n", "lambda_marker = 1\n", "if f: return lambda y: y\n", "```\n", "Done.\n"]
     with SlowMockServer([_streamed_turn(chunks, 0.2)]) as srv:
-        raw = run(bin_path, ["sleep:0.8", "type:code", "key:enter", "sleep:3.0"],
+        raw = run(bin_path, [READY, "type:code", "key:enter", wait_for("Done.", 20), IDLE],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.06, term_size=(24, 80))
     assert b"lambda_marker" in raw, "the reply was not rendered"
     assert _sgr_before(raw, "lambda") == _sgr_before(raw, "return"), \
