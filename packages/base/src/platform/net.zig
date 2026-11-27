@@ -415,7 +415,7 @@ pub fn setNonblocking(s: Socket, enable: bool) bool {
     }
     const flags = std.c.fcntl(s, std.c.F.GETFL, @as(c_int, 0));
     if (flags < 0) return false;
-    const nonblock: c_int = @bitCast(@as(u32, 0x0004)); // O_NONBLOCK on Darwin and Linux
+    const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
     const updated = if (enable) flags | nonblock else flags & ~nonblock;
     return std.c.fcntl(s, std.c.F.SETFL, updated) >= 0;
 }
@@ -1027,6 +1027,73 @@ test "UDS listen/connect/send/recv roundtrip(POSIX)" {
     const n = recv(conn, &buf);
     try testing.expectEqual(@as(isize, msg.len), n);
     try testing.expectEqualSlices(u8, msg, buf[0..@intCast(n)]);
+}
+
+test "setNonblocking sets and clears only the POSIX NONBLOCK flag" {
+    if (is_windows) return error.SkipZigTest;
+    const sock = try newTcp(.ip4);
+    defer closeSocket(sock);
+    const original = std.c.fcntl(sock, std.c.F.GETFL);
+    try testing.expect(original >= 0);
+    const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+    const append: c_int = @bitCast(@as(u32, @bitCast(std.c.O{ .APPEND = true })));
+    try testing.expect(std.c.fcntl(sock, std.c.F.SETFL, original | append) >= 0);
+    const baseline = std.c.fcntl(sock, std.c.F.GETFL);
+    try testing.expect(baseline >= 0);
+    try testing.expect(baseline & append != 0);
+    try testing.expect(baseline & nonblock == 0);
+
+    for ([_]bool{ true, true, false, false, true, false }) |enable| {
+        try testing.expect(setNonblocking(sock, enable));
+        const expected = if (enable) baseline | nonblock else baseline;
+        try testing.expectEqual(expected, std.c.fcntl(sock, std.c.F.GETFL));
+    }
+}
+
+test "sendSome returns would_block when a nonblocking loopback peer does not read" {
+    const listener = try listenLoopback(0, 4);
+    defer closeSocket(listener.sock);
+    const client = try connectLoopback(listener.port);
+    defer closeSocket(client);
+    const conn = acceptConn(listener.sock) orelse return error.AcceptFailed;
+    defer closeSocket(conn);
+    try testing.expect(setNonblocking(client, true));
+
+    var done = std.atomic.Value(bool).init(false);
+    var expired = std.atomic.Value(bool).init(false);
+    const Watchdog = struct {
+        fn run(sock: Socket, finished: *std.atomic.Value(bool), timed_out: *std.atomic.Value(bool)) void {
+            for (0..500) |_| {
+                if (finished.load(.acquire)) return;
+                psync.sleepMs(10);
+            }
+            timed_out.store(true, .release);
+            shutdownSocket(sock);
+        }
+    };
+    const watchdog = try std.Thread.spawn(.{}, Watchdog.run, .{ client, &done, &expired });
+    defer {
+        done.store(true, .release);
+        watchdog.join();
+    }
+
+    const payload = [_]u8{0x5a} ** (64 * 1024);
+    var sent_any = false;
+    for (0..4096) |_| {
+        switch (sendSome(client, &payload)) {
+            .sent => |n| {
+                try testing.expect(n > 0 and n <= payload.len);
+                sent_any = true;
+            },
+            .would_block => {
+                try testing.expect(!expired.load(.acquire));
+                try testing.expect(sent_any);
+                return;
+            },
+            .failed => return error.SendFailed,
+        }
+    }
+    return error.SendBufferNeverFilled;
 }
 
 test "setRecvTimeout makes blocking recv return on idle" {
