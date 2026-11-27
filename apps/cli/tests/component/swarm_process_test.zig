@@ -485,18 +485,19 @@ const LeadHost = struct {
         try out.appendSlice(arena, &.{ "--base-url", try arena.dupe(u8, self.base_url), "--model", "lead-model", "--reasoning-effort", "low" });
     }
 
-    fn handedKey(ctx: *anyopaque) ?swctx.HandedKey {
+    fn handedKey(ctx: *anyopaque) ?[]const u8 {
         const self: *LeadHost = @ptrCast(@alignCast(ctx));
-        const key = self.key orelse return null;
-        return .{ .key = key };
+        return self.key;
     }
 };
 
 var g_cli_exe: []const u8 = "";
 var g_key_in_argv = false;
+var g_key_handed = false;
 
 fn spawnRealCli(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
     g_key_in_argv = false;
+    g_key_handed = p.handed_key != null;
     if (p.handed_key) |key| for (p.extra_flags) |flag| {
         if (std.mem.indexOf(u8, flag, key) != null) g_key_in_argv = true;
     };
@@ -593,6 +594,7 @@ const AppLead = struct {
         for (args) |arg| try argv.append(arena, (try arena.dupeZ(u8, arg)).ptr);
         var config = cc.parseArgsForTest(argv.items, arena);
         config.state_root = real.home;
+        config.resolved_provider_id = config.provider_profile;
         self.app = try cc.app_module.App.initWithOptions(std.testing.allocator, self.io_rt.io(), config, api_key, options);
         errdefer self.app.deinit();
         var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -620,19 +622,20 @@ fn headersOf(request: harness.CapturedRequest) []const u8 {
     return request.raw[0..end];
 }
 
-test "L2: a lead on a Metask route hands its teammate the key it started with on a descriptor, with its --base-url and the Task's model and effort" {
+test "L2: a lead on --provider metask hands its teammate the key it started with on a descriptor, with its --base-url and the Task's model and effort" {
     var buf: [256]u8 = undefined;
     var real: RealTeammate = undefined;
     try real.start(&buf, "cc-zig-sw6-handed-key", null, "sk-ambient-metask-key");
     defer real.stop();
     const url = try real.server.urlOwned(real.arena_state.allocator());
     var lead: AppLead = undefined;
-    try lead.start(&real, &.{ "metacodes", "--base-url", url, "--model", "lead-model" }, "sk-start-key", .{
+    try lead.start(&real, &.{ "metacodes", "--provider", "metask", "--base-url", url, "--model", "lead-model" }, "sk-start-key", .{
         .command_line_base_url = url,
         .handed_key = "sk-start-key",
     });
     defer lead.stop();
     try lead.spawn(&real, .{ .model = "task-model", .effort = .{ .level = .high } });
+    try std.testing.expect(g_key_handed);
     try std.testing.expect(!g_key_in_argv);
 
     const request = try real.firstRequest();
@@ -643,7 +646,7 @@ test "L2: a lead on a Metask route hands its teammate the key it started with on
     try std.testing.expect(std.mem.indexOf(u8, request.body(), "\"effort\":\"high\"") != null);
 }
 
-test "L2: a lead on a Metask route whose .env holds a Metask key hands no key, and its teammate starts on the .env key" {
+test "L2: a lead on --provider metask hands its key even when .env holds a Metask key, and its teammate sends the lead's key" {
     var buf: [256]u8 = undefined;
     var real: RealTeammate = undefined;
     try real.start(&buf, "cc-zig-sw6-dotenv-key", null, null);
@@ -651,19 +654,18 @@ test "L2: a lead on a Metask route whose .env holds a Metask key hands no key, a
     try real.writeDotEnv("METASK_API_KEY=sk-dotenv-key\n");
     const url = try real.server.urlOwned(real.arena_state.allocator());
     var lead: AppLead = undefined;
-    try lead.start(&real, &.{ "metacodes", "--base-url", url, "--model", "lead-model" }, "sk-start-key", .{
+    try lead.start(&real, &.{ "metacodes", "--provider", "metask", "--base-url", url, "--model", "lead-model" }, "sk-start-key", .{
         .command_line_base_url = url,
         .handed_key = "sk-start-key",
-        .local_metask_key = true,
     });
     defer lead.stop();
-    try std.testing.expect(lead.app.teammateKey() == null);
+    try std.testing.expectEqualStrings("sk-start-key", lead.app.teammateKey() orelse return error.TestExpectedEqual);
     try lead.spawn(&real, .{});
 
     const request = try real.firstRequest();
     errdefer std.debug.print("teammate request:\n{s}\n", .{request.raw});
-    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-dotenv-key") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request.raw, "sk-start-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-start-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.raw, "sk-dotenv-key") == null);
 }
 
 test "L2: a METACODES_API_KEY_FD left in the lead's environment does not reach a process teammate that gets no key" {
@@ -722,7 +724,7 @@ test "L2: the Task's model and effort reach the teammate's own parser after the 
     }
 }
 
-test "L2: a process teammate gets the lead's command-line --base-url and start key only while the lead still uses them" {
+test "L2: a process teammate gets the lead's command-line --base-url and start key only while the lead still uses them, and the key only on the provider it was started for" {
     var home_buf: [256]u8 = undefined;
     const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-lead-route");
     defer cc.util_fs.testing.rmrfBestEffort(home);
@@ -738,18 +740,16 @@ test "L2: a process teammate gets the lead's command-line --base-url and start k
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const url = "http://127.0.0.1:9/v1";
-    var config = cc.parseArgsForTest(&.{ "metacodes", "--base-url", url, "--model", "flag-model" }, arena);
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--provider", "metask", "--base-url", url, "--model", "flag-model" }, arena);
     config.state_root = home;
+    config.resolved_provider_id = "metask";
     const app = try cc.app_module.App.initWithOptions(std.testing.allocator, io_runtime.io(), config, "sk-start-key", .{
         .command_line_base_url = url,
         .handed_key = "sk-start-key",
     });
     defer app.deinit();
 
-    const handed = app.teammateKey() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("sk-start-key", handed.key);
-    try std.testing.expectEqual(@as(usize, 1), handed.drop_env.len);
-    try std.testing.expectEqualStrings("METASK_API_KEY", handed.drop_env[0]);
+    try std.testing.expectEqualStrings("sk-start-key", app.teammateKey() orelse return error.TestExpectedEqual);
     var args: std.ArrayList([]const u8) = .empty;
     try app.appendTeammateRouteArgs(arena, &args);
     const at = for (args.items, 0..) |arg, i| {
@@ -757,6 +757,7 @@ test "L2: a process teammate gets the lead's command-line --base-url and start k
     } else return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(url, args.items[at + 1]);
 
+    const start_base_url = app.api_client.base_url;
     app.api_key = "sk-moved-key";
     app.api_client.base_url = "http://127.0.0.1:10/elsewhere";
     args.clearRetainingCapacity();
@@ -765,9 +766,67 @@ test "L2: a process teammate gets the lead's command-line --base-url and start k
     try std.testing.expect(app.teammateKey() == null);
 
     app.api_key = "sk-start-key";
-    try std.testing.expectEqualStrings("sk-start-key", (app.teammateKey() orelse return error.TestExpectedEqual).key);
-    app.local_metask_key = true;
+    app.api_client.base_url = start_base_url;
+    try std.testing.expectEqualStrings("sk-start-key", app.teammateKey() orelse return error.TestExpectedEqual);
+
+    const started_on = app.config.resolved_provider_id;
+    defer app.config.resolved_provider_id = started_on;
+    app.config.resolved_provider_id = "prov-other";
     try std.testing.expect(app.teammateKey() == null);
+    const profile = app.config.provider_profile;
+    defer app.config.provider_profile = profile;
+    app.config.resolved_provider_id = null;
+    app.config.provider_profile = null;
+    try std.testing.expect(app.teammateKey() == null);
+}
+
+const BareRouteHost = struct {
+    flags: []const []const u8,
+
+    fn append(ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        const self: *BareRouteHost = @ptrCast(@alignCast(ctx));
+        for (self.flags) |flag| try out.append(arena, try arena.dupe(u8, flag));
+    }
+};
+
+test "L2: a Task's model reaches a process teammate only on a route that names its provider or endpoint, and is refused before anything starts otherwise" {
+    const a = std.testing.allocator;
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-task-model-pin");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    const Case = struct { host: []const []const u8, spawned: bool };
+    for ([_]Case{
+        .{ .host = &.{ "--model", "lead-model", "--reasoning-effort", "high" }, .spawned = false },
+        .{ .host = &.{}, .spawned = false },
+        .{ .host = &.{ "--provider", "metask", "--model", "lead-model" }, .spawned = true },
+        .{ .host = &.{ "--model", "lead-model", "--base-url", "http://127.0.0.1:9" }, .spawned = true },
+    }) |case| {
+        var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
+        var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
+        defer tf.deinit();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const config_path = team.configPath(home, "proj", &pbuf);
+        try team.save(a, &tf, config_path);
+        var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
+        defer sw.deinit();
+        var host: BareRouteHost = .{ .flags = case.host };
+        sw.teammate_args = .{ .ctx = &host, .appendFn = BareRouteHost.append };
+
+        g_mock_flags_len = 0;
+        const spawned = tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", test_session.asSlice(), null, &mockSpawn, true, .{ .model = "gpt-4o" });
+        var saved = team.load(a, config_path) orelse return error.TeamConfigMissing;
+        defer saved.deinit();
+        if (case.spawned) {
+            _ = try spawned;
+            try std.testing.expect(mockSawFlag("gpt-4o"));
+            try std.testing.expect(saved.findMember("worker") != null);
+        } else {
+            try std.testing.expectError(error.TaskModelNeedsLeadProvider, spawned);
+            try std.testing.expectEqual(@as(usize, 0), g_mock_flags_len);
+            try std.testing.expect(saved.findMember("worker") == null);
+        }
+    }
 }
 
 fn writeFile(arena: std.mem.Allocator, dir: []const u8, name: []const u8, text: []const u8) ![]const u8 {
@@ -820,6 +879,85 @@ test "L2: a lead started with --provider and METACODES_API_KEY_FD sends the key 
     const request = server.lastRequest() orelse return error.NoRequestCaptured;
     try std.testing.expect(std.mem.startsWith(u8, request.raw, "POST /x/v1/messages"));
     try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-descriptor-key") != null);
+}
+
+test "L2: a lead started with --provider metask and METACODES_API_KEY_FD sends the key on the descriptor, not a Metask sign-in" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const raw_cli = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-fd-metask-provider");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    try cc.util_fs.mkdirParents(home);
+    var server = try harness.MockServer.startCassette(&.{ANSWER_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    const key_path = try writeFile(a, home, "key", "sk-descriptor-key");
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, std.mem.span(raw_cli), a);
+    const args = [_][]const u8{
+        "/usr/bin/env",                                                                                         "-i",
+        try std.fmt.allocPrint(a, "HOME={s}", .{home}),                                                         "PATH=/usr/bin:/bin",
+        "METACODES_KG_AUTOSTART=0",                                                                             "METACODES_JEV_URL=off",
+        "METACODES_NO_PROBE=1",                                                                                 "METACODES_API_KEY_FD=3",
+        "/bin/sh",                                                                                              "-c",
+        "exec \"$0\" --state-dir \"$1\" --provider metask --base-url \"$3\" --model lead-model -p hi 3<\"$2\"", cli,
+        home,                                                                                                   key_path,
+        url,
+    };
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    for (args) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    try argv.append(a, null);
+    const out = try cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 60_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, home);
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    const request = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-descriptor-key") != null);
+}
+
+fn writeNamedProviderWithPreset(arena: std.mem.Allocator, state_root: []const u8, port: u16) !void {
+    const config = try std.fmt.allocPrint(arena,
+        \\{{"custom_providers":{{"prov-x":{{"display_name":"Prov X","credential_kinds":["api_key"],"env_aliases":[{{"name":"PROV_X_TOKEN","kind":"api_key","canonical":true}}],"channels":[{{"id":"primary","base_url":"http://127.0.0.1:{d}/x","protocol":"anthropic_messages"}}],"models":[{{"request_model_id":"x-model","display_name":"X model"}}]}}}},"presets":{{"px":{{"target":{{"kind":"auto_route","selector":"x-model"}}}}}}}}
+    , .{port});
+    _ = try writeFile(arena, state_root, "config.json", config);
+}
+
+test "L2: a start whose provider a preset names leaves METACODES_API_KEY_FD unread and sends that provider's own key" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const raw_cli = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-fd-preset-provider");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    try cc.util_fs.mkdirParents(home);
+    var server = try harness.MockServer.startCassette(&.{ANSWER_SSE}, 0);
+    defer server.stop();
+    try writeNamedProviderWithPreset(a, home, server.port);
+    const key_path = try writeFile(a, home, "key", "sk-descriptor-key");
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, std.mem.span(raw_cli), a);
+    const args = [_][]const u8{
+        "/usr/bin/env",                                 "-i",
+        try std.fmt.allocPrint(a, "HOME={s}", .{home}), "PATH=/usr/bin:/bin",
+        "METACODES_KG_AUTOSTART=0",                     "METACODES_JEV_URL=off",
+        "METACODES_NO_PROBE=1",                         "METACODES_API_KEY_FD=3",
+        "PROV_X_TOKEN=sk-own-key",                      "/bin/sh",
+        "-c",                                           "exec \"$0\" --state-dir \"$1\" --preset px -p hi 3<\"$2\"",
+        cli,                                            home,
+        key_path,
+    };
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    for (args) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    try argv.append(a, null);
+    const out = try cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 60_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, home);
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    const request = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.startsWith(u8, request.raw, "POST /x/v1/messages"));
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-own-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.raw, "sk-descriptor-key") == null);
 }
 
 test "L2: a lead on a named provider hands its teammate the key it started with, and the teammate sends it" {

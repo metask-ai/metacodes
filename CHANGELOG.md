@@ -448,21 +448,29 @@ status, compatibility boundaries, and entry points are defined by
   lead's spent descriptor number. It used the provider's own endpoint
   instead of the lead's `--base-url`, and it ignored the model and effort
   the `Task` named. While the lead still sends the key it was started with,
-  it now hands that key over on an inherited descriptor
-  (`METACODES_API_KEY_FD`, never in the arguments or the environment) and
-  leaves `METASK_API_KEY` out of the teammate's environment. On a Metask
-  route whose `.env` holds a Metask key it hands none, and the teammate
-  signs in with that key as before. The lead adds `--base-url` while it is
-  on the endpoint that flag set, and the Task's `--model` and
-  `--reasoning-effort` follow the lead's. Process teammates stay POSIX-only.
+  and the teammate's route names the provider that key was started for,
+  the lead now hands the key over on a descriptor the teammate reads and
+  closes before it starts anything else. The key is never in the arguments
+  or the environment; the teammate uses it as `--api-key`, ahead of a
+  Metask key in its environment or `.env`, and `METACODES_API_KEY_FD` no
+  longer reaches the teammate's environment. The lead adds `--base-url`
+  while it is on the endpoint that flag set, and the Task's `--model` and
+  `--reasoning-effort` follow the lead's. A Task that names a model is
+  refused when the lead's route names neither a provider nor an endpoint,
+  since the model's name alone would then choose the provider. Process
+  teammates stay POSIX-only.
 
-- **`METACODES_API_KEY_FD` works with a named provider.** A start that named
-  a provider (`--provider`, a preset, a stored default) ignored the key on
-  that descriptor and looked for the provider's environment variables,
-  saved key or sign-in instead. It now reads the descriptor once and uses
-  its key ahead of the environment variables, as the Metask route does.
-  Passing it together with `--api-key`, or with `METASK_API_KEY` set, is
-  refused as ambiguous, as there.
+- **`METACODES_API_KEY_FD` works with a provider named at start.** A start
+  that named its provider with `--provider`, `--offer` or
+  `METACODES_PROVIDER` ignored the key on that descriptor: a named provider
+  looked for its environment variables, saved key or sign-in, and
+  `--provider metask` used the Metask sign-in. It now reads the descriptor
+  once and uses its key as it would `--api-key`. Passing it together with
+  `--api-key`, or with `METASK_API_KEY` set, is refused as ambiguous, as on
+  the historical Metask path. A provider that a preset, the directory's
+  preset or the stored default chose keeps its own key and leaves the
+  descriptor unread, and a descriptor the start does not read is closed on
+  exec, so no tool, MCP server or language server it starts inherits it.
 
 - **A process teammate runs on the lead's route.** A teammate started with
   `--teammate-mode process` chose its route again in its own worktree: it

@@ -499,7 +499,7 @@ pub const App = struct {
     command_name: []const u8 = "",
     command_line_endpoint: ?CommandLineEndpoint = null,
     handed_key: ?[]const u8 = null,
-    local_metask_key: bool = false,
+    handed_key_owner: ?provider_ids_mod.Slug = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
@@ -836,7 +836,6 @@ pub const App = struct {
         command_name: []const u8 = "",
         command_line_base_url: ?[]const u8 = null,
         handed_key: ?[]const u8 = null,
-        local_metask_key: bool = false,
     };
 
     pub const CommandLineEndpoint = struct {
@@ -927,7 +926,7 @@ pub const App = struct {
             .startup_notice = options.startup_notice,
             .command_name = options.command_name,
             .handed_key = options.handed_key,
-            .local_metask_key = options.local_metask_key,
+            .handed_key_owner = if (options.handed_key != null) startProvider(config) else null,
             .openrouter_background = options.models_cache and std.c.getenv("METACODES_NO_PROBE") == null,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
@@ -1488,21 +1487,17 @@ pub const App = struct {
         return app.appendTeammateRouteArgs(arena, out);
     }
 
-    fn handedTeammateKey(ctx: *anyopaque) ?@import("metacodes-internal").swarm.context.HandedKey {
+    fn handedTeammateKey(ctx: *anyopaque) ?[]const u8 {
         const app: *App = @ptrCast(@alignCast(ctx));
         return app.teammateKey();
     }
 
-    pub fn teammateKey(app: *App) ?@import("metacodes-internal").swarm.context.HandedKey {
+    pub fn teammateKey(app: *App) ?[]const u8 {
         const handed = app.handed_key orelse return null;
         if (app.unbound() != null or !std.mem.eql(u8, app.api_key, handed)) return null;
-        if (app.local_metask_key and app.teammateOnMetask()) return null;
-        return .{ .key = handed, .drop_env = &.{@import("metacodes-internal").core.auth.METASK_API_KEY_ENV} };
-    }
-
-    fn teammateOnMetask(app: *App) bool {
-        const named = app.teammateRoute().provider orelse return true;
-        return named.len == 0 or std.ascii.eqlIgnoreCase(named, "metask");
+        const owner = app.handed_key_owner orelse return null;
+        const named = app.teammateRoute().provider orelse return null;
+        return if (owner.eqlText(named)) handed else null;
     }
 
     fn teammateBaseUrl(app: *const App) ?[]const u8 {
@@ -3759,11 +3754,12 @@ pub const App = struct {
     /// provider instead of falling back to Metask.
     fn cliApiKey(config: types.Config) ?provider_binding_mod.ScopedSecret {
         const secret = config.api_key orelse return null;
-        const owner = if (config.provider_profile == null)
-            provider_ids_mod.Slug.lit("metask")
-        else
-            provider_ids_mod.Slug.parse(config.resolved_provider_id orelse return null) catch return null;
-        return .{ .provider_id = owner, .secret = secret };
+        return .{ .provider_id = startProvider(config) orelse return null, .secret = secret };
+    }
+
+    fn startProvider(config: types.Config) ?provider_ids_mod.Slug {
+        if (config.provider_profile == null) return provider_ids_mod.Slug.lit("metask");
+        return provider_ids_mod.Slug.parse(config.resolved_provider_id orelse return null) catch null;
     }
 
     /// Move the live session onto a committed selection.

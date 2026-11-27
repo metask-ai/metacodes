@@ -445,7 +445,6 @@ pub const SpawnProcessParams = struct {
     /// 额外 CLI flag 透传(如 --agent-teams --model X);借用。
     extra_flags: []const []const u8 = &.{},
     handed_key: ?[]const u8 = null,
-    drop_env: []const []const u8 = &.{},
 };
 
 pub const TaskEffort = union(enum) {
@@ -460,8 +459,16 @@ pub const TaskRoute = struct {
 };
 
 pub const handed_key_fd: c_int = 3;
+pub const handed_key_flag = "--teammate-key-fd";
 pub const max_handed_key_bytes = 4096;
 const key_fd_variable = "METACODES_API_KEY_FD";
+
+fn namesTheRoute(flags: []const []const u8) bool {
+    for (flags) |flag| {
+        if (std.mem.eql(u8, flag, "--provider") or std.mem.eql(u8, flag, "--base-url")) return true;
+    }
+    return false;
+}
 
 fn applyTaskRoute(arena: std.mem.Allocator, flags: *std.ArrayList([]const u8), route: TaskRoute) error{OutOfMemory}!void {
     if (route.model) |model| try flags.appendSlice(arena, &.{ "--model", try arena.dupe(u8, model) });
@@ -484,23 +491,13 @@ fn dropFlagWithValue(flags: *std.ArrayList([]const u8), flag: []const u8) void {
     }
 }
 
-pub fn buildTeammateEnv(a: std.mem.Allocator, environ: [*:null]const ?[*:0]const u8, key_fd: ?c_int, drop: []const []const u8) ![]?[*:0]const u8 {
+pub fn buildTeammateEnv(a: std.mem.Allocator, environ: [*:null]const ?[*:0]const u8) ![]?[*:0]const u8 {
     var list: std.ArrayList(?[*:0]const u8) = .empty;
     errdefer list.deinit(a);
     var i: usize = 0;
     while (environ[i]) |entry| : (i += 1) {
-        const text = std.mem.span(entry);
-        if (namesVariable(text, key_fd_variable)) continue;
-        if (for (drop) |name| {
-            if (namesVariable(text, name)) break true;
-        } else false) continue;
+        if (namesVariable(std.mem.span(entry), key_fd_variable)) continue;
         try list.append(a, entry);
-    }
-    var owned: ?[:0]u8 = null;
-    errdefer if (owned) |entry| a.free(entry);
-    if (key_fd) |fd| {
-        owned = try std.fmt.allocPrintSentinel(a, key_fd_variable ++ "={d}", .{fd}, 0);
-        try list.append(a, owned.?.ptr);
     }
     try list.append(a, null);
     return list.toOwnedSlice(a);
@@ -508,11 +505,6 @@ pub fn buildTeammateEnv(a: std.mem.Allocator, environ: [*:null]const ?[*:0]const
 
 fn namesVariable(entry: []const u8, name: []const u8) bool {
     return entry.len > name.len and entry[name.len] == '=' and std.mem.eql(u8, entry[0..name.len], name);
-}
-
-pub fn freeTeammateEnv(a: std.mem.Allocator, env: []?[*:0]const u8, key_fd: ?c_int) void {
-    if (key_fd != null and env.len >= 2) if (env[env.len - 2]) |entry| a.free(std.mem.span(entry));
-    a.free(env);
 }
 
 /// 构造 teammate 子进程 argv(可测)。exe = 自身可执行文件;身份 + cwd + 透传 flag。
@@ -541,6 +533,10 @@ pub fn buildTeammateArgv(a: std.mem.Allocator, exe: []const u8, p: SpawnProcessP
     if (p.cwd.len > 0) {
         try list.append(a, (try a.dupeZ(u8, "--teammate-cwd")).ptr);
         try list.append(a, (try a.dupeZ(u8, p.cwd)).ptr);
+    }
+    if (p.handed_key != null) {
+        try list.append(a, (try a.dupeZ(u8, handed_key_flag)).ptr);
+        try list.append(a, (try std.fmt.allocPrintSentinel(a, "{d}", .{handed_key_fd}, 0)).ptr);
     }
     for (p.extra_flags) |f| try list.append(a, (try a.dupeZ(u8, f)).ptr);
     try list.append(a, null);
@@ -655,6 +651,18 @@ pub fn spawnTeammateProcess(
     if (std.ascii.eqlIgnoreCase(name_s, team_mod.TEAM_LEAD_NAME)) return error.ReservedName;
     if (!sw.hasTeam()) return error.NoActiveTeam;
 
+    var flags_arena = std.heap.ArenaAllocator.init(a);
+    defer flags_arena.deinit();
+    const fa = flags_arena.allocator();
+    var flags: std.ArrayList([]const u8) = .empty;
+    var preview_arg: [@import("metacodes-ai").preview.Features.max_arg_len]u8 = undefined;
+    if (!lsp_enabled) try flags.append(fa, "--no-lsp");
+    try flags.append(fa, "--no-preview");
+    if (!sw.preview.eql(.none)) try flags.append(fa, sw.preview.enableArg(&preview_arg));
+    if (sw.teammate_args) |host_args| try host_args.append(fa, &flags);
+    if (task_route.model != null and !namesTheRoute(flags.items)) return error.TaskModelNeedsLeadProvider;
+    try applyTaskRoute(fa, &flags, task_route);
+
     // ① worktree(best-effort:失败降级为无隔离)。
     var effective_wt = worktree_path;
     if (worktree_path.len > 0 and worktree_base.len > 0) {
@@ -709,17 +717,6 @@ pub fn spawnTeammateProcess(
     }
 
     // ③ fork+exec(或 mock)。
-    var flags_arena = std.heap.ArenaAllocator.init(a);
-    defer flags_arena.deinit();
-    const fa = flags_arena.allocator();
-    var flags: std.ArrayList([]const u8) = .empty;
-    var preview_arg: [@import("metacodes-ai").preview.Features.max_arg_len]u8 = undefined;
-    if (!lsp_enabled) try flags.append(fa, "--no-lsp");
-    try flags.append(fa, "--no-preview");
-    if (!sw.preview.eql(.none)) try flags.append(fa, sw.preview.enableArg(&preview_arg));
-    if (sw.teammate_args) |host_args| try host_args.append(fa, &flags);
-    try applyTaskRoute(fa, &flags, task_route);
-    const handed: ?swarm_ctx.HandedKey = if (sw.teammate_args) |host_args| host_args.handedKey() else null;
     const pid = try spawn_fn(a, .{
         .name = name_s,
         .team = sw.team_sanitized,
@@ -728,8 +725,7 @@ pub fn spawnTeammateProcess(
         .cwd = effective_wt,
         .state_root = sw.state_root,
         .extra_flags = flags.items,
-        .handed_key = if (handed) |h| h.key else null,
-        .drop_env = if (handed) |h| h.drop_env else &.{},
+        .handed_key = if (sw.teammate_args) |host_args| host_args.handedKey() else null,
     });
     // The child is live but not yet owned by process_teammates. Any
     // allocation/append failure below must terminate and reap it before the
@@ -787,9 +783,8 @@ pub fn forkExecTeammateAt(a: std.mem.Allocator, exe: []const u8, p: SpawnProcess
     const argv = try buildTeammateArgv(a, exe, p);
     defer freeArgv(a, argv);
     const exe_path_z: [*:0]const u8 = argv[0].?; // argv[0] = dupeZ(exe),NUL 结尾
-    const key_fd: ?c_int = if (p.handed_key != null) handed_key_fd else null;
-    const envp = try buildTeammateEnv(a, @ptrCast(std.c.environ), key_fd, p.drop_env);
-    defer freeTeammateEnv(a, envp, key_fd);
+    const envp = try buildTeammateEnv(a, @ptrCast(std.c.environ));
+    defer a.free(envp);
 
     // 与 platform/process 的 spawn 共用 fork 串行锁:这个 fork 不能落在别处"建了 pipe
     // 还没关子进程侧"的窗口里,否则那条 pipe 会跟着进 teammate 进程,对方永远等不到 EOF。
@@ -947,26 +942,43 @@ test "process ownership requires lead session and per-spawn lease" {
     try testing.expect(!ownsPersistedMember(a, cfg, "worker", session, lease, "/wrong-worktree"));
 }
 
-test "buildTeammateEnv: a handed key puts its descriptor in METACODES_API_KEY_FD and drops what the host names, and without one a stale number is dropped" {
+test "buildTeammateEnv: the lead's METACODES_API_KEY_FD never reaches the child, and the rest of its environment does" {
     const a = testing.allocator;
-    const environ = [_:null]?[*:0]const u8{ "HOME=/home/lead", "METACODES_API_KEY_FD=9", "PATH=/bin", "METACODES_API_KEY_FDX=1", "METASK_API_KEY=sk-ambient", "METASK_API_KEY_OTHER=x" };
-    for ([_]?c_int{ handed_key_fd, null }) |key_fd| {
-        const drop: []const []const u8 = if (key_fd != null) &.{"METASK_API_KEY"} else &.{};
-        const env = try buildTeammateEnv(a, &environ, key_fd, drop);
-        defer freeTeammateEnv(a, env, key_fd);
-        var names: std.ArrayList(u8) = .empty;
-        defer names.deinit(a);
-        for (env[0 .. env.len - 1]) |entry| {
-            try names.appendSlice(a, std.mem.span(entry.?));
-            try names.append(a, ';');
-        }
-        try testing.expect(env[env.len - 1] == null);
-        const expected = if (key_fd != null)
-            "HOME=/home/lead;PATH=/bin;METACODES_API_KEY_FDX=1;METASK_API_KEY_OTHER=x;METACODES_API_KEY_FD=3;"
-        else
-            "HOME=/home/lead;PATH=/bin;METACODES_API_KEY_FDX=1;METASK_API_KEY=sk-ambient;METASK_API_KEY_OTHER=x;";
-        try testing.expectEqualStrings(expected, names.items);
+    const environ = [_:null]?[*:0]const u8{ "HOME=/home/lead", "METACODES_API_KEY_FD=9", "PATH=/bin", "METACODES_API_KEY_FDX=1", "METASK_API_KEY=sk-ambient" };
+    const env = try buildTeammateEnv(a, &environ);
+    defer a.free(env);
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(a);
+    for (env[0 .. env.len - 1]) |entry| {
+        try names.appendSlice(a, std.mem.span(entry.?));
+        try names.append(a, ';');
     }
+    try testing.expect(env[env.len - 1] == null);
+    try testing.expectEqualStrings("HOME=/home/lead;PATH=/bin;METACODES_API_KEY_FDX=1;METASK_API_KEY=sk-ambient;", names.items);
+}
+
+test "buildTeammateArgv: a handed key is named by its descriptor, never by its bytes" {
+    const a = testing.allocator;
+    const argv = try buildTeammateArgv(a, "/usr/local/bin/metacodes", .{ .name = "bob", .team = "proj", .state_root = "/srv/state", .handed_key = "sk-secret-key" });
+    defer freeArgv(a, argv);
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(a);
+    for (argv) |item| if (item) |s| {
+        try all.appendSlice(a, std.mem.span(s));
+        try all.append(a, '\n');
+    };
+    try testing.expect(std.mem.indexOf(u8, all.items, "--teammate-key-fd\n3\n") != null);
+    try testing.expect(std.mem.indexOf(u8, all.items, "sk-secret-key") == null);
+    const without = try buildTeammateArgv(a, "/usr/local/bin/metacodes", .{ .name = "bob", .team = "proj", .state_root = "/srv/state" });
+    defer freeArgv(a, without);
+    for (without) |item| if (item) |s| try testing.expect(!std.mem.eql(u8, std.mem.span(s), handed_key_flag));
+}
+
+test "namesTheRoute: only a provider or an endpoint pins where a Task's model is sent" {
+    try testing.expect(namesTheRoute(&.{ "--no-preview", "--provider", "metask", "--model", "m" }));
+    try testing.expect(namesTheRoute(&.{ "--model", "m", "--base-url", "http://127.0.0.1:9" }));
+    try testing.expect(!namesTheRoute(&.{ "--no-preview", "--model", "m", "--reasoning-effort", "high" }));
+    try testing.expect(!namesTheRoute(&.{}));
 }
 
 test "applyTaskRoute: the Task's model and effort come after the lead's, and a named model without an effort drops the lead's" {

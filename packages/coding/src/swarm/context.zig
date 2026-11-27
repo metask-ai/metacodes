@@ -23,25 +23,20 @@ pub const ProcessTeammate = struct {
 
 pub const Scheduler = enum { in_process, host };
 
-pub const HandedKey = struct {
-    key: []const u8,
-    drop_env: []const []const u8 = &.{},
-};
-
 pub const TeammateArgs = struct {
     ctx: *anyopaque,
     appendFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void,
-    handedKeyFn: *const fn (ctx: *anyopaque) ?HandedKey = handsNoKey,
+    handedKeyFn: *const fn (ctx: *anyopaque) ?[]const u8 = handsNoKey,
 
     pub fn append(self: TeammateArgs, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
         return self.appendFn(self.ctx, arena, out);
     }
 
-    pub fn handedKey(self: TeammateArgs) ?HandedKey {
+    pub fn handedKey(self: TeammateArgs) ?[]const u8 {
         return self.handedKeyFn(self.ctx);
     }
 
-    fn handsNoKey(_: *anyopaque) ?HandedKey {
+    fn handsNoKey(_: *anyopaque) ?[]const u8 {
         return null;
     }
 };

@@ -23,6 +23,7 @@ const provider_oauth_mod = @import("metacodes-internal").provider.oauth;
 const provider_ids_mod = @import("metacodes-internal").provider.ids;
 const version_info = @import("metacodes-internal").version_info;
 const invocation = @import("app/invocation.zig");
+const teammate_route_mod = @import("app/teammate_route.zig");
 pub const doctor = @import("metacodes-internal").core.doctor; // pub: component tests build the report by hand
 pub const app_state_env = @import("app/state_env.zig"); // pub: component tests read the template and the parser
 const state_env_mod = app_state_env;
@@ -779,6 +780,13 @@ pub fn storedDefaultOn(
     return if (providerSignInStored(arena, config.state_root, profile)) .{ .usable = usable } else .{ .lacks_credential = label };
 }
 
+fn keepRuntimeKeyFdFromChildren() void {
+    const raw = std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) orelse return;
+    const fd = std.fmt.parseInt(pfs.Fd, std.mem.span(raw), 10) catch return;
+    if (fd < 3) return;
+    pfs.makeCloseOnExec(fd) catch {};
+}
+
 /// `METACODES_AUTH_PRECEDENCE`, which overrides `--auth-precedence`. A start
 /// applies it before the startup order; `login status` (#537) does too, so
 /// both judge an empty `METASK_API_KEY` the same way under `oauth-first`.
@@ -1284,6 +1292,7 @@ pub fn main(init: std.process.Init) !void {
         printHelp();
         std.process.exit(0);
     }
+    keepRuntimeKeyFdFromChildren();
     started_as = firstArgument(init, allocator);
 
     // `--state-dir` as argv[1] is a global option: it precedes, and applies
@@ -1358,6 +1367,23 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             };
         }
+    }
+    var teammate_key: ?[]u8 = null;
+    defer if (teammate_key) |key| std.crypto.secureZero(u8, key);
+    if (config.teammate_key_fd) |fd| {
+        if (config.teammate_name.len == 0) {
+            std.debug.print("error: --teammate-key-fd is only for a teammate process\n", .{});
+            std.process.exit(2);
+        }
+        if (config.api_key != null or std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null) {
+            std.debug.print("error: --teammate-key-fd cannot be combined with --api-key or METACODES_API_KEY_FD\n", .{});
+            std.process.exit(2);
+        }
+        teammate_key = teammate_route_mod.takeHandedKey(allocator, fd) catch |err| {
+            std.debug.print("error: the key handed on --teammate-key-fd cannot be used: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        config.api_key = teammate_key.?;
     }
 
     if (config.show_version) {
@@ -1665,8 +1691,9 @@ pub fn main(init: std.process.Init) !void {
         .unreadable = preset_facts.unreadable,
     } } else null;
     const resolves_credential = !introspection_only and unbound == null;
+    const runtime_key_named = startup_decision == .named and std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null;
     if (resolves_credential and metask_scope and config.provider_profile != null and
-        std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit)
+        std.ascii.eqlIgnoreCase(config.provider_profile.?, "metask") and !metask_legacy_explicit and !runtime_key_named)
     {
         var browser_key = false;
         const session = try loadStartupMetask(&startup_metask, init.gpa, config.state_root);
@@ -1710,7 +1737,7 @@ pub fn main(init: std.process.Init) !void {
         // provider without a key opens the TUI unbound, naming the key it
         // needs (#485, 第十节第 3 条); `-p` and the rest stop with its help.
         const report: CredentialReport = if (may_open_unbound) .quiet else .print_help;
-        if (std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null) {
+        if (runtime_key_named) {
             runtime_fd_credential = auth.resolveRuntimeCredential(allocator, config.state_root, config.api_key, config.auth_precedence) catch |err| {
                 std.debug.print("error: the key passed on METACODES_API_KEY_FD cannot be used: {s}\n", .{@errorName(err)});
                 return err;
@@ -1880,7 +1907,6 @@ pub fn main(init: std.process.Init) !void {
         .command_name = invokedCommand(allocator),
         .command_line_base_url = command_line_base_url,
         .handed_key = if (start_key_from_flag and unbound == null) api_key else null,
-        .local_metask_key = local_metask_key != null,
     };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
@@ -5342,6 +5368,15 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |v| config.teammate_lease_id = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--teammate-cwd")) {
             if (args.next()) |v| config.teammate_cwd = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--teammate-key-fd")) {
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --teammate-key-fd", .{});
+                return;
+            };
+            config.teammate_key_fd = std.fmt.parseInt(c_int, v, 10) catch {
+                setParseError(config, allocator, "invalid value '{s}' for --teammate-key-fd", .{v});
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--teammate-mode")) {
             const v = args.next() orelse {
                 setParseError(config, allocator, "missing value for --teammate-mode", .{});

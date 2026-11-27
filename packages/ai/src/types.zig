@@ -216,6 +216,7 @@ pub const Config = struct {
     teammate_parent_session: []const u8 = "",
     teammate_lease_id: []const u8 = "",
     teammate_cwd: []const u8 = "",
+    teammate_key_fd: ?c_int = null,
     /// SW6:lead 用 `--teammate-mode process` 让 Task(name) spawn 进程外 teammate(fork+exec +
     /// worktree 隔离)而非进程内线程。默认 false(进程内,SW1)。
     teammate_out_of_process: bool = false,

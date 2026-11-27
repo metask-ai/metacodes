@@ -309,7 +309,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             // lead loop,ctx.lsp 忠实反映用户的开关。若将来把 lsp 透传进 subagent,这个等价
             // 关系就断了,得改用显式的配置字段。
             const task_effort: tp.TaskEffort = if (child_effort) |level| .{ .level = level } else if (model_override != null) .model_default else .lead;
-            const pid = tp.spawnTeammateProcess(sw, name, prompt, wt, if (wt.len > 0) "HEAD" else "", ctx.project_dir, ctx.session.asSlice(), ctx.abort, &tp.forkExecTeammate, ctx.lsp != null, .{ .model = model_override, .effort = task_effort }) catch |err| return err;
+            const pid = tp.spawnTeammateProcess(sw, name, prompt, wt, if (wt.len > 0) "HEAD" else "", ctx.project_dir, ctx.session.asSlice(), ctx.abort, &tp.forkExecTeammate, ctx.lsp != null, .{ .model = model_override, .effort = task_effort }) catch |err| switch (err) {
+                error.TaskModelNeedsLeadProvider => return @import("../core/tool_error.zig").errorToJson("InvalidModelForProcessTeammate", "cannot start a process teammate on model \"{s}\": the lead's route names no provider or endpoint (--provider, --base-url), so the model's name alone would pick the provider. Leave out `model`, or use an agent type without one, to run the teammate on the lead's model.", .{model_override.?}, ctx.allocator),
+                else => return err,
+            };
             return std.fmt.allocPrint(ctx.allocator, "{{\"teammate\":\"{s}\",\"pid\":{d},\"backend\":\"process\",\"status\":\"spawned\"}}", .{ name_s, pid });
         }
 
