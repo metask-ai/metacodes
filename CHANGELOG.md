@@ -360,16 +360,19 @@ status, compatibility boundaries, and entry points are defined by
 
 - **The permission dialog shows a call's whole arguments and says what
   each answer covers.** It cut the arguments to 60 columns; they are now
-  wrapped in full, and folded after ten lines behind
-  `tab to show all N lines` (Tab again folds them). The answers read as if
-  they were about this one call, while `Yes, always` allowed the whole tool
-  and `Don't ask again` denied it. They now say what they do:
+  wrapped in full and folded after ten lines behind
+  `tab to show all N lines` (Tab again folds them). The box narrows with
+  the terminal and leaves out the argument lines the screen has no room
+  for, counting them: `… N more lines`. The answers read as if they were
+  about this one call, while `Yes, always` allowed the whole tool and
+  `Don't ask again` denied it. They now say what they do:
   - `[y] Yes, once`
   - `[a] Yes, and allow <tool> in this project from now on`: the tool is
-    remembered for the session and written to the project's
-    `.claude/settings.local.json`; without a project directory it is
-    written to `~/.claude/settings.json` and the answer says
-    `everywhere from now on`
+    remembered for the session and written to the repository's
+    `.claude/settings.local.json`, which the next start there reads. It is
+    offered only where that holds: in a git repository, and not after the
+    session moved into a worktree with `EnterWorktree`. Elsewhere the
+    dialog has no `[a]`.
   - `[n] No`
   - `[d] No, and deny <tool> for the rest of this session`
   - A shell command that is hard to undo gets no `[a]` and starts on No:
@@ -382,9 +385,11 @@ status, compatibility boundaries, and entry points are defined by
     `npm`/`pnpm`/`yarn publish`, `cargo publish`, `twine upload`,
     `gem push`, `docker push`), reaches the network (`curl`, `wget`, `ssh`,
     `scp`, `sftp`, `rsync`, `nc`, `ncat`, `netcat`, `telnet`, `ftp`) or runs
-    under `sudo` or `doas`. Other tools keep their four answers.
-  - A call the permission gate refused shows as
-    `Did not run 1 shell command` rather than `Ran 1 shell command`.
+    under `sudo` or `doas`. Other tools are not judged this way.
+  - A Bash, Read, Grep or Glob call the permission gate refused shows as
+    `Did not run 1 shell command`, `Did not read 1 file`,
+    `Did not search for 1 pattern` or `Did not look for files` rather than
+    as if it ran.
 
 - **Bench concurrency is set only on the profile page.** The 评测 page no
   longer has a 并发数 field and `POST /api/profiles/run` no longer takes

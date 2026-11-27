@@ -175,9 +175,9 @@ def _resize_during_dialog(bin_path, tool, tool_input, dialog_marker, answer_even
     tool_result the next provider request carried.
 
     The dialog redraws after each resize. The narrower terminal has re-wrapped
-    its full-width rows (and the 64-column permission box no longer fits 60),
-    so a redraw that climbs the rows it was drawn with stops inside the old
-    frame and leaves a second copy: `drawn_once` is on at most one row of the
+    its full-width rows (the permission box was drawn for 80 columns), so a
+    redraw that climbs the rows it was drawn with stops inside the old frame
+    and leaves a second copy: `drawn_once` is on at most one row of the
     screen the terminal holds (replayed with its reflow and autowrap).
     """
     import json
@@ -248,7 +248,7 @@ def test_T14_resize_during_permission_prompt_keeps_waiting(bin_path):
         json.dumps({"file_path": target, "content": "x"}),
         "Permission required",
         ["type:y", idle_footer("? for shortcuts")],
-        "[a] Yes, and allow Write",
+        "[d] No, and deny Write",
     )
     text = _tool_result_text(result)
     if result.get("is_error") or "declined" in text:

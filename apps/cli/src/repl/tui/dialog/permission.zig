@@ -5,7 +5,7 @@
 //! 功能:
 //! - 边框 + 标题 "Permission required"
 //! - 工具名 + 参数(按框宽折行,超过 10 行折叠,Tab 展开/收起)
-//! - 选项:[y] 允许一次 / [a] 以后都允许这个工具(文字按 guard 写规则的位置说范围) / [n] 拒绝 /
+//! - 选项:[y] 允许一次 / [a] 以后都允许这个工具(只在规则下次启动读得回时给) / [n] 拒绝 /
 //!   [d] 本会话里一律拒绝这个工具;
 //!   难回滚的 Bash 命令(hard_to_undo.zig)不给 [a],默认停在 [n]
 //! - 键盘选择(y/a/n/d 直接选 + ↑↓ 移动高亮 + Enter 确认)
@@ -54,20 +54,24 @@ pub fn optionsFor(always_offered: bool) []const Option {
     return if (always_offered) &every_option else &options_without_always;
 }
 
-pub fn firstSelected(always_offered: bool) usize {
-    return if (always_offered) 0 else 1;
+pub fn firstSelected(options: []const Option, hard_to_undo_call: bool) usize {
+    if (!hard_to_undo_call) return 0;
+    for (options, 0..) |opt, i| {
+        if (opt.choice == .deny_once) return i;
+    }
+    return 0;
 }
 
-pub const AlwaysScope = enum { project, everywhere, session };
+pub fn alwaysComesBack(writes_settings_file: bool, home: []const u8, write_root: []const u8, read_root: ?[]const u8) bool {
+    const project = read_root orelse return false;
+    if (!writes_settings_file or home.len == 0) return false;
+    return std.mem.eql(u8, write_root, project);
+}
 
-pub fn optionLabel(buf: []u8, choice: PermissionChoice, tool_name: []const u8, always: AlwaysScope) []const u8 {
+pub fn optionLabel(buf: []u8, choice: PermissionChoice, tool_name: []const u8) []const u8 {
     return switch (choice) {
         .allow_once => "Yes, once",
-        .allow_always => switch (always) {
-            .project => std.fmt.bufPrint(buf, "Yes, and allow {s} in this project from now on", .{tool_name}) catch "Yes, and allow it in this project from now on",
-            .everywhere => std.fmt.bufPrint(buf, "Yes, and allow {s} everywhere from now on", .{tool_name}) catch "Yes, and allow it everywhere from now on",
-            .session => std.fmt.bufPrint(buf, "Yes, and allow {s} for the rest of this session", .{tool_name}) catch "Yes, and allow it for the rest of this session",
-        },
+        .allow_always => std.fmt.bufPrint(buf, "Yes, and allow {s} in this project from now on", .{tool_name}) catch "Yes, and allow it in this project from now on",
         .deny_once => "No",
         .deny_tool_session => std.fmt.bufPrint(buf, "No, and deny {s} for the rest of this session", .{tool_name}) catch "No, and deny it for the rest of this session",
     };
@@ -75,20 +79,46 @@ pub fn optionLabel(buf: []u8, choice: PermissionChoice, tool_name: []const u8, a
 
 pub const max_folded_arg_lines = 10;
 
-const arg_cols = 60;
-
-const dialog_chrome_rows = 12;
+const widest_content = 64;
+const narrowest_content = 20;
+const box_edges = 4;
 
 pub const View = struct {
     selected: usize = 0,
     expanded: bool = false,
     always_offered: bool = true,
-    always_scope: AlwaysScope = .project,
     rows: u16 = 24,
+    cols: u16 = 80,
 };
+
+fn contentWidth(cols: u16) usize {
+    return std.math.clamp(@as(usize, cols) -| box_edges, narrowest_content, widest_content);
+}
+
+pub fn frameRows(frame: []const u8, cols: u16) usize {
+    return reflow.Anchor.atEnd(frame, cols).climb(cols, true);
+}
 
 /// 渲染权限对话框为字符串。caller free。
 pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8, view: View) ![]u8 {
+    const width = contentWidth(view.cols);
+    const arg_lines = try layout.wrapLines(alloc, args, width);
+    defer alloc.free(arg_lines);
+    const limit = @max(@as(usize, view.rows) -| 1, 1);
+    const unfolded = if (view.expanded) arg_lines.len else @min(arg_lines.len, max_folded_arg_lines);
+    var shown = unfolded;
+    while (true) {
+        const frame = try renderShowing(alloc, th, tool_name, arg_lines, .{ .shown = shown, .cut_by_screen = shown < unfolded }, view, width);
+        const height = frameRows(frame, view.cols);
+        if (shown == 0 or height <= limit) return frame;
+        alloc.free(frame);
+        shown -|= @max(height - limit, 1);
+    }
+}
+
+const Shown = struct { shown: usize, cut_by_screen: bool };
+
+fn renderShowing(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, arg_lines: []const []const u8, fit: Shown, view: View, width: usize) ![]u8 {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
 
@@ -97,22 +127,21 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
     try content.appendSlice(alloc, th.reset);
     try content.append(alloc, '\n');
 
-    const arg_lines = try layout.wrapLines(alloc, args, arg_cols);
-    defer alloc.free(arg_lines);
-    const room = @max(max_folded_arg_lines, @as(usize, view.rows) -| dialog_chrome_rows);
-    const shown = @min(arg_lines.len, if (view.expanded) room else max_folded_arg_lines);
-    for (arg_lines[0..shown]) |line| {
+    for (arg_lines[0..fit.shown]) |line| {
         try content.appendSlice(alloc, th.dim);
         try content.appendSlice(alloc, line);
         try content.appendSlice(alloc, th.reset);
         try content.append(alloc, '\n');
     }
-    if (arg_lines.len > max_folded_arg_lines) {
+    const hidden = arg_lines.len - fit.shown;
+    const foldable = arg_lines.len > max_folded_arg_lines;
+    if (hidden > 0 or (view.expanded and foldable)) {
         try content.appendSlice(alloc, th.dim);
-        if (!view.expanded) {
-            try content.print(alloc, "tab to show all {d} lines", .{arg_lines.len});
-        } else if (shown < arg_lines.len) {
-            try content.print(alloc, "… {d} more lines · tab to show less", .{arg_lines.len - shown});
+        if (fit.cut_by_screen) {
+            try content.print(alloc, "… {d} more {s}", .{ hidden, lineWord(hidden) });
+            if (view.expanded and foldable) try content.appendSlice(alloc, " · tab to show less");
+        } else if (!view.expanded) {
+            try content.print(alloc, "tab to show all {d} {s}", .{ arg_lines.len, lineWord(arg_lines.len) });
         } else {
             try content.appendSlice(alloc, "tab to show less");
         }
@@ -123,26 +152,56 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 
     const opts = optionsFor(view.always_offered);
     for (opts, 0..) |opt, i| {
-        if (i == view.selected) {
-            try content.appendSlice(alloc, th.accent);
-            try content.appendSlice(alloc, th.icon_arrow);
-            try content.append(alloc, ' ');
-        } else {
-            const arrow_w = term.displayWidth(th.icon_arrow);
-            var p: usize = 0;
-            while (p < arrow_w + 1) : (p += 1) try content.append(alloc, ' ');
-        }
         var label_buf: [192]u8 = undefined;
-        try content.print(alloc, "[{c}] {s}", .{ opt.key, optionLabel(&label_buf, opt.choice, tool_name, view.always_scope) });
-        if (i == view.selected) try content.appendSlice(alloc, th.reset);
+        try appendAnswer(alloc, &content, th, opt.key, optionLabel(&label_buf, opt.choice, tool_name), i == view.selected, width);
         if (i + 1 < opts.len) try content.append(alloc, '\n');
     }
 
     return try layout.drawBox(alloc, th, content.items, .{
         .title = "Permission required",
-        .width = arg_cols + 4,
+        .width = width,
         .padding = 1,
     });
+}
+
+fn appendAnswer(alloc: std.mem.Allocator, content: *std.ArrayList(u8), th: Theme, key: u8, label: []const u8, selected: bool, width: usize) !void {
+    const arrow_w = term.displayWidth(th.icon_arrow);
+    const indent = arrow_w + 1 + "[k] ".len;
+    const room = @max(width -| indent, 1);
+    if (selected) {
+        try content.appendSlice(alloc, th.accent);
+        try content.appendSlice(alloc, th.icon_arrow);
+        try content.append(alloc, ' ');
+    } else {
+        try content.appendNTimes(alloc, ' ', arrow_w + 1);
+    }
+    try content.print(alloc, "[{c}] ", .{key});
+    var used: usize = 0;
+    var words = std.mem.tokenizeScalar(u8, label, ' ');
+    while (words.next()) |word| {
+        const pieces = try layout.wrapLines(alloc, word, room);
+        defer alloc.free(pieces);
+        for (pieces, 0..) |piece, p| {
+            const piece_w = term.displayWidth(piece);
+            if (used > 0 and (p > 0 or used + 1 + piece_w > room)) {
+                if (selected) try content.appendSlice(alloc, th.reset);
+                try content.append(alloc, '\n');
+                if (selected) try content.appendSlice(alloc, th.accent);
+                try content.appendNTimes(alloc, ' ', indent);
+                used = 0;
+            } else if (used > 0) {
+                try content.append(alloc, ' ');
+                used += 1;
+            }
+            try content.appendSlice(alloc, piece);
+            used += piece_w;
+        }
+    }
+    if (selected) try content.appendSlice(alloc, th.reset);
+}
+
+fn lineWord(n: usize) []const u8 {
+    return if (n == 1) "line" else "lines";
 }
 
 /// 渲染 + 读键循环(不管 raw mode / 终端接管——调用方负责)。
@@ -152,18 +211,19 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 /// 重画用 render 实际行数(不再硬编码 8——参数长会折行变多行,硬编码会错位)。
 /// 回顶按终端现在的宽度数上一帧占的行:框比终端宽时画的那一刻就折了行,终端变窄后
 /// 又会把每行重排成多行(reflow.zig);回顶后 ED 0 清掉旧帧多出的行。
-pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, always_scope: AlwaysScope) ?PermissionChoice {
-    return answerLoop(alloc, th, in_fd, out_fd, tool_name, args, always_scope, .interactive);
+pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, always_comes_back: bool) ?PermissionChoice {
+    return answerLoop(alloc, th, in_fd, out_fd, tool_name, args, always_comes_back, .interactive);
 }
 
 fn promptLoopTimed(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, timing: answer_gate.Timing) ?PermissionChoice {
-    return answerLoop(alloc, th, in_fd, out_fd, tool_name, args, .project, timing);
+    return answerLoop(alloc, th, in_fd, out_fd, tool_name, args, true, timing);
 }
 
-fn answerLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, always_scope: AlwaysScope, timing: answer_gate.Timing) ?PermissionChoice {
-    const always_offered = !hard_to_undo.isHardToUndo(alloc, tool_name, args);
+fn answerLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, always_comes_back: bool, timing: answer_gate.Timing) ?PermissionChoice {
+    const hard = hard_to_undo.isHardToUndo(alloc, tool_name, args);
+    const always_offered = always_comes_back and !hard;
     const choices = optionsFor(always_offered);
-    var view: View = .{ .selected = firstSelected(always_offered), .always_offered = always_offered, .always_scope = always_scope };
+    var view: View = .{ .selected = firstSelected(choices, hard), .always_offered = always_offered };
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
     var parser = input_mod.KeyParser{};
@@ -172,6 +232,7 @@ fn answerLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, 
         const size = term.getSize(out_fd);
         const cols: u16 = if (size) |known| known.cols else 80;
         view.rows = if (size) |known| known.rows else 24;
+        view.cols = cols;
         if (drawn) |anchor| {
             var up_buf: [16]u8 = undefined;
             writeAll(out_fd, ansi.cursor.up(anchor.climb(cols, reflows), &up_buf));
@@ -279,21 +340,13 @@ test "render: the title, the tool, its arguments and the four answers saying wha
     try capture.expectNoAnsi(s);
 }
 
-test "render: the always answer names where the rule goes: this project, everywhere, or only this session" {
-    const th = theme_mod.monochrome;
-    const cases = [_]struct { scope: AlwaysScope, label: []const u8 }{
-        .{ .scope = .project, .label = "[a] Yes, and allow Edit in this project from now on" },
-        .{ .scope = .everywhere, .label = "[a] Yes, and allow Edit everywhere from now on" },
-        .{ .scope = .session, .label = "[a] Yes, and allow Edit for the rest of this session" },
-    };
-    for (cases) |c| {
-        const s = try render(testing.allocator, th, "Edit", "{\"file_path\":\"/x\"}", .{ .always_scope = c.scope });
-        defer testing.allocator.free(s);
-        try capture.expectContains(s, c.label);
-    }
-    const everywhere = try render(testing.allocator, th, "Edit", "{}", .{ .always_scope = .everywhere });
-    defer testing.allocator.free(everywhere);
-    try testing.expect(std.mem.indexOf(u8, everywhere, "in this project") == null);
+test "always is offered only where guard writes the rule to the project settings the next start reads" {
+    try testing.expect(alwaysComesBack(true, "/home/u", "/repo", "/repo"));
+    try testing.expect(!alwaysComesBack(true, "/home/u", "/tmp/not-a-repo", null));
+    try testing.expect(!alwaysComesBack(true, "/home/u", "/home/u", null));
+    try testing.expect(!alwaysComesBack(true, "/home/u", "/repo/.worktrees/topic", "/repo"));
+    try testing.expect(!alwaysComesBack(false, "/home/u", "/repo", "/repo"));
+    try testing.expect(!alwaysComesBack(true, "", "/repo", "/repo"));
 }
 
 test "render: dark 含 ANSI + 高亮箭头" {
@@ -324,10 +377,10 @@ test "render: long arguments are shown whole, wrapped at the box width" {
 fn argsOfLines(buf: []u8, n: usize) []const u8 {
     var len: usize = 0;
     for (0..n) |i| {
-        const line = std.fmt.bufPrint(buf[len..], "{d:0>2}{s}", .{ i, "-" ** 58 }) catch unreachable;
+        const line = std.fmt.bufPrint(buf[len..], "{d:0>2}{s}\n", .{ i, "-" ** 38 }) catch unreachable;
         len += line.len;
     }
-    return buf[0..len];
+    return buf[0 .. len - 1];
 }
 
 test "render: more than ten lines of arguments fold behind a tab hint, and expanding shows them all when the screen holds them" {
@@ -348,14 +401,72 @@ test "render: more than ten lines of arguments fold behind a tab hint, and expan
 
     const short_screen = try render(testing.allocator, th, "Bash", args, .{ .rows = 24, .expanded = true });
     defer testing.allocator.free(short_screen);
-    try capture.expectContains(short_screen, "11-");
-    try testing.expect(std.mem.indexOf(u8, short_screen, "12-") == null);
-    try capture.expectContains(short_screen, "… 13 more lines · tab to show less");
+    try capture.expectContains(short_screen, "13-");
+    try testing.expect(std.mem.indexOf(u8, short_screen, "14-") == null);
+    try capture.expectContains(short_screen, "… 11 more lines · tab to show less");
+
+    var one_buf: [40 * 12]u8 = undefined;
+    const one_hidden = try render(testing.allocator, th, "Bash", argsOfLines(&one_buf, 11), .{ .rows = 20, .expanded = true });
+    defer testing.allocator.free(one_hidden);
+    try capture.expectContains(one_hidden, "… 1 more line · tab to show less");
+}
+
+test "render: the whole frame, wrapped rows included, fits in a short or narrow terminal and says what it left out" {
+    const th = theme_mod.monochrome;
+    var buf: [40 * 30]u8 = undefined;
+    const args = argsOfLines(&buf, 25);
+    const long_tool = "mcp__a_rather_long_server_name__and_an_even_longer_tool_name_here";
+    const Case = struct { cols: u16, rows: u16, tool: []const u8 };
+    const cases = [_]Case{
+        .{ .cols = 80, .rows = 15, .tool = "Bash" }, .{ .cols = 80, .rows = 15, .tool = long_tool },
+        .{ .cols = 60, .rows = 24, .tool = "Bash" }, .{ .cols = 60, .rows = 24, .tool = long_tool },
+        .{ .cols = 40, .rows = 12, .tool = "Bash" },
+    };
+    for (cases) |c| {
+        for ([_]bool{ false, true }) |expanded| {
+            errdefer std.debug.print("{d}x{d} expanded={} tool={s}\n", .{ c.cols, c.rows, expanded, c.tool });
+            const s = try render(testing.allocator, th, c.tool, args, .{ .cols = c.cols, .rows = c.rows, .expanded = expanded });
+            defer testing.allocator.free(s);
+            try testing.expect(frameRows(s, c.cols) <= c.rows - 1);
+            var lines = std.mem.splitScalar(u8, s, '\n');
+            while (lines.next()) |line| try testing.expect(term.displayWidth(line) <= c.cols);
+            try testing.expect(std.mem.indexOf(u8, s, " more line") != null or std.mem.indexOf(u8, s, "tab to show all 25 lines") != null);
+        }
+    }
+
+    const short = try render(testing.allocator, th, "Bash", args, .{ .cols = 80, .rows = 15 });
+    defer testing.allocator.free(short);
+    try capture.expectContains(short, "04-");
+    try testing.expect(std.mem.indexOf(u8, short, "05-") == null);
+    try capture.expectContains(short, "… 20 more lines");
+    try testing.expect(std.mem.indexOf(u8, short, "tab to show") == null);
+}
+
+test "render: an answer too long for the box wraps between words, splits a word longer than a row, and keeps its highlight on every row" {
+    const tool = "mcp__a_rather_long_server_name__and_an_even_longer_tool_name_here";
+    const mono = try render(testing.allocator, theme_mod.monochrome, tool, "{}", .{ .cols = 60, .selected = 1 });
+    defer testing.allocator.free(mono);
+    var rows = std.mem.splitScalar(u8, mono, '\n');
+    while (rows.next()) |row| try testing.expect(term.displayWidth(row) <= 60);
+    try capture.expectContains(mono, "-> [a] Yes, and allow ");
+    try capture.expectContains(mono, tool[0..49]);
+    try capture.expectContains(mono, tool[49..] ++ " in this project from now on");
+
+    const th = theme_mod.dark;
+    const dark = try render(testing.allocator, th, tool, "{}", .{ .cols = 60, .selected = 1 });
+    defer testing.allocator.free(dark);
+    const first = std.mem.indexOf(u8, dark, "[a] Yes, and allow") orelse return error.TestUnexpectedResult;
+    const last = std.mem.indexOf(u8, dark, "from now on") orelse return error.TestUnexpectedResult;
+    const from = std.mem.lastIndexOfScalar(u8, dark[0..first], '\n') orelse return error.TestUnexpectedResult;
+    var answer_rows = std.mem.splitScalar(u8, dark[from + 1 .. last], '\n');
+    var count: usize = 0;
+    while (answer_rows.next()) |row| : (count += 1) try testing.expect(std.mem.indexOf(u8, row, th.accent) != null);
+    try testing.expectEqual(@as(usize, 3), count);
 }
 
 test "render: a call that is hard to undo offers no always and starts on No" {
     const th = theme_mod.monochrome;
-    const s = try render(testing.allocator, th, "Bash", "{\"command\":\"rm -rf build\"}", .{ .always_offered = false, .selected = firstSelected(false) });
+    const s = try render(testing.allocator, th, "Bash", "{\"command\":\"rm -rf build\"}", .{ .always_offered = false, .selected = firstSelected(optionsFor(false), true) });
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "[a]") == null);
     try capture.expectContains(s, "-> [n] No");
@@ -370,8 +481,9 @@ test "options: four answers, or three without always, each with its choice" {
     try testing.expectEqual(PermissionChoice.deny_tool_session, optionsFor(true)[3].choice);
     try testing.expectEqual(@as(usize, 3), optionsFor(false).len);
     for (optionsFor(false)) |opt| try testing.expect(opt.choice != .allow_always);
-    try testing.expectEqual(PermissionChoice.deny_once, optionsFor(false)[firstSelected(false)].choice);
-    try testing.expectEqual(PermissionChoice.allow_once, optionsFor(true)[firstSelected(true)].choice);
+    try testing.expectEqual(PermissionChoice.deny_once, optionsFor(false)[firstSelected(optionsFor(false), true)].choice);
+    try testing.expectEqual(PermissionChoice.allow_once, optionsFor(false)[firstSelected(optionsFor(false), false)].choice);
+    try testing.expectEqual(PermissionChoice.allow_once, optionsFor(true)[firstSelected(optionsFor(true), false)].choice);
 }
 
 test "VISUAL demo (打印到 stderr,看真实渲染)" {

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 
 from tty_driver import READY, case_tmpdir, run, wait_for
 from asserts import TTYAssert
@@ -39,7 +40,13 @@ def _result_text(result):
     return str(content)
 
 
-def _answer_dialog(bin_path, tool, tool_input, marker, keys):
+def _repository(prefix):
+    path = case_tmpdir(prefix)
+    subprocess.run(["git", "init", "-q", path], check=True)
+    return path
+
+
+def _answer_dialog(bin_path, tool, tool_input, marker, keys, cwd=None, env=None):
     turns = [
         slow_text_then_tooluse(n_chunks=1, delay=0.1, tool=tool, tool_input=tool_input),
         slow_text_then_end(n_chunks=1, delay=0.1),
@@ -48,9 +55,10 @@ def _answer_dialog(bin_path, tool, tool_input, marker, keys):
         raw = run(
             bin_path,
             [READY, "type:go", "key:enter", wait_for(marker, 15), "strictsleep:0.5"] + keys + ["sleep:2.5"],
+            env=env,
             base_url=srv.url,
             permission="default",
-            cwd=case_tmpdir("cc-tty-dialog-keys-project-"),
+            cwd=cwd or _repository("cc-tty-dialog-keys-project-"),
             startup_drain=0.8,
             per_key_drain=0.05,
         )
@@ -188,12 +196,85 @@ def test_a_command_that_is_hard_to_undo_offers_no_always_and_enter_refuses_it(bi
         a._fail("the refused command is not shown as not run")
 
 
-def test_the_dialog_says_what_always_and_dont_ask_again_cover(bin_path):
-    target = os.path.join(case_tmpdir("cc-tty-dialog-keys-labels-"), "answer.txt")
+def _call_without_dialog(bin_path, tool, tool_input, cwd):
+    turns = [
+        slow_text_then_tooluse(n_chunks=1, delay=0.1, tool=tool, tool_input=tool_input),
+        slow_text_then_end(n_chunks=1, delay=0.1),
+    ]
+    with SlowMockServer(turns) as srv:
+        raw = run(
+            bin_path,
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt", 15), "sleep:3"],
+            base_url=srv.url,
+            permission="default",
+            cwd=cwd,
+            startup_drain=0.8,
+            per_key_drain=0.05,
+        )
+        requests = list(srv.requests)
+    result = _tool_result(requests[1]) if len(requests) >= 2 else None
+    return TTYAssert(raw), result
+
+
+def test_always_in_a_repository_is_written_where_the_next_start_reads_it(bin_path):
+    project = _repository("cc-tty-dialog-keys-always-")
+    first = os.path.join(project, "first.txt")
     a, result = _answer_dialog(
-        bin_path, "Write", json.dumps({"file_path": target, "content": "x"}), "Permission required", ["type:n"])
+        bin_path, "Write", json.dumps({"file_path": first, "content": "x"}), "Permission required", ["type:a"], cwd=project)
     asked = a.screens_with("Permission required")
     for label in ("[a] Yes, and allow Write in this project from now on",
                   "[d] No, and deny Write for the rest of this session"):
         if not any(sc.find_row(label) is not None for sc in asked):
             a._fail(f"the dialog does not show {label!r}")
+    if result is None or result.get("is_error") or not os.path.exists(first):
+        a._fail(f"a did not allow the write: tool_result={result!r}")
+    settings = os.path.join(project, ".claude", "settings.local.json")
+    if not os.path.exists(settings):
+        a._fail(f"a wrote no rule to {settings}")
+    with open(settings) as f:
+        allowed = json.load(f).get("permissions", {}).get("allow", [])
+    if "Write" not in allowed:
+        a._fail(f"{settings} does not allow Write: {allowed!r}")
+
+    second = os.path.join(project, "second.txt")
+    a, result = _call_without_dialog(bin_path, "Write", json.dumps({"file_path": second, "content": "x"}), project)
+    if b"Permission required" in a.raw:
+        a._fail("the next start in the same repository asked again")
+    if result is None or result.get("is_error") or not os.path.exists(second):
+        a._fail(f"the next start did not run the allowed write: tool_result={result!r}")
+
+
+def test_outside_a_repository_the_dialog_offers_no_always(bin_path):
+    cwd = case_tmpdir("cc-tty-dialog-keys-no-repository-")
+    target = os.path.join(cwd, "answer.txt")
+    a, result = _answer_dialog(
+        bin_path, "Write", json.dumps({"file_path": target, "content": "x"}), "Permission required",
+        ["type:a", "strictsleep:0.6", "type:n"], cwd=cwd)
+    asked = a.screens_with("Permission required")
+    if any(sc.find_row("[a]") is not None for sc in asked):
+        a._fail("outside a repository the dialog offered an always answer")
+    if not any(sc.find_row("[d] No, and deny Write for the rest of this session") is not None for sc in asked):
+        a._fail("the dialog does not show its [d] answer")
+    if result is None or not result.get("is_error") or os.path.exists(target):
+        a._fail(f"a should not have answered and n should have refused: tool_result={result!r}")
+    if os.path.exists(os.path.join(cwd, ".claude", "settings.local.json")):
+        a._fail("a rule was written into the working directory")
+
+
+def test_started_in_the_home_directory_the_dialog_offers_no_always_and_writes_no_settings(bin_path):
+    home = case_tmpdir("cc-tty-dialog-keys-home-")
+    target = os.path.join(home, "answer.txt")
+    a, result = _answer_dialog(
+        bin_path, "Write", json.dumps({"file_path": target, "content": "x"}), "Permission required",
+        ["type:a", "strictsleep:0.6", "type:n"], cwd=home, env={"HOME": home})
+    asked = a.screens_with("Permission required")
+    if not asked:
+        a._fail("the permission dialog never opened")
+    if any(sc.find_row("[a]") is not None for sc in asked):
+        a._fail("started in the home directory, the dialog offered an always answer")
+    if result is None or not result.get("is_error") or os.path.exists(target):
+        a._fail(f"a should not have answered and n should have refused: tool_result={result!r}")
+    for name in ("settings.local.json", "settings.json"):
+        written = os.path.join(home, ".claude", name)
+        if os.path.exists(written):
+            a._fail(f"a settings file was written: {written}")

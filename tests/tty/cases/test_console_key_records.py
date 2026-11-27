@@ -15,6 +15,7 @@ records of them, so they never reach the decoder.
 """
 import json
 import os
+import subprocess
 import sys
 
 from tty_driver import READY, case_tmpdir, run, wait_for
@@ -69,11 +70,17 @@ def _result_text(result):
     return str(content)
 
 
+def _repository(prefix):
+    path = case_tmpdir(prefix)
+    subprocess.run(["git", "init", "-q", path], check=True)
+    return path
+
+
 def _answer_dialog(bin_path, tool, tool_input, dialog_marker, answer):
     """One tool call whose dialog takes `answer`; the tool_result the next
     request carried (None if there was none) and the final screen. The
-    session runs in a directory of its own: "Yes, always" keeps its rule in
-    the project's `.claude/settings.local.json`."""
+    session runs in a repository of its own: `[a]` keeps its rule in the
+    repository's `.claude/settings.local.json`."""
     turns = [
         slow_text_then_tooluse(n_chunks=1, delay=0.1, tool=tool, tool_input=tool_input),
         slow_text_then_end(n_chunks=1, delay=0.1),
@@ -85,7 +92,7 @@ def _answer_dialog(bin_path, tool, tool_input, dialog_marker, answer):
             + answer + ["sleep:2.0"],
             base_url=srv.url,
             permission="default",
-            cwd=case_tmpdir("cc-tty-records-project-"),
+            cwd=_repository("cc-tty-records-project-"),
             startup_drain=0.8,
             per_key_drain=0.05,
         )
@@ -116,7 +123,7 @@ def test_permission_dialog_reads_y_and_n_records(bin_path):
 
 
 def test_permission_dialog_reads_arrow_enter_and_ctrl_c_records(bin_path):
-    # Down then Enter: the second option, "Yes, always".
+    # Down then Enter: the second option, [a].
     a, result, written = _write_permission(bin_path, press("down", "enter"))
     if not written or result.get("is_error"):
         a._fail(f"Down, Enter did not allow the write: tool_result={_result_text(result)!r}")
