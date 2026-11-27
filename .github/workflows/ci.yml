@@ -534,7 +534,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          checkout=$(scripts/eval/workbuddy/provision_checkout.sh "$RUNNER_TEMP/workbuddy-bench")
+          checkout_dir=$(mktemp -d "$RUNNER_TEMP/workbuddy-bench.XXXXXX")
+          checkout=$(scripts/eval/workbuddy/provision_checkout.sh "$checkout_dir")
           echo "METACODES_WORKBUDDY_CHECKOUT=$checkout" >> "$GITHUB_ENV"
       # `zig build test` as its three parts (build.zig: `test` is exactly
       # `test:units`, `test:integration` and `test:product`): units and

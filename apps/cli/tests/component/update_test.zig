@@ -576,7 +576,7 @@ test "update: a session running from the install refuses the update; this instal
 
     // A session.
     {
-        var session = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "sleep", "30000" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        var session = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "wait-stdin" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
         defer session.kill(testing.io);
         try waitForProcesses(&env, 1);
         try testing.expectError(error.SessionsRunning, env.run(.{}));
@@ -599,11 +599,14 @@ test "update: a session running from the install refuses the update; this instal
         try testing.expect(std.mem.indexOf(u8, env.probeLog(), "--upgrade") == null);
         try testing.expectEqualStrings("1.0.0", (try install.measure(env.arena(), testing.io, env.prefix)).record.version);
         if (is_windows) try testing.expectError(error.IgnoreRunningUnsupported, env.run(.{ .ignore_running = true }));
+        session.stdin.?.close(testing.io);
+        session.stdin = null;
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try session.wait(testing.io));
     }
     try waitForProcesses(&env, 0);
 
     // The service: a kgd stand-in with its tinykgd child on a pipe.
-    var service = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "kgd" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    var service = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "kgd" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
     defer service.kill(testing.io);
     try waitForProcesses(&env, 2);
     const checked = try env.run(.{ .check = true });
@@ -630,13 +633,32 @@ test "update: --ignore-running goes ahead and names the sessions left running" {
     try env.publish(.{ .version = "1.1.0" }, false);
     try env.setLatest("1.1.0");
     const exe = try std.fs.path.join(env.arena(), &.{ env.prefix, "bin", EXE });
-    var session = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "sleep", "30000" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    var session = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "wait-stdin" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
     defer session.kill(testing.io);
     try waitForProcesses(&env, 1);
     const outcome = try env.run(.{ .ignore_running = true });
     try testing.expectEqual(update.Action.upgrade, outcome.action);
     try testing.expectEqual(@as(usize, 1), outcome.running_sessions.len);
     try testing.expectEqual(pidOf(&session), outcome.running_sessions[0]);
+    session.stdin.?.close(testing.io);
+    session.stdin = null;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try session.wait(testing.io));
+    try waitForProcesses(&env, 0);
+}
+
+test "update: fixture service and its child exit when the test closes stdin" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    try env.installDirect(.{ .version = "1.0.0", .tinykgd = .probe }, try env.mirrorSource());
+    const exe = try std.fs.path.join(env.arena(), &.{ env.prefix, "bin", EXE });
+    var service = try std.process.spawn(testing.io, .{ .argv = &.{ exe, "kgd" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer service.kill(testing.io);
+    try waitForProcesses(&env, 2);
+    service.stdin.?.close(testing.io);
+    service.stdin = null;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try service.wait(testing.io));
+    try waitForProcesses(&env, 0);
 }
 
 fn jsonOf(env: *Env, outcome: update.Outcome) ![]const u8 {
