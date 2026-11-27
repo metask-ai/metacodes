@@ -107,6 +107,7 @@ const SUBSYSTEMS = [_]Subsystem{
             "apps/cli/src/repl/tui/ansi.zig",
             "apps/cli/src/repl/tui/theme.zig",
             "apps/cli/src/repl/tui/term.zig",
+            "apps/cli/src/repl/tui/char_width.zig",
             "packages/ai/src/provider/ids.zig",
             "packages/ai/src/provider/offer.zig",
             "packages/ai/src/provider/controls.zig",

@@ -2657,27 +2657,7 @@ fn decodeCodepoint(s: []const u8) ?u21 {
     };
 }
 
-/// 显示宽度（East Asian Width 的 W/F = 2，其他 = 1，控制字符 = 0）。
-/// 简化表，覆盖 CJK + emoji 主要区段。
-fn codepointDisplayWidth(cp: u21) usize {
-    if (cp < 0x20 or cp == 0x7F) return 0;
-    // 常见双宽区段
-    if (cp >= 0x1100 and cp <= 0x115F) return 2; // Hangul Jamo
-    if (cp >= 0x2E80 and cp <= 0x303E) return 2; // CJK Radicals + 部首补充
-    if (cp >= 0x3041 and cp <= 0x33FF) return 2; // 日文假名 + CJK 符号
-    if (cp >= 0x3400 and cp <= 0x4DBF) return 2; // CJK 扩展 A
-    if (cp >= 0x4E00 and cp <= 0x9FFF) return 2; // CJK 统一
-    if (cp >= 0xA000 and cp <= 0xA4CF) return 2; // 彝文
-    if (cp >= 0xAC00 and cp <= 0xD7A3) return 2; // 韩文音节
-    if (cp >= 0xF900 and cp <= 0xFAFF) return 2; // CJK 兼容
-    if (cp >= 0xFE30 and cp <= 0xFE4F) return 2; // CJK 兼容形式
-    if (cp >= 0xFF00 and cp <= 0xFF60) return 2; // 全角 ASCII
-    if (cp >= 0xFFE0 and cp <= 0xFFE6) return 2; // 全角货币符号
-    if (cp >= 0x1F300 and cp <= 0x1FAFF) return 2; // emoji
-    if (cp >= 0x20000 and cp <= 0x2FFFD) return 2; // CJK 扩展 B-F
-    if (cp >= 0x30000 and cp <= 0x3FFFD) return 2; // CJK 扩展 G
-    return 1;
-}
+const codepointDisplayWidth = tui_term_root.codepointDisplayWidth;
 
 // ============================================================================
 // Tests

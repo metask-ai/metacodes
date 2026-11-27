@@ -45,9 +45,12 @@ const Vector = struct {
 };
 
 /// screen.py's cell token: `<ch><kind><class><written>`.
-fn encodeCell(c: vterm.Cell, buf: *[8]u8) []const u8 {
+fn encodeCell(c: vterm.Cell, buf: *[20]u8) []const u8 {
     var n: usize = 0;
-    if (!c.cont) n = std.unicode.utf8Encode(c.cp, buf[0..4]) catch unreachable;
+    if (!c.cont) {
+        n = std.unicode.utf8Encode(c.cp, buf[0..4]) catch unreachable;
+        for (c.marks[0..c.mark_count]) |mark| n += std.unicode.utf8Encode(mark, buf[n..][0..4]) catch unreachable;
+    }
     buf[n] = if (c.cont) 'c' else '0' + @as(u8, c.width);
     buf[n + 1] = switch (c.class) {
         .plain => 'p',
@@ -66,7 +69,7 @@ fn expectCells(name: []const u8, what: []const u8, index: usize, got: []const vt
         return error.TestExpectedEqual;
     }
     for (got, want, 0..) |c, tok, col| {
-        var buf: [8]u8 = undefined;
+        var buf: [20]u8 = undefined;
         const enc = encodeCell(c, &buf);
         if (!std.mem.eql(u8, enc, tok)) {
             std.debug.print("{s}: {s} {d} col {d}: vterm \"{s}\", screen.py \"{s}\"\n", .{ name, what, index, col, enc, tok });
@@ -149,15 +152,17 @@ test "vterm agrees with screen.py on every golden vector" {
     try testing.expect(count >= hand + 80);
 }
 
-test "vterm width table matches the TUI's (term.zig displayWidth)" {
+test "the TUI never counts a character narrower than the reference terminal draws it" {
     var cp: u21 = 0;
-    while (cp < 0x40000) : (cp += 1) {
+    while (cp <= 0x10FFFF) : (cp += 1) {
         if (cp >= 0xD800 and cp <= 0xDFFF) continue;
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
         const tui = cc.tui_term.displayWidth(buf[0..n]);
-        if (tui != vterm.charWidth(cp)) {
-            std.debug.print("U+{X:0>4}: term.zig width {d}, vterm {d}\n", .{ cp, tui, vterm.charWidth(cp) });
+        const drawn = vterm.charWidth(cp);
+        const kept_wider = (drawn == 0 and tui == 1) or (cp >= 0x1F1E6 and cp <= 0x1F1FF and drawn == 1 and tui == 2);
+        if (tui < drawn or (tui != drawn and !kept_wider)) {
+            std.debug.print("U+{X:0>4}: term.zig width {d}, reference terminal {d}\n", .{ cp, tui, drawn });
             return error.TestExpectedEqual;
         }
     }

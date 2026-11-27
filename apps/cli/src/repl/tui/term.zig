@@ -7,6 +7,7 @@
 //! - UTF-8 + CJK 全角的显示宽度计算(从 loop.zig 抽出来共享给所有组件)
 
 const std = @import("std");
+const char_width = @import("char_width.zig");
 
 // ============================================================================
 // 颜色能力
@@ -203,24 +204,25 @@ fn decodeCodepoint(s: []const u8) ?u21 {
     };
 }
 
-/// East Asian Width 主要区段(简化表)。
 pub fn codepointDisplayWidth(cp: u21) usize {
-    if (cp < 0x20 or cp == 0x7F) return 0;
-    if (cp >= 0x1100 and cp <= 0x115F) return 2; // Hangul Jamo
-    if (cp >= 0x2E80 and cp <= 0x303E) return 2;
-    if (cp >= 0x3041 and cp <= 0x33FF) return 2;
-    if (cp >= 0x3400 and cp <= 0x4DBF) return 2;
-    if (cp >= 0x4E00 and cp <= 0x9FFF) return 2;
-    if (cp >= 0xA000 and cp <= 0xA4CF) return 2;
-    if (cp >= 0xAC00 and cp <= 0xD7A3) return 2;
-    if (cp >= 0xF900 and cp <= 0xFAFF) return 2;
-    if (cp >= 0xFE30 and cp <= 0xFE4F) return 2;
-    if (cp >= 0xFF00 and cp <= 0xFF60) return 2;
-    if (cp >= 0xFFE0 and cp <= 0xFFE6) return 2;
-    if (cp >= 0x1F300 and cp <= 0x1FAFF) return 2;
-    if (cp >= 0x20000 and cp <= 0x2FFFD) return 2;
-    if (cp >= 0x30000 and cp <= 0x3FFFD) return 2;
+    if (cp < 0xA0) return if (cp < 0x20 or cp == 0x7F) 0 else 1;
+    if (inRanges(&char_width.zero, cp)) return 0;
+    if (inRanges(&char_width.wide, cp)) return 2;
     return 1;
+}
+
+fn inRanges(ranges: []const [2]u21, cp: u21) bool {
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cp < ranges[mid][0]) {
+            hi = mid;
+        } else if (cp > ranges[mid][1]) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -334,4 +336,23 @@ test "displayWidth: emoji = 2" {
 test "displayWidth: 控制字符 = 0" {
     try testing.expectEqual(@as(usize, 0), displayWidth("\x01\x02"));
     try testing.expectEqual(@as(usize, 5), displayWidth("\x01hello"));
+}
+
+test "displayWidth: wide emoji outside the U+1F300 block take two columns" {
+    for ([_][]const u8{ "✅", "❌", "⭐", "⚡", "⌛", "⏳", "☕", "✨" }) |emoji| try testing.expectEqual(@as(usize, 2), displayWidth(emoji));
+}
+
+test "displayWidth: combining marks take no column, joiners and zero width spaces one as Terminal.app draws them" {
+    try testing.expectEqual(@as(usize, 1), displayWidth("e\u{301}"));
+    try testing.expectEqual(@as(usize, 1), displayWidth("\u{200B}"));
+    try testing.expectEqual(@as(usize, 5), displayWidth("\u{1F468}\u{200D}\u{1F4BB}"));
+    try testing.expectEqual(@as(usize, 8), displayWidth("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"));
+}
+
+test "displayWidth: emoji presentation, flags and decomposed Hangul count at least what a terminal draws" {
+    try testing.expectEqual(@as(usize, 2), displayWidth("\u{26A0}\u{FE0F}"));
+    try testing.expectEqual(@as(usize, 2), displayWidth("1\u{FE0F}\u{20E3}"));
+    try testing.expectEqual(@as(usize, 4), displayWidth("\u{1F1E8}\u{1F1F3}"));
+    try testing.expectEqual(@as(usize, 4), displayWidth("\u{1112}\u{1161}\u{11AB}"));
+    try testing.expectEqual(@as(usize, 1), displayWidth("\u{1F321}"));
 }

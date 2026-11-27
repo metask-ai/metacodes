@@ -21,11 +21,13 @@
 //! (scroll regions, insert/delete, ECH and the rest are swallowed); ED 3
 //! clears the screen but keeps the scrollback; erased cells take the default
 //! style (no background-colour erase); a wide character that does not
-//! fit the last column of an autowrap terminal wraps whole; a line's text
+//! fit the last column of an autowrap terminal wraps whole; a zero-width
+//! mark joins the cell before the cursor, three at most; a line's text
 //! drops trailing U+0020 only (screen.py's `rstrip` drops all Unicode
 //! whitespace, so the parity corpus avoids the others).
 
 const std = @import("std");
+const terminal_width = @import("terminal_width.zig");
 
 /// screen.py's `border_class`: SGR foreground folded to the theme's semantic
 /// colours. Kept for parity; `Style` is the full state.
@@ -70,6 +72,8 @@ pub const Cell = struct {
     /// A character (an explicit space included) was written here. Erased
     /// cells are not; resize re-wrap measures a line by it.
     written: bool = false,
+    marks: [3]u21 = @splat(0),
+    mark_count: u2 = 0,
 };
 
 /// One scrollback line: its cells at the width it had when it left the
@@ -489,6 +493,7 @@ pub const Screen = struct {
     }
 
     fn putChar(self: *Screen, cp: u21, w: u2) !void {
+        if (w == 0 and cp >= 0xA0) return self.attachMark(cp);
         if (self.autowrap) {
             if (self.pending_wrap) {
                 self.pending_wrap = false;
@@ -517,6 +522,17 @@ pub const Screen = struct {
         } else if (self.col > self.cols) {
             self.col = self.cols;
         }
+    }
+
+    fn attachMark(self: *Screen, cp: u21) void {
+        var col = if (self.pending_wrap) self.col else if (self.col > 0) self.col - 1 else return;
+        col = @min(col, self.cols - 1);
+        const cells = self.grid.items[self.row];
+        if (cells[col].cont and col > 0) col -= 1;
+        const cell = &cells[col];
+        if (cell.mark_count == cell.marks.len) return;
+        cell.marks[cell.mark_count] = cp;
+        cell.mark_count += 1;
     }
 
     fn newline(self: *Screen) !void {
@@ -806,8 +822,8 @@ pub const Screen = struct {
         for (cells) |c| {
             if (c.cont) continue;
             var buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(c.cp, &buf) catch unreachable;
-            try out.appendSlice(gpa, buf[0..n]);
+            try out.appendSlice(gpa, buf[0 .. std.unicode.utf8Encode(c.cp, &buf) catch unreachable]);
+            for (c.marks[0..c.mark_count]) |mark| try out.appendSlice(gpa, buf[0 .. std.unicode.utf8Encode(mark, &buf) catch unreachable]);
         }
         var end = out.items.len;
         while (end > start and out.items[end - 1] == ' ') end -= 1;
@@ -1039,18 +1055,26 @@ pub const Screen = struct {
     }
 };
 
-/// Display width the terminal gives a code point. Same table as screen.py
-/// `char_width` and apps/cli/src/repl/tui/term.zig (vterm_test.zig pins all three):
-/// controls 0, East Asian wide and emoji blocks 2, everything else 1.
+/// Display width the terminal gives a code point: terminal_width.zig, the
+/// Unicode tables scripts/gen_char_width.py writes for this file and for
+/// screen.py `char_width`. A terminal model, not the TUI's own estimate.
 pub fn charWidth(cp: u21) u2 {
-    if (cp < 0x20 or cp == 0x7F) return 0;
-    const wide = [_][2]u21{
-        .{ 0x1100, 0x115F },   .{ 0x2E80, 0x303E },   .{ 0x3041, 0x33FF },
-        .{ 0x3400, 0x4DBF },   .{ 0x4E00, 0x9FFF },   .{ 0xA000, 0xA4CF },
-        .{ 0xAC00, 0xD7A3 },   .{ 0xF900, 0xFAFF },   .{ 0xFE30, 0xFE4F },
-        .{ 0xFF00, 0xFF60 },   .{ 0xFFE0, 0xFFE6 },   .{ 0x1F300, 0x1FAFF },
-        .{ 0x20000, 0x2FFFD }, .{ 0x30000, 0x3FFFD },
-    };
-    for (wide) |range| if (cp >= range[0] and cp <= range[1]) return 2;
+    if (cp < 0xA0) return if (cp < 0x20 or cp == 0x7F) 0 else 1;
+    if (inRanges(&terminal_width.zero, cp)) return 0;
+    if (inRanges(&terminal_width.wide, cp)) return 2;
     return 1;
+}
+
+fn inRanges(ranges: []const [2]u21, cp: u21) bool {
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cp < ranges[mid][0]) {
+            hi = mid;
+        } else if (cp > ranges[mid][1]) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
 }
