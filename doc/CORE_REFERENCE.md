@@ -79,14 +79,15 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 
 `zig build layer:check`(在 `gate:static` 里)检查:每个文件都有归属;每条 `@import`(包括 test 块里的,
 named module 按写下它的源文件算)和 `build.zig` 里每个 module 的 import 都在 `allowed_dependencies` 里;
-包之间无环;不深层 import 别的包的文件;module 根目录不覆盖它不能依赖的包。现状逐条文件边记在
+包之间无环;不深层 import 别的包的文件;module 根目录不覆盖它不能依赖的包。向上依赖和包间环必须为零,出现即失败,不进入基线。
+深层 import、module 接线和根目录过宽的现状记在
 `layer_baseline.zon`,**只减不增**:新违规会失败,已经消失的条目也必须删掉;CI 还会和 PR 的合并基线比较
 (`-Dlayer-base=<ref>`),白名单变多、kernel 预算放宽或 `allowed_dependencies` 变宽都会失败。
-调整分层(拆包、改归属)的 PR 单独提。拆包后暴露出来的边,只有基线代码里本来就有、而且按基线清单两端在同一个包里,才不算新增;
-upward 条目必须在基线的 upward 里,deep 条目可以来自基线的 upward 或 deep。一个包可以新依赖基线里没有的包,
+调整分层(拆包、改归属)的 PR 单独提。拆包后暴露出来的 deep 边,只有基线代码里本来就有、而且按基线清单两端在同一个包里,才不算新增。
+一个包可以新依赖基线里没有的包,
 前提是新包依赖的包它原来都能访问,新包的每个文件在基线代码里都已存在于同一路径、在基线清单里有归属,而且它原来就能访问那个包。
-从基线以来挪动过的文件(git 识别出的改名)按它在基线里的路径比较:upward 条目必须是基线里的 upward,
-deep 条目可以来自基线的 upward 或 deep,也可以是基线代码里两端同包的 import。
+从基线以来挪动过的文件(git 识别出的改名)的 deep 条目按它在基线里的路径比较:可以来自基线的 deep,
+也可以是基线代码里两端同包的 import。拆包和移动豁免仅适用于 deep,不能豁免向上依赖或包间环。
 包可以用 `root` 指定自己的一个文件作为公开入口:相对 import 别的包的 root 不算深层 import。新代码经 `packages/base/src/root.zig`、`packages/ai/src/root.zig` 访问 base 和 ai,不再往白名单里加条目。
 `kernel_budget` 限定 kernel 的行数和它依赖的包,只能往下调。唯一的例外是单独提的 PR:`max_lines` 和新的 `raise_reason` 一起抬高,而且这个 PR 本身不让 kernel 超过基线的预算,需要这部分额度的代码在之后的 PR 里提。检查会打印「包 → 包」的违规数,作为迁移进度表。
 建立时(2026-11)的现状:
