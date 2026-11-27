@@ -28,6 +28,7 @@ const files = @import("files.zig");
 const vscode = @import("vscode.zig");
 const apple = @import("apple_terminal.zig");
 const input = @import("../../repl/input.zig");
+const TerminalEnv = @import("../../repl/tui/term.zig").TerminalEnv;
 
 /// What Shift+Enter sends once set up: ESC CR.
 pub const newline_sequence = "\x1b\r";
@@ -35,10 +36,8 @@ pub const newline_sequence = "\x1b\r";
 /// The process environment this module reads (one struct so detection is a
 /// pure function of it in tests).
 pub const Env = struct {
-    term_program: ?[]const u8 = null,
+    terminal: TerminalEnv = .{},
     term_program_version: ?[]const u8 = null,
-    term: ?[]const u8 = null,
-    tmux: bool = false,
     /// `VSCODE_GIT_ASKPASS_MAIN`: a script inside the VS Code install.
     vscode_askpass_main: ?[]const u8 = null,
     path: ?[]const u8 = null,
@@ -78,10 +77,8 @@ pub const Env = struct {
         };
         const env: Lookup = .{ .vars = vars };
         return .{
-            .term_program = env.get("TERM_PROGRAM"),
+            .terminal = TerminalEnv.fromProcess(),
             .term_program_version = env.get("TERM_PROGRAM_VERSION"),
-            .term = env.get("TERM"),
-            .tmux = env.get("TMUX") != null,
             .vscode_askpass_main = env.get("VSCODE_GIT_ASKPASS_MAIN"),
             .path = env.get("PATH"),
             .cursor_trace_id = env.get("CURSOR_TRACE_ID") != null,
@@ -121,14 +118,18 @@ const native_term_programs = [_]struct { []const u8, []const u8 }{
 };
 
 pub fn detect(env: Env) Host {
-    if (env.tmux) return .tmux;
+    switch (env.terminal.innerMultiplexer()) {
+        .tmux => return .tmux,
+        .gnu_screen, .zellij, .remote_tmux => return .{ .other = null },
+        .none => {},
+    }
     // TERM is the terminal's own; TERM_PROGRAM may be inherited from the one
     // that started it (kitty opened from Terminal.app), as in input.zig.
-    if (env.term) |term| {
+    if (env.terminal.term) |term| {
         if (std.mem.indexOf(u8, term, "kitty") != null) return .{ .native = "kitty" };
         if (std.mem.eql(u8, term, "xterm-ghostty")) return .{ .native = "Ghostty" };
     }
-    const tp = env.term_program orelse return .{ .other = null };
+    const tp = env.terminal.resolvedTermProgram() orelse return .{ .other = null };
     if (std.mem.eql(u8, tp, "Apple_Terminal")) return .apple_terminal;
     if (std.mem.eql(u8, tp, "vscode")) return if (vscode.isRemote(env)) .vscode_remote else .vscode;
     for (native_term_programs) |entry| if (std.mem.eql(u8, tp, entry[0])) return .{ .native = entry[1] };
@@ -889,17 +890,17 @@ test "the newline sequence is what KeyParser reads as Shift+Enter" {
 }
 
 test "detect: the terminals with a setup, the native ones, and the rest" {
-    try testing.expect(detect(.{ .term_program = "Apple_Terminal", .term = "xterm-256color" }) == .apple_terminal);
-    try testing.expect(detect(.{ .term_program = "vscode", .term = "xterm-256color" }) == .vscode);
-    try testing.expect(detect(.{ .term_program = "vscode", .remote_session = true }) == .vscode_remote);
-    try testing.expectEqualStrings("iTerm2", detect(.{ .term_program = "iTerm.app" }).native);
-    try testing.expectEqualStrings("Warp", detect(.{ .term_program = "WarpTerminal" }).native);
-    try testing.expectEqualStrings("Ghostty", detect(.{ .term_program = "ghostty" }).native);
-    try testing.expectEqualStrings("WezTerm", detect(.{ .term_program = "WezTerm" }).native);
+    try testing.expect(detect(.{ .terminal = .{ .term_program = "Apple_Terminal", .term = "xterm-256color" } }) == .apple_terminal);
+    try testing.expect(detect(.{ .terminal = .{ .term_program = "vscode", .term = "xterm-256color" } }) == .vscode);
+    try testing.expect(detect(.{ .terminal = .{ .term_program = "vscode" }, .remote_session = true }) == .vscode_remote);
+    try testing.expectEqualStrings("iTerm2", detect(.{ .terminal = .{ .term_program = "iTerm.app" } }).native);
+    try testing.expectEqualStrings("Warp", detect(.{ .terminal = .{ .term_program = "WarpTerminal" } }).native);
+    try testing.expectEqualStrings("Ghostty", detect(.{ .terminal = .{ .term_program = "ghostty" } }).native);
+    try testing.expectEqualStrings("WezTerm", detect(.{ .terminal = .{ .term_program = "WezTerm" } }).native);
     // TERM is the terminal's own: kitty started from Terminal.app is kitty.
-    try testing.expectEqualStrings("kitty", detect(.{ .term_program = "Apple_Terminal", .term = "xterm-kitty" }).native);
-    try testing.expect(detect(.{ .term_program = "Apple_Terminal", .tmux = true }) == .tmux);
-    try testing.expectEqualStrings("Hyper", detect(.{ .term_program = "Hyper" }).other.?);
+    try testing.expectEqualStrings("kitty", detect(.{ .terminal = .{ .term_program = "Apple_Terminal", .term = "xterm-kitty" } }).native);
+    try testing.expect(detect(.{ .terminal = .{ .term_program = "Apple_Terminal", .tmux = true } }) == .tmux);
+    try testing.expectEqualStrings("Hyper", detect(.{ .terminal = .{ .term_program = "Hyper" } }).other.?);
     try testing.expect(detect(.{}).other == null);
 }
 
@@ -911,6 +912,70 @@ test "detect: the native terminals are the ones input.zig turns the keyboard pro
     // the terminal.
     try testing.expect(input.classifyKittyKeyboard("Apple_Terminal", "xterm-256color", .none) == .disable);
     try testing.expect(input.classifyKittyKeyboard("vscode", "xterm-256color", .none) == .disable);
+}
+
+test "terminal environment agrees across setup, keyboard, color and reflow" {
+    const term = @import("../../repl/tui/term.zig");
+    const cases = [_]TerminalEnv{
+        .{ .term = "screen-256color", .term_program = "Apple_Terminal" },
+        .{ .sty = true, .term = "xterm-256color", .term_program = "vscode" },
+        .{ .zellij = true, .term = "xterm-256color", .term_program = "Apple_Terminal" },
+        .{ .zellij = true, .term = "xterm-256color", .term_program = "vscode" },
+    };
+    for (cases) |terminal| {
+        try testing.expect(detect(.{ .terminal = terminal }).other == null);
+        try testing.expectEqual(input.KeyboardPolicy.disable, input.keyboardPolicyFor(terminal));
+        if (terminal.insideGnuScreen()) {
+            try testing.expect(terminal.wrappedByGnuScreen());
+            try testing.expect(!term.reflowFor(terminal, false));
+            try testing.expect(!term.reflowNeedsProbeFor(terminal));
+        }
+    }
+    const nested: TerminalEnv = .{ .sty = true, .tmux = true, .term = "tmux-256color", .term_program = "vscode" };
+    try testing.expect(nested.wrappedByGnuScreen());
+    try testing.expect(!nested.insideGnuScreen());
+    try testing.expect(term.effectiveColorterm("truecolor", nested.sty, nested.tmux, nested.term) == null);
+    try testing.expect(term.reflowFor(nested, true));
+    try testing.expect(!term.reflowNeedsProbeFor(nested));
+    try testing.expectEqual(input.KeyboardPolicy.enable, input.keyboardPolicyFor(nested));
+    try testing.expect(detect(.{ .terminal = nested }) == .tmux);
+    const iterm: TerminalEnv = .{ .lc_terminal = "iTerm2", .term = "xterm-256color" };
+    try testing.expectEqual(input.KeyboardPolicy.enable, input.keyboardPolicyFor(iterm));
+    try testing.expectEqualStrings("iTerm2", detect(.{ .terminal = iterm }).native);
+}
+
+test "SSH terminal signals reach the process consumers and screen never enables mouse reporting" {
+    const term = @import("../../repl/tui/term.zig");
+    const copy = @import("../../repl/tui/copy_select.zig");
+    const names = [_][*:0]const u8{ "TMUX", "STY", "ZELLIJ", "TERM", "TERM_PROGRAM", "LC_TERMINAL", "XTERM_VERSION", input.no_keyboard_enhancement_env, copy.no_mouse_env };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var previous: [names.len]?[:0]u8 = undefined;
+    for (names, &previous) |name, *saved| saved.* = if (std.c.getenv(name)) |raw| try arena.dupeZ(u8, std.mem.span(raw)) else null;
+    defer for (names, previous) |name, saved| {
+        if (saved) |value| paths.setEnv(name, value.ptr) else paths.unsetEnv(name);
+    };
+    for (names) |name| paths.unsetEnv(name);
+    paths.setEnv("TERM", "screen-256color");
+    paths.setEnv("TERM_PROGRAM", "vscode");
+    const screen = try Env.fromProcess(arena);
+    try testing.expect(screen.terminal.insideGnuScreen());
+    try testing.expect(input.insideGnuScreen());
+    try testing.expectEqual(input.KeyboardPolicy.disable, input.keyboardPolicy());
+    try testing.expect(!term.reflowNeedsProbe());
+    if (@import("metacodes-internal").platform.terminal.console_reflows == null) try testing.expect(!term.reflowFromEnv());
+    try testing.expect(detect(screen).other == null);
+    const was_mouse = input.mouseSelectionOn();
+    defer input.recordMouseSelection(was_mouse);
+    input.recordMouseSelection(false);
+    copy.enable(testing.allocator, "", -1);
+    try testing.expect(!input.mouseSelectionOn());
+    paths.setEnv("TERM", "xterm-256color");
+    paths.unsetEnv("TERM_PROGRAM");
+    paths.setEnv("LC_TERMINAL", "iTerm2");
+    try testing.expectEqual(input.KeyboardPolicy.enable, input.keyboardPolicy());
+    try testing.expectEqualStrings("iTerm2", detect(try Env.fromProcess(arena)).native);
 }
 
 const Harness = struct {
@@ -958,7 +1023,7 @@ test "run vscode: a missing file is created, a second run changes nothing, resto
     const h = try Harness.init();
     defer h.deinit();
     try h.tmp.dir.createDirPath(testing.io, "appdata/Code/User");
-    const env: Env = .{ .term_program = "vscode", .os = .windows, .home = h.root, .appdata = try h.join(&.{"appdata"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .windows, .home = h.root, .appdata = try h.join(&.{"appdata"}) };
     const ctx = try h.ctx(env);
     const file = try h.join(&.{ "appdata", "Code", "User", "keybindings.json" });
 
@@ -1002,7 +1067,7 @@ test "run vscode: comments and trailing commas survive, the backup is the file b
     ;
     try h.tmp.dir.createDirPath(testing.io, "cfg/Cursor/User");
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "cfg/Cursor/User/keybindings.json", .data = original });
-    const env: Env = .{ .term_program = "vscode", .cursor_trace_id = true, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .cursor_trace_id = true, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const ctx = try h.ctx(env);
     const file = try h.join(&.{ "cfg", "Cursor", "User", "keybindings.json" });
 
@@ -1035,7 +1100,7 @@ test "run vscode: a conflicting binding and a broken file are left alone, withou
     ;
     try h.tmp.dir.createDirPath(testing.io, "home/Library/Application Support/Code/User");
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "home/Library/Application Support/Code/User/keybindings.json", .data = conflicting });
-    const env: Env = .{ .term_program = "vscode", .os = .macos, .home = try h.join(&.{"home"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .macos, .home = try h.join(&.{"home"}) };
     const ctx = try h.ctx(env);
     const file = try h.join(&.{ "home", "Library", "Application Support", "Code", "User", "keybindings.json" });
 
@@ -1053,7 +1118,7 @@ test "run vscode: a conflicting binding and a broken file are left alone, withou
 
     // A settings folder that is not there is not created.
     h.reset();
-    const nowhere: Env = .{ .term_program = "vscode", .os = .macos, .home = try h.join(&.{"nobody"}) };
+    const nowhere: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .macos, .home = try h.join(&.{"nobody"}) };
     try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(nowhere), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "--keybindings") != null);
 }
@@ -1068,7 +1133,7 @@ test "run vscode: a keybindings.json that is a link: the file it links to change
     try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
     const target = try h.join(&.{ "dotfiles", "keybindings.json" });
     try @import("metacodes-internal").platform.test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
-    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const ctx = try h.ctx(env);
     const link_path = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
 
@@ -1089,7 +1154,7 @@ test "run vscode: a keybindings.json that is a link: the file it links to change
     h.reset();
     try h.tmp.dir.createDirPath(testing.io, "cfg2/Code/User");
     try @import("metacodes-internal").platform.test_support.symlinkOrSkip(h.tmp.dir, testing.io, try h.join(&.{ "dotfiles", "gone.json" }), "cfg2/Code/User/keybindings.json", .{});
-    const dangling: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg2"}) };
+    const dangling: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg2"}) };
     try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(dangling), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "does not exist") != null);
     try testing.expect(!files.exists(try h.join(&.{ "dotfiles", "gone.json" })));
@@ -1110,7 +1175,7 @@ test "run vscode: a keybindings.json that cannot be written is left alone, and t
     const arena = h.arena_state.allocator();
     try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
     try h.tmp.dir.createDirPath(testing.io, "cfg/Cursor/User");
-    const code_env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const code_env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     var cursor_env = code_env;
     cursor_env.cursor_trace_id = true;
     // The record lists Cursor's file already.
@@ -1142,7 +1207,7 @@ test "run vscode: a link to a file that cannot be written says to add the bindin
     const target = try h.join(&.{ "store", "keybindings.json" });
     try @import("metacodes-internal").platform.test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
     try occupy(h, "store/keybindings.json.metacodes-tmp");
-    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const link_path = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
 
     try testing.expectEqual(Outcome.failed, run(testing.allocator, try h.ctx(env), .{}, &h.out.writer).outcome);
@@ -1176,7 +1241,7 @@ test "run vscode: the command for a profile quotes its file for the shell it is 
     // POSIX: a ' in the path.
     try h.tmp.dir.createDirPath(testing.io, "it's/Code/User/globalStorage");
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "it's/Code/User/globalStorage/storage.json", .data = storage });
-    const posix: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"it's"}) };
+    const posix: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"it's"}) };
     try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(posix), .{ .action = .preview }, &h.out.writer).outcome);
     const posix_file = try h.join(&.{ "it's", "Code", "User", "profiles", "1d77a59e", "keybindings.json" });
     const posix_cmd = try std.fmt.allocPrint(h.arena_state.allocator(), "--keybindings {s}\n", .{try shellArg(h.arena_state.allocator(), .other, posix_file)});
@@ -1187,7 +1252,7 @@ test "run vscode: the command for a profile quotes its file for the shell it is 
     h.reset();
     try h.tmp.dir.createDirPath(testing.io, "app data/Code/User/globalStorage");
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "app data/Code/User/globalStorage/storage.json", .data = storage });
-    const windows: Env = .{ .term_program = "vscode", .os = .windows, .home = h.root, .appdata = try h.join(&.{"app data"}) };
+    const windows: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .windows, .home = h.root, .appdata = try h.join(&.{"app data"}) };
     try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(windows), .{ .action = .preview }, &h.out.writer).outcome);
     const windows_file = try h.join(&.{ "app data", "Code", "User", "profiles", "1d77a59e", "keybindings.json" });
     const windows_cmd = try std.fmt.allocPrint(h.arena_state.allocator(), "--keybindings \"{s}\"\n", .{windows_file});
@@ -1200,7 +1265,7 @@ test "run vscode: --restore --terminal undoes only that build; a named file with
     const arena = h.arena_state.allocator();
     try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
     try h.tmp.dir.createDirPath(testing.io, "cfg/Cursor/User");
-    const code_env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const code_env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     var cursor_env = code_env;
     cursor_env.cursor_trace_id = true;
     try testing.expectEqual(Outcome.changed, run(testing.allocator, try h.ctx(code_env), .{}, &h.out.writer).outcome);
@@ -1233,7 +1298,7 @@ test "run vscode: restore keeps the record when the file does not parse, and fin
     defer h.deinit();
     const arena = h.arena_state.allocator();
     try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
-    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const ctx = try h.ctx(env);
     try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
     const file = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
@@ -1263,7 +1328,7 @@ test "run: a record that cannot be read stops install and restore before anythin
     try h.tmp.dir.createDirPath(testing.io, "state/terminal-setup");
     const garbage = "{\"vscode\": [ {\"keybindings\": \"/other/file\"";
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "state/terminal-setup/installed.json", .data = garbage });
-    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const ctx = try h.ctx(env);
 
     try testing.expectEqual(Outcome.refused, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
@@ -1284,7 +1349,7 @@ test "run vscode: profiles with their own shortcuts are named, and the footer wa
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "cfg/Code/User/globalStorage/storage.json", .data =
         \\{"userDataProfiles":[{"location":"1d77a59e","name":"tsprobe"},{"location":"5c2e","name":"shared","useDefaultFlags":{"keybindings":true}}]}
     });
-    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     const ctx = try h.ctx(env);
     const profile_file = try h.join(&.{ "cfg", "Code", "User", "profiles", "1d77a59e", "keybindings.json" });
 
@@ -1311,22 +1376,22 @@ test "run vscode: profiles with their own shortcuts are named, and the footer wa
 test "run: native terminals, tmux and unknown ones change nothing" {
     const h = try Harness.init();
     defer h.deinit();
-    try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .term_program = "iTerm.app" }), .{}, &h.out.writer).outcome);
+    try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .terminal = .{ .term_program = "iTerm.app" } }), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "iTerm2") != null);
     try testing.expect(std.mem.indexOf(u8, h.report(), "Nothing to set up") != null);
     h.reset();
-    try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(.{ .tmux = true }), .{}, &h.out.writer).outcome);
+    try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(.{ .terminal = .{ .tmux = true } }), .{}, &h.out.writer).outcome);
     h.reset();
-    try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .term_program = "Hyper" }), .{}, &h.out.writer).outcome);
+    try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .terminal = .{ .term_program = "Hyper" } }), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "\\e\\r") != null);
     // A terminal the startup probe found speaking the keyboard protocol needs nothing.
     h.reset();
-    var probed = try h.ctx(.{ .term_program = "SomeNewTerminal" });
+    var probed = try h.ctx(.{ .terminal = .{ .term_program = "SomeNewTerminal" } });
     probed.keyboard_protocol = true;
     try testing.expectEqual(Outcome.unchanged, run(testing.allocator, probed, .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "already inserts a newline") != null);
     h.reset();
-    try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(.{ .term_program = "vscode", .remote_session = true }), .{}, &h.out.writer).outcome);
+    try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(.{ .terminal = .{ .term_program = "vscode" }, .remote_session = true }), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "workbench.action.terminal.sendSequence") != null);
     try testing.expect(!files.exists(try h.join(&.{"state"})));
 }
@@ -1336,16 +1401,16 @@ test "run: with METACODES_NO_KEYBOARD_ENHANCEMENT set the report names it and no
     defer h.deinit();
     for ([_][]const u8{ "iTerm.app", "ghostty", "WezTerm", "WarpTerminal", "Hyper" }) |term_program| {
         h.reset();
-        try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .term_program = term_program, .no_keyboard_enhancement = true }), .{}, &h.out.writer).outcome);
+        try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .terminal = .{ .term_program = term_program }, .no_keyboard_enhancement = true }), .{}, &h.out.writer).outcome);
         try testing.expect(std.mem.startsWith(u8, h.report(), input.no_keyboard_enhancement_env ++ " is set"));
         try testing.expect(std.mem.indexOf(u8, h.report(), "already inserts a newline") == null);
     }
     try testing.expect(std.mem.indexOf(u8, h.report(), "\\e\\r") != null);
     h.reset();
-    _ = run(testing.allocator, try h.ctx(.{ .term = "xterm-kitty", .no_keyboard_enhancement = true }), .{}, &h.out.writer);
+    _ = run(testing.allocator, try h.ctx(.{ .terminal = .{ .term = "xterm-kitty" }, .no_keyboard_enhancement = true }), .{}, &h.out.writer);
     try testing.expect(std.mem.indexOf(u8, h.report(), "Terminal: kitty. With the protocol off, Shift+Enter arrives as a plain Return and submits") != null);
     h.reset();
-    _ = run(testing.allocator, try h.ctx(.{ .term = "xterm-kitty" }), .{}, &h.out.writer);
+    _ = run(testing.allocator, try h.ctx(.{ .terminal = .{ .term = "xterm-kitty" } }), .{}, &h.out.writer);
     try testing.expect(std.mem.indexOf(u8, h.report(), input.no_keyboard_enhancement_env) == null);
     try testing.expect(std.mem.indexOf(u8, h.report(), "already inserts a newline") != null);
 }
@@ -1445,7 +1510,7 @@ test "run apple terminal (macOS): set up, a dry run, a second run, the record, r
         \\{"Default Window Settings":"Basic","Startup Window Settings":"Basic","Window Settings":{"Basic":{"name":"Basic"}}}
     );
 
-    var ctx = try h.ctx(.{ .term_program = "Apple_Terminal", .home = h.root });
+    var ctx = try h.ctx(.{ .terminal = .{ .term_program = "Apple_Terminal" }, .home = h.root });
     ctx.apple = store;
     ctx.terminal_pid = 4242;
 
@@ -1491,7 +1556,7 @@ test "run apple terminal (macOS): a change that does not take is rolled back, an
     const arena = h.arena_state.allocator();
     // The record lists a VS Code file already; that entry has to come through.
     try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
-    const code_env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const code_env: Env = .{ .terminal = .{ .term_program = "vscode" }, .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
     try testing.expectEqual(Outcome.changed, run(testing.allocator, try h.ctx(code_env), .{}, &h.out.writer).outcome);
     const record_file = try h.join(&.{ "state", "terminal-setup", "installed.json" });
     const record_before = try files.read(arena, record_file);
@@ -1499,7 +1564,7 @@ test "run apple terminal (macOS): a change that does not take is rolled back, an
         \\{"Default Window Settings":"Basic","Startup Window Settings":"Basic","Window Settings":{"Basic":{"name":"Basic"}}}
     );
     const prefs_before = try exportDomain(h, store.domain);
-    var ctx = try h.ctx(.{ .term_program = "Apple_Terminal", .home = h.root });
+    var ctx = try h.ctx(.{ .terminal = .{ .term_program = "Apple_Terminal" }, .home = h.root });
     ctx.terminal_pid = 4242;
 
     // The edit fails before anything is imported: this Terminal.app has no

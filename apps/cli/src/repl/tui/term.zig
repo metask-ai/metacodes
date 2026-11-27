@@ -9,6 +9,81 @@
 const std = @import("std");
 const char_width = @import("char_width.zig");
 
+pub const TerminalEnv = struct {
+    term: ?[]const u8 = null,
+    term_program: ?[]const u8 = null,
+    lc_terminal: ?[]const u8 = null,
+    tmux: bool = false,
+    sty: bool = false,
+    zellij: bool = false,
+    xterm: bool = false,
+
+    pub const Multiplexer = enum { none, tmux, gnu_screen, zellij, remote_tmux };
+
+    pub fn fromProcess() TerminalEnv {
+        return .{
+            .term = value("TERM"),
+            .term_program = value("TERM_PROGRAM"),
+            .lc_terminal = value("LC_TERMINAL"),
+            .tmux = nonEmpty("TMUX"),
+            .sty = nonEmpty("STY"),
+            .zellij = value("ZELLIJ") != null,
+            .xterm = nonEmpty("XTERM_VERSION"),
+        };
+    }
+
+    pub fn innerMultiplexer(self: TerminalEnv) Multiplexer {
+        if (self.tmux) return .tmux;
+        if (self.wrappedByGnuScreen()) return .gnu_screen;
+        if (self.zellij) return .zellij;
+        if (self.term) |term| if (std.mem.startsWith(u8, term, "tmux")) return .remote_tmux;
+        return .none;
+    }
+
+    pub fn insideTmux(self: TerminalEnv) bool {
+        return self.innerMultiplexer() == .tmux;
+    }
+
+    pub fn insideGnuScreen(self: TerminalEnv) bool {
+        return self.innerMultiplexer() == .gnu_screen;
+    }
+
+    pub fn wrappedByGnuScreen(self: TerminalEnv) bool {
+        if (self.sty) return true;
+        const term = self.term orelse return false;
+        return !self.tmux and std.mem.startsWith(u8, term, "screen");
+    }
+
+    pub fn resolvedTermProgram(self: TerminalEnv) ?[]const u8 {
+        if (self.term_program) |program| if (program.len > 0) return program;
+        if (self.lc_terminal) |terminal| if (std.mem.eql(u8, terminal, "iTerm2")) return "iTerm.app";
+        return null;
+    }
+
+    fn value(name: [*:0]const u8) ?[]const u8 {
+        return if (std.c.getenv(name)) |raw| std.mem.span(raw) else null;
+    }
+
+    fn nonEmpty(name: [*:0]const u8) bool {
+        return if (value(name)) |raw| raw.len > 0 else false;
+    }
+};
+
+test "multiplexer layers and terminal program resolution" {
+    const screen: TerminalEnv = .{ .term = "screen-256color" };
+    try testing.expect(screen.insideGnuScreen());
+    try testing.expect(screen.wrappedByGnuScreen());
+    const nested: TerminalEnv = .{ .tmux = true, .sty = true, .term = "tmux-256color" };
+    try testing.expect(nested.insideTmux());
+    try testing.expect(!nested.insideGnuScreen());
+    try testing.expect(nested.wrappedByGnuScreen());
+    try testing.expectEqual(TerminalEnv.Multiplexer.zellij, (TerminalEnv{ .zellij = true }).innerMultiplexer());
+    try testing.expectEqual(TerminalEnv.Multiplexer.remote_tmux, (TerminalEnv{ .term = "tmux-256color" }).innerMultiplexer());
+    try testing.expectEqualStrings("iTerm.app", (TerminalEnv{ .lc_terminal = "iTerm2" }).resolvedTermProgram().?);
+    try testing.expectEqualStrings("vscode", (TerminalEnv{ .term_program = "vscode", .lc_terminal = "iTerm2" }).resolvedTermProgram().?);
+    try testing.expectEqualStrings("iTerm.app", (TerminalEnv{ .term_program = "", .lc_terminal = "iTerm2" }).resolvedTermProgram().?);
+}
+
 // ============================================================================
 // 颜色能力
 // ============================================================================
@@ -84,11 +159,11 @@ pub fn detectFromEnv(fd: c_int) ColorCapability {
             force_color = std.fmt.parseInt(u8, s, 10) catch 1; // 任何非空 = at least basic
         }
     }
-    const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
+    const env = TerminalEnv.fromProcess();
     const inherited = if (std.c.getenv("COLORTERM")) |t| std.mem.span(t) else null;
-    const colorterm = effectiveColorterm(inherited, envSet("STY"), envSet("TMUX"), term);
+    const colorterm = if (env.wrappedByGnuScreen()) null else inherited;
 
-    return detectColor(no_color, force_color, term, colorterm, tty);
+    return detectColor(no_color, force_color, env.term, colorterm, tty);
 }
 
 pub fn effectiveColorterm(colorterm: ?[]const u8, sty: bool, tmux: bool, term: ?[]const u8) ?[]const u8 {
@@ -96,9 +171,7 @@ pub fn effectiveColorterm(colorterm: ?[]const u8, sty: bool, tmux: bool, term: ?
 }
 
 pub fn insideScreen(sty: bool, tmux: bool, term: ?[]const u8) bool {
-    if (sty) return true;
-    const t = term orelse return false;
-    return !tmux and std.mem.startsWith(u8, t, "screen");
+    return (TerminalEnv{ .sty = sty, .tmux = tmux, .term = term }).wrappedByGnuScreen();
 }
 
 // ============================================================================
@@ -158,9 +231,12 @@ pub fn recordProbeAnswers(xtversion: []const u8, da2: []const u8) void {
 
 pub fn reflowNeedsProbe() bool {
     if (platform_term.console_reflows != null) return false;
-    const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
-    if (envSet("TMUX") or envSet("STY") or envSet("XTERM_VERSION")) return false;
-    return if (term) |t| !termClips(t) else true;
+    return reflowNeedsProbeFor(TerminalEnv.fromProcess());
+}
+
+pub fn reflowNeedsProbeFor(env: TerminalEnv) bool {
+    if (env.insideTmux() or env.insideGnuScreen() or env.xterm) return false;
+    return if (env.term) |t| !termClips(t) else true;
 }
 
 /// detectReflow over the process environment (`TMUX`, GNU screen's `STY`,
@@ -170,13 +246,11 @@ pub fn reflowNeedsProbe() bool {
 /// platform.terminal.console_reflows), neither is consulted.
 pub fn reflowFromEnv() bool {
     if (platform_term.console_reflows) |reflows| return reflows;
-    const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
-    return detectReflow(envSet("TMUX"), envSet("STY"), envSet("XTERM_VERSION") or g_answers_name_clipping_terminal, term);
+    return reflowFor(TerminalEnv.fromProcess(), g_answers_name_clipping_terminal);
 }
 
-fn envSet(name: [*:0]const u8) bool {
-    const v = std.c.getenv(name) orelse return false;
-    return std.mem.span(v).len > 0;
+pub fn reflowFor(env: TerminalEnv, probe_clips: bool) bool {
+    return detectReflow(env.insideTmux(), env.insideGnuScreen(), env.xterm or probe_clips, env.term);
 }
 
 // ============================================================================
