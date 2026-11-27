@@ -7,6 +7,12 @@
             .root = "packages/base/src/root.zig",
         },
         .{
+            .name = "lsp",
+            .paths = .{"packages/lsp/"},
+            .allowed_dependencies = .{"base"},
+            .root = "packages/lsp/src/root.zig",
+        },
+        .{
             .name = "ai",
             .paths = .{"packages/ai/"},
             .allowed_dependencies = .{"base"},
@@ -25,9 +31,21 @@
             .root = "packages/guard/src/root.zig",
         },
         .{
+            .name = "jev",
+            .paths = .{"packages/jev/"},
+            .allowed_dependencies = .{ "base", "ai", "guard" },
+            .root = "packages/jev/src/root.zig",
+        },
+        .{
+            .name = "telemetry",
+            .paths = .{"packages/telemetry/"},
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard" },
+            .root = "packages/telemetry/src/root.zig",
+        },
+        .{
             .name = "coding",
             .paths = .{"packages/coding/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard" },
+            .allowed_dependencies = .{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry" },
             .root = "packages/coding/src/root.zig",
         },
         .{
@@ -45,7 +63,7 @@
         .{
             .name = "facade",
             .paths = .{ "src/lib.zig", "src/internal.zig" },
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" },
+            .allowed_dependencies = .{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork" },
         },
         .{
             .name = "agentcore",
@@ -55,7 +73,7 @@
         .{
             .name = "cli",
             .paths = .{"apps/cli/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade" },
+            .allowed_dependencies = .{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork", "facade" },
         },
         .{
             .name = "testing",
@@ -63,12 +81,12 @@
                 "tests/_harness/",
                 "tests/helpers/",
             },
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli" },
+            .allowed_dependencies = .{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli" },
         },
         .{
             .name = "tests",
             .paths = .{ "tests/", "apps/cli/tests/" },
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli", "testing" },
+            .allowed_dependencies = .{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli", "testing" },
         },
     },
     .kernel_budget = .{

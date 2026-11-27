@@ -20,7 +20,7 @@
 //! permanent(二进制缺/版本不符 → degraded)、data(环/NotFound → 透传模型改参)。
 
 const std = @import("std");
-const jev_excerpt = @import("../jev/excerpt.zig");
+const jev_excerpt = @import("metacodes-jev").excerpt;
 const pfs = @import("platform").fs;
 const net = @import("platform").net;
 const time = @import("metacodes-base").util.time;

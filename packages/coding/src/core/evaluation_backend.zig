@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
-const ui_backend = @import("protocol/ui_backend.zig");
+const ui_backend = @import("metacodes-guard").core.protocol.ui_backend;
 const util_json = @import("metacodes-base").util.json;
 const util_time = @import("metacodes-base").util.time;
 const pricing = @import("metacodes-base").util.pricing;
@@ -17,7 +17,7 @@ const json_util = @import("metacodes-base").util.json;
 const AbortSignal = @import("metacodes-base").util.abort.AbortSignal;
 const request_gate = @import("request_gate.zig");
 const ToolExecutionPolicy = @import("../tools/context.zig").ToolExecutionPolicy;
-const jev_advisor = @import("../jev/advisor.zig");
+const jev_advisor = @import("metacodes-jev").advisor;
 
 const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;

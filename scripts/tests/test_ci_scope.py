@@ -470,7 +470,11 @@ class LayoutTest(unittest.TestCase):
             ("packages/teamwork/src/root.zig", ("teamwork", "facade", "cli"), False),
             ("packages/session/src/root.zig", ("session", "facade", "agentcore", "cli"), True),
             ("packages/coding/src/core/agent_loop.zig", ("coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
-            ("packages/ai/src/root.zig", ("ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/lsp/src/client.zig", ("lsp", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/jev/src/advisor.zig", ("jev", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/telemetry/src/span.zig", ("telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/guard/src/root.zig", ("guard", "jev", "telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/ai/src/root.zig", ("ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
         ):
             with self.subTest(path=path):
                 scope, reason = ci_scope.classify([path], layout=layout)
@@ -1339,7 +1343,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
             "packages/guard/src/core/goal.zig",
             "packages/coding/src/core/agent_loop.zig",
             "packages/session/src/core/session_host.zig",
-            "packages/coding/src/lsp_test_root.zig",
+            "packages/lsp/src/root.zig",
             "packages/base/src/platform/platform.zig",
             "packages/base/src/root.zig",
         ):

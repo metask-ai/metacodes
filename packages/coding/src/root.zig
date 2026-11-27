@@ -63,7 +63,6 @@ pub const core = struct {
     pub const protocol = struct {
         pub const chat_sentinel = @import("core/protocol/chat_sentinel.zig");
         pub const frontend_capabilities = @import("core/protocol/frontend_capabilities.zig");
-        pub const ui_backend = @import("core/protocol/ui_backend.zig");
         pub const wire = @import("core/protocol/wire.zig");
     };
     pub const read_state = @import("core/read_state.zig");
@@ -108,13 +107,6 @@ pub const core = struct {
 pub const formal = struct {
     pub const task_audit = @import("formal/task_audit.zig");
 };
-pub const jev = struct {
-    pub const advisor = @import("jev/advisor.zig");
-    pub const client = @import("jev/client.zig");
-    pub const excerpt = @import("jev/excerpt.zig");
-    pub const question = @import("jev/question.zig");
-    pub const runtime = @import("jev/runtime.zig");
-};
 pub const kg = struct {
     pub const autosync = @import("kg/autosync.zig");
     pub const client = @import("kg/client.zig");
@@ -141,18 +133,6 @@ pub const kg = struct {
     pub const task_projection = @import("kg/task_projection.zig");
     pub const task_protocol = @import("kg/task_protocol.zig");
     pub const transport = @import("kg/transport.zig");
-};
-pub const lsp = struct {
-    pub const capability = @import("lsp/capability.zig");
-    pub const client = @import("lsp/client.zig");
-    pub const lsp = @import("lsp/lsp.zig");
-    pub const protocol = @import("lsp/protocol.zig");
-    pub const reporter = @import("lsp/reporter.zig");
-    pub const servers = @import("lsp/servers.zig");
-    pub const service = @import("lsp/service.zig");
-    pub const symbols = @import("lsp/symbols.zig");
-    pub const transport = @import("lsp/transport.zig");
-    pub const workspace = @import("lsp/workspace.zig");
 };
 pub const mcp = struct {
     pub const canonical = @import("mcp/canonical.zig");
@@ -236,15 +216,6 @@ pub const swarm = struct {
     pub const teammate_process = @import("swarm/teammate_process.zig");
     pub const tools = @import("swarm/tools.zig");
 };
-pub const telemetry = struct {
-    pub const config = @import("telemetry/config.zig");
-    pub const exporter = @import("telemetry/exporter.zig");
-    pub const otlp = @import("telemetry/otlp.zig");
-    pub const recorder = @import("telemetry/recorder.zig");
-    pub const span = @import("telemetry/span.zig");
-    pub const store = @import("telemetry/store.zig");
-    pub const telemetry = @import("telemetry/telemetry.zig");
-};
 pub const tools = struct {
     pub const agent = @import("tools/agent.zig");
     pub const apply_patch = @import("tools/apply_patch.zig");
@@ -296,10 +267,8 @@ test {
     std.testing.refAllDecls(core.memory);
     std.testing.refAllDecls(core.protocol);
     std.testing.refAllDecls(formal);
-    std.testing.refAllDecls(jev);
     std.testing.refAllDecls(kg);
     std.testing.refAllDecls(kg.kgd);
-    std.testing.refAllDecls(lsp);
     std.testing.refAllDecls(mcp);
     std.testing.refAllDecls(plugin);
     std.testing.refAllDecls(sandbox);
@@ -307,6 +276,5 @@ test {
     std.testing.refAllDecls(skills.runtime);
     std.testing.refAllDecls(skills.sealed);
     std.testing.refAllDecls(swarm);
-    std.testing.refAllDecls(telemetry);
     std.testing.refAllDecls(tools);
 }

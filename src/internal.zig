@@ -172,7 +172,7 @@ pub const core = struct {
         pub const chat_sentinel = @import("metacodes-coding").core.protocol.chat_sentinel;
         pub const frontend_capabilities = @import("metacodes-coding").core.protocol.frontend_capabilities;
         pub const permission_choice = @import("metacodes-guard").core.protocol.permission_choice;
-        pub const ui_backend = @import("metacodes-coding").core.protocol.ui_backend;
+        pub const ui_backend = @import("metacodes-guard").core.protocol.ui_backend;
         pub const ui_event = @import("metacodes-guard").core.protocol.ui_event;
         pub const ui_request = @import("metacodes-guard").core.protocol.ui_request;
         pub const wire = @import("metacodes-coding").core.protocol.wire;
@@ -193,11 +193,11 @@ pub const highlight = struct {
     pub const hl_adapter = @import("metacodes-base").highlight.hl_adapter;
 };
 pub const jev = struct {
-    pub const advisor = @import("metacodes-coding").jev.advisor;
-    pub const client = @import("metacodes-coding").jev.client;
-    pub const excerpt = @import("metacodes-coding").jev.excerpt;
-    pub const question = @import("metacodes-coding").jev.question;
-    pub const runtime = @import("metacodes-coding").jev.runtime;
+    pub const advisor = @import("metacodes-jev").advisor;
+    pub const client = @import("metacodes-jev").client;
+    pub const excerpt = @import("metacodes-jev").excerpt;
+    pub const question = @import("metacodes-jev").question;
+    pub const runtime = @import("metacodes-jev").runtime;
 };
 pub const kg = struct {
     pub const autosync = @import("metacodes-coding").kg.autosync;
@@ -221,9 +221,9 @@ pub const kg = struct {
     };
 };
 pub const lsp = struct {
-    pub const lsp = @import("metacodes-coding").lsp.lsp;
-    pub const service = @import("metacodes-coding").lsp.service;
-    pub const transport = @import("metacodes-coding").lsp.transport;
+    pub const lsp = @import("metacodes-lsp").lsp;
+    pub const service = @import("metacodes-lsp").service;
+    pub const transport = @import("metacodes-lsp").transport;
 };
 pub const mcp = struct {
     pub const canonical = @import("metacodes-coding").mcp.canonical;
@@ -374,8 +374,8 @@ pub const teamwork = struct {
     };
 };
 pub const telemetry = struct {
-    pub const store = @import("metacodes-coding").telemetry.store;
-    pub const telemetry = @import("metacodes-coding").telemetry.telemetry;
+    pub const store = @import("metacodes-telemetry").store;
+    pub const telemetry = @import("metacodes-telemetry").telemetry;
 };
 pub const tools = struct {
     pub const agent = @import("metacodes-coding").tools.agent;

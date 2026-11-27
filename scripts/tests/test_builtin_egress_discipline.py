@@ -45,7 +45,7 @@ SKIPPED_DIRS = {".git", ".zig-cache", "zig-out", ".lake", "node_modules", "deps"
 # Cleartext destinations the product is allowed to name, keyed by
 # (root-relative POSIX path, `host[:port]` as written) with why each is not on
 # by default. Rule 2 below guards the first one.
-JEV_RUNTIME = "packages/coding/src/jev/runtime.zig"
+JEV_RUNTIME = "packages/jev/src/runtime.zig"
 JEV_DEFAULT = (JEV_RUNTIME, "58.211.6.133:10420")
 ALLOWED_CLEARTEXT = {
     JEV_DEFAULT: (

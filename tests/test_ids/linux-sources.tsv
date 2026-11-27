@@ -9,9 +9,12 @@ checks	zig-metacodes-coding-test-ReleaseSafe-2of4	packages/coding/src	1
 checks	zig-metacodes-coding-test-ReleaseSafe-3of4	packages/coding/src	1
 checks	zig-metacodes-core-test-ReleaseSafe-0of1	src	1
 checks	zig-metacodes-guard-test-ReleaseSafe-0of1	packages/guard/src	1
+checks	zig-metacodes-jev-test-ReleaseSafe-0of1	packages/jev/src	1
 checks	zig-metacodes-kernel-test-ReleaseSafe-0of1	packages/kernel/src	1
+checks	zig-metacodes-lsp-test-ReleaseSafe-0of1	packages/lsp/src	1
 checks	zig-metacodes-session-test-ReleaseSafe-0of1	packages/session/src	1
 checks	zig-metacodes-teamwork-test-ReleaseSafe-0of1	packages/teamwork/src	1
+checks	zig-metacodes-telemetry-test-ReleaseSafe-0of1	packages/telemetry/src	1
 pr-checks	zig-layer-gate-unit-ReleaseSafe	scripts	1
 product	py-eval	scripts/eval/tests	3
 units	py-scripts-tests	.	17
@@ -39,9 +42,10 @@ units	zig-integration-suite-Debug-5of8	tests	1
 units	zig-integration-suite-Debug-6of8	tests	1
 units	zig-integration-suite-Debug-7of8	tests	1
 units	zig-internal-test-Debug	src	1
+units	zig-jev-test-Debug	packages/jev/src	1
 units	zig-kernel-test-Debug	packages/kernel/src	1
 units	zig-layer-gate-unit-ReleaseSafe	scripts	1
-units	zig-lsp-test-Debug	packages/coding/src	1
+units	zig-lsp-test-Debug	packages/lsp/src	1
 units	zig-manifest-common-unit-ReleaseSafe	scripts	1
 units	zig-mcp-test-Debug	packages/coding/src	1
 units	zig-model-name-sources-Debug	tests	1
@@ -57,4 +61,5 @@ units	zig-spike-Debug	tests/_harness	1
 units	zig-spike-Debug	tests/unit	1
 units	zig-subsystem-boundary-gate-unit-ReleaseSafe	scripts	1
 units	zig-teamwork-test-Debug	packages/teamwork/src	1
+units	zig-telemetry-test-Debug	packages/telemetry/src	1
 units	zig-tool-dispatcher-metadata-Debug	tests/component	1

@@ -399,7 +399,7 @@ const Internal = struct {
 
     const name = "metacodes-internal";
     const root = "src/internal.zig";
-    const package_names = [_][]const u8{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" };
+    const package_names = [_][]const u8{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork" };
 
     const Package = struct {
         module: []const u8,
