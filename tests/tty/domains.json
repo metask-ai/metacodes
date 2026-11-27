@@ -75,6 +75,7 @@
       "test_task_tab",
       "test_terminal_behaviors",
       "test_terminal_compat",
+      "test_thinking_display",
       "test_tmux_wide_chars",
       "test_ui_tools",
       "test_wrap_resize"
