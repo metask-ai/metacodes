@@ -108,6 +108,20 @@ def _assert_nothing_sent(case):
     assert case.server.seen == [], f"an unbound session sent {case.server.seen}"
 
 
+def test_a_first_start_names_the_sign_in_the_env_file_and_the_guide_before_anything_is_typed(bin_path):
+    with _Case() as case:
+        case.bin = bin_path
+        raw = case.run([READY, "strictsleep:0.5"], term_size=(40, 180))
+        a = TTYAssert(raw, rows=40, cols=180)
+        screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+        a.assert_prose_contains(NOT_SET)
+        assert "To start: /login signs in to Metask, or put your own provider key in " in screen, screen
+        assert os.path.join(case.state, ".env") + " and restart." in screen, screen
+        assert "How to: https://" in screen, screen
+        assert "No model is set up." not in screen, screen
+        _assert_nothing_sent(case)
+
+
 def test_unbound_start_reminds_and_sends_nothing(bin_path):
     with _Case() as case:
         case.bin = bin_path

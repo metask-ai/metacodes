@@ -324,6 +324,13 @@ status, compatibility boundaries, and entry points are defined by
   provider's page returns to it in the list. Only providers past the 64 a
   dialog holds are still counted under the list.
 
+- **A first start says where to begin.** With nothing set up, the terminal
+  UI showed only `not set — /login, or configure .env` in its banner; the
+  path of this install's `.env` and the guide came only once a message was
+  refused. It now says under the banner, before anything is typed: `To
+  start: /login signs in to Metask, or put your own provider key in
+  <state root>/.env and restart.` and the guide's address.
+
 - **API failure notices are in English.** The line under `API request
   failed` mixed Chinese into an English screen, e.g. `HTTP 429(重试 4 次后放弃):
   …`. It now reads `HTTP 429 (gave up after 4 attempts): …`, and the named

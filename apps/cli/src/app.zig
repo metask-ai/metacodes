@@ -1492,6 +1492,20 @@ pub const App = struct {
         };
     }
 
+    pub fn writeFirstStartNotice(app: *App, w: *std.Io.Writer) !void {
+        const state_env = @import("app/state_env.zig");
+        var arena_state = std.heap.ArenaAllocator.init(app.allocator);
+        defer arena_state.deinit();
+        const root = app.stateRoot();
+        const env_path: []const u8 = if (root.len == 0) "" else try std.fs.path.join(arena_state.allocator(), &.{ root, state_env.file_name });
+        try route_state_mod.writeFirstStart(w, env_path, state_env.guide_url);
+    }
+
+    pub fn startsUnconfigured(app: *const App) bool {
+        const reason = app.unbound() orelse return false;
+        return reason == .nothing_configured and app.unchosen_local_providers.len == 0;
+    }
+
     /// The unbound reminder (#484) for this install: its `.env` (and the
     /// template beside it when an install wrote one), the provider keys the
     /// environment sets (names only), the providers `.env` names none of.

@@ -170,6 +170,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     splash = .off; // ended (and freed) by the banner
     // A stored default passed over for want of a credential (#485): once.
     if (app.startup_notice) |notice| cmd_output.print("{s}{s}{s}\n\n", .{ app.theme.warn, notice, app.theme.reset });
+    if (app.startsUnconfigured()) printFirstStartNotice(app);
 
     printStartupSuggestion(&suggestion_git);
 
@@ -1816,6 +1817,15 @@ fn refusedUnbound(app: *app_mod.App) bool {
     if (app.unbound() == null) return false;
     printUnboundReminder(app);
     return true;
+}
+
+fn printFirstStartNotice(app: *app_mod.App) void {
+    var text: std.Io.Writer.Allocating = .init(app.allocator);
+    defer text.deinit();
+    app.writeFirstStartNotice(&text.writer) catch return;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text.written(), "\n"), '\n');
+    while (lines.next()) |line| cmd_output.print("{s}{s}{s}\n", .{ app.theme.dim, line, app.theme.reset });
+    cmd_output.print("\n", .{});
 }
 
 /// The unbound reminder (`App.writeUnboundReminder`), in the theme's danger
