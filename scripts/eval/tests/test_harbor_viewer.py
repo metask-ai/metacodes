@@ -441,8 +441,11 @@ class FakeNode {{
   append(...items) {{
     for (const item of items) {{
       if (item === null || item === undefined || item === false) continue;
-      if (typeof item === 'string') this.children.push({{ textContent: item, children: [] }});
-      else this.children.push(item);
+      if (item instanceof FakeNode || (item && typeof item === 'object' && !Array.isArray(item) && 'textContent' in item)) {{
+        this.children.push(item);
+      }} else {{
+        this.children.push({{ textContent: String(item), children: [] }});
+      }}
     }}
   }}
   replaceChildren(...items) {{ this.children = []; this.append(...items); }}
@@ -789,16 +792,28 @@ ctx.api = async () => {
     };
   };
   const lbRoot = await vm.runInContext('renderLeaderboard', ctx)('tb');
+  const boardTables = () => walk(lbRoot).filter((n) => n.tagName === 'table' && n.className === 'board');
+  const boardInitialTables = boardTables().length;
+  const boardInitialHasOther = boardTables().some((t) => t.textContent.includes('Other'));
   const stripBox = walk(lbRoot).find((n) => n.tagName === 'input' && n.attrs.type === 'checkbox');
   stripBox.checked = false;
   stripBox.dispatch('change');
-  const boardSelectedCount = vm.runInContext("state.boardSelected['tb'].size", ctx);
+  const boardAfterStripTables = boardTables().length;
+  const boardAfterStripHasOther = boardTables().some((t) => t.textContent.includes('Other'));
+  const boardSelectedAfterStrip = vm.runInContext("state.boardSelected['tb'].size", ctx);
+  const tableBox = walk(boardTables()[0]).find((n) => n.tagName === 'input' && n.attrs.type === 'checkbox');
+  tableBox.checked = !tableBox.checked;
+  tableBox.dispatch('change');
+  const boardAfterTableTables = boardTables().length;
+  const boardSelectedAfterTable = vm.runInContext("state.boardSelected['tb'].size", ctx);
 
   console.log(JSON.stringify({
     overviewCalls, hasDock, clearedDock,
     jobCalls, jobFiltered,
     cmpCalls, cmpBaseline,
-    boardCalls, boardSelectedCount,
+    boardCalls, boardInitialTables, boardInitialHasOther,
+    boardAfterStripTables, boardAfterStripHasOther, boardSelectedAfterStrip,
+    boardAfterTableTables, boardSelectedAfterTable,
   }));
 })();
 """)
@@ -811,7 +826,13 @@ ctx.api = async () => {
         self.assertEqual(result["cmpCalls"], 2)
         self.assertEqual(result["cmpBaseline"], "j2")
         self.assertEqual(result["boardCalls"], 1)
-        self.assertEqual(result["boardSelectedCount"], 1)
+        self.assertEqual(result["boardInitialTables"], 1)
+        self.assertTrue(result["boardInitialHasOther"])
+        self.assertEqual(result["boardAfterStripTables"], 1)
+        self.assertTrue(result["boardAfterStripHasOther"])
+        self.assertEqual(result["boardSelectedAfterStrip"], 1)
+        self.assertEqual(result["boardAfterTableTables"], 1)
+        self.assertEqual(result["boardSelectedAfterTable"], 2)
 
 
 if __name__ == "__main__":

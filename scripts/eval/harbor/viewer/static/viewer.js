@@ -168,7 +168,7 @@ function localView(build) {
   function redraw() {
     const prev = new Map([...(root.querySelectorAll ? root.querySelectorAll('details[data-key]') : [])].map((d) => [d.dataset.key, d.open]));
     state.editing = false;
-    root.replaceChildren(...[build(redraw)].flat().filter(Boolean));
+    root.replaceChildren(...[build(redraw)].flat(Infinity).filter(Boolean));
     for (const d of (root.querySelectorAll ? root.querySelectorAll('details[data-key]') : [])) {
       if (prev.has(d.dataset.key)) d.open = prev.get(d.dataset.key);
     }
@@ -2514,7 +2514,7 @@ async function renderLeaderboard(suiteId) {
         pickedJobs.length >= 2
           ? h('a', { class: 'button primary sm', href: '#/compare/' + pickedJobs.map((j) => encodeURIComponent(j.name)).join(','), text: `进入 ${pickedJobs.length} 版本对比台 →` })
           : h('span', { class: 'muted', style: 'font-size:11px', text: '请至少勾选 2 个版本' })) : null) : null;
-    return [topBar, myProfilesStrip, d.boards.map((b) => boardPanel(b, d.suite, selectedSet, ourColorMap, redraw)), rest];
+    return [topBar, myProfilesStrip, ...d.boards.map((b) => boardPanel(b, d.suite, selectedSet, ourColorMap, redraw)), rest];
   });
 }
 
