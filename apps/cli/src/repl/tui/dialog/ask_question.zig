@@ -1434,15 +1434,18 @@ test "run counts the quiet spell from when the box is on screen: a key typed whi
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const sync = @import("metacodes-internal").platform.sync;
-    const net = @import("metacodes-internal").platform.net;
     var screen: [2]std.c.fd_t = undefined;
     try testing.expectEqual(@as(c_int, 0), std.c.pipe(&screen));
     defer _ = std.c.close(screen[0]);
-    try testing.expect(net.setNonblocking(screen[1], true));
+    const blocking = std.c.fcntl(screen[1], std.c.F.GETFL);
+    try testing.expect(blocking >= 0);
+    const nonblocking_bit: c_int = @bitCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+    try testing.expect(std.c.fcntl(screen[1], std.c.F.SETFL, blocking | nonblocking_bit) >= 0);
+    try testing.expect(std.c.fcntl(screen[1], std.c.F.GETFL) & nonblocking_bit != 0);
     const filler = [_]u8{'.'} ** 512;
     while (pfs.write(screen[1], &filler) > 0) {}
     while (pfs.write(screen[1], filler[0..1]) > 0) {}
-    try testing.expect(net.setNonblocking(screen[1], false));
+    try testing.expect(std.c.fcntl(screen[1], std.c.F.SETFL, blocking) >= 0);
     const Terminal = struct {
         fn takeFramesAfter(fd: c_int, stall_ms: u32) void {
             sync.sleepMs(stall_ms);
