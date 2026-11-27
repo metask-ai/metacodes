@@ -47,43 +47,61 @@ pub const RenderOpts = struct {
 
 pub const ResultKind = enum { ok, err };
 
-/// 结果渲染策略(对齐 cc:renderToolResultMessage 可选 + opt-out)。
-/// - hidden:结果**不进消息流**(对齐 cc 返回 null)。Task 系列在 Task 面板反馈、
-///   plan mode 是模式切换 —— 它们的结果不该刷屏。renderResult 对这些工具返回空串。
-/// - summary:渲染人类可读摘要(专用渲染器)。
-/// 关键:**没有"裸 JSON 兜底"**。无专用渲染器又非 summary 的工具默认 hidden,
-/// 绝不把工具返回的原始 JSON 原样打到屏幕(对齐 cc"纯文本结果是反模式")。
 pub const ResultRenderMode = enum { hidden, summary };
 
-pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
-    // opt-out(故意 hidden):
-    // - Task 族:状态在 Task 面板反馈,不刷消息流。
-    // - AskUserQuestion:走专门的交互 UI(选项菜单),非工具卡片。
-    // - Skill:结果(rendered body)内联进对话文本,本身就是可见内容,无需卡片。
-    // Task 写操作(建/改/闭)→ **可见一行确认**(用户对任务建/闭合有感;cc 的 TodoWrite 也
-    // 可见渲染,这是 parity 非 divergence)。查询类(TaskList/TaskGet)+ 面板反馈的 Task/Agent
-    // spawn + TaskOutput 仍 hidden(状态在 Task 面板/subagent 卡,避免与面板重复刷屏)。
-    if (std.mem.eql(u8, tool_name, "TaskCreate") or
-        std.mem.eql(u8, tool_name, "TaskUpdate") or
-        std.mem.eql(u8, tool_name, "TaskStop")) return .summary;
-    if (std.mem.startsWith(u8, tool_name, "Task")) return .hidden;
-    if (std.mem.eql(u8, tool_name, "AskUserQuestion")) return .hidden;
-    if (std.mem.eql(u8, tool_name, "Skill")) return .hidden;
-    // 有专用 summary 渲染器的工具(renderResultBody 分发到 diff/搜索/Read/WebFetch 渲染器)。
-    const summary_tools = [_][]const u8{
-        "Bash",     "BashOutput", "Edit",  "Write",      "Read", "Grep", "Glob",
-        "WebFetch", "WebSearch",  "Agent", "ApplyPatch",
+const CardPolicy = union(enum) {
+    hidden_all,
+    start_only,
+    progress,
+    live_builtin: enum { bash, read, search },
+    specialized: enum { write, edit, apply_patch, bash_output, web_fetch, agent, task_confirmation },
+    json_summary,
+    mcp,
+    generic_live,
+};
+
+fn classifyCard(tool_name: []const u8) CardPolicy {
+    const policies = .{
+        .{ "AskUserQuestion", CardPolicy.hidden_all },
+        .{ "Skill", CardPolicy.hidden_all },
+        .{ "TaskGet", CardPolicy.hidden_all },
+        .{ "TaskList", CardPolicy.hidden_all },
+        .{ "TaskOutput", CardPolicy.hidden_all },
+        .{ "TaskBatch", CardPolicy.hidden_all },
+        .{ "Task", CardPolicy.start_only },
+        .{ "TaskCreate", CardPolicy{ .specialized = .task_confirmation } },
+        .{ "TaskUpdate", CardPolicy{ .specialized = .task_confirmation } },
+        .{ "TaskStop", CardPolicy{ .specialized = .task_confirmation } },
+        .{ "WebSearch", CardPolicy.progress },
+        .{ "Bash", CardPolicy{ .live_builtin = .bash } },
+        .{ "Read", CardPolicy{ .live_builtin = .read } },
+        .{ "Grep", CardPolicy{ .live_builtin = .search } },
+        .{ "Glob", CardPolicy{ .live_builtin = .search } },
+        .{ "Write", CardPolicy{ .specialized = .write } },
+        .{ "Edit", CardPolicy{ .specialized = .edit } },
+        .{ "ApplyPatch", CardPolicy{ .specialized = .apply_patch } },
+        .{ "BashOutput", CardPolicy{ .specialized = .bash_output } },
+        .{ "WebFetch", CardPolicy{ .specialized = .web_fetch } },
+        .{ "Agent", CardPolicy{ .specialized = .agent } },
     };
-    for (summary_tools) |t| {
-        if (std.mem.eql(u8, tool_name, t)) return .summary;
+    inline for (policies) |entry| {
+        if (std.mem.eql(u8, tool_name, entry[0])) return entry[1];
     }
-    if (isMcpTool(tool_name) or isGenericCardTool(tool_name)) return .summary;
-    // 有副作用、返回 JSON 的工具:有人话渲染器(renderJsonToolSummary)→ summary。
-    // 否则 hidden 会让 agent_loop 连 ⏺ 起始卡都跳过(工具被调用时 TUI 完全无感,
-    // 2026-06-04 实测过的 WebSearch bug)。
-    if (isJsonSummaryTool(tool_name)) return .summary;
-    // 真正未知/无渲染器的工具:仍 hidden(绝不裸吐 JSON;新工具要显示就加渲染器)。
-    return .hidden;
+    const json_tools = [_][]const u8{
+        "NotebookEdit",  "KillShell",    "Monitor",          "CronCreate",           "CronDelete",          "CronList",
+        "EnterWorktree", "ExitWorktree", "PushNotification", "ListMcpResourcesTool", "ReadMcpResourceTool", "ToolSearch",
+        "KgRemember",    "KgRecall",     "KgContext",
+    };
+    for (json_tools) |name| if (std.mem.eql(u8, tool_name, name)) return .json_summary;
+    if (isMcpTool(tool_name)) return .mcp;
+    return .generic_live;
+}
+
+pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
+    return switch (classifyCard(tool_name)) {
+        .hidden_all, .start_only => .hidden,
+        else => .summary,
+    };
 }
 
 /// 是否在工具开始时渲染起始卡(⏺ <tool>)。与 resultRenderMode(它管*结果体*显示)分离。
@@ -93,16 +111,11 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
 /// 历史 bug:agent_loop 旧逻辑直接用 resultRenderMode==hidden 跳过起始卡 → Task 被调用时
 /// TUI 完全无感(用户看不到 subagent 启动)。本函数把"是否打起始卡"独立出来修复之。
 pub fn showStartCard(tool_name: []const u8) bool {
-    if (std.mem.eql(u8, tool_name, "AskUserQuestion")) return false;
-    if (std.mem.eql(u8, tool_name, "Skill")) return false;
-    // Task/Agent:起始卡可见(精确匹配,避免 TaskCreate/TaskUpdate 等子工具噪声)。
-    if (std.mem.eql(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) return true;
-    // Task 写子工具是**瞬时**操作:只显结果一行,不打起始卡(否则 sub-second 卡闪一下)。
-    if (std.mem.eql(u8, tool_name, "TaskCreate") or
-        std.mem.eql(u8, tool_name, "TaskUpdate") or
-        std.mem.eql(u8, tool_name, "TaskStop")) return false;
-    // 其余:沿用 resultRenderMode——非 hidden 才打起始卡。
-    return resultRenderMode(tool_name) != .hidden;
+    return switch (classifyCard(tool_name)) {
+        .hidden_all => false,
+        .specialized => |kind| kind != .task_confirmation,
+        else => true,
+    };
 }
 
 /// 头部状态图标 + 颜色。与 ResultKind 解耦,处理 Bash 的两类"成功但非真成功"特例:
@@ -138,7 +151,7 @@ pub fn displayName(tool_name: []const u8) []const u8 {
 /// 独占显示)。返 true 的工具:不走 renderStart→滚动历史、不在底部 spinner 显工具段,
 /// 改由 render_region.drawToolProgressCard 在动态区显示双段卡。当前仅 WebSearch。
 pub fn hasProgressCard(tool_name: []const u8) bool {
-    return std.mem.eql(u8, tool_name, "WebSearch");
+    return classifyCard(tool_name) == .progress;
 }
 
 /// 类A(查询/执行类):执行期整张卡活在底部动态重绘区(自然语言进行时标题),
@@ -146,13 +159,19 @@ pub fn hasProgressCard(tool_name: []const u8) bool {
 /// MCP、ApplyPatch 和通用卡工具也走这里:完成时把调用行和结果一起 commit。
 /// 与 hasProgressCard(WebSearch:完成只移除,结果走助手文本)互斥。
 pub fn usesLiveCard(tool_name: []const u8) bool {
-    return std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Read") or
-        std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob") or
-        commitsCallWithResult(tool_name);
+    return switch (classifyCard(tool_name)) {
+        .live_builtin, .mcp, .generic_live => true,
+        .specialized => |kind| kind == .apply_patch,
+        else => false,
+    };
 }
 
 fn commitsCallWithResult(tool_name: []const u8) bool {
-    return isMcpTool(tool_name) or isGenericCardTool(tool_name) or std.mem.eql(u8, tool_name, "ApplyPatch");
+    return switch (classifyCard(tool_name)) {
+        .mcp, .generic_live => true,
+        .specialized => |kind| kind == .apply_patch,
+        else => false,
+    };
 }
 
 /// tool_start 时是否占用动态区那张卡(addToolCard)。两类(WebSearch progress + 类A live)统称。
@@ -555,16 +574,16 @@ fn renderResultBody(
     kind: ResultKind,
     elapsed_ms: u64,
 ) !void {
-    if (isMcpTool(tool_name)) {
-        return renderMcpResult(alloc, th, output_text, out, opts, kind);
-    }
-    if (isGenericCardTool(tool_name)) {
-        return renderGenericToolResult(alloc, th, output_text, out, opts, kind);
+    const policy = classifyCard(tool_name);
+    switch (policy) {
+        .mcp => return renderMcpResult(alloc, th, output_text, out, opts, kind),
+        .generic_live => return renderGenericToolResult(alloc, th, output_text, out, opts, kind),
+        else => {},
     }
     if (kind == .err) {
         return renderErrorBody(alloc, th, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "Write")) {
+    if (policy == .specialized and policy.specialized == .write) {
         // cc 风格:Write 结果首行摘要 `Wrote N lines to <basename>`,下接内容预览。
         // 对齐 cc DIFF#8b:Write 是纯新建,预览**无 diff 标记**(plain 行号,非 +/-)。
         const path = extractField(output_text, "file_path") orelse extractField(output_text, "path") orelse "";
@@ -576,10 +595,10 @@ fn renderResultBody(
         }
         return renderEditDiffImpl(alloc, th, output_text, out, opts, true); // plain=true(无 +/-)
     }
-    if (std.mem.eql(u8, tool_name, "Edit")) {
+    if (policy == .specialized and policy.specialized == .edit) {
         return renderEditDiffImpl(alloc, th, output_text, out, opts, false); // plain=false(diff +/-)
     }
-    if (std.mem.eql(u8, tool_name, "ApplyPatch")) {
+    if (policy == .specialized and policy.specialized == .apply_patch) {
         // 多文件 patch:结果 gitDiff 逐文件拼接。摘要行 A/M/D 计数 + diff 渲染(+/-)。
         // hl-zig 高亮仅覆盖首个改动文件(edit_hl_cache 单对);其余按纯 +/- 着色。
         const a_n = extractJsonNumberField(output_text, "added") orelse 0;
@@ -603,30 +622,32 @@ fn renderResultBody(
         }
         return renderJsonToolSummary(alloc, th, tool_name, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
+    if (policy == .live_builtin and policy.live_builtin == .search) {
         return renderSearchSummary(alloc, th, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "Read")) {
+    if (policy == .live_builtin and policy.live_builtin == .read) {
         return renderReadSummary(alloc, th, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "WebSearch")) {
+    if (policy == .progress) {
         // 完成态(对齐 cc renderToolResultMessage):`Did N searches`(N = 结果块数)。
         // 详细结果(链接/摘要)verbose/transcript 才展开。
         return renderWebSearchSummary(alloc, th, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "WebFetch")) {
+    if (policy == .specialized and policy.specialized == .web_fetch) {
         // 结果首行人类可读摘要;非 verbose 只显首行,verbose/transcript 展开。
         return renderWebFetchSummary(alloc, th, output_text, out, opts);
     }
     // 有副作用但返回 JSON 的工具:提关键字段拼一行人话(绝不裸吐 JSON)。
     // NotebookEdit/KillShell/Monitor/Cron*/Worktree/PushNotification/ListMcp/ReadMcp/ToolSearch。
-    if (isJsonSummaryTool(tool_name)) {
+    if (policy == .json_summary) {
         return renderJsonToolSummary(alloc, th, tool_name, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "BashOutput")) {
+    if ((policy == .live_builtin and policy.live_builtin == .bash) or
+        (policy == .specialized and policy.specialized == .bash_output))
+    {
         return renderBashResult(alloc, th, tool_name, output_text, out, opts);
     }
-    if (std.mem.startsWith(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) {
+    if (policy == .specialized and (policy.specialized == .task_confirmation or policy.specialized == .agent)) {
         return renderTaskResult(alloc, th, tool_name, output_text, out, elapsed_ms);
     }
     return renderGenericFold(alloc, th, output_text, out, opts);
@@ -1417,27 +1438,32 @@ fn jsonUnescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 /// 对齐 cc:Write/Edit→文件 basename;Bash→命令首行;Read→basename;Grep/Glob→pattern;
 /// WebFetch→域名;WebSearch→"query";其余→空(标题不带括号)。caller free。
 fn headerArg(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
-    if (isMcpTool(tool_name) or isGenericCardTool(tool_name)) return argSummary(alloc, args);
-    if (std.mem.eql(u8, tool_name, "ApplyPatch")) return patchFilesSummary(alloc, args);
-    if (std.mem.eql(u8, tool_name, "Bash")) {
+    const policy = classifyCard(tool_name);
+    switch (policy) {
+        .mcp, .generic_live => return argSummary(alloc, args),
+        else => {},
+    }
+    if (policy == .specialized and policy.specialized == .apply_patch) return patchFilesSummary(alloc, args);
+    if (policy == .live_builtin and policy.live_builtin == .bash) {
         if (extractField(args, "command")) |cmd| {
             const dec = try jsonUnescape(alloc, cmd);
             defer alloc.free(dec);
             return try alloc.dupe(u8, firstLine(dec));
         }
-    } else if (std.mem.eql(u8, tool_name, "Read") or std.mem.eql(u8, tool_name, "Edit") or
-        std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "NotebookEdit"))
+    } else if ((policy == .live_builtin and policy.live_builtin == .read) or
+        (policy == .specialized and (policy.specialized == .edit or policy.specialized == .write)) or
+        (policy == .json_summary and std.mem.eql(u8, tool_name, "NotebookEdit")))
     {
         if (extractField(args, "file_path") orelse extractField(args, "path")) |p| {
             return try alloc.dupe(u8, basename(p)); // cc 用 basename,不显完整路径
         }
-    } else if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
+    } else if (policy == .live_builtin and policy.live_builtin == .search) {
         if (extractField(args, "pattern")) |p| return try alloc.dupe(u8, p);
-    } else if (std.mem.eql(u8, tool_name, "WebFetch")) {
+    } else if (policy == .specialized and policy.specialized == .web_fetch) {
         if (extractField(args, "url")) |u| return try alloc.dupe(u8, u);
-    } else if (std.mem.eql(u8, tool_name, "WebSearch")) {
+    } else if (policy == .progress) {
         if (extractField(args, "query")) |q| return try std.fmt.allocPrint(alloc, "\"{s}\"", .{q});
-    } else if (std.mem.eql(u8, tool_name, "Agent") or std.mem.eql(u8, tool_name, "Task")) {
+    } else if (policy == .start_only or (policy == .specialized and policy.specialized == .agent)) {
         if (extractField(args, "subagent_type") orelse extractField(args, "description")) |d|
             return try alloc.dupe(u8, d);
     }
@@ -1477,8 +1503,9 @@ pub fn toolPreviewPub(alloc: std.mem.Allocator, tool_name: []const u8, args: []c
 /// 根据工具名和参数 JSON 生成单行预览("$ cmd" / "📄 path" / 等)。caller free。
 /// 不识别的工具 → 返回空 slice(预览行省略)。
 fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
+    const policy = classifyCard(tool_name);
     if (commitsCallWithResult(tool_name)) return headerArg(alloc, tool_name, args);
-    if (std.mem.eql(u8, tool_name, "Bash")) {
+    if (policy == .live_builtin and policy.live_builtin == .bash) {
         if (extractField(args, "command")) |cmd| {
             // command 含 shell 操作符(&&、>、换行),JSON 里被转义成 && 等;
             // unescape 后再显示,否则用户看到 && 而非 &&。
@@ -1487,16 +1514,18 @@ fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8
             const oneline = firstLine(dec); // 多行命令只显首行预览
             return try std.fmt.allocPrint(alloc, "$ {s}", .{oneline});
         }
-    } else if (std.mem.eql(u8, tool_name, "Read")) {
+    } else if (policy == .live_builtin and policy.live_builtin == .read) {
         if (extractField(args, "file_path") orelse extractField(args, "path")) |p| {
             // 对齐 cc:Read 卡 ⎿ 行只显 basename,**无 📄 icon、无完整路径**(实测 `  ⎿  CLAUDE.md`)。
             return try alloc.dupe(u8, basename(p));
         }
-    } else if (std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "NotebookEdit")) {
+    } else if ((policy == .specialized and (policy.specialized == .edit or policy.specialized == .write)) or
+        (policy == .json_summary and std.mem.eql(u8, tool_name, "NotebookEdit")))
+    {
         if (extractField(args, "file_path") orelse extractField(args, "path")) |p| {
             return try std.fmt.allocPrint(alloc, "± {s}", .{p});
         }
-    } else if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
+    } else if (policy == .live_builtin and policy.live_builtin == .search) {
         // 对齐 cc GrepTool/UI.tsx:`pattern: "<pat>"[, path: "<path>"]`(双引号包,非斜杠)。
         // 旧 `/{s}/` 会把以 / 开头/结尾的 pattern(如搜 "/v1/models")显示成 "//v1/models/"。
         if (extractField(args, "pattern")) |p| {
@@ -1505,16 +1534,16 @@ fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8
             }
             return try std.fmt.allocPrint(alloc, "pattern: \"{s}\"", .{p});
         }
-    } else if (std.mem.eql(u8, tool_name, "WebFetch")) {
+    } else if (policy == .specialized and policy.specialized == .web_fetch) {
         if (extractField(args, "url")) |u| {
             return try std.fmt.allocPrint(alloc, "↗ {s}", .{u});
         }
-    } else if (std.mem.eql(u8, tool_name, "WebSearch")) {
+    } else if (policy == .progress) {
         // 对齐 cc 标题参数:⏺ Web Search("query")。
         if (extractField(args, "query")) |q| {
             return try std.fmt.allocPrint(alloc, "\"{s}\"", .{q});
         }
-    } else if (std.mem.eql(u8, tool_name, "Agent") or std.mem.eql(u8, tool_name, "Task")) {
+    } else if (policy == .start_only or (policy == .specialized and policy.specialized == .agent)) {
         // 让用户认出"这是哪种 subagent"(用户曾困惑"要 subagent 却显示 Task")。
         // 预览:◆ <subagent_type>: <description>。缺省 general-purpose。
         const st = extractField(args, "subagent_type") orelse "general-purpose";
@@ -1851,16 +1880,7 @@ fn jsonStringFirstLine(alloc: std.mem.Allocator, escaped: []const u8) ![]u8 {
     return text.toOwnedSlice(alloc);
 }
 
-const GENERIC_CARD_TOOLS = [_][]const u8{
-    "ScheduleWakeup", "CodeMap",    "FindSymbol",  "ReadArtifact",
-    "TeamCreate",     "TeamDelete", "SendMessage", "ExecuteCode",
-};
 const GUTTER_COLS: usize = 5;
-
-fn isGenericCardTool(tool_name: []const u8) bool {
-    for (GENERIC_CARD_TOOLS) |name| if (std.mem.eql(u8, tool_name, name)) return true;
-    return false;
-}
 
 fn renderGenericToolResult(
     alloc: std.mem.Allocator,
@@ -1873,9 +1893,17 @@ fn renderGenericToolResult(
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(alloc);
     if (kind == .err) {
-        if (extractField(output_text, "detail") != null or extractField(output_text, "message") != null)
-            return renderErrorBody(alloc, th, output_text, out, opts);
-        try appendPrintable(alloc, &text, std.mem.trim(u8, output_text, " \t\r\n"));
+        if (extractField(output_text, "detail") != null or extractField(output_text, "message") != null) {
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(alloc);
+            try renderErrorBody(alloc, theme_mod.monochrome, output_text, &body, opts);
+            try appendPrintable(alloc, &text, body.items);
+            try out.appendSlice(alloc, th.danger);
+            try out.appendSlice(alloc, text.items);
+            try out.appendSlice(alloc, th.reset);
+            return;
+        }
+        try appendReadable(alloc, &text, std.mem.trim(u8, output_text, " \t\r\n"));
         const line = firstLine(text.items);
         if (line.len == 0) return renderErrorBody(alloc, th, output_text, out, opts);
         return appendLine(alloc, out, th.danger, line, th.reset);
@@ -1922,19 +1950,6 @@ fn renderFoldedText(alloc: std.mem.Allocator, th: Theme, text: []const u8, out: 
         try capped.appendSlice(alloc, shown);
     }
     return renderGenericFold(alloc, th, capped.items, out, opts);
-}
-
-/// 这些工具有副作用、返回 JSON,需提关键字段拼人话(绝不裸吐 JSON),由 renderJsonToolSummary 处理。
-fn isJsonSummaryTool(tool_name: []const u8) bool {
-    const names = [_][]const u8{
-        "NotebookEdit",         "KillShell",           "Monitor",
-        "CronCreate",           "CronDelete",          "CronList",
-        "EnterWorktree",        "ExitWorktree",        "PushNotification",
-        "ListMcpResourcesTool", "ReadMcpResourceTool", "ToolSearch",
-        "KgRemember",           "KgRecall",            "KgContext",
-    };
-    for (names) |n| if (std.mem.eql(u8, tool_name, n)) return true;
-    return false;
 }
 
 /// 把有副作用工具的 JSON 结果提成一行人话。提不到关键字段 → 通用 "done" 兜底(不吐 JSON)。
@@ -2315,8 +2330,7 @@ test "resultRenderMode: 故意 hidden vs 应显示" {
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("TaskStop"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("AskUserQuestion"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("Skill"));
-    // 完全未知的工具 hidden(绝不裸吐 JSON)。
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("SomeFutureTool"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("SomeFutureTool"));
     // 有专用渲染器的工具 → summary。
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("Bash"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("Edit"));
@@ -2387,8 +2401,7 @@ test "showStartCard: Task/Agent 起始卡可见但结果仍 hidden(#8)" {
     // 普通可见工具:打起始卡(沿用 resultRenderMode != hidden)。
     try testing.expect(showStartCard("Bash"));
     try testing.expect(showStartCard("WebSearch"));
-    // 完全未知工具:不打(resultRenderMode hidden)。
-    try testing.expect(!showStartCard("SomeFutureTool"));
+    try testing.expect(showStartCard("SomeFutureTool"));
 }
 
 test "renderResult: Bash 非零 exit_code 头部降级 ✗(#3)" {
@@ -2773,7 +2786,7 @@ test "actionLabel: 超长 CJK 参数按显示宽截断且不切碎 UTF-8" {
 test "an MCP tool gets a start line and a result body, as a built-in tool does" {
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("mcp__plc__echo"));
     try testing.expect(showStartCard("mcp__plc__echo"));
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("plc__echo"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("plc__echo"));
 }
 
 test "an MCP start line names the tool and summarizes its arguments in one line" {
@@ -2942,9 +2955,73 @@ test "an ApplyPatch start line keeps file names on one line and out of the termi
     try testing.expectEqualStrings("* ApplyPatch\n", empty);
 }
 
+test "registered tools are visible except for the exact opt-outs" {
+    const a = testing.allocator;
+    const registry = @import("metacodes-internal").tools_root.registry;
+    for (registry) |entry| {
+        const hidden = std.mem.eql(u8, entry.name, "AskUserQuestion") or
+            std.mem.eql(u8, entry.name, "Skill") or
+            std.mem.eql(u8, entry.name, "TaskGet") or
+            std.mem.eql(u8, entry.name, "TaskList") or
+            std.mem.eql(u8, entry.name, "TaskOutput") or
+            std.mem.eql(u8, entry.name, "TaskBatch");
+        const start_only = std.mem.eql(u8, entry.name, "Task");
+        const result_only = std.mem.eql(u8, entry.name, "TaskCreate") or
+            std.mem.eql(u8, entry.name, "TaskUpdate") or
+            std.mem.eql(u8, entry.name, "TaskStop");
+        try testing.expectEqual(!hidden and !result_only, showStartCard(entry.name));
+        try testing.expectEqual(if (hidden or start_only) ResultRenderMode.hidden else .summary, resultRenderMode(entry.name));
+        const generic = classifyCard(entry.name) == .generic_live;
+        const content = if (generic) "{\"status\":\"ok\\u001b[2J\\u0007\"}" else "ok";
+        const output = try renderResult(a, theme_mod.monochrome, entry.name, "{}", content, .ok, 0, .{});
+        defer a.free(output);
+        try testing.expectEqual(hidden or start_only, output.len == 0);
+        if (generic) {
+            try capture.expectContains(output, "status: ok");
+            try testing.expect(std.mem.indexOfScalar(u8, output, 0x1b) == null);
+            try testing.expect(std.mem.indexOfScalar(u8, output, 0x07) == null);
+            try testing.expect(std.mem.indexOf(u8, output, "{\"status\"") == null);
+        }
+    }
+    for ([_][]const u8{ "AskUserQuestion", "Skill", "TaskGet", "TaskList", "TaskOutput", "TaskBatch" }) |name| {
+        try testing.expect(classifyCard(name) == .hidden_all);
+        try testing.expect(!showStartCard(name));
+        try testing.expect(!usesDynamicCard(name));
+        try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode(name));
+    }
+}
+
+test "unlisted tools use safe live cards for success and failure" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "FormalAuditTask", "SpawnTeammate", "SomeFutureTool", "plc__echo", "TaskFuture" }) |name| {
+        try testing.expect(classifyCard(name) == .generic_live);
+        try testing.expect(usesLiveCard(name));
+        try testing.expect(!hasProgressCard(name));
+        const input = "{\"message\":\"hello\\u001b[2J\\nworld\"}";
+        const preview = try toolPreviewPub(a, name, input);
+        defer a.free(preview);
+        try testing.expect(std.mem.indexOfScalar(u8, preview, 0x1b) == null);
+        try testing.expect(std.mem.indexOfScalar(u8, preview, '\n') == null);
+        for ([_]ResultKind{ .ok, .err }) |kind| {
+            const output = try renderLiveDone(a, theme_mod.monochrome, name, input, "{\"status\":\"ok\\u001b[2J\\u0007\"}", kind, 0, .{});
+            defer a.free(output);
+            try capture.expectContains(output, name);
+            try capture.expectContains(output, "status: ok");
+            try testing.expect(std.mem.indexOfScalar(u8, output, 0x1b) == null);
+            try testing.expect(std.mem.indexOfScalar(u8, output, 0x07) == null);
+            try testing.expect(std.mem.indexOf(u8, output, "{\"status\"") == null);
+        }
+        const failed = try renderResult(a, theme_mod.monochrome, name, input, "{\"error\":{\"detail\":\"bad\\u001b[2J\\u0007\"}}", .err, 0, .{});
+        defer a.free(failed);
+        try capture.expectContains(failed, "bad");
+        try testing.expect(std.mem.indexOfScalar(u8, failed, 0x1b) == null);
+        try testing.expect(std.mem.indexOfScalar(u8, failed, 0x07) == null);
+    }
+}
+
 test "the tools that drew nothing get a start line naming the tool and its arguments" {
     const a = testing.allocator;
-    for (GENERIC_CARD_TOOLS) |name| {
+    for ([_][]const u8{ "ScheduleWakeup", "CodeMap", "FindSymbol", "ReadArtifact", "TeamCreate", "TeamDelete", "SendMessage", "ExecuteCode", "FormalAuditTask", "SpawnTeammate", "SomeFutureTool", "plc__echo", "TaskFuture" }) |name| {
         try testing.expectEqual(ResultRenderMode.summary, resultRenderMode(name));
         try testing.expect(showStartCard(name));
     }
