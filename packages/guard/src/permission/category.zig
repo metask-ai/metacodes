@@ -45,6 +45,7 @@ pub fn getToolCategory(tool_name: []const u8) ToolCategory {
     // KgRemember 是持久写(跨会话 store);按 read 分类会被 auto 等模式静默放行(M5)。
     // KgRecall/KgContext 是只读检索/遍历 → read。
     if (std.mem.eql(u8, tool_name, "KgRemember")) return .write;
+    if (std.mem.eql(u8, tool_name, "EnterWorktree") or std.mem.eql(u8, tool_name, "ExitWorktree")) return .write;
     if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Monitor")) return .execute;
     return .read;
 }
@@ -83,6 +84,12 @@ test "getToolCategory: KgRemember=write,KgRecall/KgContext=read" {
     try std.testing.expect(getToolCategory("KgRemember") == .write);
     try std.testing.expect(getToolCategory("KgRecall") == .read);
     try std.testing.expect(getToolCategory("KgContext") == .read);
+}
+
+test "getToolCategory: EnterWorktree and ExitWorktree move the working root and run git worktree, so they are write" {
+    try std.testing.expect(getToolCategory("EnterWorktree") == .write);
+    try std.testing.expect(getToolCategory("ExitWorktree") == .write);
+    try std.testing.expect(getRiskLevel("EnterWorktree") == .medium);
 }
 
 test "getToolCategory unknown defaults to read" {

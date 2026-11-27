@@ -277,3 +277,119 @@ test "L2 dontAsk denies Monitor without asking" {
 test "L2 bypassPermissions runs Monitor without asking" {
     try expectMonitorCase(.{ .mode = "bypassPermissions", .asks = false, .runs = true });
 }
+
+const WorktreeCase = struct {
+    mode: [*:0]const u8,
+    then_exit: bool,
+    answers: []const ui_request.PermissionChoice = &.{},
+    asked: []const []const u8,
+    root_moved: bool,
+};
+
+fn expectWorktreeCase(case: WorktreeCase) !void {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var home: Home = undefined;
+    try home.init();
+    defer home.deinit();
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const process_cwd = try a.dupeZ(u8, pfs.getCwd(&cwd_buf) orelse return error.NoCwd);
+    defer a.free(process_cwd);
+    defer _ = pfs.chdir(process_cwd.ptr);
+
+    try home.tmp.dir.createDirPath(std.testing.io, "elsewhere");
+    const elsewhere = try std.fmt.allocPrint(a, "{s}/elsewhere", .{home.root});
+    defer a.free(elsewhere);
+    const enter_input = try std.fmt.allocPrint(a, "{{\\\"path\\\":\\\"{s}\\\"}}", .{elsewhere});
+    defer a.free(enter_input);
+    const enter_sse = try toolUseSse(a, "tu_enter", "EnterWorktree", enter_input);
+    defer a.free(enter_sse);
+    const exit_sse = try toolUseSse(a, "tu_exit", "ExitWorktree", "{\\\"action\\\":\\\"keep\\\"}");
+    defer a.free(exit_sse);
+
+    const with_exit = [_][]const u8{ enter_sse, exit_sse, FINAL_SSE };
+    const enter_only = [_][]const u8{ enter_sse, FINAL_SSE };
+    const bodies: []const []const u8 = if (case.then_exit) &with_exit else &enter_only;
+    var server = try harness.MockServer.startCassette(bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var session: Session = undefined;
+    try session.init(url, case.mode);
+    defer session.deinit();
+    const original_root = try a.dupe(u8, session.app.cwdAbs());
+    defer a.free(original_root);
+
+    var host = Host{ .home = &home, .answers = case.answers };
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, try session.turn(&host));
+    const root = session.app.cwdAbs();
+    errdefer std.debug.print("mode={s} then_exit={}: asked {d} time(s) [{s}] [{s}], working root {s}\n", .{
+        case.mode,
+        case.then_exit,
+        host.asked,
+        host.askedFor(0),
+        host.askedFor(1),
+        root,
+    });
+
+    try std.testing.expectEqual(case.asked.len, host.asked);
+    for (case.asked, 0..) |name, index| try std.testing.expectEqualStrings(name, host.askedFor(index));
+    if (case.root_moved) {
+        try std.testing.expectEqualStrings(elsewhere, root);
+    } else {
+        try std.testing.expectEqualStrings(original_root, root);
+    }
+}
+
+test "L2 default asks before EnterWorktree moves the working root, and deny_once leaves it in place" {
+    try expectWorktreeCase(.{
+        .mode = "default",
+        .then_exit = false,
+        .answers = &.{.deny_once},
+        .asked = &.{"EnterWorktree"},
+        .root_moved = false,
+    });
+}
+
+test "L2 default asks before EnterWorktree and before ExitWorktree" {
+    try expectWorktreeCase(.{
+        .mode = "default",
+        .then_exit = true,
+        .answers = &.{ .allow_once, .deny_once },
+        .asked = &.{ "EnterWorktree", "ExitWorktree" },
+        .root_moved = true,
+    });
+}
+
+test "L2 acceptEdits and auto ask before EnterWorktree moves the working root" {
+    try expectWorktreeCase(.{
+        .mode = "acceptEdits",
+        .then_exit = false,
+        .answers = &.{.deny_once},
+        .asked = &.{"EnterWorktree"},
+        .root_moved = false,
+    });
+    try expectWorktreeCase(.{
+        .mode = "auto",
+        .then_exit = false,
+        .answers = &.{.deny_once},
+        .asked = &.{"EnterWorktree"},
+        .root_moved = false,
+    });
+}
+
+test "L2 bypassPermissions moves the working root with EnterWorktree and back with ExitWorktree without asking" {
+    try expectWorktreeCase(.{
+        .mode = "bypassPermissions",
+        .then_exit = false,
+        .asked = &.{},
+        .root_moved = true,
+    });
+    try expectWorktreeCase(.{
+        .mode = "bypassPermissions",
+        .then_exit = true,
+        .asked = &.{},
+        .root_moved = false,
+    });
+}

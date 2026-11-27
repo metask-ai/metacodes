@@ -1228,6 +1228,12 @@ status, compatibility boundaries, and entry points are defined by
   shortcut does not extend to it, so a Monitor command that only reads
   asks too.
 
+- **EnterWorktree and ExitWorktree ask first.** Entering a worktree
+  creates one with `git worktree add` or makes an existing directory the
+  session's working directory, and leaving one with `remove` deletes it.
+  Both now ask in `default`, `acceptEdits` and `auto`, are refused in
+  `dontAsk` and run in `bypassPermissions`.
+
 ## 0.13.0 — 2026-11-20
 
 ### Changed

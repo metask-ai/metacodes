@@ -333,7 +333,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "EnterWorktree",
-        .category = .read,
+        .category = .write,
         .description = "Enter an isolated git worktree. Pass `path` to switch into an existing worktree, OR pass `name` (and optional `base` branch) to create a new worktree under .metacodes/worktrees/<name>/. Changes the session's working directory. Returns {worktree, branch, entered, created}.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "Name for a new worktree to create" },
@@ -344,7 +344,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "ExitWorktree",
-        .category = .read,
+        .category = .write,
         .description = "Exit the current worktree and return to the original directory. Args: action='keep' (leaves worktree and branch intact) or 'remove' (also deletes the worktree). Optional discard_changes=true to force-remove even with uncommitted changes.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "action", .type = "string", .description = "keep leaves worktree intact; remove deletes it", .enum_values = &.{ "keep", "remove" } },
@@ -1429,8 +1429,8 @@ test "builtin permission categories cover the registry and preserve legacy behav
         .{ "KillShell", .read },
         .{ "Monitor", .execute },
         .{ "NotebookEdit", .write },
-        .{ "EnterWorktree", .read },
-        .{ "ExitWorktree", .read },
+        .{ "EnterWorktree", .write },
+        .{ "ExitWorktree", .write },
         .{ "ListMcpResourcesTool", .read },
         .{ "ReadMcpResourceTool", .read },
         .{ "PushNotification", .read },
