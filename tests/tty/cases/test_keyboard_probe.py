@@ -27,6 +27,7 @@ SHIFT_HINT = "shift + \u23ce for newline"
 BACKSLASH_HINT = "\\ + \u23ce for newline"
 # 等查询:DA1 是每轮的最后一个查询,它出现时整轮查询都已写出。
 QUERY_SENT = "waitbytes:\\x1b[c:10"
+LATE_ENABLE_SENT = "waitbytes:\\x1b[>1u:5"
 
 
 def _posix_only():
@@ -113,21 +114,39 @@ def test_probe_negative_keeps_kitty_off(bin_path):
     assert "52c" not in screen and "61;4" not in screen, "DA1 漏进了屏幕:\n" + screen
 
 
-def test_probe_timeout_falls_back_and_late_answers_do_not_leak(bin_path):
+def test_probe_timeout_without_an_answer_keeps_kitty_off(bin_path):
     _posix_only()
-    # 终端什么都不答:探测到期按"不知道"处理(不发),启动照常。应答晚于探测才到
-    # (慢链路),这时 REPL 已在读键:整条吃掉,不能变成输入框里的字符。
+    raw = _run(bin_path, [
+        QUERY_SENT,
+        wait_for('Try "fix typecheck errors"'),
+        "type:z", "key:shift_enter", "type:w",
+        wait_for(BACKSLASH_HINT),
+    ], _unknown_terminal())
+    assert KITTY_ENABLE not in raw, "超时没有答案 → 不应发 Kitty enable"
+    a, screen = _screen(raw)
+    assert BACKSLASH_HINT in screen, "没发 Kitty 协议,多行提示应是 \\+⏎:\n" + screen
+    top = a.box_top_row()
+    a.assert_line_contains(top + 1, "z")
+    a.assert_line_contains(top + 2, "w")
+
+
+def test_late_answers_at_the_prompt_turn_kitty_on_and_do_not_leak(bin_path):
+    _posix_only()
+    # 应答晚于探测才到(慢链路),这时 REPL 已在读键:整条吃掉,不能变成输入框里的字符;
+    # 其中的 Kitty 应答补开协议,多行提示跟着变成 shift+⏎。
     # 背景色应答以前会变成 Esc、字符、Esc:两次 Esc 连按清空输入框里已经打的 z。
     raw = _run(bin_path, [
         QUERY_SENT,
         wait_for('Try "fix typecheck errors"'),
         "type:z",
         "raw:\\x1b]11;rgb:ffff/ffff/ffff\\x1b\\\\\\x1b[?1u\\x1b[?62;22c",
+        LATE_ENABLE_SENT,
         "key:shift_enter", "type:w",
-        wait_for(BACKSLASH_HINT),
+        wait_for(SHIFT_HINT),
     ], _unknown_terminal())
-    assert KITTY_ENABLE not in raw, "超时没有答案 → 不应发 Kitty enable"
+    assert KITTY_ENABLE in raw, "a Kitty answer that came at the prompt should turn the protocol on"
     a, screen = _screen(raw)
+    assert SHIFT_HINT in screen, "with the protocol turned on the multi-line hint should be shift+⏎:\n" + screen
     top = a.box_top_row()
     a.assert_line_contains(top + 1, "z")
     a.assert_line_contains(top + 2, "w")
@@ -262,9 +281,55 @@ def test_late_answers_do_not_skip_the_splash(bin_path):
     ], _unknown_terminal(METACODES_NO_STARTUP_ANIMATION=None), term_size=(30, 100))
     redraws = raw.count(b"\x1b[?2026h\x1b[8A")
     assert redraws >= 15, f"{redraws} redraws: a late answer cut the splash short"
+    assert KITTY_ENABLE in raw, "a Kitty answer read while the splash played should turn the protocol on"
     a, screen = _screen_sized(raw, 30, 100)
     a.assert_input_echo("")
     assert "62;22c" not in screen
+
+
+def test_a_kitty_answer_during_a_slow_startup_turns_kitty_on_at_the_first_prompt(bin_path):
+    _posix_only()
+    raw = _slow_startup(bin_path, [
+        QUERY_SENT,
+        "strictsleep:0.3",
+        LATE_ANSWERS,
+        IDLE,
+        "type:x", "key:shift_enter", "type:y",
+        wait_for(SHIFT_HINT),
+    ], _unknown_terminal())
+    assert KITTY_ENABLE in raw, "a Kitty answer that came while App.init ran should turn the protocol on"
+    a, screen = _screen(raw)
+    assert SHIFT_HINT in screen, "with the protocol on the multi-line hint should be shift+⏎:\n" + screen
+    top = a.box_top_row()
+    a.assert_line_contains(top + 1, "x")
+    a.assert_line_contains(top + 2, "y")
+
+
+def _late_kitty_answer_then(bin_path, *events):
+    return _run(bin_path, [
+        QUERY_SENT,
+        wait_for('Try "fix typecheck errors"'),
+        "raw:\\x1b[?1u\\x1b[?62;22c",
+        LATE_ENABLE_SENT,
+        *events,
+    ], _unknown_terminal())
+
+
+def _assert_kitty_turned_off(raw, how):
+    assert raw.rfind(b"\x1b[<u") > raw.rfind(KITTY_ENABLE), f"{how} left the Kitty keyboard flags pushed"
+    assert raw.rfind(b"\x1b[>4m") > raw.rfind(b"\x1b[>4;2m"), f"{how} left modifyOtherKeys on"
+
+
+def test_exit_turns_a_late_kitty_protocol_off(bin_path):
+    _posix_only()
+    raw = _late_kitty_answer_then(bin_path, "type:/exit", "key:enter", "sleep:3")
+    _assert_kitty_turned_off(raw, "/exit after a late Kitty answer")
+
+
+def test_a_fatal_signal_turns_a_late_kitty_protocol_off(bin_path):
+    _posix_only()
+    raw = _late_kitty_answer_then(bin_path, "signal:QUIT", "sleep:0.8")
+    _assert_kitty_turned_off(raw, "SIGQUIT after a late Kitty answer")
 
 
 SPLASH_FIRST_FRAME = "waitbytes:\\x1b[?25l\\x1b[?2026h\\r:30"

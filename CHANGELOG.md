@@ -665,6 +665,15 @@ status, compatibility boundaries, and entry points are defined by
   could finish the agent and then fail on a missing verifier image. The
   summary now also shows how many of the selected tasks are ready.
 
+- **A terminal's late answer turns on the Kitty keyboard protocol over a
+  slow SSH link.** A terminal metacodes cannot name from its environment is
+  asked at startup whether it speaks the protocol, and the answer was
+  awaited for 120 ms. One that came later, over a link with a longer round
+  trip, was ignored: the protocol stayed off for the session, Shift+Enter
+  submitted the prompt and the footer said `\ + ⏎ for newline`. The answer
+  now turns the protocol on when it comes, during startup or at the prompt;
+  the footer follows, and `/exit`, a crash and SIGTSTP turn it off again.
+
 - **Bench no longer shows a negative 用时 for a running job.** Harbor writes a
   job's start and finish times in the executing machine's local time without
   a zone, and the workbench reads them as UTC, so a job running on a node at

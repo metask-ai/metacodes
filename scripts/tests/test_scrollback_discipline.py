@@ -73,6 +73,7 @@ ALLOWED_SINKS = {
     (Path("apps/cli/src/repl/input.zig"), "emitEnableSequences"): "keyboard protocol, bracketed paste and win32-input-mode on",
     (Path("apps/cli/src/repl/input.zig"), "emitDisableSequences"): "keyboard protocol, bracketed paste and win32-input-mode off",
     (Path("apps/cli/src/repl/input.zig"), "rescueTerminal"): "keyboard protocol, bracketed paste and mouse off when the process dies or stops",
+    (Path("apps/cli/src/repl/input.zig"), "emitLateKeyboardEnable"): "keyboard protocol on when the terminal's Kitty answer came after the startup probe",
     (Path("apps/cli/src/repl/tui/bg_probe.zig"), "sendQuery"): "OSC 11, Kitty flags and DA1 queries at startup",
     (Path("apps/cli/src/repl/tui/terminal_title.zig"), "writeAll"): "OSC 0 window title",
     # Regular files, not the terminal.

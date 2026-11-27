@@ -128,6 +128,7 @@ pub const KeyParser = struct {
     num2: u32 = 0,
     num3: u32 = 0,
     mouse_field: u8 = 0,
+    kitty_answer: KittyAnswer = .none,
     // 一字节 feed 偶尔需吐多个键(ESC 后紧跟普通字符 = 孤立 ESC + 该字符;`ESC ]` 后不是
     // OSC 应答 = ESC + ']' + 数字 + 下一个键):feed 返回第一个,其余按序暂存这里,
     // 调用方 feed / flushEsc 后须 while(drain())|k| 排空。
@@ -145,6 +146,8 @@ pub const KeyParser = struct {
 
     // ']' + 3 位数字 + 截断它的那个键。
     const queue_capacity = 5;
+
+    const KittyAnswer = enum { none, question_mark, flags };
 
     // csi_skip:一个认不出的 CSI(私有前缀 `?`/`>`/`=`、不成形的 `<` 鼠标报告、四段以上参数、`:` 子参数),
     // 吃到它的终结字节(0x40-0x7E)为止,整条报一个 .unknown。终端应答(DA1 `ESC[?62c`、
@@ -348,6 +351,7 @@ pub const KeyParser = struct {
                 return cursorKey(b);
             },
             .csi_seen => {
+                self.kitty_answer = if (b == '?') .question_mark else .none;
                 if (b >= '0' and b <= '9') {
                     self.num1 = b - '0';
                     self.state = .csi_num1;
@@ -508,9 +512,15 @@ pub const KeyParser = struct {
                 return .unknown;
             },
             .csi_skip => {
-                if (csiParam(b)) return null;
+                if (csiParam(b)) {
+                    if (self.kitty_answer != .none) self.kitty_answer = if (b >= '0' and b <= '9') .flags else .none;
+                    return null;
+                }
                 self.state = .normal;
-                if (b >= 0x40 and b <= 0x7e) return .unknown; // 终结字节:整条认不出的序列
+                if (b >= 0x40 and b <= 0x7e) { // 终结字节:整条认不出的序列
+                    if (b == 'u' and self.kitty_answer == .flags) noteLateKeyboardAnswer();
+                    return .unknown;
+                }
                 // 不是 CSI 的字节,序列到此为止:这个字节是下一个键(ESC 开新序列,控制键照常)。
                 if (b == 0x1b) {
                     self.state = .esc_seen;
@@ -1067,22 +1077,58 @@ fn terminalProgram() ?[]const u8 {
     return null;
 }
 
-/// 启动探测的答案:终端答了 Kitty flags 查询。进程内只在启动时、首次进 raw mode 之前写一次
-/// (app.resolveInteractiveTerminal),此后 enable/restore/提示文案读到的恒是同一个值。
+/// 启动探测的答案:终端答了 Kitty flags 查询。启动时、首次进 raw mode 之前写一次
+/// (app.resolveInteractiveTerminal);探测到期后才到的应答再把它从 false 改成 true 一次
+/// (takeLateKeyboardAnswer),改的地方当场补发 enable,enable/restore/提示文案读到的始终一致。
 var g_kitty_answered = std.atomic.Value(bool).init(false);
 
 pub fn recordKeyboardProbe(kitty_answered: bool) void {
     g_kitty_answered.store(kitty_answered, .release);
 }
 
-/// 发不发 Kitty 协议:策略 + (策略要探测时)启动探测的答案。同进程 env 不变、答案只写一次,
-/// enterRawMode 与 restoreMode 的判定恒一致。
+/// 发不发 Kitty 协议:策略 + (策略要探测时)启动探测的答案。同进程 env 不变,答案至多从 false
+/// 变成 true 一次、变时当场补发 enable,enterRawMode 与 restoreMode 的判定恒一致。
 pub fn shouldEnableKittyKeyboard() bool {
     return switch (keyboardPolicy()) {
         .enable => true,
         .disable => false,
         .probe => g_kitty_answered.load(.acquire),
     };
+}
+
+const LateKeyboardAnswer = enum(u8) { none, awaited, arrived };
+var g_late_keyboard_answer = std.atomic.Value(LateKeyboardAnswer).init(.none);
+
+fn takeProbeKeyboard(keyboard: bg_probe.Keyboard) void {
+    switch (keyboard) {
+        .supported => recordKeyboardProbe(true),
+        .unknown => if (keyboardPolicy() == .probe) g_late_keyboard_answer.store(.awaited, .release),
+        .unsupported => {},
+    }
+}
+
+fn noteLateKeyboardAnswer() void {
+    _ = g_late_keyboard_answer.cmpxchgStrong(.awaited, .arrived, .acq_rel, .acquire);
+}
+
+fn takeLateKeyboardAnswer() bool {
+    if (g_late_keyboard_answer.cmpxchgStrong(.arrived, .none, .acq_rel, .acquire) != null) return false;
+    recordKeyboardProbe(true);
+    return shouldEnableKittyKeyboard();
+}
+
+pub fn adoptLateKeyboardAnswer(fd: c_int) bool {
+    if (!takeLateKeyboardAnswer()) return false;
+    emitLateKeyboardEnable(fd);
+    rescueKeyboardToo();
+    return true;
+}
+
+fn emitLateKeyboardEnable(fd: c_int) void {
+    var unbuffered: [0]u8 = .{};
+    _ = std.debug.lockStderr(&unbuffered);
+    defer std.debug.unlockStderr();
+    _ = pfs.writeAll(fd, kbd_enable_seq);
 }
 
 /// 当前终端的换行方式提示(对齐真 cc getNewlineInstructions,但按 cc-zig 实际能力):
@@ -1124,15 +1170,18 @@ pub fn recordNewlineBinding(live: bool) void {
 var g_first_raw_entry = std.atomic.Value(bool).init(true);
 
 pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
-    // 启动探测到期、应答还在路上时终端一直是安静模式(bg_probe.Late):接管它,返回探测前的
-    // 模式供 restoreMode 复原(当前的安静模式不是要复原的那个)。
-    const original = bg_probe.handOver(fd);
+    // 启动探测到期、应答还在路上时终端一直是安静模式(bg_probe.Late):接管它和这期间到的 Kitty
+    // 应答,返回探测前的模式供 restoreMode 复原(当前的安静模式不是要复原的那个)。
+    const handed = bg_probe.handOver(fd);
+    if (handed) |late| takeProbeKeyboard(late.keyboard);
+    const original = if (handed) |late| late.original else null;
     // 模式切换走可移植 platform/terminal(POSIX termios / Windows console mode)。
     const startup = g_first_raw_entry.swap(false, .acq_rel);
     const orig = (if (startup) platform_term.enterRawKeepingInput(fd) else platform_term.enterRaw(fd)) orelse {
         if (original) |o| platform_term.restoreModeKeepingInput(fd, o);
         return null;
     };
+    _ = takeLateKeyboardAnswer();
     emitEnableSequences(fd);
     armRescue(fd, original orelse orig);
     if (startup) collectStartupInput(fd, startupSettleMs(bg_probe.roundTripMs()));
@@ -1291,6 +1340,13 @@ fn armRescue(fd: c_int, mode: platform_term.SavedMode) void {
     if (@import("builtin").os.tag != .windows and !g_rescue_installed.swap(true, .acq_rel)) rescue_signals.install();
 }
 
+fn rescueKeyboardToo() void {
+    if (!g_rescue_armed.swap(false, .acq_rel)) return;
+    @memcpy(g_rescue_bytes[g_rescue_len..][0..kbd_disable_seq.len], kbd_disable_seq);
+    g_rescue_len += kbd_disable_seq.len;
+    g_rescue_armed.store(true, .release);
+}
+
 fn disarmRescue() void {
     g_rescue_armed.store(false, .release);
 }
@@ -1361,7 +1417,7 @@ const rescue_signals = struct {
 };
 
 /// emitEnableSequences 开的转义模式关回去。关 bracketed paste(始终)+ 键盘协议(仅发过 enable
-/// 的——对称 enterRawMode,同进程 env 不变、探测答案只写一次,判定恒一致,不会发了 enable 没
+/// 的——对称 enterRawMode,同进程 env 不变、探测答案变成 true 时当场补发 enable,判定恒一致,不会发了 enable 没
 /// disable;没发过的不发孤立 disable,避免 Apple Terminal honor 它出异常)+ 控制台的
 /// win32-input-mode 与它的 bracketed paste。
 fn emitDisableSequences(fd: c_int) void {
@@ -3014,6 +3070,100 @@ test "rescueTerminal writes the off sequences once, only while armed" {
     try testing.expectEqualStrings(paste_only, buf[0..paste_only.len]);
 }
 
+fn unknownTerminalForTest() ![7]SavedEnv {
+    return .{
+        try SavedEnv.set("TERM", "xterm-256color"),
+        try SavedEnv.set("TERM_PROGRAM", null),
+        try SavedEnv.set("LC_TERMINAL", null),
+        try SavedEnv.set("TMUX", null),
+        try SavedEnv.set("STY", null),
+        try SavedEnv.set("ZELLIJ", null),
+        try SavedEnv.set(no_keyboard_enhancement_env, null),
+    };
+}
+
+test "takeProbeKeyboard: an answer in by the hand-over counts, an open question is awaited, a definite no is final" {
+    const was_answered = g_kitty_answered.load(.acquire);
+    defer recordKeyboardProbe(was_answered);
+    defer g_late_keyboard_answer.store(.none, .release);
+    const envs = try unknownTerminalForTest();
+    defer for (envs) |saved| saved.restore();
+    try testing.expectEqual(KeyboardPolicy.probe, keyboardPolicy());
+
+    recordKeyboardProbe(false);
+    takeProbeKeyboard(.unsupported);
+    try testing.expectEqual(LateKeyboardAnswer.none, g_late_keyboard_answer.load(.acquire));
+    try testing.expect(!takeLateKeyboardAnswer());
+    try testing.expect(!shouldEnableKittyKeyboard());
+
+    takeProbeKeyboard(.unknown);
+    try testing.expectEqual(LateKeyboardAnswer.awaited, g_late_keyboard_answer.load(.acquire));
+    try testing.expect(!takeLateKeyboardAnswer());
+    noteLateKeyboardAnswer();
+    try testing.expect(takeLateKeyboardAnswer());
+    try testing.expect(shouldEnableKittyKeyboard());
+    try testing.expect(!takeLateKeyboardAnswer());
+
+    recordKeyboardProbe(false);
+    takeProbeKeyboard(.supported);
+    try testing.expect(shouldEnableKittyKeyboard());
+
+    recordKeyboardProbe(false);
+    ppaths.setEnv("TERM_PROGRAM", "Apple_Terminal");
+    takeProbeKeyboard(.unknown);
+    try testing.expectEqual(LateKeyboardAnswer.none, g_late_keyboard_answer.load(.acquire));
+}
+
+test "adoptLateKeyboardAnswer: a late Kitty answer turns the protocol on once, with its crash rescue and the newline hint" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const was_installed = g_rescue_installed.swap(true, .acq_rel);
+    defer g_rescue_installed.store(was_installed, .release);
+    const was_mouse = mouseSelectionOn();
+    defer recordMouseSelection(was_mouse);
+    const was_answered = g_kitty_answered.load(.acquire);
+    defer recordKeyboardProbe(was_answered);
+    const was_binding = g_newline_binding.load(.acquire);
+    defer recordNewlineBinding(was_binding);
+    defer g_late_keyboard_answer.store(.none, .release);
+    defer disarmRescue();
+    const envs = try unknownTerminalForTest();
+    defer for (envs) |saved| saved.restore();
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var buf: [128]u8 = undefined;
+    const shift = "shift + \xe2\x8f\x8e for newline";
+    const backslash = "\\ + \xe2\x8f\x8e for newline";
+    const typed_text = platform_term.keyRecordsTypeText();
+
+    recordMouseSelection(false);
+    recordNewlineBinding(false);
+    recordKeyboardProbe(false);
+    takeProbeKeyboard(.unknown);
+    armRescue(fds[1], std.mem.zeroes(platform_term.SavedMode));
+    try testing.expect(!adoptLateKeyboardAnswer(fds[1]));
+    try testing.expect(!shouldEnableKittyKeyboard());
+    if (!typed_text) try testing.expectEqualStrings(backslash, newlineHint());
+
+    var parser = KeyParser{};
+    for ("\x1b[?1u") |b| _ = parser.feed(b);
+    try testing.expect(adoptLateKeyboardAnswer(fds[1]));
+    try testing.expectEqual(@as(isize, kbd_enable_seq.len), std.c.read(fds[0], &buf, buf.len));
+    try testing.expectEqualStrings(kbd_enable_seq, buf[0..kbd_enable_seq.len]);
+    try testing.expect(shouldEnableKittyKeyboard());
+    try testing.expectEqualStrings(shift, newlineHint());
+
+    for ("\x1b[?1u") |b| _ = parser.feed(b);
+    try testing.expect(!adoptLateKeyboardAnswer(fds[1]));
+    try testing.expectEqual(@as(c_int, 0), platform_term.waitReadable(fds[0], 0));
+
+    rescueTerminal();
+    const off = "\x1b[?2004l" ++ kbd_disable_seq;
+    try testing.expectEqual(@as(isize, off.len), std.c.read(fds[0], &buf, buf.len));
+    try testing.expectEqualStrings(off, buf[0..off.len]);
+}
+
 test "shouldEnableKittyKeyboard: 要探测的终端只在答了 Kitty flags 时才发,提示文案跟着走" {
     const saved = g_kitty_answered.load(.acquire);
     defer recordKeyboardProbe(saved);
@@ -3673,6 +3823,26 @@ test "KeyParser: 迟到的背景色应答(OSC 11,BEL 或 ST 结尾)整条吃掉,
     try testing.expectEqual(@as(u8, 'b'), keys[2].char);
     try testing.expect(keys[3] == .unknown);
     try testing.expectEqual(@as(u8, 'c'), keys[4].char);
+}
+
+test "KeyParser: a Kitty flags answer is one unknown key, and is noted only while the probe's question is open" {
+    defer g_late_keyboard_answer.store(.none, .release);
+    var buf: [16]Key = undefined;
+    g_late_keyboard_answer.store(.none, .release);
+    _ = parseAll("\x1b[?1u", &buf);
+    try testing.expectEqual(LateKeyboardAnswer.none, g_late_keyboard_answer.load(.acquire));
+
+    g_late_keyboard_answer.store(.awaited, .release);
+    for ([_][]const u8{ "\x1b[?u", "\x1b[?1;2u", "\x1b[?1:2u", "\x1b[>1u", "\x1b[?62;22c", "\x1b[?1\x1b[1:2u" }) |not_an_answer| {
+        _ = parseAll(not_an_answer, &buf);
+        try testing.expectEqual(LateKeyboardAnswer.awaited, g_late_keyboard_answer.load(.acquire));
+    }
+    const keys = parseAll("a\x1b[?31ub", &buf);
+    try testing.expectEqual(@as(usize, 3), keys.len);
+    try testing.expectEqual(@as(u8, 'a'), keys[0].char);
+    try testing.expect(keys[1] == .unknown);
+    try testing.expectEqual(@as(u8, 'b'), keys[2].char);
+    try testing.expectEqual(LateKeyboardAnswer.arrived, g_late_keyboard_answer.load(.acquire));
 }
 
 test "KeyParser: Alt+] 后面不是 OSC 应答 → 还是 Esc、']' 和后面那几个键" {
