@@ -109,7 +109,7 @@ def test_reply_draft_survives_a_permission_dialog(bin_path):
             bin_path,
             [READY, "type:go", "key:enter", wait_for("esc to interrupt"),
              "type:keep me", wait_for("❯ keep me"),
-             wait_for("Permission required", 20), "type:y",
+             wait_for("Permission required", 20), "strictsleep:0.5", "type:y",
              # The dialog erased the region; the box drawn again after it is the signal.
              wait_for("❯ keep me", 20),
              "type:!", wait_for("❯ keep me!", 10), "key:enter",

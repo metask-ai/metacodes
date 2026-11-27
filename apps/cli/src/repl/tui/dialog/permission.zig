@@ -22,6 +22,8 @@ const layout = @import("../layout.zig");
 const term = @import("../term.zig");
 const reflow = @import("../reflow.zig");
 const input_mod = @import("../../input.zig");
+const util_time = @import("metacodes-internal").util.time;
+const answer_gate = @import("answer_gate.zig");
 const Theme = theme_mod.Theme;
 
 /// PermissionChoice 已移到中立协议位置(core/protocol/);此处 re-export 保 UI 端引用兼容。
@@ -97,10 +99,15 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 /// 回顶按终端现在的宽度数上一帧占的行:框比终端宽时画的那一刻就折了行,终端变窄后
 /// 又会把每行重排成多行(reflow.zig);回顶后 ED 0 清掉旧帧多出的行。
 pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8) ?PermissionChoice {
+    return promptLoopTimed(alloc, th, in_fd, out_fd, tool_name, args, .interactive);
+}
+
+fn promptLoopTimed(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8, timing: answer_gate.Timing) ?PermissionChoice {
     var selected: usize = 0;
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
     var parser = input_mod.KeyParser{};
+    var gate = answer_gate.Gate.init(timing, util_time.nowNs());
     while (true) {
         const cols: u16 = if (term.getSize(out_fd)) |size| size.cols else 80;
         if (drawn) |anchor| {
@@ -120,21 +127,51 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
             .closed => return .deny_once,
         };
         switch (key) {
+            .ctrl_c => return .deny_once,
+            .paste_begin => {
+                if (skipPaste(in_fd, &parser)) |choice| return choice;
+                gate.close(util_time.nowNs());
+                continue;
+            },
+            .mouse, .cursor_position => continue,
+            else => {},
+        }
+        if (!gate.admits(util_time.nowNs())) continue;
+        if (gate.pasteFollows(in_fd, &parser)) {
+            if (skipUnmarkedPaste(in_fd, &parser, &gate)) |choice| return choice;
+            gate.close(util_time.nowNs());
+            continue;
+        }
+        switch (key) {
             .char => |c| switch (c) {
                 'y', 'Y' => return .allow_once,
                 'a', 'A' => return .allow_always,
                 'n', 'N' => return .deny_once,
                 'd', 'D' => return .deny_tool_session,
-                else => {},
+                else => gate.close(util_time.nowNs()),
             },
-            .ctrl_c => return .deny_once,
+            .backspace => gate.close(util_time.nowNs()),
             .enter => return options[selected].choice,
             .up => selected = if (selected == 0) options.len - 1 else selected - 1,
             .down => selected = (selected + 1) % options.len,
-            .paste_begin => if (skipPaste(in_fd, &parser)) |choice| return choice,
             else => {},
         }
     }
+}
+
+fn skipUnmarkedPaste(in_fd: c_int, parser: *input_mod.KeyParser, gate: *const answer_gate.Gate) ?PermissionChoice {
+    while (gate.pasteFollows(in_fd, parser)) {
+        switch (input_mod.readKey(in_fd, parser)) {
+            .key => |key| switch (key) {
+                .ctrl_c => return .deny_once,
+                .paste_begin => if (skipPaste(in_fd, parser)) |choice| return choice,
+                else => {},
+            },
+            .interrupted => {},
+            .closed => return .deny_once,
+        }
+    }
+    return null;
 }
 
 fn skipPaste(in_fd: c_int, parser: *input_mod.KeyParser) ?PermissionChoice {
@@ -237,11 +274,11 @@ test "promptLoop 读 Windows 控制台送来的按键记录:y、n、Ctrl+C 各�
     };
     for (cases) |c| {
         try console.sendChars(c.records);
-        try testing.expectEqual(c.choice, promptLoop(testing.allocator, theme_mod.dark, 0, sink, "Write", "{}").?);
+        try testing.expectEqual(c.choice, promptLoopTimed(testing.allocator, theme_mod.dark, 0, sink, "Write", "{}", .immediate).?);
     }
 }
 
-test "promptLoop reads whole keys: Ctrl+C sent as CSI u refuses, keys written together each count, a paste never answers" {
+test "promptLoop with no answer delay reads whole keys: Ctrl+C sent as CSI u refuses, keys written together each count, a paste never answers" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const sink = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
     try testing.expect(sink >= 0);
@@ -266,8 +303,55 @@ test "promptLoop reads whole keys: Ctrl+C sent as CSI u refuses, keys written to
         defer _ = std.c.close(fds[0]);
         try testing.expect(pfs.writeAll(fds[1], c.now));
         const thread = try std.Thread.spawn(.{}, Later.send, .{ fds[1], c.later });
-        const got = promptLoop(testing.allocator, theme_mod.monochrome, fds[0], sink, "Write", "{}");
+        const got = promptLoopTimed(testing.allocator, theme_mod.monochrome, fds[0], sink, "Write", "{}", .immediate);
         thread.join();
         try testing.expectEqual(c.choice, got.?);
     }
+}
+
+test "promptLoop answers only a key that follows a quiet spell: keys typed as the box opens, typing that goes on and a paste without markers never answer" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const sink = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    try testing.expect(sink >= 0);
+    defer _ = pfs.close(sink);
+    const Step = struct { after_ms: u32, bytes: []const u8 };
+    const Script = struct {
+        fn play(fd: c_int, steps: []const Step) void {
+            for (steps) |step| {
+                @import("metacodes-internal").platform.sync.sleepMs(step.after_ms);
+                _ = pfs.writeAll(fd, step.bytes);
+            }
+            @import("metacodes-internal").platform.sync.sleepMs(300);
+            _ = std.c.close(fd);
+        }
+    };
+    const timing: answer_gate.Timing = .{ .quiet_ms = 200, .paste_gap_ms = answer_gate.Timing.interactive.paste_gap_ms };
+    const cases = [_]struct { steps: []const Step, choice: PermissionChoice }{
+        .{ .steps = &.{ .{ .after_ms = 0, .bytes = "a" }, .{ .after_ms = 450, .bytes = "d" } }, .choice = .deny_tool_session },
+        .{ .steps = &.{ .{ .after_ms = 0, .bytes = "\r" }, .{ .after_ms = 450, .bytes = "d" } }, .choice = .deny_tool_session },
+        .{ .steps = &.{
+            .{ .after_ms = 0, .bytes = "t" },   .{ .after_ms = 20, .bytes = "e" }, .{ .after_ms = 20, .bytes = "a" },
+            .{ .after_ms = 20, .bytes = "y" },  .{ .after_ms = 20, .bytes = "n" }, .{ .after_ms = 20, .bytes = "\r" },
+            .{ .after_ms = 450, .bytes = "d" },
+        }, .choice = .deny_tool_session },
+        .{ .steps = &.{ .{ .after_ms = 450, .bytes = "say hi\r" }, .{ .after_ms = 450, .bytes = "d" } }, .choice = .deny_tool_session },
+        .{ .steps = &.{ .{ .after_ms = 450, .bytes = "yes\r" }, .{ .after_ms = 450, .bytes = "d" } }, .choice = .deny_tool_session },
+        .{ .steps = &.{ .{ .after_ms = 450, .bytes = "t" }, .{ .after_ms = 20, .bytes = "y" }, .{ .after_ms = 450, .bytes = "d" } }, .choice = .deny_tool_session },
+        .{ .steps = &.{.{ .after_ms = 450, .bytes = "y" }}, .choice = .allow_once },
+        .{ .steps = &.{ .{ .after_ms = 450, .bytes = "\x1b[B" }, .{ .after_ms = 60, .bytes = "\r" } }, .choice = .allow_always },
+        .{ .steps = &.{ .{ .after_ms = 0, .bytes = "\x1b[99;5u" }, .{ .after_ms = 450, .bytes = "y" } }, .choice = .deny_once },
+    };
+    for (cases) |c| {
+        var fds: [2]std.c.fd_t = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        defer _ = std.c.close(fds[0]);
+        const thread = try std.Thread.spawn(.{}, Script.play, .{ fds[1], c.steps });
+        const got = promptLoopTimed(testing.allocator, theme_mod.monochrome, fds[0], sink, "Write", "{}", timing);
+        thread.join();
+        try testing.expectEqual(c.choice, got.?);
+    }
+}
+
+test {
+    _ = answer_gate;
 }

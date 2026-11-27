@@ -421,6 +421,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A dialog that opens while you type no longer takes your keys as its
+  answer.** The permission and AskUserQuestion dialogs acted on the first
+  key after they were drawn, so the next letter of a message being typed
+  during a reply answered them (`a` is "Yes, always"), and so did a paste
+  the terminal sent without bracketed paste markers. They now take an
+  answer only after 400 ms without input, counted from when they open:
+  keys typed on while they wait are dropped, a key that arrives together
+  with more input is handled as a paste, and Ctrl+C (and Esc in a
+  question) still refuses or cancels at once.
+
 - **A process teammate starts on the task it was given.** `Task` with a
   teammate name under `--teammate-mode process` started the teammate
   without its prompt: the teammate came online and waited until the lead

@@ -14,6 +14,8 @@ const std = @import("std");
 const pfs = @import("metacodes-internal").platform.fs;
 const ansi = @import("../ansi.zig");
 const input_mod = @import("../../input.zig");
+const util_time = @import("metacodes-internal").util.time;
+const answer_gate = @import("answer_gate.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
@@ -544,6 +546,18 @@ pub fn run(
     out: *std.ArrayList([]const u8),
     cols: usize,
 ) !void {
+    return runTimed(alloc, th, in_fd, questions, out, cols, .interactive);
+}
+
+fn runTimed(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    in_fd: c_int,
+    questions: []const ctx.AskQuestion,
+    out: *std.ArrayList([]const u8),
+    cols: usize,
+    timing: answer_gate.Timing,
+) !void {
     const out_fd: c_int = 2;
     const nq = questions.len;
     if (nq == 0) return;
@@ -566,6 +580,7 @@ pub fn run(
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
     var parser = input_mod.KeyParser{};
+    var gate = answer_gate.Gate.init(timing, util_time.nowNs());
     while (true) {
         for (qs[0..nq], 0..) |s, qi| answered_flags[qi] = s.answered;
         // 单问完成:advanceView 把 view 推过末尾(== nq)→ finalize 返回(无 Submit 视图)。
@@ -616,9 +631,26 @@ pub fn run(
             .interrupted => continue,
             .closed => return error.InputAborted,
         };
+        const field: ?*QState = if (on_submit) null else &qs[view];
+        const field_options: usize = if (on_submit) 0 else questions[view].options.len;
         if (key == .paste_begin) {
-            if (on_submit) try readPaste(in_fd, &parser, null, 0) else try readPaste(in_fd, &parser, &qs[view], questions[view].options.len);
+            if (!try readPaste(in_fd, &parser, field, field_options)) gate.close(util_time.nowNs());
             continue;
+        }
+        switch (key) {
+            .mouse, .cursor_position => continue,
+            .ctrl_c, .esc => {},
+            else => {
+                if (!gate.admits(util_time.nowNs())) continue;
+                if (gate.pasteFollows(in_fd, &parser)) {
+                    if (!try readUnmarkedPaste(in_fd, &parser, &gate, key, field, field_options)) gate.close(util_time.nowNs());
+                    continue;
+                }
+                if (typesOutsideAField(key, field, if (on_submit) null else questions[view])) {
+                    gate.close(util_time.nowNs());
+                    continue;
+                }
+            },
         }
 
         if (on_submit) {
@@ -736,27 +768,70 @@ fn appendNote(st: *QState, real_n: usize, c: u8) void {
     st.note_len[oi] += 1;
 }
 
-fn readPaste(in_fd: c_int, parser: *input_mod.KeyParser, st: ?*QState, real_n: usize) error{InputAborted}!void {
+fn readPaste(in_fd: c_int, parser: *input_mod.KeyParser, st: ?*QState, real_n: usize) error{InputAborted}!bool {
+    var typed = false;
     while (true) {
         const key = switch (input_mod.readKey(in_fd, parser)) {
             .key => |key| key,
             .interrupted => continue,
             .closed => return error.InputAborted,
         };
-        const c: u8 = switch (key) {
-            .paste_end => return,
+        switch (key) {
+            .paste_end => return typed,
             .ctrl_c => return error.InputAborted,
-            .char => |c| c,
-            .enter, .tab => ' ',
-            else => continue,
-        };
-        const s = st orelse continue;
-        if (s.editing_note) {
-            appendNote(s, real_n, c);
-        } else if (s.selected == real_n) {
-            appendOther(s, c);
+            else => if (typePasted(st, real_n, key)) {
+                typed = true;
+            },
         }
     }
+}
+
+fn readUnmarkedPaste(in_fd: c_int, parser: *input_mod.KeyParser, gate: *const answer_gate.Gate, first: input_mod.Key, st: ?*QState, real_n: usize) error{InputAborted}!bool {
+    var typed = typePasted(st, real_n, first);
+    while (gate.pasteFollows(in_fd, parser)) {
+        const key = switch (input_mod.readKey(in_fd, parser)) {
+            .key => |key| key,
+            .interrupted => continue,
+            .closed => return error.InputAborted,
+        };
+        const went_in = switch (key) {
+            .ctrl_c => return error.InputAborted,
+            .paste_begin => try readPaste(in_fd, parser, st, real_n),
+            else => typePasted(st, real_n, key),
+        };
+        if (went_in) typed = true;
+    }
+    return typed;
+}
+
+fn typePasted(st: ?*QState, real_n: usize, key: input_mod.Key) bool {
+    const c: u8 = switch (key) {
+        .char => |c| c,
+        .enter, .tab => ' ',
+        else => return false,
+    };
+    const s = st orelse return false;
+    if (s.editing_note) {
+        appendNote(s, real_n, c);
+    } else if (s.selected == real_n) {
+        appendOther(s, c);
+    } else return false;
+    return true;
+}
+
+fn typesOutsideAField(key: input_mod.Key, field: ?*const QState, question: ?ctx.AskQuestion) bool {
+    const typed: ?u8 = switch (key) {
+        .char => |c| c,
+        .backspace => null,
+        else => return false,
+    };
+    const st = field orelse return if (typed) |c| c != '1' and c != '2' else true;
+    const q = question orelse return false;
+    if (st.editing_note or st.selected == q.options.len) return false;
+    const c = typed orelse return true;
+    if (c == ' ' or (c >= '1' and c <= '9')) return false;
+    const previews = !q.multi and st.selected < q.options.len and q.options[st.selected].preview.len > 0;
+    return !(c == 'n' and previews);
 }
 
 fn anyChecked(checked: []const bool) bool {
@@ -1114,7 +1189,7 @@ test "run: 单问 enter 后正常结束(回归:advanceView 推过末尾不越界
         answers.deinit(a);
     }
     // out_fd 走 fd2;in_fd 用管道读端。run 内部 writeAll 到 fd2(测试时可见但无碍)。
-    try run(a, th, pipefd[0], &.{q}, &answers, 80);
+    try runTimed(a, th, pipefd[0], &.{q}, &answers, 80, .immediate);
     try testing.expectEqual(@as(usize, 1), answers.items.len);
     try testing.expectEqualStrings("Red", answers.items[0]); // 首项默认选中
 }
@@ -1150,7 +1225,7 @@ test "run: 重画前 clear-to-end-of-screen 抹旧帧足迹(回归:残字乱码 
         for (answers.items) |it| a.free(@constCast(it));
         answers.deinit(a);
     }
-    run(a, th, inpipe[0], &.{q}, &answers, 80) catch {};
+    runTimed(a, th, inpipe[0], &.{q}, &answers, 80, .immediate) catch {};
 
     // 恢复 fd2,再读捕获内容(顺序:先恢复避免后续测试输出进捕获管道)。
     _ = std.c.dup2(saved_fd2, 2);
@@ -1237,7 +1312,7 @@ test "render: note 已输入显文本(非编辑态 → Notes: <text>)" {
     try capture.expectContains(r.frame, "my note");
 }
 
-test "run reads whole keys: Esc and Ctrl+C sent as CSI u cancel, text written at once is kept, a paste only types" {
+test "run with no answer delay reads whole keys: Esc and Ctrl+C sent as CSI u cancel, text written at once is kept, a paste only types" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     const sink = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
@@ -1284,7 +1359,7 @@ test "run reads whole keys: Esc and Ctrl+C sent as CSI u cancel, text written at
         }
         const saved_fd2 = std.c.dup(2);
         _ = std.c.dup2(sink, 2);
-        const result = run(a, theme_mod.monochrome, fds[0], c.questions, &answers, 80);
+        const result = runTimed(a, theme_mod.monochrome, fds[0], c.questions, &answers, 80, .immediate);
         _ = std.c.dup2(saved_fd2, 2);
         _ = std.c.close(saved_fd2);
         thread.join();
@@ -1292,6 +1367,62 @@ test "run reads whole keys: Esc and Ctrl+C sent as CSI u cancel, text written at
             try result;
             try testing.expectEqual(want.len, answers.items.len);
             for (want, answers.items) |w, got| try testing.expectEqualStrings(w, got);
+        } else {
+            try testing.expectError(error.InputAborted, result);
+        }
+    }
+}
+
+test "run answers only a key that follows a quiet spell: Enter typed as the box opens, a paste without markers and typing never pick an option" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const sink = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    try testing.expect(sink >= 0);
+    defer _ = pfs.close(sink);
+    const Step = struct { after_ms: u32, bytes: []const u8 };
+    const Script = struct {
+        fn play(fd: c_int, steps: []const Step) void {
+            for (steps) |step| {
+                @import("metacodes-internal").platform.sync.sleepMs(step.after_ms);
+                _ = pfs.writeAll(fd, step.bytes);
+            }
+            @import("metacodes-internal").platform.sync.sleepMs(300);
+            _ = std.c.close(fd);
+        }
+    };
+    const timing: answer_gate.Timing = .{ .quiet_ms = 200, .paste_gap_ms = answer_gate.Timing.interactive.paste_gap_ms };
+    const opts = [_]ctx.AskOption{ mkOpt("Red", ""), mkOpt("Blue", "") };
+    const one = [_]ctx.AskQuestion{.{ .question = "Color?", .header = "C", .multi = false, .options = &opts }};
+    const cases = [_]struct { steps: []const Step, answer: ?[]const u8 }{
+        .{ .steps = &.{ .{ .after_ms = 0, .bytes = "\r" }, .{ .after_ms = 450, .bytes = "2" } }, .answer = "Blue" },
+        .{ .steps = &.{ .{ .after_ms = 450, .bytes = "1\r" }, .{ .after_ms = 450, .bytes = "\x1b[B" }, .{ .after_ms = 60, .bytes = "\r" } }, .answer = "Blue" },
+        .{ .steps = &.{ .{ .after_ms = 450, .bytes = "a" }, .{ .after_ms = 20, .bytes = "\r" }, .{ .after_ms = 450, .bytes = "2" } }, .answer = "Blue" },
+        .{ .steps = &.{ .{ .after_ms = 0, .bytes = "\x1b[27u" }, .{ .after_ms = 450, .bytes = "\r" } }, .answer = null },
+        .{ .steps = &.{
+            .{ .after_ms = 450, .bytes = "\x1b[B" },      .{ .after_ms = 60, .bytes = "\x1b[B" },
+            .{ .after_ms = 60, .bytes = "\xe4\xbd\xa0" }, .{ .after_ms = 60, .bytes = "\r" },
+        }, .answer = "\xe4\xbd\xa0" },
+    };
+    for (cases) |c| {
+        var fds: [2]std.c.fd_t = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        defer _ = std.c.close(fds[0]);
+        const thread = try std.Thread.spawn(.{}, Script.play, .{ fds[1], c.steps });
+        var answers: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (answers.items) |it| a.free(@constCast(it));
+            answers.deinit(a);
+        }
+        const saved_fd2 = std.c.dup(2);
+        _ = std.c.dup2(sink, 2);
+        const result = runTimed(a, theme_mod.monochrome, fds[0], &one, &answers, 80, timing);
+        _ = std.c.dup2(saved_fd2, 2);
+        _ = std.c.close(saved_fd2);
+        thread.join();
+        if (c.answer) |want| {
+            try result;
+            try testing.expectEqual(@as(usize, 1), answers.items.len);
+            try testing.expectEqualStrings(want, answers.items[0]);
         } else {
             try testing.expectError(error.InputAborted, result);
         }
