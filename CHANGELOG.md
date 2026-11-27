@@ -375,17 +375,25 @@ status, compatibility boundaries, and entry points are defined by
     dialog has no `[a]`.
   - `[n] No`
   - `[d] No, and deny <tool> for the rest of this session`
-  - A shell command that is hard to undo gets no `[a]` and starts on No:
-    any part of it, with `timeout`, `env`, `xargs` and the like looked
-    through, that deletes files (`rm`, `rmdir`, `unlink`, `shred`,
-    `truncate`, `dd` with `of=`, `mkfs`, `find -delete` or `-exec rm`,
-    `git clean`, `git rm`), discards changes (`git reset --hard`,
-    `git checkout --` and `.`, `git restore`, `git stash drop` and `clear`,
-    `git branch -D`), pushes or publishes (`git push`,
-    `npm`/`pnpm`/`yarn publish`, `cargo publish`, `twine upload`,
-    `gem push`, `docker push`), reaches the network (`curl`, `wget`, `ssh`,
-    `scp`, `sftp`, `rsync`, `nc`, `ncat`, `netcat`, `telnet`, `ftp`) or runs
-    under `sudo` or `doas`. Other tools are not judged this way.
+  - A shell command that is hard to undo gets no `[a]` and starts on No. Every
+    part of it counts, read the way the shell splits and unquotes it: through
+    keywords and subshells, `NAME=value` prefixes, wrappers such as `timeout`,
+    `env`, `xargs` and `npx`, `$(…)` and backticks, `sh -c`, `cmd /c`,
+    `powershell -Command` and `eval`, with program names matched in any case
+    and without `.exe`. It is hard to undo when it deletes files (such as
+    `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `rimraf`, `dd` with `of=`,
+    `mkfs`, `find -delete` or `-exec rm`, `Remove-Item`, `del`, `rd`,
+    `Clear-Content`, `format`), discards work (`git clean`, `git rm`,
+    `git restore`, `git reset --hard`, `git checkout` with `--`, `.`, `-f` or
+    a commit and a path, `git switch -f` or `--discard-changes`,
+    `git stash drop` and `clear`, `git branch -D` or `-d -f`,
+    `git worktree remove -f`, `git reflog expire`, `git tag -d`), pushes or
+    publishes (`git push`, `npm`, `pnpm`, `yarn`, `bun`, `cargo`, `poetry` and
+    `uv publish`, `twine upload`, `gem push`, `docker push`, `podman push`),
+    reaches the network (`curl`, `wget`, `ssh`, `scp`, `sftp`, `rsync`, `nc`,
+    `telnet`, `ftp`, `Invoke-WebRequest`, `Invoke-RestMethod`) or raises
+    privileges (`sudo`, `doas`, `su`, `pkexec`, `runas`). Other tools are not
+    judged this way.
   - A Bash, Read, Grep or Glob call the permission gate refused shows as
     `Did not run 1 shell command`, `Did not read 1 file`,
     `Did not search for 1 pattern` or `Did not look for files` rather than
