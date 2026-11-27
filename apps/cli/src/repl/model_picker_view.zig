@@ -142,10 +142,21 @@ fn noneConfigured(picker: *const Picker) bool {
     return true;
 }
 
+const list_title = "Model";
+const filter_prefix = "  /";
+
+pub const FilterCaret = struct { row: u16, col: u16 };
+
+pub fn filterCaret(picker: *const Picker, cols: usize) ?FilterCaret {
+    if (picker.stage != .list) return null;
+    const col = 2 + list_title.len + filter_prefix.len + term.displayWidth(picker.filter());
+    return .{ .row = 0, .col = @intCast(@min(col, cols -| 1)) };
+}
+
 fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     line(w);
     const title = switch (picker.stage) {
-        .list => "Model",
+        .list => list_title,
         // By pointer: the slug's bytes are inline, and a copy captured by
         // value would be gone before `title` is printed.
         .setup => if (picker.setup) |*setup| setup.provider.slice() else "Provider",
@@ -158,8 +169,8 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 
         used += 1 + state.len;
     };
     if (picker.filter_len > 0 and picker.stage != .setup) {
-        w.print("  {s}/{s}{s}", .{ th.dim, picker.filter(), th.reset }) catch {};
-        used += 3 + picker.filter_len;
+        w.print("{s}{s}{s}{s}{s}", .{ filter_prefix[0..2], th.dim, filter_prefix[2..], picker.filter(), th.reset }) catch {};
+        used += filter_prefix.len + term.displayWidth(picker.filter());
     }
     const status: []const u8 = switch (picker.status) {
         // A stale or failed list must say so on the line the user is reading,
@@ -987,6 +998,27 @@ test "a control that declares its default shows it bracketed, with no default sl
     picker.presetControl("reasoning_effort", "none");
     text = try screen(arena, &picker, 120);
     try testing.expect(std.mem.indexOf(u8, text, "Reasoning effort  [none]  low   high   max   ←/→") != null);
+}
+
+test "the filter caret stands after the typed text, counted in columns, and a wide filter leaves the scopes where a narrow one does" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]control_plane.OfferSummary{offerOf("metask", "default", "glm-4.6", "anthropic_messages")};
+    try seed(&picker, &offers, null);
+    try testing.expectEqual(FilterCaret{ .row = 0, .col = 10 }, filterCaret(&picker, 80).?);
+    for ("abcd") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expectEqual(FilterCaret{ .row = 0, .col = 14 }, filterCaret(&picker, 80).?);
+    const narrow = (try visibleRows(arena, drawAt(&picker, try arena.alloc(u8, 32 * 1024), 80)))[0];
+    for (0..4) |_| _ = picker.onKey(.backspace);
+    for ("中文") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expectEqual(FilterCaret{ .row = 0, .col = 14 }, filterCaret(&picker, 80).?);
+    const wide = (try visibleRows(arena, drawAt(&picker, try arena.alloc(u8, 32 * 1024), 80)))[0];
+    try testing.expect(std.mem.indexOf(u8, wide, "Model  /中文") != null);
+    try testing.expectEqual(term.displayWidth(narrow), term.displayWidth(wide));
+    try testing.expectEqual(FilterCaret{ .row = 0, .col = 11 }, filterCaret(&picker, 12).?);
 }
 
 test "a provider with no credential is not drawn, and a filter does not find it (#488)" {

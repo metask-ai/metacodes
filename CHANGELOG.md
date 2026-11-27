@@ -703,6 +703,15 @@ status, compatibility boundaries, and entry points are defined by
   the remote machine's name, as the OSC 8 convention asks, so the terminal
   can tell the file is not local. Local sessions are unchanged.
 
+- **Typing Chinese into the `/model` filter shows it where the filter is.**
+  The picker drew its filter in its header line but left the terminal's
+  cursor in the input box below it, so an input method opened its
+  candidates, and drew the text being composed, down there. While the picker
+  is open the cursor now stands at the end of its filter. The header also
+  counts the filter in columns, so a wide filter no longer pulls the scope
+  labels out of line, and Backspace takes back a whole character instead of
+  one of its bytes.
+
 - **A provider overload is retried like a 503.** HTTP 529 was an unnamed
   status that ended the turn after one attempt; it is now
   `ServiceUnavailable` and goes through the connect retry (attempt limit,
