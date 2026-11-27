@@ -18,7 +18,16 @@ Scopes, narrowest first:
   manifest run; suites and TTY do not. Independent doc_references and
   release_docs outputs select protocol path/pin validation and the real
   documents-only release copy/verification steps, respectively.
-- `eval`: every changed path is documentation or the Python evaluation
+- `bench`: every changed path is documentation or a Bench platform file
+  (`scripts/eval/harbor/**`, `scripts/eval/tests/test_bench_*.py`,
+  `scripts/eval/tests/test_harbor_*.py`, `scripts/eval/bench_cli_smoke.py`,
+  `scripts/eval/bench_ui_smoke.py`, `scripts/bench_assets.zig`). Only the
+  Bench/Harbor Python unit suites, lint and basic doc/version checks run;
+  when Bench runtime code, embedded asset wiring or the CLI smoke changes,
+  `bench_smoke=true` also builds `metacodes` and runs `bench_cli_smoke.py`
+  on POSIX. Unrelated unit, integration, product, release, Lean, TTY and
+  SDK suites are skipped.
+- `eval`: every changed path is documentation, Bench or the Python evaluation
   harness (`scripts/eval/**`, `evals/**`). The gates run in full, since
   `zig build test` runs the harness's suites and smokes against the built
   binary; the TTY suites, which drive the interactive binary and read
@@ -78,6 +87,15 @@ DIFF_EVENTS = ("pull_request", "merge_group", "local")
 # same manifest as build.zig, including licence files outside the doc tree.
 RELEASE_DOCS = ("README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md")
 PROTOCOL = "evals/plugin-v1/protocol.json"
+BENCH_PREFIXES = ("scripts/eval/harbor/",)
+BENCH_FILES = (
+    "scripts/bench_assets.zig",
+    "scripts/eval/bench_cli_smoke.py",
+    "scripts/eval/bench_ui_smoke.py",
+)
+BENCH_TEST_PREFIXES = ("test_bench_", "test_harbor_")
+BENCH_NO_SMOKE_PREFIXES = ("scripts/eval/harbor/viewer/static/",)
+BENCH_NO_SMOKE_FILES = ("scripts/eval/bench_ui_smoke.py",)
 EVAL_PREFIXES = ("scripts/eval/", "evals/")
 LAYERS = "layers.zon"
 LAYER_BASELINE = "layer_baseline.zon"
@@ -87,7 +105,7 @@ TTY_TESTS = "tests/tty/"
 TTY_DOMAINS = "tests/tty/domains.json"
 TESTS_PACKAGE = "tests"
 TEST_PACKAGES = ("testing", TESTS_PACKAGE)
-CLI_NO_TTY_PREFIXES = ("apps/cli/src/web/", "apps/cli/src/daemon/")
+CLI_NO_TTY_PREFIXES = ("apps/cli/src/web/", "apps/cli/src/daemon/", "apps/cli/src/app/bench_cli.zig")
 CLI_PROVIDER_TTY_FILES = (
     "apps/cli/src/repl/model_picker.zig",
     "apps/cli/src/repl/model_picker_view.zig",
@@ -112,6 +130,30 @@ def is_docs(path: str, release_sources: Sequence[str] = RELEASE_DOCS) -> bool:
     if path.startswith("doc/"):
         return True
     return "/" not in path and path.endswith(".md")
+
+
+def is_bench_test(path: str) -> bool:
+    prefix = "scripts/eval/tests/"
+    if not path.startswith(prefix):
+        return False
+    name = path[len(prefix):]
+    return "/" not in name and name.startswith(BENCH_TEST_PREFIXES) and name.endswith(".py")
+
+
+def is_bench(path: str) -> bool:
+    return path.startswith(BENCH_PREFIXES) or path in BENCH_FILES or is_bench_test(path)
+
+
+def bench_needs_smoke(status: str, path: str) -> bool:
+    if is_bench_test(path):
+        return False
+    if path.startswith(BENCH_PREFIXES) and path.endswith(".md"):
+        return False
+    if status == "D":
+        return True
+    if path.startswith(BENCH_NO_SMOKE_PREFIXES) or path in BENCH_NO_SMOKE_FILES:
+        return False
+    return True
 
 
 def is_eval(path: str) -> bool:
@@ -258,9 +300,11 @@ def load_layout(read: Callable[[str], str]) -> Layout:
 
 def path_kind(path: str, layout: Optional[Layout], release_sources: Sequence[str] = RELEASE_DOCS,
               document_protocol: bool = False) -> str:
-    """docs, eval, script-test, tty-test, suite-test, package or full."""
+    """docs, bench, eval, script-test, tty-test, suite-test, package or full."""
     if is_docs(path, release_sources) or (path == PROTOCOL and document_protocol):
         return "docs"
+    if is_bench(path):
+        return "bench"
     if is_eval(path):
         return "eval"
     if path.startswith(SCRIPT_TESTS):
@@ -286,7 +330,10 @@ def classify(paths: Sequence[str], deleted: Sequence[str] = (), *,
     kinds = {path: path_kind(path, layout, release_sources, document_protocol) for path in paths}
     if all(kind == "docs" for kind in kinds.values()):
         return "docs", f"docs scope: only documents or their protocol paths changed ({_shown(paths)}); references and release documents are checked independently"
-    outside = [path for path in paths if kinds[path] not in ("docs", "eval")]
+    outside_bench = [path for path in paths if kinds[path] not in ("docs", "bench")]
+    if not outside_bench:
+        return "bench", f"bench scope: only bench platform files and documentation changed ({_shown(paths)}); unrelated suites and TTY are skipped"
+    outside = [path for path in paths if kinds[path] not in ("docs", "bench", "eval")]
     if not outside:
         return "eval", "eval scope: only documentation and the evaluation harness changed; the TTY suites are skipped"
     unknown = [path for path in outside if kinds[path] == "full"]
@@ -366,6 +413,8 @@ class Selection:
     script_tests: Tuple[str, ...] = ()
     tty_domains: Tuple[str, ...] = ()
     offline_eval: bool = True
+    bench_tests: bool = False
+    bench_smoke: bool = False
 
     @property
     def complete(self) -> bool:
@@ -382,7 +431,7 @@ def path_tty_domains(
     layout: Layout,
     tty_domains: Optional[TtyDomains],
 ) -> Optional[Tuple[str, ...]]:
-    if kind in ("docs", "script-test"):
+    if kind in ("docs", "script-test", "bench"):
         return ()
     if kind == "tty-test":
         if status != "D" and tty_domains is not None:
@@ -445,6 +494,14 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
     if scope == "docs":
         return Selection(suites=False, tty=False, sdk=False, units=False,
                          integration=False, product=False, release=False, offline_eval=False)
+    if scope == "bench":
+        smoke = (
+            any(bench_needs_smoke(status, path) for status, path in changes if is_bench(path))
+            if changes else True
+        )
+        return Selection(suites=False, tty=False, sdk=False, units=False,
+                         integration=False, product=False, release=False,
+                         offline_eval=False, bench_tests=True, bench_smoke=smoke)
     if scope == "eval":
         return Selection(suites=True, tty=False, sdk=False, units=True,
                          integration=True, product=True, release=True)
@@ -458,7 +515,7 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
     # A shared fixture under tests/ can feed the TTY cases as well as the Zig
     # suites; a script suite build.zig names runs in test:units on every
     # platform, Windows included, so it keeps test:units.
-    suites = any(kind in ("suite-test", "eval") for kind in kinds.values())
+    suites = any(kind in ("suite-test", "eval", "bench") for kind in kinds.values())
     units = suites or bool(modules & layout.build_suites)
     if scope == "tests":
         tty_changes = [(status, path) for status, path in changes if kinds[path] in ("tty-test", "suite-test")]
@@ -528,7 +585,7 @@ def protocol_documents_only(before: dict, after: dict, release_sources: Sequence
 
 
 def document_checks(scope: str, changes: Sequence[Change], inputs: DocumentInputs) -> Tuple[bool, bool]:
-    if scope != "docs":
+    if scope not in ("docs", "bench"):
         return True, True
     paths = {path for _, path in changes}
     return (PROTOCOL in paths or bool(paths & inputs.protocol_paths), bool(paths & inputs.release_sources))
@@ -588,7 +645,9 @@ def decide(
         document_protocol = (PROTOCOL in paths and protocol_change is not None
                              and all(path == PROTOCOL or is_docs(path, release_sources) for path in paths)
                              and protocol_change(base, candidate))
-        needs_layout = layout is not None and any(not (is_docs(path, release_sources) or is_eval(path)) for path in paths)
+        needs_layout = layout is not None and any(
+            not (is_docs(path, release_sources) or is_bench(path) or is_eval(path)) for path in paths
+        )
         scope, reason = classify(paths, [path for status, path in found if status == "D"],
                                  document_protocol=document_protocol, release_sources=release_sources,
                                  layout=layout() if needs_layout else None)
@@ -629,6 +688,8 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
              f"| Product suite | {run(chosen.suites and chosen.product)} |",
              f"| Release layout | {run(chosen.suites and chosen.release)} |",
              f"| Offline evaluation | {run(chosen.offline_eval)} |",
+             f"| Bench unit suites | {run(chosen.bench_tests)} |",
+             f"| Bench CLI smoke | {run(chosen.bench_smoke)} |",
              f"| Changed script suites | {cell(' '.join(chosen.script_tests)) or 'None'} |",
              f"| TTY | {tty_label} |",
              f"| SDK bindings | {run(chosen.sdk)} |"]
@@ -657,6 +718,11 @@ def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: 
     every changed script suite, which CI runs on a checks-leg step of its own
     when build.zig does not. The rest of the AGENTS.md checklist runs on its
     own."""
+    if selection.bench_tests:
+        commands = [[sys.executable, "scripts/eval/tests/run_shard.py", "--bench-only", "--jobs", "4", "-v"]]
+        if selection.bench_smoke and not windows:
+            commands.append([zig, "build", "test:bench-smoke"])
+        return commands
     if not selection.suites:
         return []
     unittest = [[sys.executable, "-m", "unittest", *scripts]] if scripts else []
@@ -743,7 +809,7 @@ def replay_report(rows: Sequence[Tuple[str, str, str, Tuple[str, ...], str]], ti
     if not rows:
         return "\n".join(lines + ["No commits in the window.", ""])
     lines.extend(["| Scope | Commits | Share |", "|---|---|---|"])
-    for scope in ("docs", "eval", "tests", "packages", "full") + tuple(
+    for scope in ("docs", "bench", "eval", "tests", "packages", "full") + tuple(
             extra for extra in ("fast-path", "unknown") if counts[extra]):
         lines.append(f"| {scope} | {counts[scope]} | {100 * counts[scope] / len(rows):.0f}% |")
     lines.extend(["", "| Commit | PR | Scope | Packages | Reason |", "|---|---|---|---|---|"])
@@ -942,6 +1008,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"units={flag(selection.units)}\nintegration={flag(selection.integration)}\n"
                 f"product={flag(selection.product)}\nrelease={flag(selection.release)}\n"
                 f"offline_eval={flag(selection.offline_eval)}\n"
+                f"bench_tests={flag(selection.bench_tests)}\n"
+                f"bench_smoke={flag(selection.bench_smoke)}\n"
                 f"packages={','.join(selection.packages)}\npackage_tests={' '.join(selection.package_tests)}\n"
                 f"script_tests={' '.join(selection.script_tests)}\ncomplete={flag(selection.complete)}\n"
                 f"reason={reason}\n"
