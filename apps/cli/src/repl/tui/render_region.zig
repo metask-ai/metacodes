@@ -2003,9 +2003,9 @@ pub const RenderRegion = struct {
         if (!self.inGeneration()) return;
         self.observeResize();
         self.hold_paint = true;
-        self.endGenThinkingLocked(util_time.nowMs());
         self.flushGenAssistantLocked(); // 助手文本残行(markdown)先 flush
         self.flushLineBuf(); // 再把行缓冲残行(无尾随 \n 的末行)输出,别丢
+        self.endGenThinkingLocked(util_time.nowMs());
         self.hold_paint = false;
         self.paintLocked(.hidden, ""); // 立即边界:攒下的文本写出,区擦掉不重画
         self.eraseRegion(); // 擦掉固定区(若在),光标回文本续接点
@@ -2204,6 +2204,11 @@ pub const RenderRegion = struct {
     }
 
     fn writeThinkingSummaryLocked(self: *RenderRegion, elapsed_ms: ?i64) void {
+        const held = self.hold_paint;
+        self.hold_paint = true;
+        self.flushGenAssistantLocked();
+        self.flushLineBuf();
+        self.hold_paint = held;
         var buf: [160]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         const pending = self.pending_scroll.items;

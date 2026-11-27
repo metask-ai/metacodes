@@ -306,3 +306,63 @@ test "a resumed session replays its thinking as one summary line without seconds
     try std.testing.expect(summary < answer);
     try expectAbsent(screen, "the private reasoning");
 }
+
+test "L2 an answer line left without a newline, then thinking, then more text: the summary comes after that line" {
+    const body = comptime message_start ++ answerText("0", "Let me check") ++ thinking("1", "weighing the parser") ++ answerText("2", "Then the file.") ++ finish("end_turn");
+    var fx: Fixture = undefined;
+    try fx.init(&.{body});
+    defer fx.deinit();
+    const screen = try fx.drawnTurn(1);
+    defer gpa.free(screen);
+
+    const earlier = try expectLine(screen, "⏺ Let me check");
+    var found: [4]usize = undefined;
+    const summaries = rowsStartingWith(screen, summary_start, &found);
+    try std.testing.expectEqual(@as(usize, 1), summaries.len);
+    const later = try expectLine(screen, "  Then the file.");
+    try std.testing.expect(earlier < summaries[0] and summaries[0] < later);
+    try expectAbsent(screen, "weighing the parser");
+}
+
+test "a reply that ends while thinking after a line without a newline keeps that line before the summary" {
+    const fx = try region_harness.AppFixture.create(gpa);
+    defer fx.destroy();
+    const t = try region_harness.Term.create(gpa, .{ .rows = 24, .cols = 60 });
+    defer t.destroy();
+    t.region.enterGenerating(fx.app, null);
+    t.region.beginGenAssistant();
+    t.region.writeGenAssistantText("partial answer");
+    t.region.writeGenThinking("still going", 0);
+    t.region.leaveGenerating(fx.app);
+    const after = try t.transcriptAlloc(.{});
+    defer gpa.free(after);
+    const line = try expectLine(after, "⏺ partial answer");
+    var found: [4]usize = undefined;
+    const summaries = rowsStartingWith(after, summary_start, &found);
+    try std.testing.expectEqual(@as(usize, 1), summaries.len);
+    try std.testing.expect(line < summaries[0]);
+}
+
+test "a resumed reply whose thinking follows a text block without a newline replays that text before the summary" {
+    const fx = try region_harness.AppFixture.create(gpa);
+    defer fx.destroy();
+    const t = try region_harness.Term.create(gpa, .{ .rows = 24, .cols = 60 });
+    defer t.destroy();
+    var conv = cc.conversation.Conversation.init(gpa);
+    defer conv.deinit();
+    try conv.appendText(.user, "fix it");
+    const blocks = try gpa.alloc(cc.message.Block, 3);
+    blocks[0] = .{ .text = try gpa.dupe(u8, "Reading it.") };
+    blocks[1] = .{ .thinking = try gpa.dupe(u8, "the private reasoning") };
+    blocks[2] = .{ .text = try gpa.dupe(u8, "Done.") };
+    try conv.append(.{ .role = .assistant, .blocks = blocks });
+
+    try cc.repl_replay.replay(gpa, .{ .region = &t.region, .theme = &t.region.theme, .verbose = false }, &conv);
+    const screen = try t.transcriptAlloc(.{});
+    defer gpa.free(screen);
+    const reading = try expectLine(screen, "⏺ Reading it.");
+    const summary = try expectLine(screen, "✻ Thought");
+    const done = try expectLine(screen, "  Done.");
+    try std.testing.expect(reading < summary and summary < done);
+    try expectAbsent(screen, "the private reasoning");
+}

@@ -116,3 +116,15 @@ def test_a_reply_broken_off_while_thinking_shows_its_summary_the_notice_and_the_
     answer = next(i for i, line in enumerate(shown) if line.startswith("⏺ clean answer"))
     assert summaries[0] < notice < summaries[1] < answer, "\n".join(shown)
     _assert_thinking_gone(shown, ["halfway through a thought", "a whole thought"])
+
+
+def test_an_answer_line_without_a_newline_stays_above_the_summary_of_the_thinking_after_it(bin_path):
+    turn = (START + _answer("Let me check", index=0) + _thinking(["weighing the parser"], 0.2, index=1)
+            + _answer("Then the file.", index=2) + END_TURN)
+    raw = _ask(bin_path, [turn], [wait_for("Then the file.", 15), IDLE])
+    shown = _shown(raw)
+    earlier = next(i for i, line in enumerate(shown) if line.startswith("⏺ Let me check"))
+    summaries = _summaries(shown)
+    later = next(i for i, line in enumerate(shown) if line.strip() == "Then the file.")
+    assert len(summaries) == 1 and earlier < summaries[0] < later, "\n".join(shown)
+    _assert_thinking_gone(shown, ["weighing the parser"])
