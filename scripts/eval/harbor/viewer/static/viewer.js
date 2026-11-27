@@ -318,8 +318,10 @@ const ITEM_ACTIONS = {
 };
 function itemActions(b, index) {
   const item = b.items[index];
+  const hasProgress = Boolean(item.run || item.resumed_runs?.length);
   const names = item.status === 'pending' ? ['cancel'] : item.status === 'running' ? ['stop']
-    : ['cancelled', 'interrupted', 'failed'].includes(item.status) && item.run ? ['resume', 'run'] : ['run'];
+    : (['cancelled', 'interrupted', 'failed'].includes(item.status) && hasProgress)
+      || (item.status === 'skipped' && item.resumed_runs?.length) ? ['resume', 'run'] : ['run'];
   return names.map((name) => h('button', { type: 'button', class: 'button',
     title: { resume: '只运行还没跑完的题', run: '把这个评测集的题全部再运行一次' }[name] || null,
     onclick: async (event) => {
@@ -784,6 +786,7 @@ async function renderProfile(id) {
         return h('tr', { class: href ? 'link' : null, onclick: href ? () => { location.hash = href; } : null },
           h('td', {}, href ? link(href, item.suite_name || item.suite) : h('span', { text: item.suite_name || item.suite }), h('span', { class: 'sub', text: [item.category_name, `${(item.tasks || []).length} 道题`,
             item.concurrency ? `并发 ${item.concurrency}` : null,
+            item.resume_tasks_count && ['pending', 'running'].includes(item.status) ? `继续剩余 ${item.resume_tasks_count} 道题` : null,
             item.auto_rerun ? `自动重跑无效的题 第 ${item.auto_rerun} 轮` : null,
             skippedFeatures(b, item).length ? `本次未开启 ${skippedFeatures(b, item).join(', ')}` : null].filter(Boolean).join(' · ') })),
           h('td', { text: item.model || '—' }),
@@ -794,7 +797,7 @@ async function renderProfile(id) {
           h('td', { class: 'num', text: js ? pct(js.first_pass_rate) : '—' }),
           h('td', { class: 'num', text: js ? compact(js.total_tokens) : '—' }),
           h('td', { class: 'num', text: j ? dur(j.wall_s) : '—' }),
-          b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index), j && !j.running && item.status !== 'running' ? h('button', { class: 'button', onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除结果') : null)) : null);
+          b.can_run ? h('td', { class: 'pinned' }, h('div', { class: 'row-actions' }, itemActions(b, index), j && !j.running && !['pending', 'running'].includes(item.status) ? h('button', { class: 'button', onclick: (e) => { e.stopPropagation(); deleteJob(j, e.currentTarget); } }, '删除结果') : null)) : null);
       };
       const itemHeads = ['评测集', '模型', '状态', '完成', '结局分布', '首次满分率', '总 Token', '用时', ...(b.can_run ? ['操作'] : [])];
       const itemTable = (rows, empty) => h('div', { class: 'table-scroll' }, h('table', {},

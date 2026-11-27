@@ -613,6 +613,47 @@ ctx.api = async () => payload;
             ["0.12.0", "默认功能"],
         ])
 
+    def test_resumed_item_actions_and_pending_row_controls(self):
+        result = self._run_js("""
+const profile = {
+  id: 'prof-1', name: 'Prof', status: 'queued', can_run: true, concurrency: 64,
+  created_at: '2026-11-27T01:00:00Z', last_run_at: '2026-11-27T01:29:00Z',
+  metacodes: { label: '0.12.0' }, models: ['m'], features: [], tasks: [], by_model: [],
+  summary: { counts: { pass: 0, fail: 0, partial: 0, timeout: 0, invalid: 0, running: 0 }, trials: 0, valid: 0,
+             first_passed: 0, first_valid: 0, tasks_solved: 0, tasks_attempted: 0 },
+  items: [
+    { index: 0, submission: 's1', suite: 'frontier-harness-eval-1.1', suite_name: 'FrontierHarness Eval v1.1',
+      category_name: '终端工程', model: 'm', tasks: ['a', 'b', 'c'], attempts: 4, concurrency: 64,
+      status: 'pending', run: null, resumed_runs: ['bench-1'], resume_tasks_count: 1,
+      job: { name: 'bench-1', planned: 12, running: false, wall_s: 60,
+             summary: { trials: 10, counts: { pass: 8, fail: 0, partial: 0, timeout: 0, invalid: 2, running: 0 },
+                        first_pass_rate: 0.8, total_tokens: 1000 } } },
+    { index: 1, submission: 's1', suite: 'terminal-bench-2.1', suite_name: 'Terminal-Bench 2.1',
+      category_name: '终端工程', model: 'm', tasks: ['a'], attempts: 1, status: 'skipped',
+      run: null, resumed_runs: ['bench-2'] },
+    { index: 2, submission: 's1', suite: 'terminal-bench-2.0', suite_name: 'Terminal-Bench 2.0',
+      category_name: '终端工程', model: 'm', tasks: ['a'], attempts: 1, status: 'skipped', run: null },
+  ],
+};
+const itemActions = vm.runInContext('itemActions', ctx);
+const actionLabels = profile.items.map((_, idx) => itemActions(profile, idx).map((btn) => btn.textContent));
+vm.runInContext('state.profileExpanded = true', ctx);
+ctx.api = async () => profile;
+(async () => {
+  const root = await vm.runInContext('renderProfile', ctx)('prof-1');
+  const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+  const rows = walk(root).filter((n) => n.tagName === 'article' && n.className === 'submission')
+    .flatMap((article) => walk(article).filter((n) => n.tagName === 'tbody').flatMap((tb) => tb.children));
+  const firstRowText = rows[0].children.map((td) => td.textContent);
+  const firstRowButtons = walk(rows[0]).filter((n) => n.tagName === 'button').map((b) => b.textContent);
+  console.log(JSON.stringify({ actionLabels, firstRowText, firstRowButtons }));
+})();
+""")
+        self.assertEqual(result["actionLabels"], [["取消"], ["继续", "运行"], ["运行"]])
+        self.assertIn("继续剩余 1 道题", result["firstRowText"][0])
+        self.assertEqual(result["firstRowText"][3], "10 / 12")
+        self.assertEqual(result["firstRowButtons"], ["取消"])
+
     def test_profile_expand_and_filters_redraw_locally_without_refetching(self):
         result = self._run_js("""
 const summary = {
