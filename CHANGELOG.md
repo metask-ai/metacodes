@@ -400,6 +400,14 @@ status, compatibility boundaries, and entry points are defined by
   future session", while the picker's header calls that choice "from now
   on". It now says `press Tab there for "from now on" to keep it`.
 
+- **`/model` lists only the region a stored key works in.** GLM Coding Plan,
+  Kimi, Kimi Code, MiniMax and Qwen each run a China and a Global site, and
+  a key works on the site it was made on. A key `/login` stored records that
+  page, yet the picker listed every model's routes on both sites
+  (`cn-anthropic`, `global-openai`, …), half of which the key cannot use. It
+  now lists only the routes of the key's site; a key from the environment or
+  `.env`, whose site is not known, still lists both.
+
 - **Bench profiles replace batches.** A profile (评测配置) is one frozen
   metacodes version with a fixed set of advanced features, and every run
   belongs to one; the same version with the same features is always the same
