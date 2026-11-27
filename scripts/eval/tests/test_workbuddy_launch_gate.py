@@ -2123,6 +2123,44 @@ with urllib.request.urlopen(
             self.assertIn("step_audit_sha256s", task)
             self.assertTrue(task["step_audit_sha256s"])
 
+    def test_collect_usage_does_not_double_count_cached_prompt_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_multistep_usage_fixture(
+                Path(directory), 1.0, step_turns=(1, 1)
+            )
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            for i in (1, 2):
+                tp = next(workbuddy.rglob(f"steps/step-{i}/agent/trajectory.json"))
+                traj = json.loads(tp.read_text(encoding="utf-8"))
+                fm = traj["final_metrics"]
+                fm["total_prompt_tokens"] = (10 + 3 + 4) * i
+                fm["total_completion_tokens"] = 2 * i
+                fm["total_cached_tokens"] = 3 * i
+                fm["extra"]["cache_creation_input_tokens"] = 4 * i
+                fm["extra"]["prompt_tokens_include_cache"] = True
+                tp.write_text(json.dumps(traj) + "\n", encoding="utf-8")
+            usage = _collect_usage(manifest, started_ns=0, official_runner=True)
+            task = usage["tasks"]["code-task-a"]
+            self.assertEqual(19 + 38, task["metered_tokens"])
+            self.assertEqual(17 + 34, task["prompt_tokens"])
+            self.assertEqual(2 + 4, task["completion_tokens"])
+            self.assertEqual(3 + 6, task["cache_read_input_tokens"])
+            self.assertEqual(4 + 8, task["cache_creation_input_tokens"])
+
+    def test_collect_usage_rejects_prompt_smaller_than_cache_when_cache_included(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._official_usage_fixture(Path(directory), 1.0)
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            tp = next(workbuddy.rglob("agent/trajectory.json"))
+            traj = json.loads(tp.read_text(encoding="utf-8"))
+            traj["final_metrics"]["total_prompt_tokens"] = 5
+            traj["final_metrics"]["total_cached_tokens"] = 3
+            traj["final_metrics"]["extra"]["cache_creation_input_tokens"] = 4
+            traj["final_metrics"]["extra"]["prompt_tokens_include_cache"] = True
+            tp.write_text(json.dumps(traj) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(LaunchError, "inconsistent cached prompt token usage"):
+                _collect_usage(manifest, started_ns=0, official_runner=True)
+
     def test_v3_multistep_request_audit_reconciles_summed_turns(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest = self._official_multistep_usage_fixture(
@@ -4290,6 +4328,36 @@ class TrialResumeAuditTest(WorkBuddyRequestAuditRetryTest):
                 _collect_usage(
                     manifest, started_ns=0, official_runner=True, resumes=resumes
                 )
+
+    def test_tainted_attempt1_usage_does_not_double_count_cached_prompt_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, resumes = self._resumed_fixture(Path(directory))
+            workbuddy = Path(manifest["workbuddy"]["checkout"])
+            tainted_dir = workbuddy / "results" / manifest["job"]["slug"] / resumes[0]["tainted_dir_rel"]
+            tainted_traj = tainted_dir / "agent" / "trajectory.json"
+            tainted_traj.parent.mkdir(parents=True, exist_ok=True)
+            tainted_traj.write_text(
+                json.dumps(
+                    {
+                        "final_metrics": {
+                            "total_prompt_tokens": 210,
+                            "total_completion_tokens": 30,
+                            "total_cached_tokens": 80,
+                            "total_cost_usd": 0.01,
+                            "extra": {
+                                "cache_creation_input_tokens": 10,
+                                "prompt_tokens_include_cache": True,
+                            },
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            usage = _collect_usage(
+                manifest, started_ns=0, official_runner=True, resumes=resumes
+            )
+            self.assertEqual(usage["resumed_attempts"]["code-task-a"]["metered_tokens"], 240)
 
 
 class TrialResumeOrchestrationTest(unittest.TestCase):

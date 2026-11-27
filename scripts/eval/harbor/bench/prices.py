@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from scripts.eval.harbor.bench.runner import atomic_json
 from scripts.eval.harbor.command import split_model
@@ -29,6 +30,8 @@ CACHE_NAME = "openrouter-prices.json"
 MAX_AGE_S = 24 * 3600
 FIELDS = {"input": "prompt", "output": "completion", "cached_input": "input_cache_read",
           "cache_write": "input_cache_write"}
+VERSION_SEP = re.compile(r"(?<=\d)-(?=(?:0|[1-9]\d?)(?=-|:|$))")
+DATE_SUFFIX = re.compile(r"(?:[-@]20\d{6}|-20\d{2}-\d{2}-\d{2})$")
 
 
 def fetch(timeout: float = 10.0) -> Dict[str, Dict[str, Any]]:
@@ -63,20 +66,65 @@ def per_million(value: Any) -> Optional[float]:
     return round(number, 6) if number >= 0 else None
 
 
+def _normalize_version(slug: str) -> str:
+    previous = None
+    current = slug
+    while current != previous:
+        previous = current
+        current = VERSION_SEP.sub(".", current)
+    return current
+
+
+def _strip_date(slug: str) -> str:
+    return DATE_SUFFIX.sub("", slug)
+
+
+def _apply_slug(model_id: str, has_namespace: bool, transform: Callable[[str], str]) -> str:
+    if has_namespace:
+        vendor, sep, slug = model_id.partition("/")
+        return vendor + "/" + transform(slug) if sep else transform(model_id)
+    return transform(model_id)
+
+
+def _match_openrouter_id(request_id: str, models: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    has_namespace = "/" in request_id
+    candidates = [
+        (openrouter_id, openrouter_id.lower() if has_namespace else openrouter_id.rsplit("/", 1)[-1].lower())
+        for openrouter_id in models
+    ]
+    passes = (
+        (lambda slug: slug, lambda slug: slug),
+        (_normalize_version, _normalize_version),
+        (lambda slug: _normalize_version(_strip_date(slug)), _normalize_version),
+    )
+    for request_transform, catalog_transform in passes:
+        want = _apply_slug(request_id, has_namespace, request_transform)
+        matches = [
+            openrouter_id
+            for openrouter_id, candidate in candidates
+            if _apply_slug(candidate, has_namespace, catalog_transform) == want
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None
+    return None
+
+
 def price_for(model: str, models: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """The run model's price in USD per million tokens and the OpenRouter id
     it came from, or None when no single OpenRouter model matches. A request
     model id with its own namespace (`acme/model`) matches that OpenRouter id
-    only; a bare one matches the single id ending in `/<model>`."""
+    only; a bare one matches the single id ending in `/<model>`. Exact matches
+    win; otherwise hyphen/dot version separators (`4-6` vs `4.6`) and a
+    trailing release date (`-YYYYMMDD`, `@YYYYMMDD`, `-YYYY-MM-DD`) on the
+    request id are normalized."""
     request_id = split_model(model)[1].lower()
-    if "/" in request_id:
-        matches = [i for i in models if i.lower() == request_id]
-    else:
-        matches = [i for i in models if i.rsplit("/", 1)[-1].lower() == request_id]
-    if len(matches) != 1:
+    matched = _match_openrouter_id(request_id, models)
+    if matched is None:
         return None
-    pricing = models[matches[0]]
+    pricing = models[matched]
     price = {name: per_million(pricing.get(key)) for name, key in FIELDS.items()}
     if price["input"] is None or price["output"] is None:
         return None
-    return {"openrouter_id": matches[0], **{k: v for k, v in price.items() if v is not None}}
+    return {"openrouter_id": matched, **{k: v for k, v in price.items() if v is not None}}

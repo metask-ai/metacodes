@@ -485,6 +485,15 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
         input_tokens, cache_tokens, output_tokens = (measured["usage"].get(k) for k in ("input_tokens", "cache_tokens", "output_tokens"))
     else:
         fallback = usage_values(agent)
+        raw_input = number(agent.get("input_tokens"))
+        if (
+            input_tokens is not None
+            and raw_input is not None
+            and fallback.get("input_tokens") is not None
+            and input_tokens == raw_input
+            and fallback["input_tokens"] > input_tokens
+        ):
+            input_tokens = fallback["input_tokens"]
         input_tokens = input_tokens if input_tokens is not None else fallback.get("input_tokens", measured["usage"].get("input_tokens"))
         cache_tokens = cache_tokens if cache_tokens is not None else fallback.get("cache_tokens", measured["usage"].get("cache_tokens"))
         output_tokens = output_tokens if output_tokens is not None else fallback.get("output_tokens", measured["usage"].get("output_tokens"))

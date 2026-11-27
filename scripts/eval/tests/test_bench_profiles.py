@@ -1335,6 +1335,52 @@ class ModelPriceTest(unittest.TestCase):
                                                                  "other/model": {"prompt": "1", "completion": "1"}}),
                          {"openrouter_id": "acme/model", "input": 1.0, "output": 2.0})
 
+    def test_price_for_matches_hyphenated_versions_and_dated_snapshots_without_breaking_exact_or_ambiguous(self):
+        from scripts.eval.harbor.bench import prices
+        catalog = {
+            "anthropic/claude-opus-4.6": {"prompt": "0.000005", "completion": "0.000025",
+                                          "input_cache_read": "0.0000005", "input_cache_write": "0.00000625"},
+            "anthropic/claude-sonnet-4.6": {"prompt": "0.000003", "completion": "0.000015"},
+            "anthropic/claude-haiku-4.5": {"prompt": "0.000001", "completion": "0.000005"},
+            "anthropic/claude-opus-5.5": {"prompt": "0.000004", "completion": "0.00002"},
+            "deepseek/deepseek-v4.1-flash-1017": {"prompt": "0.0000003", "completion": "0.0000012"},
+            "deepseek/deepseek-v4.1-flash": {"prompt": "0.00000014", "completion": "0.0000006"},
+            "openai/gpt-4o": {"prompt": "0.0000025", "completion": "0.00001"},
+            "openai/gpt-4o-2024-05-13": {"prompt": "0.000005", "completion": "0.000015"},
+            "openai/gpt-5.2": {"prompt": "0.00000175", "completion": "0.000014"},
+            "qwen/qwen3.5-plus-20260420": {"prompt": "0.0000004", "completion": "0.0000012"},
+            "qwen/qwen3.5-35b-a3b": {"prompt": "0.0000002", "completion": "0.0000008"},
+            "a/dup-4.6": {"prompt": "0.000001", "completion": "0.000002"},
+            "b/dup-4.6": {"prompt": "0.000003", "completion": "0.000004"},
+        }
+        self.assertEqual(
+            prices.price_for("metask/claude-opus-4-6", catalog),
+            {"openrouter_id": "anthropic/claude-opus-4.6", "input": 5.0, "output": 25.0,
+             "cached_input": 0.5, "cache_write": 6.25},
+        )
+        self.assertEqual(prices.price_for("metask/claude-sonnet-4-6", catalog)["openrouter_id"], "anthropic/claude-sonnet-4.6")
+        self.assertEqual(prices.price_for("metask/claude-opus-5-5", catalog)["openrouter_id"], "anthropic/claude-opus-5.5")
+        self.assertEqual(prices.price_for("openrouter/anthropic/claude-opus-4-6", catalog)["openrouter_id"], "anthropic/claude-opus-4.6")
+        self.assertIsNone(prices.price_for("gateway/other/claude-opus-4-6", catalog))
+        self.assertEqual(prices.price_for("metask/claude-haiku-4-5-20251001", catalog)["openrouter_id"], "anthropic/claude-haiku-4.5")
+        self.assertEqual(prices.price_for("metask/claude-haiku-4-5@20251001", catalog)["openrouter_id"], "anthropic/claude-haiku-4.5")
+        self.assertEqual(prices.price_for("metask/gpt-5.2-2025-12-11", catalog)["openrouter_id"], "openai/gpt-5.2")
+        self.assertEqual(prices.price_for("metask/gpt-5-2-2025-12-11", catalog)["openrouter_id"], "openai/gpt-5.2")
+        self.assertEqual(prices.price_for("metask/gpt-4o-2024-05-13", catalog)["openrouter_id"], "openai/gpt-4o-2024-05-13")
+        self.assertEqual(prices.price_for("metask/gpt-4o-2025-01-01", catalog)["openrouter_id"], "openai/gpt-4o")
+        self.assertEqual(prices.price_for("metask/qwen3-5-plus-20260420", catalog)["openrouter_id"], "qwen/qwen3.5-plus-20260420")
+        self.assertEqual(prices.price_for("metask/qwen3-5-35b-a3b", catalog)["openrouter_id"], "qwen/qwen3.5-35b-a3b")
+        self.assertEqual(prices.price_for("metask/deepseek-v4-1-flash-1017", catalog)["openrouter_id"], "deepseek/deepseek-v4.1-flash-1017")
+        self.assertIsNone(prices.price_for("metask/deepseek-v4.1-flash-9999", catalog))
+        self.assertIsNone(prices.price_for("metask/dup-4-6", catalog))
+        self.assertEqual(
+            prices.price_for("metask/exact-4-6", {
+                "a/exact-4.6": {"prompt": "0.000001", "completion": "0.000002"},
+                "b/exact-4-6": {"prompt": "0.000003", "completion": "0.000004"},
+            })["openrouter_id"],
+            "b/exact-4-6",
+        )
+
     def test_the_catalog_is_cached_for_a_day_and_a_failed_fetch_keeps_the_cached_copy(self):
         from scripts.eval.harbor.bench import prices
         calls = []

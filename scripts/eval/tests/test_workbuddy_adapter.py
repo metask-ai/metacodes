@@ -2881,10 +2881,11 @@ with tempfile.TemporaryDirectory() as directory:
     control = trajectory["final_metrics"]["extra"]["control_metrics"]
     assert control["tinykg"]["task_list_calls"] == 1
     assert control["tinykg"]["task_tinykg_status_results"] == 1
-    assert context.n_input_tokens == 120
+    assert context.n_input_tokens == 210
     assert context.n_cache_tokens == 80
     assert context.n_output_tokens == 30
     assert context.cost_usd == 0.01
+    assert trajectory["final_metrics"]["extra"]["prompt_tokens_include_cache"] is True
 '''
         env = dict(os.environ)
         env["PYTHONPATH"] = str(checkout / "src")
@@ -5678,6 +5679,46 @@ class WorkBuddyLeaderboardProtocolTest(unittest.TestCase):
                     "x", _CapturingEnvironment(), None
                 )
             )
+
+    def test_build_trajectory_includes_cached_tokens_in_total_prompt_tokens(self):
+        class _Record:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        with _stubbed_adapter() as adapter, tempfile.TemporaryDirectory() as directory:
+            for name in ("Agent", "FinalMetrics", "Observation", "ObservationResult", "Step", "ToolCall", "Trajectory"):
+                setattr(adapter, name, _Record)
+            logs = Path(directory) / "trial__l2" / "agent"
+            logs.mkdir(parents=True)
+            agent = _bare_agent(
+                adapter,
+                logs,
+                _version="0.13.0",
+                _context_window=None,
+                _context_compact_pct=None,
+            )
+            trace = {
+                "steps": [],
+                "result": {
+                    "stop_reason": "end_turn",
+                    "turns": 2,
+                    "tool_calls": 1,
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "cache_read_input_tokens": 80,
+                    "cache_creation_input_tokens": 10,
+                    "cost_usd": 0.01,
+                    "text": "done",
+                },
+                "control_metrics": {},
+            }
+            trajectory = agent._build_trajectory(trace)
+            metrics = trajectory.final_metrics
+            self.assertEqual(metrics.total_prompt_tokens, 210)
+            self.assertEqual(metrics.total_completion_tokens, 30)
+            self.assertEqual(metrics.total_cached_tokens, 80)
+            self.assertEqual(metrics.extra["cache_creation_input_tokens"], 10)
+            self.assertTrue(metrics.extra["prompt_tokens_include_cache"])
 
     @unittest.skipUnless(
         POSIX and os.environ.get("METACODES_NATIVE_E2E_BIN"),
