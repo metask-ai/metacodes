@@ -2546,6 +2546,21 @@ test "KeyParser: ESC and the next byte written together are one Alt key, never E
     try testing.expect(p.feedQueued('b', false).? == .alt_b);
 }
 
+test "KeyParser: typing goes on after an Alt key written together with its ESC" {
+    var p = KeyParser{};
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expectEqual(Key.ctrl_w, p.feedQueued(0x7f, false).?);
+    try testing.expect(!p.pendingEsc());
+    for ("abc") |b| try testing.expectEqual(Key{ .char = b }, p.feedQueued(b, false).?);
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expectEqual(Key.unknown, p.feedQueued('k', false).?);
+    for ("xy") |b| try testing.expectEqual(Key{ .char = b }, p.feedQueued(b, false).?);
+    try testing.expect(p.feedQueued(0x1b, false) == null);
+    try testing.expectEqual(Key.esc, p.flushEsc().?);
+    try testing.expectEqual(Key{ .char = 'z' }, p.feedQueued('z', false).?);
+    try testing.expect(p.drain() == null);
+}
+
 test "KeyParser: Esc and then Backspace or a letter, read apart, stay two keys" {
     var p = KeyParser{};
     try testing.expect(p.feedQueued(0x1b, false) == null);
