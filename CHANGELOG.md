@@ -469,6 +469,13 @@ status, compatibility boundaries, and entry points are defined by
   go of the sign-in it held and the next turn sends the new one; when it is
   for another gateway, `/login` says so and points to `/model` or a restart.
 
+- **`/model` says how to sign in to ChatGPT.** A route that needs ChatGPT's
+  sign-in, reached without it (a stored default after `/logout
+  chatgpt-codex`), showed `chatgpt-codex not configured` and only the
+  `.env` guide. It now says `Sign in: /login chatgpt-codex`, as it does for
+  Metask and OpenRouter; a custom provider that declares its own OAuth
+  client gets the same pointer.
+
 - **Choosing a model for every future session in `/model` makes it this
   session's current route too.** The route the session started on stayed
   recorded as the session's own choice, which outranks the default, so

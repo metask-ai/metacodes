@@ -1966,8 +1966,9 @@ test "L2 (#488): a provider's setup names the variable its key is read from, and
         .{ .id = "metask", .variable = "METASK_API_KEY", .sign_in = true },
         // The canonical alias, wherever it is declared.
         .{ .id = "keyonly", .variable = "KEYONLY_TOKEN", .sign_in = false },
-        // A provider with an OAuth grant gets no /login pointer here either.
-        .{ .id = "relay", .variable = null, .sign_in = false },
+        .{ .id = "relay", .variable = null, .sign_in = true },
+        .{ .id = "chatgpt-codex", .variable = null, .sign_in = true },
+        .{ .id = "openai", .variable = "OPENAI_API_KEY", .sign_in = false },
         .{ .id = "kimi", .variable = "MOONSHOT_API_KEY", .sign_in = false },
         .{ .id = "kimi-code", .variable = "KIMI_CODE_API_KEY", .sign_in = false },
         .{ .id = "gemini", .variable = "GEMINI_API_KEY", .sign_in = false },

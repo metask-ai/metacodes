@@ -3373,9 +3373,11 @@ pub const App = struct {
         return .{
             .provider = profile.id,
             .variable = variable,
-            // Metask, and a provider whose site creates the key (OpenRouter):
-            // `/login` is the way in, a variable the other.
-            .sign_in = profile.id.eqlText("metask") or profile.key_grant != null,
+            // Metask, a provider whose site creates the key (OpenRouter), and
+            // one that signs in with a client of its own (ChatGPT): `/login`
+            // is the way in, a variable the other.
+            .sign_in = profile.id.eqlText("metask") or profile.key_grant != null or
+                (profile.declaresInteractiveOAuth() and profile.oauth_client_id != null),
         };
     }
 
