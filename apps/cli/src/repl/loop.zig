@@ -2075,7 +2075,7 @@ fn readLineRaw(
             }
             if (n == 0) return error.Eof;
 
-            const editor_takes_text = !region.escapeClosesOverlay() and (!vim_keys or vim_state.mode == .insert);
+            const editor_takes_text = !region.overlayTakesKeys() and (!vim_keys or vim_state.mode == .insert);
             break :blk (if (editor_takes_text) parser.feedEditorRead(fd, b[0]) else parser.feedRead(fd, b[0])) orelse continue;
         };
 
@@ -2126,7 +2126,7 @@ fn readLineRaw(
         // dispatch 判断"空 buffer + ?"依赖 editor 投影,调前同步。
         {
             region.setInput(editor.view(), editor.cursor);
-            const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key, .now_ms = util_time.nowMs() } });
+            const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key, .now_ms = util_time.nowMs(), .pasted = parser.pasting() } });
             switch (eff.action) {
                 .pass_to_editor => if (vim_keys and vim_state.mode != .insert) continue,
                 .none, .commit, .cancel, .exit => continue, // overlay 消费了(已重画),不喂 editor

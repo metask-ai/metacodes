@@ -43,7 +43,7 @@ pub const Frame = struct {
 /// 纯状态转移。改 state + 返回 Effect(副作用描述)。绝不碰 IO。
 pub fn dispatch(state: *UiState, ev: Event) Effect {
     switch (ev) {
-        .key => |k| return dispatchKey(state, k.key, k.now_ms),
+        .key => |k| return dispatchKey(state, k.key, k.now_ms, k.pasted),
         .spinner_tick => {
             const g = state.generatingPhase() orelse return .{};
             g.spinner.frame +%= 1;
@@ -118,7 +118,7 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
     }
 }
 
-fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
+fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64, pasted: bool) Effect {
     // 按键只属于交互阶段:idle 时没有输入框,也没有能接收它的 widget。
     const ix = state.interaction() orelse return .{};
     // Ctrl+X Ctrl+K 序列(Emacs 双键前缀,杀后台任务)。arming 在 UiState,dispatch 统一处理。
@@ -173,7 +173,7 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     if (ix.picker_open and key == .ctrl_d and ix.editor.view.len > 0) return .{ .redraw_region = false };
 
     // `?` 帮助(非模态,对齐 cc onChange):空 editor 打 `?` → toggle help_open,`?` 不进 editor。
-    if (key == .char and key.char == '?' and ix.editor.view.len == 0) {
+    if (!pasted and key == .char and key.char == '?' and ix.editor.view.len == 0) {
         ix.help_open = !ix.help_open;
         return .{ .redraw_region = true };
     }
@@ -239,7 +239,7 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
             p.menu_dismissal.dismiss(view);
             return .{ .redraw_region = true };
         }
-        if (!menus_dismissed) {
+        if (!menus_dismissed and !(pasted and key == .enter)) {
             // ── /models 两级账号 API key / model 菜单导航。必须先于普通 slash 菜单。
             if (complete.modelsMenuOpen(view)) {
                 switch (key) {
@@ -643,6 +643,48 @@ const testing = std.testing;
 
 fn press(state: *UiState, k: input.Key) Effect {
     return dispatch(state, .{ .key = .{ .key = k } });
+}
+
+fn paste(state: *UiState, k: input.Key) Effect {
+    return dispatch(state, .{ .key = .{ .key = k, .pasted = true } });
+}
+
+test "a pasted `?` on an empty prompt goes into the draft and leaves the shortcut panel shut, at the prompt and during a reply" {
+    var prompt = UiState.in(.{ .input = .{} });
+    try testing.expectEqual(event.LoopAction.pass_to_editor, paste(&prompt, .{ .char = '?' }).action);
+    try testing.expect(!prompt.interaction().?.help_open);
+    _ = press(&prompt, .{ .char = '?' });
+    try testing.expect(prompt.interaction().?.help_open);
+
+    var replying = UiState.in(.{ .generating = .{} });
+    try testing.expectEqual(event.LoopAction.pass_to_editor, paste(&replying, .{ .char = '?' }).action);
+    try testing.expect(!replying.interaction().?.help_open);
+}
+
+test "a pasted `?` closes a shortcut panel the user opened and goes into the draft" {
+    var state = UiState.in(.{ .input = .{} });
+    _ = press(&state, .{ .char = '?' });
+    const pasted = paste(&state, .{ .char = '?' });
+    try testing.expectEqual(event.LoopAction.pass_to_editor, pasted.action);
+    try testing.expect(pasted.redraw_region);
+    try testing.expect(!state.interaction().?.help_open);
+}
+
+test "a pasted Enter sends the draft as written, never the command or file the `/` or `@` menu highlights" {
+    var state = UiState.in(.{ .input = .{} });
+    const ix = state.interaction().?;
+    ix.editor = .{ .view = "/he", .cursor = 3 };
+    try testing.expectEqual(event.LoopAction.slash_select, press(&state, .enter).action);
+    try testing.expectEqual(event.LoopAction.pass_to_editor, paste(&state, .enter).action);
+    try testing.expectEqual(event.LoopAction.slash_complete, press(&state, .tab).action);
+
+    ix.editor = .{ .view = "see @src", .cursor = 8 };
+    try testing.expectEqual(event.LoopAction.at_select, press(&state, .enter).action);
+    try testing.expectEqual(event.LoopAction.pass_to_editor, paste(&state, .enter).action);
+
+    ix.editor = .{ .view = "/models", .cursor = 7 };
+    try testing.expectEqual(event.LoopAction.models_select, press(&state, .enter).action);
+    try testing.expectEqual(event.LoopAction.pass_to_editor, paste(&state, .enter).action);
 }
 
 test "issue #16: Ctrl+O opens the picker and Ctrl+X Ctrl+O still opens the transcript" {

@@ -597,6 +597,12 @@ pub const RenderRegion = struct {
         return ui_mod.suggestionMenuOpen(&self.ui) and !self.menusDismissed(self.editorView());
     }
 
+    pub fn overlayTakesKeys(self: *RenderRegion) bool {
+        self.lock();
+        defer self.unlock();
+        return self.pickerOpenLocked() or self.agentView() != .closed;
+    }
+
     pub fn cancelCtrlXPrefix(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();
@@ -1838,6 +1844,7 @@ pub const RenderRegion = struct {
         app: *const app_mod.App,
         conv: *const Conversation,
         key: input.Key,
+        pasted: bool,
         ed_view: []const u8,
         ed_cursor: usize,
     ) event_mod.Effect {
@@ -1848,7 +1855,7 @@ pub const RenderRegion = struct {
         // dispatch 判"空 buffer + ?"依赖 editor 投影,调前同步 watcher 的 LineEditor 视图。
         self.setGenEditorLocked(ed_view, ed_cursor);
         _ = app;
-        const eff = ui_mod.dispatch(&self.ui, .{ .key = .{ .key = key } });
+        const eff = ui_mod.dispatch(&self.ui, .{ .key = .{ .key = key, .pasted = pasted } });
         self.requestRedrawLocked(eff);
         return eff;
     }

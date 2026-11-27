@@ -77,3 +77,28 @@ def test_a_bracketed_paste_keeps_its_line_breaks_and_enter_sends_it(bin_path):
     texts = [_last_user_text(body) for body in requests]
     if len(texts) != 1 or "MARKED_ONE\nMARKED_TWO" not in texts[0]:
         a._fail(f"expected the bracketed paste as one two-line message: {texts}")
+
+
+def test_a_paste_without_markers_that_starts_with_slash_keeps_its_line_break_and_runs_no_command(bin_path):
+    a, requests = _run(bin_path, [_raw(b"/he\rworld"), "strictsleep:1.0"])
+    if _box_rows(a) != ["❯ /he", "world"]:
+        a._fail(f"the line break in the paste picked from the / menu instead of breaking the line: {_box_rows(a)}")
+
+
+def test_a_paste_without_markers_that_starts_with_a_question_mark_keeps_it(bin_path):
+    a, requests = _run(bin_path, [_raw(b"?why is it slow"), "strictsleep:1.0"])
+    if _box_rows(a) != ["❯ ?why is it slow"]:
+        a._fail(f"the paste's ? was taken for the shortcut panel key: {_box_rows(a)}")
+
+
+def test_a_tab_in_a_paste_without_markers_is_sent_as_a_tab(bin_path):
+    a, requests = _run(bin_path, [_raw(b"col1\tcol2"), "strictsleep:0.5", "key:enter", wait_for(REPLY), "strictsleep:0.5"])
+    texts = [_last_user_text(body) for body in requests]
+    if len(texts) != 1 or texts[0].strip() != "col1\tcol2":
+        a._fail(f"the paste's Tab ran completion instead of staying in the text: {texts}")
+
+
+def test_the_enter_ending_a_one_line_paste_sends_it_as_written_not_the_highlighted_command(bin_path):
+    a, requests = _run(bin_path, [_raw(b"/he\r"), wait_for("Unknown command"), "strictsleep:0.5"])
+    if a.final.find_row("Unknown command: /he") is None:
+        a._fail("the Enter ending the paste picked the highlighted / command instead of sending /he")
