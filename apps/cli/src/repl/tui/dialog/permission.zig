@@ -107,7 +107,7 @@ fn promptLoopTimed(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
     var parser = input_mod.KeyParser{};
-    var gate = answer_gate.Gate.init(timing, util_time.nowNs());
+    var gate = answer_gate.Gate.init(timing);
     while (true) {
         const cols: u16 = if (term.getSize(out_fd)) |size| size.cols else 80;
         if (drawn) |anchor| {
@@ -120,6 +120,7 @@ fn promptLoopTimed(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_
         defer alloc.free(frame);
         writeAll(out_fd, frame);
         drawn = reflow.Anchor.atEnd(frame, cols);
+        gate.shown(util_time.nowNs());
 
         const key = switch (input_mod.readKey(in_fd, &parser)) {
             .key => |key| key,
@@ -350,6 +351,46 @@ test "promptLoop answers only a key that follows a quiet spell: keys typed as th
         thread.join();
         try testing.expectEqual(c.choice, got.?);
     }
+}
+
+test "promptLoop counts the quiet spell from when the box is on screen: a key typed while a slow terminal takes the first frame does not answer" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const sync = @import("metacodes-internal").platform.sync;
+    const net = @import("metacodes-internal").platform.net;
+    var screen: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&screen));
+    defer _ = std.c.close(screen[0]);
+    try testing.expect(net.setNonblocking(screen[1], true));
+    const filler = [_]u8{'.'} ** 512;
+    while (pfs.write(screen[1], &filler) > 0) {}
+    while (pfs.write(screen[1], filler[0..1]) > 0) {}
+    try testing.expect(net.setNonblocking(screen[1], false));
+    const Terminal = struct {
+        fn takeFramesAfter(fd: c_int, stall_ms: u32) void {
+            sync.sleepMs(stall_ms);
+            var taken: [4096]u8 = undefined;
+            while (pfs.read(fd, &taken) != 0) {}
+        }
+        fn typeKeys(fd: c_int) void {
+            sync.sleepMs(300);
+            _ = pfs.writeAll(fd, "y");
+            sync.sleepMs(700);
+            _ = pfs.writeAll(fd, "n");
+            sync.sleepMs(300);
+            _ = std.c.close(fd);
+        }
+    };
+    var keys: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&keys));
+    defer _ = std.c.close(keys[0]);
+    const terminal = try std.Thread.spawn(.{}, Terminal.takeFramesAfter, .{ screen[0], 600 });
+    const typist = try std.Thread.spawn(.{}, Terminal.typeKeys, .{keys[1]});
+    const timing: answer_gate.Timing = .{ .quiet_ms = 200, .paste_gap_ms = answer_gate.Timing.interactive.paste_gap_ms };
+    const got = promptLoopTimed(testing.allocator, theme_mod.monochrome, keys[0], screen[1], "Write", "{}", timing);
+    _ = std.c.close(screen[1]);
+    terminal.join();
+    typist.join();
+    try testing.expectEqual(PermissionChoice.deny_once, got.?);
 }
 
 test {

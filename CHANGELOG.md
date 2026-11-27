@@ -740,6 +740,13 @@ status, compatibility boundaries, and entry points are defined by
   paste sends what was pasted. Keys typed one at a time open the panel,
   complete and pick from the menus as before.
 
+- **A dialog drawn on a slow terminal no longer takes a key typed while it
+  appeared as its answer.** The permission and AskUserQuestion dialogs
+  started their 400 ms wait before their box was written, so when the
+  terminal took longer than that to show it, a key typed in the meantime
+  answered the dialog. The wait now starts when the box is on screen, and
+  a redraw while the dialog is still waiting starts it again.
+
 - **Signing in over SSH no longer waits forever for a browser that cannot come
   back** (#722). `metacodes login` and `/login` sent the browser back to
   `http://localhost:1455`, which on a machine reached over SSH is not where
