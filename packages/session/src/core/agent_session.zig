@@ -1818,8 +1818,11 @@ pub const AgentSession = struct {
                 return error.ArtifactStoreRequired;
         }
         var jobs: ?JobRegistry = null;
-        if (selected_tools.contains("Bash") or selected_tools.contains("BashOutput") or selected_tools.contains("KillShell")) {
-            jobs = try JobRegistry.init(allocator);
+        for (selected_tools.entries) |entry| {
+            if (workspace_mod.isShellTool(entry.definition.name)) {
+                jobs = try JobRegistry.init(allocator);
+                break;
+            }
         }
         errdefer if (jobs) |*registry| registry.deinit();
         var cron: ?CronRegistry = null;
@@ -6022,28 +6025,37 @@ test "run-aware Host UI adapter rejects cross-Session identity and poisons only 
 }
 
 test "Workspace shell policy is an authority ceiling for Session tools" {
-    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Bash" } });
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Bash", "BashOutput", "KillShell" } });
     defer runtime.destroy() catch unreachable;
     const cwd = try testCwd();
     defer std.testing.allocator.free(cwd);
-    try std.testing.expectError(error.ShellToolDisabled, runtime.createSession(.{
-        .provider_kind = .anthropic,
-        .api_key = "test-key",
-        .model = "test-model",
-        .workspace = .{ .root = cwd, .shell = .disabled },
-        .allowed_tools = &.{ "Read", "Bash" },
-    }));
-
-    const session = try runtime.createSession(.{
-        .provider_kind = .anthropic,
-        .api_key = "test-key",
-        .model = "test-model",
-        .workspace = .{ .root = cwd, .shell = .disabled },
-        .allowed_tools = &.{"Read"},
-    });
-    defer session.destroy() catch unreachable;
-    try std.testing.expect(session.tools.contains("Read"));
-    try std.testing.expect(!session.tools.contains("Bash"));
+    const selections = [_][]const []const u8{
+        &.{ "Read", "Bash" },
+        &.{ "Read", "BashOutput" },
+        &.{ "Read", "KillShell" },
+        &.{ "Read", "Bash", "BashOutput", "KillShell" },
+        &.{"Read"},
+    };
+    for ([_]ShellPolicy{ .disabled, .sandboxed, .unrestricted }) |shell| {
+        for (selections) |allowed_tools| {
+            const has_shell = allowed_tools.len > 1;
+            const config: SessionConfig = .{
+                .provider_kind = .anthropic,
+                .api_key = "test-key",
+                .model = "test-model",
+                .workspace = .{ .root = cwd, .shell = shell },
+                .allowed_tools = allowed_tools,
+            };
+            if (shell == .disabled and has_shell) {
+                try std.testing.expectError(error.ShellToolDisabled, runtime.createSession(config));
+                continue;
+            }
+            const session = try runtime.createSession(config);
+            defer session.destroy() catch unreachable;
+            for (allowed_tools) |name| try std.testing.expect(session.tools.contains(name));
+            try std.testing.expectEqual(has_shell, session.jobs != null);
+        }
+    }
 }
 
 test "Sessions sharing one Runtime keep independent tool selections" {
