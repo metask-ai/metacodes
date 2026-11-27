@@ -663,13 +663,6 @@ const OpenAIStream = struct {
     /// 序列化时走占位的图像 tool_result id(owned),随 StreamHandle 回传。
     image_placeholder_ids: []const []const u8 = &.{},
     done: bool = false,
-    /// chat 协议:与内容增量**同 chunk** 到达的 usage(部分兼容端把 usage 挂在末个内容
-    /// chunk 上)。parseChunk 一次只能返回一个事件,故先返回内容事件、usage 存这里,
-    /// 下一次 next() 经 takeQueued 紧接着吐出。单槽即可:每个 chunk 至多一个 usage
-    /// 对象,且槽在读下一行之前必被 takeQueued 清空。
-    pending_usage: ?UsageDelta = null,
-    /// 本响应已报告的 usage。chat 的 usage 对象是整条响应的累计值,部分兼容端在多个
-    /// chunk 上重复它;Responses 的终止事件也是累计值。经 cursor 只发新增部分。
     usage_reports: api_stream.UsageReportCursor = .{},
     /// chat 协议:这条路由的方言怎么读 list 型 `delta.content`(`ModelProfile.content_chunks`,
     /// 建流时从方言 profile 取,没有默认值)。`.none` 时 list 整个忽略,与引入前相同。
@@ -837,26 +830,13 @@ const OpenAIStream = struct {
         registry.touchKeepalive(self.request);
     }
 
-    /// 已排队事件的唯一出口;next() 每次读新行之前先走这里。出队顺序固定:
-    ///   1. content_q     —— 同一 list 型 content chunk 里第一个之后的内容事件;
-    ///   2. pending_usage —— 与内容同 chunk 的 usage,紧跟在该 chunk 的内容事件之后;
-    ///   3. flush_q       —— 终止时 flush 的 reasoning_item / tool_use_start(按入队顺序);
-    ///   4. pending_done  —— Responses 终止后补发的 done。
-    /// 1、2 与 3 不会同时非空:content_q 与 pending_usage 只在 parseChunk 处理一行时写入,
-    /// 而下一次 next() 在读任何新行(含触发 flush 的 [DONE]/EOF/终止事件)之前就把它们
-    /// 吐掉了。所以这个顺序就是 wire 上的到达顺序。
     fn takeQueued(self: *OpenAIStream) ?StreamEvent {
         if (self.takeContent()) |ev| return ev;
-        if (self.pending_usage) |u| {
-            self.pending_usage = null;
-            return StreamEvent{ .usage = u };
-        }
         if (self.flush_pos < self.flush_q.items.len) {
             const ev = self.flush_q.items[self.flush_pos];
             self.flush_pos += 1;
             return ev;
         }
-        // Responses 终止事件已处理、flush 已排空 → 补发 done 并收流。
         if (self.pending_done) {
             self.pending_done = false;
             self.done = true;
@@ -922,46 +902,28 @@ const OpenAIStream = struct {
             const data = std.mem.trim(u8, trimmed[5..], " ");
             if (std.mem.eql(u8, data, "[DONE]")) {
                 self.done = true;
-                // `[DONE]` 只是帧尾,不证明回答说完:携带 finish_reason 的末块(或 Responses
-                // 终止事件)丢了时,它照样到达(issue #269 的 chat 形状)。
                 if (!self.stop_reported) return self.incomplete();
-                if (self.finishFlush()) |ev| return ev;
+                if (self.finishFlush()) |ev| {
+                    if (!self.tc_active) self.pending_done = true;
+                    return ev;
+                }
                 return StreamEvent{ .done = {} };
             }
             if (try self.parseChunk(data)) |ev| return ev;
-            // 该 chunk 无可 emit 事件(纯 tool_call 增量累积)→ 继续读下一行。
         }
     }
 
-    /// 解析一个 OpenAI SSE data chunk。返回可 emit 的中立事件,或 null(增量累积中)。
     fn parseChunk(self: *OpenAIStream, data: []const u8) !?StreamEvent {
-        // Responses API 走 typed 事件解析路径(chat/completions 的启发式对它不适用)。
         if (self.protocol == .responses) return self.parseResponsesChunk(data);
-        // takeQueued 在读本行之前已清空槽(见其注释);这里写入前它们必为空。
-        std.debug.assert(self.pending_usage == null);
         std.debug.assert(self.content_q.items.len == 0);
-        // OpenAI 兼容端(OpenRouter 等)在流中途报错的形状:`data: {"error":{...}}`,没有 choices。
-        // 旧实现把它当空 chunk 跳过,流随后没报告停止原因就结束 → StreamIncomplete,服务端的
-        // 答复被当成断流。现在按服务端声明的失败上抛。
         if (util_json.topLevelObjectField(data, "error")) |err_obj| {
             self.done = true;
             return client_mod.reportServerError("openai", self.id, err_obj, self.credential);
         }
-        // usage 只在**值为 object** 时存在(见 chatUsageObject)。include_usage 下每个普通
-        // chunk 都带 `"usage":null`——旧实现按 substring `"usage"` 判存在并立即 return,
-        // 把这些 chunk 的文本/推理/tool_call 增量/finish_reason 全部吞掉(issue #258)。
-        const report: ?api_stream.UsageReport = if (chatUsageObject(data)) |obj| chatUsageReport(obj) else null;
-        const usage: ?UsageDelta = if (report) |r| self.usage_reports.increment(r) else null;
-        // 内容侧照常处理。同 chunk 既有内容事件又有 usage 对象时,两个都发且顺序固定:
-        // 先内容、后 usage(存 pending_usage,下一次 next() 经 takeQueued 吐出)。
-        // tool_call 增量本身不产事件(终止时才 flush),故"tool_calls + usage 同 chunk"时
-        // usage 直接返回,先于对应的 tool_use_start。
-        if (try self.parseChatDelta(data)) |ev| {
-            self.pending_usage = usage;
-            return ev;
+        if (chatUsageObject(data)) |obj| {
+            if (chatUsageReport(obj)) |report| self.usage_reports.record(report);
         }
-        if (usage) |u| return StreamEvent{ .usage = u };
-        return null;
+        return try self.parseChatDelta(data);
     }
 
     /// chat chunk 的内容侧:finish_reason、content、reasoning(方言)、tool_calls 增量。
@@ -1175,9 +1137,8 @@ const OpenAIStream = struct {
         self.buildFlush();
         self.flushed = true;
         self.pending_done = true;
-        if (responsesUsageObject(data)) |usage_obj| return StreamEvent{ .usage = self.usage_reports.increment(responsesUsageReport(usage_obj)) };
-        // 无 usage 对象(缺失或 `"usage":null`):不伪造全零 usage——那会把"未计量"
-        // 报成"已计量为 0"(cache_break.ResponseUsage.reported)。直接吐队首事件。
+        if (responsesUsageObject(data)) |usage_obj| self.usage_reports.record(responsesUsageReport(usage_obj));
+        if (self.usage_reports.finish()) |u| return StreamEvent{ .usage = u };
         return self.takeQueued();
     }
 
@@ -1293,9 +1254,11 @@ const OpenAIStream = struct {
         return error.StreamIncomplete;
     }
 
-    /// 构建(一次)并返回队列里下一个 flush 事件;耗尽返 null。
     fn finishFlush(self: *OpenAIStream) ?StreamEvent {
         if (!self.flushed) {
+            if (self.usage_reports.finish()) |u| {
+                self.flush_q.append(self.allocator, StreamEvent{ .usage = u }) catch {};
+            }
             if (self.tc_active) self.buildFlush();
             self.flushed = true;
         }
@@ -3077,7 +3040,6 @@ test "issue #258: 同 chunk 既有内容又有 usage 对象——两个都发,�
         try std.testing.expectEqual(StopReason.end_turn, got.stop);
     }
 
-    // reasoning 增量 + usage 同 chunk:thinking 在前,usage 紧随。
     var reasoning = try replaySse(
         a,
         "deepseek-chat",
@@ -3087,7 +3049,7 @@ test "issue #258: 同 chunk 既有内容又有 usage 对象——两个都发,�
             "data: [DONE]\n\n",
     );
     defer reasoning.deinit(a);
-    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .thinking, .usage, .text, .done }, reasoning.kinds.items);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .thinking, .text, .usage, .done }, reasoning.kinds.items);
     try std.testing.expectEqualSlices(UsageDelta, &.{.{ .input_tokens = 3, .output_tokens = 1 }}, reasoning.usages.items);
 
     // tool_call 增量 + finish_reason + usage 同 chunk:增量不产事件,usage 先发,tool_use_start 在 flush 时到。
@@ -3154,15 +3116,13 @@ test "issue #258: choices[i].usage(兼容端位置)按 object 才计,null 不计
 }
 
 // Responses:usage 只在 `response.usage` 是 object 时发,数值只从该对象读。
-test "chat usage repeated on every chunk is a running total: usage events carry increments" {
-    // Some OpenAI-compatible servers attach the response's usage-so-far to every
-    // chunk. Each is a total, so adding them would count the prompt three times.
+test "chat usage repeated on every chunk settles once with final cache split" {
     const a = std.testing.allocator;
     var got = try replaySse(
         a,
         "gpt-4o",
         .chat_completions,
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1}}\n\n" ++
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n" ++
             "data: [DONE]\n\n",
@@ -3170,9 +3130,7 @@ test "chat usage repeated on every chunk is a running total: usage events carry 
     defer got.deinit(a);
     try std.testing.expectEqualStrings("Hello", got.text.items);
     try std.testing.expectEqualSlices(UsageDelta, &.{
-        .{ .input_tokens = 20, .output_tokens = 1, .cache_read_input_tokens = 80 },
-        .{ .output_tokens = 1 },
-        .{ .output_tokens = 1 },
+        .{ .input_tokens = 20, .output_tokens = 3, .cache_read_input_tokens = 80 },
     }, got.usages.items);
 }
 

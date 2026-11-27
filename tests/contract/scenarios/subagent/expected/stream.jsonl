@@ -1,16 +1,14 @@
 {"type":"turn_begin","turn":1}
 {"type":"output_segment_begin","index":0,"turn":1,"group":0}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"output_segment_end","index":0,"turn":1,"group":0,"disposition":"commentary","bytes":0}
 {"type":"tool_start","id":"toolu_01","name":"Task","input":"{\"subagent_type\":\"Explore\",\"description\":\"find notes\",\"prompt\":\"Which file holds the notes?\"}","input_bytes":93}
-{"type":"tool_result","id":"toolu_01","name":"Task","is_error":false,"elapsed_ms":<N>,"content_bytes":<N>,"content":"{\"subagent_type\":\"Explore\",\"final_text\":\"notes.txt holds the notes.\",\"stop_reason\":\"end_turn\",\"turns\":1,\"tool_calls\":0,\"tokens\":2}"}
+{"type":"tool_result","id":"toolu_01","name":"Task","is_error":false,"elapsed_ms":<N>,"content_bytes":<N>,"content":"{\"subagent_type\":\"Explore\",\"final_text\":\"notes.txt holds the notes.\",\"stop_reason\":\"end_turn\",\"turns\":1,\"tool_calls\":0,\"tokens\":13}"}
 {"type":"turn_end","turn":1,"tool_calls":1}
 {"type":"turn_begin","turn":2}
 {"type":"output_segment_begin","index":1,"turn":2,"group":1}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"text","text":"The notes are in notes.txt."}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"turn_end","turn":2,"tool_calls":1}
 {"type":"output_segment_end","index":1,"turn":2,"group":1,"disposition":"final","bytes":27}
 {"type":"run_end","turns":2,"tool_calls":1,"stop_reason":"end_turn"}

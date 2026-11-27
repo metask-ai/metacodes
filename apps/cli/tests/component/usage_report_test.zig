@@ -17,10 +17,10 @@ const cc = @import("cc");
 
 const Totals = cc.app_module.UsageTotals;
 
-/// What one Run charged: the host-visible totals and the goal it was billed to.
 const Charged = struct {
     totals: Totals = .{},
     goal_tokens: u64 = 0,
+    context_tokens: usize = 0,
 };
 
 fn runLoop(a: std.mem.Allocator, provider: anytype) !Charged {
@@ -44,6 +44,7 @@ fn runLoop(a: std.mem.Allocator, provider: anytype) !Charged {
     }, &be, a);
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     charged.goal_tokens = state.current.?.tokens_used;
+    charged.context_tokens = if (conv.usageAnchor()) |anchor| anchor.context_tokens else 0;
     return charged;
 }
 
@@ -125,13 +126,28 @@ test "L2 usage: a zero message_start placeholder followed by a full message_delt
     try expectTotals(charged, 1200, 80, 9000);
 }
 
+const PROVISIONAL_ESTIMATE_TURN =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m5\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":8607,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1434,\"output_tokens\":65,\"cache_read_input_tokens\":16000,\"cache_creation_input_tokens\":0}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 usage: Anthropic message_delta revising input_tokens down replaces message_start estimate" {
+    const a = std.testing.allocator;
+    const charged = try runAnthropic(a, &.{PROVISIONAL_ESTIMATE_TURN});
+    try expectTotals(charged, 1434, 65, 16000);
+    try std.testing.expectEqual(@as(usize, 17434), charged.context_tokens);
+}
+
 const OPENAI_REPEATED_USAGE =
-    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hel\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":1,\"total_tokens\":13}}\n\n" ++
-    "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}}\n\n" ++
-    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hel\"}}],\"usage\":{\"prompt_tokens\":10000,\"completion_tokens\":1,\"total_tokens\":10001}}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":10000,\"completion_tokens\":2,\"total_tokens\":10002,\"prompt_tokens_details\":{\"cached_tokens\":9000}}}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10000,\"completion_tokens\":3,\"total_tokens\":10003,\"prompt_tokens_details\":{\"cached_tokens\":9000}}}\n\n" ++
     "data: [DONE]\n\n";
 
-test "L2 usage: an OpenAI-compatible usage object repeated on every chunk is counted once" {
+test "L2 usage: an OpenAI-compatible usage object repeated on every chunk settles to final cache split" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startCassette(&.{OPENAI_REPEATED_USAGE}, 0);
     defer srv.stop();
@@ -141,14 +157,14 @@ test "L2 usage: an OpenAI-compatible usage object repeated on every chunk is cou
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "key", "gpt-4o", url);
     defer client.deinit();
-    try expectTotals(try runLoop(a, client.provider()), 12, 3, 0);
+    try expectTotals(try runLoop(a, client.provider()), 1000, 3, 9000);
 }
 
 const GEMINI_REPEATED_USAGE =
-    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1,\"totalTokenCount\":11}}\n\n" ++
-    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":4,\"totalTokenCount\":14}}\n\n";
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10000,\"candidatesTokenCount\":1,\"totalTokenCount\":10001}}\n\n" ++
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10000,\"candidatesTokenCount\":4,\"cachedContentTokenCount\":9000,\"totalTokenCount\":10004}}\n\n";
 
-test "L2 usage: Gemini usageMetadata repeated on several chunks is counted once" {
+test "L2 usage: Gemini usageMetadata repeated on several chunks settles to final cache split" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startCassette(&.{GEMINI_REPEATED_USAGE}, 0);
     defer srv.stop();
@@ -158,10 +174,10 @@ test "L2 usage: Gemini usageMetadata repeated on several chunks is counted once"
     defer io_rt.deinit();
     var client = cc.api_gemini.GeminiClient.init(a, io_rt.io(), "key", "gemini-2.5-flash", url);
     defer client.deinit();
-    try expectTotals(try runLoop(a, client.provider()), 10, 4, 0);
+    try expectTotals(try runLoop(a, client.provider()), 1000, 4, 9000);
 }
 
-test "L2 usage: a Bedrock Converse metadata report repeated in one response is counted once" {
+test "L2 usage: a Bedrock Converse metadata report revised in one response settles to final report" {
     const a = std.testing.allocator;
     const es = cc.api_aws_event_stream;
     const events = [_][2][]const u8{
@@ -169,7 +185,7 @@ test "L2 usage: a Bedrock Converse metadata report repeated in one response is c
         .{ "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"done\"}}" },
         .{ "contentBlockStop", "{\"contentBlockIndex\":0}" },
         .{ "messageStop", "{\"stopReason\":\"end_turn\"}" },
-        .{ "metadata", "{\"usage\":{\"inputTokens\":11,\"outputTokens\":7,\"cacheReadInputTokens\":5,\"totalTokens\":23}}" },
+        .{ "metadata", "{\"usage\":{\"inputTokens\":16,\"outputTokens\":7,\"cacheReadInputTokens\":0,\"totalTokens\":23}}" },
         .{ "metadata", "{\"usage\":{\"inputTokens\":11,\"outputTokens\":7,\"cacheReadInputTokens\":5,\"totalTokens\":23}}" },
     };
     var body: std.ArrayList(u8) = .empty;

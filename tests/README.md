@@ -125,7 +125,7 @@ ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollb
 错误和取消场景:`provider_4xx`(400,不重试)、`provider_5xx_retry`(500、503 后 200,重试成功)、
 `provider_529`(529 按过载重试,`CLAUDE_CODE_MAX_RETRIES=2` 下两次都是 529,用完重试次数后失败)、`provider_529_retry`(529 后 200,重试成功)、`provider_overloaded_event`(200 的流里先来 `overloaded_error` 错误帧,同一轮重发后完成)、`sse_cut`(第一次响应
 只发一半 SSE 就断开,重试后完成)、`user_interrupt`(provider 每秒发一个 SSE 事件,stdout 出现第一个
-`usage` 事件后给 CLI 发 SIGINT)、`tool_abort`(Bash 跑 `touch started && sleep 30`,`started`
+`output_segment_begin` 事件后给 CLI 发 SIGINT)、`tool_abort`(Bash 跑 `touch started && sleep 30`,`started`
 出现后发 SIGINT)、`interrupt_awaiting_head`(provider 收到请求后一个字节都不回,请求到达后发
 SIGINT)、`interrupt_stalled_stream`(provider 发完第一段文字后不再发字节,也不关连接,stdout 出现
 `text` 事件后发 SIGINT)。provider 的状态行、断流、沉默和事件间隔写在 `contract_test.zig` 的

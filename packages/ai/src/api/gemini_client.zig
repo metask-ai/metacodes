@@ -524,12 +524,6 @@ const GeminiStream = struct {
     /// Where the signatures of the calls this stream emits are kept (the
     /// client's store); null keeps none.
     signatures: ?*gemini_signatures.Store = null,
-    /// pending usage 槽:Gemini 常把 usageMetadata 与末 content chunk 合并(text+finishReason+usage 同 chunk)。
-    /// 一个 chunk 只能 emit 一个 StreamEvent,故先 emit 内容、把 usage 存这里,下次 next() 先吐它。
-    /// 不这样做 → usage 在最常见的"内容+usage 同 chunk"路径被静默丢(E 类 bug)。
-    pending_usage: ?UsageDelta = null,
-    /// 本响应已报告的 usage:usageMetadata 是截至该 chunk 的累计值,且可能出现在多个
-    /// chunk 上。经 cursor 只发新增部分。
     usage_reports: api_stream.UsageReportCursor = .{},
 
     fn handle(self: *GeminiStream) StreamHandle {
@@ -585,11 +579,6 @@ const GeminiStream = struct {
             self.fc_pos += 1;
             return ev;
         }
-        // pending usage 优先吐(上一个 chunk 内容+usage 合并时存的)。
-        if (self.pending_usage) |u| {
-            self.pending_usage = null;
-            return StreamEvent{ .usage = u };
-        }
         if (self.done) return null;
         if (self.reader == null) {
             const raw = http_connection.bodyReader(&self.response, &self.transfer_buf);
@@ -629,11 +618,7 @@ const GeminiStream = struct {
                     client_mod.reportStreamIncomplete("gemini", self.id);
                     return error.StreamIncomplete;
                 }
-                // 流尽:若还有 pending usage(末 chunk 只含内容+usage,内容已 emit),吐它。
-                if (self.pending_usage) |u| {
-                    self.pending_usage = null;
-                    return StreamEvent{ .usage = u };
-                }
+                if (self.usage_reports.finish()) |u| return StreamEvent{ .usage = u };
                 return null;
             };
             // 进展记账:非保活行才续正文空闲时钟(ping/注释行不算,见 stream.zig);
@@ -679,19 +664,12 @@ const GeminiStream = struct {
         // (同 OpenAI issue #258 的判定错误)。
         if (util_json.topLevelObjectField(data, "usageMetadata")) |usage_obj| {
             const cu = cache.parseGeminiCacheUsage(usage_obj);
-            // 语义归一(Anthropic-exclusive):Gemini 的 promptTokenCount **包含**
-            // cachedContentTokenCount;中立 UsageDelta 的 input_tokens 不含 cache,
-            // 消费方按 in+cache_r+cache_w 求和(usage 锚点/成本)——不减会双计。
-            const usage = self.usage_reports.increment(.{
+            self.usage_reports.record(.{
                 .input_tokens = util_json.extractIntField(usage_obj, "promptTokenCount") -| cu.read_tokens,
                 .output_tokens = util_json.extractIntField(usage_obj, "candidatesTokenCount"),
                 .cache_read_input_tokens = cu.read_tokens,
                 .cache_creation_input_tokens = cu.creation_tokens,
             });
-            const has_text = util_json.extractStringField(data, "text") != null;
-            const has_fc = std.mem.indexOf(u8, data, "\"functionCall\"") != null;
-            if (!has_text and !has_fc) return StreamEvent{ .usage = usage }; // 纯 usage chunk → 直接吐
-            self.pending_usage = usage; // 内容+usage 同 chunk → 存,内容先 emit(见下),next() 再吐 usage
         }
 
         // functionCall → 中立 tool_use_start。Gemini: parts:[{functionCall:{name,args:{...}}}]
@@ -1707,17 +1685,16 @@ fn replayGeminiUsage(a: std.mem.Allocator, sse: []const u8, out: []UsageDelta) !
     return out[0..n];
 }
 
-test "Gemini: usageMetadata repeated on several chunks is a running total, events carry increments" {
+test "Gemini: usageMetadata repeated on several chunks settles once with final cache split" {
     var buf: [4]UsageDelta = undefined;
     try std.testing.expectEqualSlices(UsageDelta, &.{
-        .{ .input_tokens = 10, .output_tokens = 1 },
-        .{ .output_tokens = 3 },
+        .{ .input_tokens = 1000, .output_tokens = 4, .cache_read_input_tokens = 9000 },
     }, try replayGeminiUsage(
         std.testing.allocator,
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hel\"}],\"role\":\"model\"},\"index\":0}]," ++
-            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1}}\n\n" ++
+            "\"usageMetadata\":{\"promptTokenCount\":10000,\"candidatesTokenCount\":1}}\n\n" ++
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}]," ++
-            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":4}}\n\n",
+            "\"usageMetadata\":{\"promptTokenCount\":10000,\"candidatesTokenCount\":4,\"cachedContentTokenCount\":9000}}\n\n",
         &buf,
     ));
 }
