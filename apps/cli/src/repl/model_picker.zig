@@ -257,6 +257,21 @@ pub const Key = union(enum) {
     char: u8,
 };
 
+fn completeUtf8Len(bytes: []const u8) usize {
+    var lead = bytes.len;
+    while (lead > 0 and bytes[lead - 1] & 0xC0 == 0x80) lead -= 1;
+    if (lead == 0) return bytes.len;
+    lead -= 1;
+    const need = std.unicode.utf8ByteSequenceLength(bytes[lead]) catch return bytes.len;
+    return if (bytes.len - lead >= need) bytes.len else lead;
+}
+
+fn lastCodepointStart(bytes: []const u8) usize {
+    var start = bytes.len - 1;
+    while (start > 0 and bytes[start] & 0xC0 == 0x80) start -= 1;
+    return start;
+}
+
 pub const PastedLine = struct {
     buffer: [MAX_FILTER]u8 = undefined,
     len: usize = 0,
@@ -397,7 +412,7 @@ pub const Picker = struct {
     }
 
     pub fn filter(self: *const Picker) []const u8 {
-        return self.filter_buffer[0..self.filter_len];
+        return self.filter_buffer[0..completeUtf8Len(self.filter_buffer[0..self.filter_len])];
     }
 
     pub fn notice(self: *const Picker) []const u8 {
@@ -949,7 +964,7 @@ pub const Picker = struct {
             },
             .backspace => {
                 if (self.filter_len == 0) return .ignored;
-                self.filter_len -= 1;
+                self.filter_len = lastCodepointStart(self.filter_buffer[0..self.filter_len]);
                 self.focusFirst();
                 return .redraw;
             },
@@ -1561,6 +1576,27 @@ test "a typed filter keeps the matches under their providers' headings, and Esc 
     try testing.expectEqual(@as(usize, 0), picker.filter_len);
     try testing.expectEqualStrings("HMMHM", try shape(&picker, &letters));
     try testing.expect(picker.onKey(.escape) == .closed);
+}
+
+test "Backspace in the filter takes back a whole character, and half a character typed so far is not shown" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "GLM-4.6", null, "glm-4.6", "anthropic_messages"),
+    };
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    for ("ab中") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expectEqualStrings("ab中", picker.filter());
+    try testing.expect(picker.onKey(.backspace) == .redraw);
+    try testing.expectEqualStrings("ab", picker.filter());
+    for ("文"[0..2]) |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expectEqualStrings("ab", picker.filter());
+    _ = picker.onKey(.{ .char = "文"[2] });
+    try testing.expectEqualStrings("ab文", picker.filter());
+    for (0..3) |_| _ = picker.onKey(.backspace);
+    try testing.expectEqualStrings("", picker.filter());
+    try testing.expectEqual(@as(usize, 0), picker.filter_len);
 }
 
 test "a typed filter lists the models that hold it whole before the ones that only hold its letters in order" {

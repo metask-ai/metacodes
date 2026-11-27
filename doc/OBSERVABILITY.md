@@ -16,7 +16,7 @@ Recording only observes. It adds nothing to a provider request (the prompt
 cache contract in [AGENTS.md](../AGENTS.md) is untouched) and cannot fail a
 Run. Export runs on its own thread with bounded queues and deadlines.
 
-Source: `packages/coding/src/telemetry/` (`telemetry.zig` is the map).
+Source: `packages/telemetry/src/` (`telemetry.zig` is the map).
 
 ## Exporting to a collector
 

@@ -944,14 +944,14 @@ test "Read 流式:offset 超文件行数 → 空" {
 /// 刻意不写成"没装就 SkipZigTest"——被 skip 掉的正是这个 bug 当初藏身的那一侧。
 fn zlsInstalled() bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    return @import("../lsp/servers.zig").which("zls", &buf) != null;
+    return @import("metacodes-lsp").servers.which("zls", &buf) != null;
 }
 
 test "Read 弱提示:LSP 在位 + >150行 + zls 真装了 → CodeMap reminder;小文件/非源码/无 LSP/没装 server 不追加" {
     const a = std.testing.allocator;
     // Y2 砍 tree-sitter 后:hint 由 hasSymbolsFor gate(ctx.lsp 开 + 该扩展名有注册 server +
     // 该 server 二进制可解析)。
-    const Service = @import("../lsp/service.zig").Service;
+    const Service = @import("metacodes-lsp").service.Service;
     var svc = Service.create(a, "/tmp", null) catch return;
     defer svc.shutdown();
     var ctx = testCtx();
@@ -1039,7 +1039,7 @@ test "Read 弱提示:同 session 同文件只提一次(dedup);没装 server 则�
     // Y2 砍 tree-sitter 后 hint 不再廉价验"真有符号"(为 hint 起 LSP server 太浪费),简化为
     // hasSymbolsFor(有 server 且装了)+ >150 行——纯注释源码也会提(轻微 over-hint,登记的取舍)。
     const a = std.testing.allocator;
-    const Service = @import("../lsp/service.zig").Service;
+    const Service = @import("metacodes-lsp").service.Service;
     var svc = Service.create(a, "/tmp", null) catch return;
     defer svc.shutdown();
 
@@ -1120,7 +1120,7 @@ test "ReadTool 含 .. 的合法文件名不被误杀" {
 
 test "Read outline e2e: 真 zls documentSymbol → 大纲(需装 zls)" {
     const a = std.testing.allocator;
-    const lsp_servers = @import("../lsp/servers.zig");
+    const lsp_servers = @import("metacodes-lsp").servers;
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
     if (lsp_servers.which("zls", &zbuf) == null) return error.SkipZigTest; // 未装 → skip
 
@@ -1144,7 +1144,7 @@ test "Read outline e2e: 真 zls documentSymbol → 大纲(需装 zls)" {
         \\
     );
 
-    const Service = @import("../lsp/service.zig").Service;
+    const Service = @import("metacodes-lsp").service.Service;
     var svc = Service.create(a, base, null) catch return;
     defer svc.shutdown();
 

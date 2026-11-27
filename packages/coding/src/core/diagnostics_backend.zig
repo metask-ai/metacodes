@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const json_util = @import("metacodes-base").util.json;
-const ui_backend = @import("protocol/ui_backend.zig");
+const ui_backend = @import("metacodes-guard").core.protocol.ui_backend;
 
 const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;

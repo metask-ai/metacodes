@@ -58,6 +58,7 @@ pub const LoopAction = enum {
     background_main,
     /// Shift+Tab 循环权限模式(调用方 App.cyclePermMode 只写 permission_ctx.mode=单一源;U2 S2)。
     cycle_perm_mode,
+    suspend_process,
     /// slash 菜单选中(Enter):调用方把 editor buffer 换成选中命令名后**提交**。
     /// 选中项 = complete.slashNthMatch(state.slash_catalog, view, state.slash_sel)。
     slash_select,

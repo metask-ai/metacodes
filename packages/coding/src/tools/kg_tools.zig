@@ -16,7 +16,7 @@ const log = @import("metacodes-base").util.log;
 const retrieval_protocol = @import("../kg/retrieval_protocol.zig");
 const lexical_query_plan = @import("../kg/lexical_query_plan.zig");
 const scoped_recall_mod = @import("../kg/scoped_recall.zig");
-const jev_advisor = @import("../jev/advisor.zig");
+const jev_advisor = @import("metacodes-jev").advisor;
 const lesson_mod = @import("../kg/lesson.zig");
 const reserved_types = @import("../kg/reserved_types.zig");
 

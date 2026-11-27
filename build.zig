@@ -88,13 +88,16 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
     mod.addImport("platform", g_platform_mod.?);
 }
 
-const lower_packages = [_][]const u8{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork" };
+const lower_packages = [_][]const u8{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork" };
 const lower_package_deps = [lower_packages.len][]const []const u8{
     &.{},
     &.{"base"},
+    &.{"base"},
     &.{ "base", "ai" },
     &.{ "base", "ai", "kernel" },
+    &.{ "base", "ai", "guard" },
     &.{ "base", "ai", "kernel", "guard" },
+    &.{ "base", "lsp", "ai", "kernel", "guard", "jev", "telemetry" },
     &.{ "base", "ai", "kernel", "guard", "coding" },
     &.{ "base", "ai", "kernel", "guard", "coding" },
 };
@@ -160,7 +163,10 @@ fn addPackages(b: *std.Build, mod: *std.Build.Module, evaluation_shadow: bool) v
 fn addAgentCorePackages(b: *std.Build, mod: *std.Build.Module) void {
     const modules = packageModules(b, false);
     for (modules, lower_packages) |dependency, name| {
-        if (std.mem.eql(u8, name, "teamwork")) continue;
+        if (std.mem.eql(u8, name, "teamwork") or
+            std.mem.eql(u8, name, "lsp") or
+            std.mem.eql(u8, name, "jev") or
+            std.mem.eql(u8, name, "telemetry")) continue;
         mod.addImport(b.fmt("metacodes-{s}", .{name}), dependency);
     }
 }
@@ -2600,21 +2606,6 @@ pub fn build(b: *std.Build) void {
     }
     core_test_step.dependOn(http_status_gate_step);
 
-    // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
-    // 根在 src/ 层(而非 packages/coding/src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
-    // 根在 packages/coding/src/lsp/ 会越出 module path(见 packages/coding/src/lsp_test_root.zig 顶部说明)。
-    // 测试本身也在主套件里跑;`test` 依赖它是为了这份独立编译证明,与 test:provider 同理。
-    const lsp_test_mod = b.createModule(.{
-        .root_source_file = b.path("packages/coding/src/lsp_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addPackageFileImports(b, lsp_test_mod, "coding");
-    const lsp_test = addRecordedTest(b, .{ .name = "lsp-test", .root_module = lsp_test_mod });
-    const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
-    lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test).step);
-
     // test:mcp —— #405: the shared MCP client alone, with no CLI, AgentCore or
     // AgentLoop in its graph. Same shape and reason as test:provider below; its
     // tests also run in the main suites, this is the proof of independence.
@@ -2816,10 +2807,13 @@ pub fn build(b: *std.Build) void {
     units_test_step.dependOn(cli_test_step);
     const package_test_steps = [lower_packages.len]*std.Build.Step{
         b.step("test:base", "Run the base package's inline tests and the platform and release-contract roots (part of `test:units`)"),
+        b.step("test:lsp", "Run the lsp package's inline tests (part of `test:units`)"),
         b.step("test:ai", "Run the ai package's inline tests and the provider root (part of `test:units`)"),
         b.step("test:kernel", "Run the kernel package's tests, fake provider and fake tools only (part of `test:units`)"),
         b.step("test:guard", "Run the guard package's inline tests (part of `test:units`)"),
-        b.step("test:coding", "Run the coding package's inline tests and the MCP and LSP roots (part of `test:units`)"),
+        b.step("test:jev", "Run the jev package's inline tests (part of `test:units`)"),
+        b.step("test:telemetry", "Run the telemetry package's inline tests (part of `test:units`)"),
+        b.step("test:coding", "Run the coding package's inline tests and the MCP root (part of `test:units`)"),
         b.step("test:session", "Run the session package's inline tests (part of `test:units`)"),
         b.step("test:teamwork", "Run the teamwork package's inline tests (part of `test:units`)"),
     };
@@ -2850,7 +2844,6 @@ pub fn build(b: *std.Build) void {
     package_test_steps[packageIndex("ai")].dependOn(provider_test_step);
     package_test_steps[packageIndex("coding")].dependOn(mcp_test_step);
     cli_test_step.dependOn(picker_test_step);
-    package_test_steps[packageIndex("coding")].dependOn(lsp_test_step);
     package_test_steps[packageIndex("base")].dependOn(platform_test_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
@@ -4048,7 +4041,7 @@ pub fn build(b: *std.Build) void {
         // subsystem with no timing/concurrency coupling to the rest of the
         // repository suite, so it does not reintroduce the flakiness the
         // comment above is guarding against.
-        windows_gate_step.dependOn(lsp_test_step);
+        windows_gate_step.dependOn(package_test_steps[packageIndex("lsp")]);
         windows_gate_step.dependOn(&windows_help_cmd.step);
 
         const windows_tty_cmd = b.addSystemCommand(&.{

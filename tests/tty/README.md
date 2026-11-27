@@ -13,6 +13,8 @@
 zig build dev
 zig build test:harness  # e2e cases that need mock_mcp_server/replay_server
 TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug
+# 按域过滤(见 tests/tty/domains.json;逗号分隔,空值/未设 = 全量;与 --shard/--jobs 兼容):
+TTY_SKIP_MODEL=1 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --domains mcp,smoke
 # 单跑某用例 + dump(-k 是纯子串过滤,匹配 `文件名.函数名`):
 python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 ```
@@ -116,7 +118,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 | e2e_metask_device(真模型) | Metask 设备码登录(程序化确认)→ 经网关请求真实模型 → 本地账本每请求带 X-Metask-Request-Id → `scripts/metask_reconcile.py` 与网关 /v1/usage 对账零差异;需 METASK_WEB_SESSION_TOKEN、METASK_SITE_URL、METASK_MODELS |
 | phase_ownership 阶段拥有 widget(#330) | 回复里打开的 agent 列表(`↓ to manage`)与 `?` help 不进入下一次提示:列表不吞下一次输入(#298 的症状),空闲 footer 不被 help 盖住;离线(slow mock server) |
 | redraw_coalesce 重画合并窗口(#328) | 突发流每行到齐且有序、帧数 < 行数/2;静默等待里 spinner 仍在动;回复中突发打字每键回显、帧数 < 键数/2;突发流中 resize 只剩一个框;中断后提示符回来、已流出的文本完整;突发后立刻 `/exit` 干净;WebSearch 结果行在卡离场前上屏。帧数断言只在 POSIX(ConPTY 重编码) |
-| keyboard_probe 键盘协议探测 | 认不出的终端启动时被问 `CSI ? u` + DA1(驱动按场景应答):答了 Kitty flags → 发 `\x1b[>1u`、多行提示 shift+⏎;只答 DA1 / 不答 → 不发、提示 \+⏎;应答之间夹着的提前敲的键回放进输入框;迟到的应答(DA1、Kitty、OSC 11)不漏成字符;deny-list / tmux / `METACODES_NO_PROBE` / `METACODES_NO_KEYBOARD_ENHANCEMENT` 不问(#327;POSIX,Windows console 不探测);`METACODES_NO_KEYBOARD_ENHANCEMENT` 在认得出的终端里也不发 `\x1b[>1u`、`\x1b[>4;2m`,退出时也不发关闭序列 |
+| keyboard_probe 键盘协议探测 | 认不出的终端启动时被问 `CSI ? u` + DA1(驱动按场景应答):答了 Kitty flags → 发 `\x1b[>1u`、多行提示 shift+⏎;只答 DA1 / 不答 → 不发、提示 \+⏎;应答之间夹着的提前敲的键回放进输入框;迟到的应答(DA1、Kitty、OSC 11)不漏成字符,其中的 Kitty 应答(启动期间到的、输入框里到的)补发 `\x1b[>1u`、提示跟着变 shift+⏎,`/exit` 和崩溃时照样关;deny-list / tmux / `METACODES_NO_PROBE` / `METACODES_NO_KEYBOARD_ENHANCEMENT` 不问(#327;POSIX,Windows console 不探测);`METACODES_NO_KEYBOARD_ENHANCEMENT` 在认得出的终端里也不发 `\x1b[>1u`、`\x1b[>4;2m`,退出时也不发关闭序列 |
 | T45-T47 resize 打断按键 | ESC、resize、`[A` 在一次 ESC 等待内先后到达:反向搜索不被取消、transcript viewer 不被关掉,`[A` 不漏进输入框(#340);单按 Esc 不等下一个键就关 viewer(POSIX;ConPTY 无 SIGWINCH,T45/T46 跳过) |
 
 ## 已发现并修复的 bug

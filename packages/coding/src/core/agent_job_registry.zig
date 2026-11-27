@@ -253,15 +253,15 @@ pub const JobEntry = struct {
     /// 会被流式 text 填充(旧前台路径走 null-writer 丢弃)。前台 entry 在 index 中可被 TaskOutput
     /// 按 id 查到——但前台 Task 同步阻塞返回 final_text,模型无法在其执行中查它;唯一可见窗口是
     /// 同批并发 Task 互查,届时读到的是对端 subagent 的真实流式输出(正确数据,非脏读)。
-    pub fn backend(self: *JobEntry) @import("protocol/ui_backend.zig").UiBackend {
+    pub fn backend(self: *JobEntry) @import("metacodes-guard").core.protocol.ui_backend.UiBackend {
         return .{ .ctx = @ptrCast(self), .emit = &emitThunk, .poll = &pollThunk };
     }
 
-    fn pollThunk(_: *anyopaque, _: @import("protocol/ui_backend.zig").SessionId) ?@import("protocol/ui_backend.zig").UiEvent {
+    fn pollThunk(_: *anyopaque, _: @import("metacodes-guard").core.protocol.ui_backend.SessionId) ?@import("metacodes-guard").core.protocol.ui_backend.UiEvent {
         return null; // subagent 无用户输入通道
     }
 
-    fn emitThunk(state: *anyopaque, _: @import("protocol/ui_backend.zig").SessionId, ev: @import("protocol/ui_backend.zig").CoreEvent) void {
+    fn emitThunk(state: *anyopaque, _: @import("metacodes-guard").core.protocol.ui_backend.SessionId, ev: @import("metacodes-guard").core.protocol.ui_backend.CoreEvent) void {
         const self: *JobEntry = @ptrCast(@alignCast(state));
         switch (ev) {
             // 流式 text(及 web_search 的 ui_text)→ 增量输出缓冲(TaskOutput since_byte 读)。

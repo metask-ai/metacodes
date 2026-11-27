@@ -28,9 +28,9 @@ const std = @import("std");
 const ToolContext = @import("context.zig").ToolContext;
 const symbol = @import("metacodes-base").symbols.symbol;
 const lsp_diag = @import("lsp_diag.zig");
-const servers = @import("../lsp/servers.zig");
+const servers = @import("metacodes-lsp").servers;
 
-pub const capability = @import("../lsp/capability.zig");
+pub const capability = @import("metacodes-lsp").capability;
 pub const Unavailable = capability.Unavailable;
 
 /// "这个文件能不能出符号"的判定结果。**三态里的两态**:能力在位(带那个 server 的 def)
@@ -143,7 +143,7 @@ pub fn extractSymbols(ctx: *const ToolContext, gpa: std.mem.Allocator, file: []c
 
 /// LspSymbol[](kind=LSP SymbolKind int)→ 中立 Symbols(kind=Kind,signature=detail)。
 /// 全部字符串 dup 进新 arena。
-fn convertLsp(gpa: std.mem.Allocator, file: []const u8, items: []const @import("../lsp/symbols.zig").LspSymbol) !symbol.Symbols {
+fn convertLsp(gpa: std.mem.Allocator, file: []const u8, items: []const @import("metacodes-lsp").symbols.LspSymbol) !symbol.Symbols {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -167,7 +167,7 @@ fn convertLsp(gpa: std.mem.Allocator, file: []const u8, items: []const @import("
 
 test "convertLsp: LSP kind→中立 Kind + detail→signature" {
     const a = std.testing.allocator;
-    const lsp_symbols = @import("../lsp/symbols.zig");
+    const lsp_symbols = @import("metacodes-lsp").symbols;
     const items = [_]lsp_symbols.LspSymbol{
         .{ .name = "add", .kind = 12, .line_start = 6, .line_end = 8, .detail = "fn (i32,i32) i32", .parent = null },
         .{ .name = "x", .kind = 8, .line_start = 2, .line_end = 2, .detail = "", .parent = "Point" },
@@ -287,7 +287,7 @@ test "CapabilityCache: 槽位按不同扩展名增长,重复扩展名不再增�
     var ctx = ToolContext.simple(a);
     // 只需要 ctx.lsp 非 null 走真判定;这里不发请求,给个 dangling 指针会 UB,
     // 故用真 Service(创建很轻:只起一个 idle reaper 线程)。
-    const Service = @import("../lsp/service.zig").Service;
+    const Service = @import("metacodes-lsp").service.Service;
     const svc = try Service.create(a, "/nonexistent_xyz_cwd", null);
     defer svc.shutdown();
     ctx.lsp = svc;

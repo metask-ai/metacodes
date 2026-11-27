@@ -101,6 +101,20 @@ def test_picker_typing_filters_without_touching_the_draft(bin_path):
     assert "explain this" in text, "picker 吃掉了输入框里的草稿:\n" + text
 
 
+def test_picker_puts_the_cursor_after_its_filter_so_an_input_method_writes_there(bin_path):
+    raw = run(
+        bin_path,
+        ["sleep:0.8", "type:draft", "sleep:0.3", "key:ctrl_o", "sleep:0.4", "type:中文", "sleep:0.4"],
+        env={"ZAI_API_KEY": "tty-dummy-zai-key"},
+        per_key_drain=0.08,
+    )
+    a, text = _screen(raw)
+    row, col = a.final.cursor()
+    header = a.final.line_text(row)
+    assert "/中文" in header, "the cursor is not on the picker's header line:\n" + text
+    assert col == header.index("/中文") + 1 + 4, f"the cursor stands at column {col}, not after the filter:\n" + text
+
+
 def test_picker_search_can_start_with_q(bin_path):
     raw = run(
         bin_path,

@@ -470,7 +470,11 @@ class LayoutTest(unittest.TestCase):
             ("packages/teamwork/src/root.zig", ("teamwork", "facade", "cli"), False),
             ("packages/session/src/root.zig", ("session", "facade", "agentcore", "cli"), True),
             ("packages/coding/src/core/agent_loop.zig", ("coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
-            ("packages/ai/src/root.zig", ("ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/lsp/src/client.zig", ("lsp", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/jev/src/advisor.zig", ("jev", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/telemetry/src/span.zig", ("telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/guard/src/root.zig", ("guard", "jev", "telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
+            ("packages/ai/src/root.zig", ("ai", "kernel", "guard", "jev", "telemetry", "coding", "session", "teamwork", "facade", "agentcore", "cli"), True),
         ):
             with self.subTest(path=path):
                 scope, reason = ci_scope.classify([path], layout=layout)
@@ -640,20 +644,76 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(ci_scope.local_commands("tests", tty, "zig")[0], ["zig", "build", "test:contract"])
         self.assertEqual(ci_scope.local_commands("tests", tty, "zig", windows=True)[1:],
                          [["zig", "build", "windows:tty", "-Dtarget=x86_64-windows-gnu"]])
+        domains = ci_scope.load_tty_domains(ci_scope.tree_reader(ROOT, None))
+        narrow_tty = ci_scope.select("tests", [("M", "tests/tty/cases/test_mcp_startup.py")], layout, tty_domains=domains)
+        self.assertEqual(narrow_tty.tty_domains, ("mcp",))
+        self.assertEqual(
+            ci_scope.local_commands("tests", narrow_tty, "zig")[-1],
+            [sys.executable, "tests/tty/run_tty_tests.py", "--bin", "zig-out/bin/metacodes-debug", "--domains", "mcp"],
+        )
 
     def test_the_local_run_never_reaches_a_real_model(self) -> None:
         seen = []
+        seen_domains = []
 
         def run(command, cwd, env, check):
             seen.append(env.get("TTY_SKIP_MODEL"))
+            seen_domains.append(env.get("TTY_DOMAINS"))
             return subprocess.CompletedProcess(command, 0)
 
         tty = ci_scope.select("tests", [("M", "tests/tty/cases/a.py")], fixture_layout())
-        with mock.patch.dict(os.environ, {"TTY_SKIP_MODEL": ""}), mock.patch.object(ci_scope.subprocess, "run", run), \
-                redirect_stdout(io.StringIO()):
+        with mock.patch.dict(os.environ, {"TTY_SKIP_MODEL": "", "TTY_DOMAINS": "stale"}), \
+                mock.patch.object(ci_scope.subprocess, "run", run), redirect_stdout(io.StringIO()):
             self.assertEqual(ci_scope.run_local(ROOT, "tests", tty, "zig"), 0)
         self.assertTrue(seen)
         self.assertEqual(set(seen), {"1"})
+        self.assertEqual(set(seen_domains), {None})
+
+        domains = ci_scope.load_tty_domains(ci_scope.tree_reader(ROOT, None))
+        narrow = ci_scope.select("tests", [("M", "tests/tty/cases/test_kg_startup.py")], fixture_layout(), tty_domains=domains)
+        seen_domains.clear()
+        with mock.patch.object(ci_scope.subprocess, "run", run), redirect_stdout(io.StringIO()):
+            self.assertEqual(ci_scope.run_local(ROOT, "tests", narrow, "zig"), 0)
+        self.assertEqual(set(seen_domains), {"kg"})
+
+    def test_tty_domains_manifest_and_narrow_selection(self) -> None:
+        layout = ci_scope.load_layout(ci_scope.tree_reader(ROOT, None))
+        domains = ci_scope.load_tty_domains(ci_scope.tree_reader(ROOT, None))
+        on_disk = {p.stem for p in (ROOT / "tests/tty/cases").glob("test_*.py")}
+        self.assertEqual(set(domains.by_module), on_disk)
+
+        cases = (
+            ([("M", "packages/lsp/src/client.zig")], "packages", True, ("smoke",)),
+            ([("M", "packages/jev/src/advisor.zig")], "packages", True, ("smoke",)),
+            ([("M", "packages/telemetry/src/span.zig")], "packages", True, ("smoke",)),
+            ([("M", "packages/teamwork/src/root.zig")], "packages", True, ("smoke", "teamwork")),
+            ([("M", "apps/cli/src/repl/teamwork.zig")], "packages", True, ("smoke", "teamwork")),
+            ([("M", "packages/coding/src/mcp/client.zig")], "packages", True, ("mcp", "smoke")),
+            ([("M", "packages/coding/src/kg/client.zig")], "packages", True, ("kg", "smoke")),
+            ([("M", "apps/cli/src/repl/model_picker.zig")], "packages", True, ("provider", "smoke")),
+            ([("M", "apps/cli/src/web/server.zig")], "packages", False, ()),
+            ([("M", "apps/cli/src/daemon/serve.zig")], "packages", False, ()),
+            ([("M", "apps/cli/src/repl/tui/theme.zig")], "packages", True, ()),
+            ([("M", "packages/coding/src/core/agent_loop.zig")], "packages", True, ()),
+            ([("M", "packages/ai/src/root.zig")], "packages", True, ()),
+            ([("M", "packages/coding/src/mcp/client.zig"), ("M", "packages/coding/src/kg/client.zig")], "packages", True, ("kg", "mcp", "smoke")),
+            ([("M", "packages/coding/src/mcp/client.zig"), ("M", "packages/coding/src/core/agent_loop.zig")], "packages", True, ()),
+            ([("M", "tests/tty/cases/test_mcp_startup.py")], "tests", True, ("mcp",)),
+            ([("M", "tests/tty/cases/test_key_login.py")], "tests", True, ("mcp", "provider")),
+            ([("M", "tests/tty/cases/test_runner_shards.py")], "tests", True, ("runner",)),
+            ([("M", "tests/tty/cases/test_kitty_csi_u_keys.py")], "tests", True, ("provider", "tui")),
+            ([("A", "tests/tty/cases/test_unmapped_new.py")], "tests", True, ()),
+            ([("D", "tests/tty/cases/test_mcp_startup.py")], "tests", True, ()),
+            ([("M", "packages/agentcore/abi_v1.zig"), ("M", "tests/tty/cases/test_layout.py")], "packages", True, ("smoke",)),
+        )
+        for changes, expected_scope, expect_tty, expect_domains in cases:
+            with self.subTest(changes=changes):
+                scope, reason = ci_scope.classify([p for _, p in changes], layout=layout)
+                self.assertEqual(scope, expected_scope, reason)
+                chosen = ci_scope.select(scope, changes, layout, tty_domains=domains)
+                self.assertEqual((chosen.tty, chosen.tty_domains), (expect_tty, expect_domains))
+                without_manifest = ci_scope.select(scope, changes, layout, tty_domains=None)
+                self.assertEqual((without_manifest.tty, without_manifest.tty_domains), (expect_tty, ()))
 
 
 class PackageScopeMainTest(unittest.TestCase):
@@ -836,6 +896,27 @@ class PackageScopeMainTest(unittest.TestCase):
         self.assertIn("| #7 | packages | mid, top |", report)
         cleared = ci_scope.replay(self.repo, [self.git("rev-parse", "HEAD").strip()], "HEAD", True)
         self.assertEqual(cleared[0][2:4], ("packages", ("side",)))
+
+    def test_tty_domains_output_and_malformed_manifest_fail_open(self) -> None:
+        (self.repo / "tests/tty/cases/test_mcp_startup.py").write_text("def test_x(b): pass\n", encoding="utf-8")
+        (self.repo / ci_scope.TTY_DOMAINS).write_text(json.dumps({
+            "schema": "metacodes.tty-domains/v1",
+            "domains": {"mcp": ["test_mcp_startup"]},
+        }), encoding="utf-8")
+        self.commit("add tty domains manifest")
+        self.edit("tests/tty/cases/test_mcp_startup.py")
+        self.commit("touch mcp tty case")
+        got = self.run_main("--event", "pull_request", "--base", "HEAD^1")
+        self.assertEqual((got["scope"], got["tty"], got["tty_domains"]), ("tests", "true", "mcp"))
+        summary = (self.repo / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("| TTY | Run (domains: mcp) |", summary)
+
+        (self.repo / ci_scope.TTY_DOMAINS).write_text("{broken", encoding="utf-8")
+        self.commit("break tty domains manifest")
+        self.edit("tests/tty/cases/test_mcp_startup.py")
+        self.commit("touch mcp tty case with broken manifest")
+        broken = self.run_main("--event", "pull_request", "--base", "HEAD^1")
+        self.assertEqual((broken["scope"], broken["tty"], broken["tty_domains"]), ("full", "true", ""))
 
 
 def load_workflow():
@@ -1099,6 +1180,8 @@ class WorkflowTest(unittest.TestCase):
                 shards = spec["strategy"]["matrix"]["shard"]
                 self.assertEqual(shards, list(range(1, len(shards) + 1)))
                 self.assertEqual(spec["env"]["TTY_SHARD"], "${{ matrix.shard }}/${{ strategy.job-total }}")
+                self.assertEqual(spec["env"]["TTY_DOMAINS"], "${{ needs.scope.outputs.tty_domains }}")
+        self.assertEqual(self.jobs["scope"]["outputs"]["tty_domains"], "${{ steps.decide.outputs.tty_domains }}")
 
     def test_the_sdk_job_reports_on_every_run(self) -> None:
         # Not a required check today; reporting under its own name on every
@@ -1339,7 +1422,7 @@ class AgentCoreWorkflowTest(unittest.TestCase):
             "packages/guard/src/core/goal.zig",
             "packages/coding/src/core/agent_loop.zig",
             "packages/session/src/core/session_host.zig",
-            "packages/coding/src/lsp_test_root.zig",
+            "packages/lsp/src/root.zig",
             "packages/base/src/platform/platform.zig",
             "packages/base/src/root.zig",
         ):

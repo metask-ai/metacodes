@@ -490,7 +490,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 两通道)。无 fg_entry(无 registry/headless)→ null-writer backend(丢弃流式输出)。
     // 单一 spawnAgentSink 调用 + 单一 SpawnOptions(避免两份字段漂移)。
     var null_wb = @import("../core/writer_backend.zig").WriterBackend.initNull();
-    const be: @import("../core/protocol/ui_backend.zig").UiBackend =
+    const be: @import("metacodes-guard").core.protocol.ui_backend.UiBackend =
         if (fg_entry) |e| e.backend() else null_wb.backend();
     // **allocator 一致铁律**:spawnAgentSink 的 allocator 必须与 call_prov 的 allocator 一致 ——
     // provider 的流式事件(tool_use/text)所有权转移进 subagent 的 agent_loop,不一致 → Invalid free

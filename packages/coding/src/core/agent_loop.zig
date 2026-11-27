@@ -53,10 +53,10 @@ const util_time = @import("metacodes-base").util.time;
 const util_json = @import("metacodes-base").util.json;
 const log = @import("metacodes-base").util.log;
 const output_semantics = @import("metacodes-guard").core.output_semantics;
-const telemetry = @import("../telemetry/telemetry.zig");
+const telemetry = @import("metacodes-telemetry").telemetry;
 const file_change_mod = @import("metacodes-guard").core.file_change;
 const tool_exec_mod = @import("tool_exec.zig");
-const ui_backend = @import("protocol/ui_backend.zig");
+const ui_backend = @import("metacodes-guard").core.protocol.ui_backend;
 const ui_event = @import("metacodes-guard").core.protocol.ui_event;
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
@@ -476,7 +476,7 @@ pub const Options = struct {
     /// 的线程模型白纸黑字要求 `sendRequest`/`sendNotification` 由**单一 caller 线程**串行调用,
     /// 而 subagent 跑在后台线程上;直接透传会让两个线程交错写同一个 server 的 stdin。要放开得先
     /// 给 Client 加发送侧串行化,那是 LSP 子系统的改动,不是加一行 `.lsp = opts.lsp`。
-    lsp: ?*@import("../lsp/service.zig").Service = null,
+    lsp: ?*@import("metacodes-lsp").service.Service = null,
     /// 自动 compact 的 token 阈值。null → 按 input context window 扣输出保留区后动态算。
     auto_compact_threshold: ?usize = null,
     /// Wire-size safety net for image results (they bypass the byte budgets):
@@ -510,7 +510,7 @@ pub const Options = struct {
     kg: ?*@import("../kg/client.zig").KgClient = null,
     /// System-One advisor for memory-plane judgments (enumeration intent here,
     /// memory relations in KgRemember via ToolContext). null = baseline only.
-    jev: ?*@import("../jev/advisor.zig").Advisor = null,
+    jev: ?*@import("metacodes-jev").advisor.Advisor = null,
     kg_projects_dir: []const u8 = "",
     /// 本 agent loop 的对外身份(KG claim 租约)。null = 沿用 session(主 loop:
     /// App.session_id 跨进程唯一且跨 turn 稳定)。subagent spawn 时必须显式 gen——
@@ -5524,7 +5524,7 @@ const KgEnumerationPending = enum { none, batch, context };
 /// coverage, journal the consultation, and return whether it armed the soft
 /// hint (advisory mode and a positive answer). Every failure arms nothing.
 fn judgeEnumerationIntent(
-    advisor: *@import("../jev/advisor.zig").Advisor,
+    advisor: *@import("metacodes-jev").advisor.Advisor,
     allocator: std.mem.Allocator,
     opts: Options,
     text: []const u8,

@@ -125,11 +125,11 @@ pub const kg_transport = @import("metacodes-coding").kg.transport; // authentica
 pub const kg_experience_packet = @import("metacodes-coding").kg.experience_packet; // prior execution feedback at claim boundary
 pub const kg_lesson = @import("metacodes-coding").kg.lesson; // learning-turn lesson envelope, binding and same-task note
 pub const kg_lexical_query_plan = @import("metacodes-coding").kg.lexical_query_plan; // governed vector-free query plans + host ledger
-pub const jev_question = @import("metacodes-coding").jev.question; // typed System-One questions (Jev-Mem control plane)
-pub const jev_client = @import("metacodes-coding").jev.client; // deadline-bounded System-One transport with breaker
-pub const jev_advisor = @import("metacodes-coding").jev.advisor; // kernel-owned shadow/advisory decision seam
-pub const jev_runtime = @import("metacodes-coding").jev.runtime; // METACODES_JEV_* wiring, address-stable runtime
-pub const jev_excerpt = @import("metacodes-coding").jev.excerpt; // query-focused judge excerpts
+pub const jev_question = @import("metacodes-jev").question; // typed System-One questions (Jev-Mem control plane)
+pub const jev_client = @import("metacodes-jev").client; // deadline-bounded System-One transport with breaker
+pub const jev_advisor = @import("metacodes-jev").advisor; // kernel-owned shadow/advisory decision seam
+pub const jev_runtime = @import("metacodes-jev").runtime; // METACODES_JEV_* wiring, address-stable runtime
+pub const jev_excerpt = @import("metacodes-jev").excerpt; // query-focused judge excerpts
 pub const kg_memory_migration_adapter = @import("metacodes-coding").kg.memory_migration_adapter; // Metacodes transaction controller over TinyKG snapshot/CAS/receipt primitives
 pub const kg_ontology_rule_snapshot_adapter = @import("metacodes-coding").kg.ontology_rule_snapshot_adapter;
 pub const kgd_identity = @import("metacodes-coding").kg.kgd.identity; // what the local TinyKG service is, and to whom
@@ -244,7 +244,7 @@ pub const sandbox_exec = @import("metacodes-guard").sandbox.exec;
 
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────
 pub const protocol = struct {
-    pub const ui_backend = @import("metacodes-coding").core.protocol.ui_backend; // UiBackend vtable
+    pub const ui_backend = @import("metacodes-guard").core.protocol.ui_backend; // UiBackend vtable
     pub const ui_event = @import("metacodes-guard").core.protocol.ui_event; // CoreEvent, UiEvent, ConfigChange
     pub const ui_request = @import("metacodes-guard").core.protocol.ui_request; // UiRequest, UiResponse, UiRequestFn
     pub const wire = @import("metacodes-coding").core.protocol.wire; // versioned JSON lines for out-of-process Hosts
@@ -262,7 +262,7 @@ pub const ui_request_store = @import("metacodes-coding").core.ui_request_store; 
 pub const tee_backend = @import("metacodes-coding").core.tee_backend; // L4:多路转发 decorator
 pub const diagnostics_backend = @import("metacodes-coding").core.diagnostics_backend; // L4:诊断 trace 后端
 pub const evaluation_backend = @import("metacodes-coding").core.evaluation_backend; // V1:稳定评估事件投影
-pub const telemetry = @import("metacodes-coding").telemetry.telemetry; // OpenTelemetry spans: recorder, OTLP exporter, session store
+pub const telemetry = @import("metacodes-telemetry").telemetry; // OpenTelemetry spans: recorder, OTLP exporter, session store
 
 // ── 工具库 ───────────────────────────────────────────────────────────────
 pub const util_abort = @import("metacodes-base").util.abort; // AbortSignal

@@ -6,7 +6,7 @@
 > 想继续用团队的那个服务，把 §7 里的配置写进 `config.json` 一次。设了 `Config.jev_builtin_default` 的嵌入方才取内置默认，
 > 本仓库里没有宿主设它。`jev` 段逐字段覆盖默认，同名 `METACODES_JEV_*` 环境变量再逐字段覆盖配置文件；任一层给出
 > `off` 或空 `url`（`"jev": false`、`"jev": {"url": "off"}`、`METACODES_JEV_URL=off`）即关闭。只写 `url`
-> 不写 `mode` 时是 `shadow`（只记录不改行为），`advisory` 才让判断影响注入。实现：`packages/coding/src/jev/`；消费方：
+> 不写 `mode` 时是 `shadow`（只记录不改行为），`advisory` 才让判断影响注入。实现：`packages/jev/src/`；消费方：
 > `packages/coding/src/kg/scoped_recall.zig`、`packages/coding/src/tools/kg_tools.zig`、`packages/coding/src/core/agent_loop.zig`。
 > 评估复现：`zig build eval:jev-recall-driver`（零 provider 驱动）+ 本文 §6。
 
@@ -45,11 +45,11 @@ Jev-Mem（arXiv 2609.23986）把这种 System-One 判断放进记忆控制：写
 ## 3. 架构
 
 ```
-packages/coding/src/jev/question.zig   封闭问题类型、comptime 校验、请求序列化、严格响应解析
-packages/coding/src/jev/client.zig     HTTP 客户端：Io.Select 竞速(响应/截止/中断)、熔断、模型钉、计费拒收
-packages/coding/src/jev/advisor.zig    问题目录(版本化) + 判断入口 + Audit(→ system_one_decision 事件)
-packages/coding/src/jev/excerpt.zig    判断窗口：候选全文中与请求词最密的 480 B
-packages/coding/src/jev/runtime.zig    config.json `jev` 段与 METACODES_JEV_* 覆盖的解析、堆上固定的 Runtime(App 持有生命周期)
+packages/jev/src/question.zig   封闭问题类型、comptime 校验、请求序列化、严格响应解析
+packages/jev/src/client.zig     HTTP 客户端：Io.Select 竞速(响应/截止/中断)、熔断、模型钉、计费拒收
+packages/jev/src/advisor.zig    问题目录(版本化) + 判断入口 + Audit(→ system_one_decision 事件)
+packages/jev/src/excerpt.zig    判断窗口：候选全文中与请求词最密的 480 B
+packages/jev/src/runtime.zig    config.json `jev` 段与 METACODES_JEV_* 覆盖的解析、堆上固定的 Runtime(App 持有生命周期)
 ```
 
 三个消费点（全部是记忆面上已经存在的决策），外加一个已退役的面：
@@ -74,7 +74,7 @@ rollout 产物摘要同样覆盖它）。
 按臂注入的就是这些变量）。`metacodes doctor` 报告生效的状态、地址和来源（内置默认 / 文件 /
 环境变量 / 两者）。
 
-内置默认（`packages/coding/src/jev/runtime.zig` `BUILTIN_DEFAULT`，只有设了 `Config.jev_builtin_default` 的宿主才取，**CLI 不取**——#474）：`url`
+内置默认（`packages/jev/src/runtime.zig` `BUILTIN_DEFAULT`，只有设了 `Config.jev_builtin_default` 的宿主才取，**CLI 不取**——#474）：`url`
 `http://58.211.6.133:10420`、`mode` `advisory`、`model` `metask-jev-4b`、`decisions`
 `["scoped_recall"]`（§7 的推荐配置：`memory_relation` 从未被咨询，`enumeration_intent` 从未越过阈值；
 KgRecall 那个面已退役），其余取下表默认。

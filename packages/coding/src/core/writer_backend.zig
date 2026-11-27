@@ -18,7 +18,7 @@
 //! poll → 恒 null(print-only sink 无输入端)。
 
 const std = @import("std");
-const ui_backend = @import("protocol/ui_backend.zig");
+const ui_backend = @import("metacodes-guard").core.protocol.ui_backend;
 const ui_event = @import("metacodes-guard").core.protocol.ui_event;
 
 const CoreEvent = ui_event.CoreEvent;

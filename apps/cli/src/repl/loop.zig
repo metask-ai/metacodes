@@ -82,9 +82,21 @@ fn debugSink(_: *anyopaque, bytes: []const u8) void {
     cmd_output.print("{s}", .{bytes});
 }
 
-/// 建一个走 std.debug.print 的 WriterBackend(colorize=true 复刻旧 DebugWriter 继承的默认)。
+/// 建一个走 std.debug.print 的 WriterBackend(着色复刻旧 DebugWriter 继承的默认,TERM=dumb 时不着色)。
 fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("metacodes-internal").core.usage.UsageTotals) writer_backend_mod.WriterBackend {
-    return .{ .sink_ctx = undefined, .sink = debugSink, .colorize = true, .verbose = verbose, .show_retry = show_retry, .usage_acc = usage_acc };
+    return .{ .sink_ctx = undefined, .sink = debugSink, .colorize = !dumbTerm(termName()), .verbose = verbose, .show_retry = show_retry, .usage_acc = usage_acc };
+}
+
+fn termName() ?[]const u8 {
+    return if (std.c.getenv("TERM")) |name| std.mem.span(name) else null;
+}
+
+fn dumbTerm(term_name: ?[]const u8) bool {
+    return if (term_name) |name| std.mem.eql(u8, name, "dumb") else false;
+}
+
+fn drawsTui(stdin_tty: bool, term_name: ?[]const u8) bool {
+    return stdin_tty and !dumbTerm(term_name);
 }
 
 /// How the REPL starts.
@@ -186,7 +198,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     defer history.saveToFile(hist_path) catch {};
 
     const stdin_fd: c_int = startup.input_fd;
-    const tty = platform_term.isatty(stdin_fd);
+    const tty = drawsTui(platform_term.isatty(stdin_fd), termName());
     if (tty) input.installResumeHandler();
 
     // TTY 会话只拥有一个 Renderer。输入期、生成期和队列续发共享同一份固定区状态
@@ -207,9 +219,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         printResumed(app, resumed);
     }
 
-    // 终端 tab 标题反映 session 状态(idle/working/需要输入)。仅 tty;退出时清空。
+    // 终端 tab 标题反映 session 状态(idle/working/需要输入)。仅 tty;退出时还原原标题。
+    if (tty) terminal_title.save();
+    defer if (tty) terminal_title.restore();
     if (tty) terminal_title.setFromApp(app, .idle);
-    defer if (tty) terminal_title.clear();
 
     // 工具 progress 心跳:tty 下经 agent_loop Options.spawn_tick_fn 传入(per-session,非全局)。
     // 非 TTY 不接(避免污染 pipe 输出)。具体在每次 run() 的 Options 里设 .spawn_tick_fn。
@@ -2011,6 +2024,7 @@ fn readLineRaw(
         if (synthetic_key == null) while (true) {
             if (app_mod.terminateRequested()) return error.TerminateRequested;
             _ = input.reconcileAfterResume(fd);
+            if (input.adoptLateKeyboardAnswer(fd)) redraw(region, &editor, app);
             if (g_winch.swap(false, .acquire)) {
                 redraw(region, &editor, app); // resize → 重测宽度重画
             }
@@ -2080,10 +2094,10 @@ fn readLineRaw(
         };
 
         switch (copy_select.handle(allocator, region, key)) {
-            .not_mine => region.ui.phase.input.copied = false,
+            .not_mine => region.ui.phase.input.copied = null,
             .consumed => continue,
-            .copied => {
-                region.ui.phase.input.copied = true;
+            .copied => |notice| {
+                region.ui.phase.input.copied = notice;
                 redraw(region, &editor, app);
                 continue;
             },
@@ -2401,6 +2415,14 @@ fn readLineRaw(
                     redraw(region, &editor, app);
                     continue;
                 },
+                .suspend_process => {
+                    if (@import("builtin").os.tag == .windows) continue;
+                    region.clear();
+                    input.stopSelf();
+                    _ = input.reconcileAfterResume(fd);
+                    redraw(region, &editor, app);
+                    continue;
+                },
                 .redraw_screen => {
                     region.resetScreen();
                     redraw(region, &editor, app);
@@ -2588,7 +2610,7 @@ fn handleReverseSearch(
         };
         switch (key) {
             // Enter(含 Kitty CSI-u 编码的 Enter / Shift+Enter / Ctrl+Enter)接受当前匹配。
-            .enter, .shift_enter, .ctrl_enter => {
+            .enter, .shift_enter => {
                 if (match) |m| try editor.setLine(m);
                 region.emitTerminal("\r\x1b[2K");
                 return;
@@ -2740,6 +2762,15 @@ test "insertStartupText: memory running out drops the startup text with a notice
         try std.testing.expectEqualStrings(startup_text_cut, insertStartupText(&editor, a, "", &cut).?);
         try std.testing.expectEqualStrings(cut.text(), editor.view());
     }
+}
+
+test "drawsTui: a terminal gets the TUI unless TERM is dumb, which gets the line mode as a pipe does" {
+    try std.testing.expect(drawsTui(true, "xterm-256color"));
+    try std.testing.expect(drawsTui(true, null));
+    try std.testing.expect(drawsTui(true, "screen"));
+    try std.testing.expect(!drawsTui(true, "dumb"));
+    try std.testing.expect(!drawsTui(false, "xterm-256color"));
+    try std.testing.expect(dumbTerm("dumb") and !dumbTerm("xterm") and !dumbTerm(null));
 }
 
 test "displayWidthUpTo ASCII only" {

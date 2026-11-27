@@ -34,6 +34,20 @@ status, compatibility boundaries, and entry points are defined by
   `running` notification that suggests KillShell and a non-interactive re-run;
   like every job notification it carries no output bytes. With the feature
   off, the Bash tool and its jobs behave as before.
+
+- **Mouse reporting can be turned off.** Set `METACODES_NO_MOUSE` (to any
+  value) or put `"mouse": false` in `<state root>/config.json` and the TUI
+  leaves mouse reporting off: the wheel scrolls the terminal's scrollback,
+  the terminal's own selection works without a key held, and dragging no
+  longer copies through metacodes
+  ([Terminal setup](doc/TERMINAL_SETUP.md#selecting-text-with-the-mouse)).
+
+- **Ctrl+Z stops metacodes, and `fg` brings it back.** metacodes first hands
+  the terminal back (bracketed paste, the keyboard protocol and mouse
+  reporting off, line editing on) and stops itself, as programs started from
+  a shell do; when it continues it turns its modes on again and draws its
+  prompt again, at the prompt and during a reply. Windows is unchanged.
+
 - **`monitor_events` preview: Monitor pushes events instead of being
   polled.** With `--preview=monitor_events`, each batch of the monitored
   command's stdout lines reaches the model as a `<task-notification>` event at
@@ -99,9 +113,12 @@ status, compatibility boundaries, and entry points are defined by
 
 - **Dragging over text in the TUI copies it.** On macOS and Linux the
   interactive TUI reports the mouse; releasing a left-button drag copies the
-  text under it through OSC 52 (and `pbcopy` in a local macOS session) and
-  the prompt shows `Copied to clipboard`, like Claude Code's fullscreen
-  mode. The wheel no longer scrolls the terminal's scrollback while the TUI
+  text under it through OSC 52 (and `pbcopy` in a local macOS session), like
+  Claude Code's fullscreen mode. The prompt says where it went: `Copied to
+  clipboard` when `pbcopy` took it, `Sent to the terminal's clipboard` when
+  OSC 52 was the only way, and inside a tmux that keeps programs' OSC 52 to
+  itself `tmux did not pass it on: set-clipboard on`. The wheel no longer
+  scrolls the terminal's scrollback while the TUI
   runs, at the prompt and during a reply, and the terminal's own selection
   needs the key that skips mouse reporting: Shift in most terminals, Option
   in iTerm2, and in VS Code and Cursor on macOS Option once
@@ -327,6 +344,12 @@ status, compatibility boundaries, and entry points are defined by
   their tool lists. Use Bash for filename and text searches. The CLI keeps
   CodeMap for source outlines and FindSymbol for locating definitions; both
   load their parameter schemas through ToolSearch when needed.
+
+- **Ctrl+Enter starts a new line, as Shift+Enter does.** In terminals that
+  report it apart from Enter (the Kitty keyboard protocol's `CSI 13;5 u`,
+  xterm's `CSI 27;5;13 ~`) it did nothing; a terminal that sends Enter for it
+  still submits.
+
 - **The lower packages are separate Zig modules under `packages/`.** `base`,
   `ai`, `kernel`, `guard`, `coding`, `session` and `teamwork` moved from
   `src/` to `packages/<package>/src/` and are the named modules
@@ -448,6 +471,17 @@ status, compatibility boundaries, and entry points are defined by
   stopped before its first request. The lead now names the route it is on
   when it starts the teammate (`--provider`, `--channel`, `--model` and, when
   set, `--reasoning-effort`), including a route it moved to with `/model`.
+
+- **Leaving metacodes puts the window title back.** The TUI cleared the
+  title on exit. It now saves the terminal's title when it starts
+  (`CSI 22;0 t`) and restores it on exit (`CSI 23;0 t`); a terminal without
+  a title stack is left with an empty title as before, and with
+  `METACODES_NO_TERMINAL_TITLE` set the title is not touched at all.
+
+- **A dumb terminal gets the line mode.** With `TERM=dumb` the TUI drew its
+  input box, spinner and window title with control sequences such a terminal
+  prints as text. It now reads a line at a time behind `> `, as when its
+  input is a pipe, and sends no cursor movements, titles or terminal modes.
 
 - **A teammate's report is no longer shown as if the user had typed it.**
   A report the lead's inbox brought in, between turns or while the lead sat
@@ -673,6 +707,15 @@ status, compatibility boundaries, and entry points are defined by
   could finish the agent and then fail on a missing verifier image. The
   summary now also shows how many of the selected tasks are ready.
 
+- **A terminal's late answer turns on the Kitty keyboard protocol over a
+  slow SSH link.** A terminal metacodes cannot name from its environment is
+  asked at startup whether it speaks the protocol, and the answer was
+  awaited for 120 ms. One that came later, over a link with a longer round
+  trip, was ignored: the protocol stayed off for the session, Shift+Enter
+  submitted the prompt and the footer said `\ + ⏎ for newline`. The answer
+  now turns the protocol on when it comes, during startup or at the prompt;
+  the footer follows, and `/exit`, a crash and SIGTSTP turn it off again.
+
 - **Bench no longer shows a negative 用时 for a running job.** Harbor writes a
   job's start and finish times in the executing machine's local time without
   a zone, and the workbench reads them as UTC, so a job running on a node at
@@ -702,6 +745,15 @@ status, compatibility boundaries, and entry points are defined by
   `SSH_CLIENT` or `SSH_TTY` is set the link is now `file://<host>/path` with
   the remote machine's name, as the OSC 8 convention asks, so the terminal
   can tell the file is not local. Local sessions are unchanged.
+
+- **Typing Chinese into the `/model` filter shows it where the filter is.**
+  The picker drew its filter in its header line but left the terminal's
+  cursor in the input box below it, so an input method opened its
+  candidates, and drew the text being composed, down there. While the picker
+  is open the cursor now stands at the end of its filter. The header also
+  counts the filter in columns, so a wide filter no longer pulls the scope
+  labels out of line, and Backspace takes back a whole character instead of
+  one of its bytes.
 
 - **A provider overload is retried like a 503.** HTTP 529 was an unnamed
   status that ended the turn after one attempt; it is now

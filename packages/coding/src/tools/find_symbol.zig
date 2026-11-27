@@ -17,7 +17,7 @@ const read_state = @import("../core/read_state.zig");
 const toolchain = @import("metacodes-base").util.toolchain;
 const symbols = @import("metacodes-base").symbols.symbol;
 const symbol_provider = @import("symbol_provider.zig");
-const capability = @import("../lsp/capability.zig");
+const capability = @import("metacodes-lsp").capability;
 const ToolContext = @import("context.zig").ToolContext;
 const ToolResultBody = @import("context.zig").ToolResultBody;
 const artifact_store = @import("metacodes-guard").core.tool_result_artifact;
@@ -384,7 +384,7 @@ test "REGRESSION issue #17: LSP 在位但符号能力缺失 → 仍不是裸 []"
         } else |_| {}
     }
 
-    const Service = @import("../lsp/service.zig").Service;
+    const Service = @import("metacodes-lsp").service.Service;
     var svc = Service.create(a, base, null) catch return;
     defer svc.shutdown();
 

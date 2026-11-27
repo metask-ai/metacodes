@@ -182,3 +182,52 @@ test "METACODES_NO_KEYBOARD_ENHANCEMENT keeps every keyboard protocol sequence o
         }
     }
 }
+
+test "METACODES_NO_MOUSE and config.json's \"mouse\": false keep mouse reporting off the terminal; without them the TUI turns it on" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const copy_select = cc.tui_copy_select;
+    const pty = try Pty.open();
+    defer pty.close();
+    const term = try EnvVar.set("TERM", "xterm-256color");
+    defer term.restore();
+    const screen = try EnvVar.set("STY", null);
+    defer screen.restore();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+
+    const cases = [_]struct { env: ?[*:0]const u8, config: ?[]const u8, on: bool }{
+        .{ .env = null, .config = null, .on = true },
+        .{ .env = null, .config = "{\"mouse\": true}", .on = true },
+        .{ .env = null, .config = "{\"theme\": \"dark\", \"mouse\": false}", .on = false },
+        .{ .env = "1", .config = null, .on = false },
+        .{ .env = "0", .config = "{\"mouse\": true}", .on = false },
+        .{ .env = "", .config = null, .on = false },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("{s}={?s} config.json={?s}\n", .{ copy_select.no_mouse_env, if (c.env) |v| std.mem.span(v) else null, c.config });
+        if (c.config) |data| {
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = data });
+        } else {
+            tmp.dir.deleteFile(testing.io, "config.json") catch {};
+        }
+        const opt_out = try EnvVar.set(copy_select.no_mouse_env, c.env);
+        defer opt_out.restore();
+        input.recordMouseSelection(false);
+        defer input.recordMouseSelection(false);
+
+        copy_select.enable(testing.allocator, state_root, pty.slave);
+        const saved = input.enterRawMode(pty.slave) orelse return error.SkipZigTest;
+        const taken = try pty.take();
+        defer testing.allocator.free(taken);
+        input.restoreMode(pty.slave, saved);
+        const given_back = try pty.take();
+        defer testing.allocator.free(given_back);
+
+        try testing.expectEqual(c.on, input.mouseSelectionOn());
+        try testing.expectEqual(c.on, contains(taken, input.mouse_selection_enable));
+        try testing.expectEqual(c.on, contains(given_back, input.mouse_selection_disable));
+        try testing.expect(contains(taken, "\x1b[?2004h"));
+    }
+}

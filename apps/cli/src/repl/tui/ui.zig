@@ -138,6 +138,7 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     if (was_x_armed and key == .ctrl_o) {
         return .{ .action = .open_transcript };
     }
+    if (key == .ctrl_z) return .{ .action = .suspend_process };
     // (was_x_armed 但下个键非 Ctrl+K:armed 已清,该键照常走下面分发,如 Ctrl+K 单按=kill-line)
 
     // ── issue #16: model picker 开着时,键盘属于它 ──────────────────────────
@@ -449,7 +450,11 @@ pub fn exitHint(state: *const UiState) ?[]const u8 {
 pub fn aboveBoxNotice(state: *const UiState) ?[]const u8 {
     const p = state.inputPhaseConst() orelse return null;
     if (p.press.kind == .clear_input) return "Esc again to clear";
-    if (p.copied) return "Copied to clipboard";
+    if (p.copied) |notice| return switch (notice) {
+        .system_clipboard => "Copied to clipboard",
+        .terminal_clipboard => "Sent to the terminal's clipboard",
+        .tmux_dropped => "tmux did not pass it on: set-clipboard on",
+    };
     if (p.paste_hint) return "Ctrl+Y to paste deleted text";
     return null;
 }
@@ -775,4 +780,25 @@ test "shortcut grid: three columns when they fit, fewer on a narrow terminal" {
         var it = std.mem.splitSequence(u8, w.buffered(), "\r\n");
         while (it.next()) |line| try testing.expect(term.displayWidth(line) <= cols);
     }
+}
+
+test "the notice above the box after a copy says where the text went" {
+    var state = UiState.in(.{ .input = .{} });
+    const p = state.inputPhase().?;
+    try testing.expect(aboveBoxNotice(&state) == null);
+    p.copied = .system_clipboard;
+    try testing.expectEqualStrings("Copied to clipboard", aboveBoxNotice(&state).?);
+    p.copied = .terminal_clipboard;
+    try testing.expectEqualStrings("Sent to the terminal's clipboard", aboveBoxNotice(&state).?);
+    p.copied = .tmux_dropped;
+    try testing.expectEqualStrings("tmux did not pass it on: set-clipboard on", aboveBoxNotice(&state).?);
+}
+
+test "Ctrl+Z asks to suspend the process at the prompt, during a reply and over an open picker" {
+    var prompt = UiState.in(.{ .input = .{} });
+    try testing.expectEqual(event.LoopAction.suspend_process, press(&prompt, .ctrl_z).action);
+    prompt.interaction().?.picker_open = true;
+    try testing.expectEqual(event.LoopAction.suspend_process, press(&prompt, .ctrl_z).action);
+    var replying = UiState.in(.{ .generating = .{} });
+    try testing.expectEqual(event.LoopAction.suspend_process, press(&replying, .ctrl_z).action);
 }

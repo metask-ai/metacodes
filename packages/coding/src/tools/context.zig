@@ -393,7 +393,7 @@ pub const ToolContext = struct {
     /// System-One advisor (`packages/coding/src/jev/advisor.zig`) for memory-plane judgments;
     /// null = baseline only. Evidence, never authority: tools may annotate
     /// their own results with it but never admit, deny or skip work on it.
-    jev: ?*@import("../jev/advisor.zig").Advisor = null,
+    jev: ?*@import("metacodes-jev").advisor.Advisor = null,
     /// The run's user request, for System-One judgments that need more than a
     /// tool argument (KgRecall evidence). Empty when unknown or no advisor.
     jev_request: []const u8 = "",
@@ -426,7 +426,7 @@ pub const ToolContext = struct {
     /// LSP 被动诊断服务(Y2 Step3):Edit/Write finalizeWrite 写前 snapshotBaseline + 写后
     /// getDiagnostics,把类型诊断 delta 附进工具结果给模型。null = 未装配(`--no-lsp`,或库调用方
     /// 本就没接 Service)。CLI 默认非 null。
-    lsp: ?*@import("../lsp/service.zig").Service = null,
+    lsp: ?*@import("metacodes-lsp").service.Service = null,
     /// Swarm 会话状态(teams/teammates):TeamCreate/TeamDelete/SendMessage + Task 的
     /// name+team_name spawn 分支用。null = 非 swarm-enabled 上下文(subagent/headless 恒 null:
     /// teammate 不 spawn teammate,扁平 roster)。见 swarm/context.zig。

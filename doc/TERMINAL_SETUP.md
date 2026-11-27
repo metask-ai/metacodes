@@ -1,14 +1,16 @@
 # Terminal setup
 
-In the metacodes prompt, Enter submits and Shift+Enter starts a new line. A
+In the metacodes prompt, Enter submits and Shift+Enter starts a new line;
+Ctrl+Enter starts one too where the terminal reports it apart from Enter. A
 terminal can only report Shift+Enter when it tells it apart from Enter, and
 not every terminal does. When the footer says `\ + ⏎ for newline`, Shift+Enter
 submits in this terminal; ending a line with `\` and pressing Enter inserts the
 line break instead. `/terminal-setup` (or `metacodes terminal-setup`) fixes
 that where the terminal's own settings can. Further down: [selecting text with
-the mouse](#selecting-text-with-the-mouse) while metacodes runs, and
+the mouse](#selecting-text-with-the-mouse) while metacodes runs,
 [multiplexers and remote sessions](#multiplexers-and-remote-sessions) (tmux,
-GNU screen, Zellij, mosh, SSH).
+GNU screen, Zellij, mosh, SSH), and [stopping it and dumb
+terminals](#stopping-it-and-dumb-terminals).
 
 | Terminal | Shift+Enter without setup | What `/terminal-setup` does |
 | --- | --- | --- |
@@ -207,9 +209,12 @@ changed.
 On macOS and Linux the interactive TUI turns on mouse reporting
 (`ESC [?1002h`, `ESC [?1006h`) for as long as it runs, so that dragging over
 text copies it: when the left button is released, metacodes copies the text
-under the drag through OSC 52 (and `pbcopy` in a local macOS session) and the
-prompt says `Copied to clipboard`. It stays off on Windows and inside GNU
-screen.
+under the drag through OSC 52 (and `pbcopy` in a local macOS session). It
+stays off on Windows and inside GNU screen, and when `METACODES_NO_MOUSE` is
+set (to any value, even `0`) or `<state root>/config.json` says
+`"mouse": false`: then the wheel scrolls the terminal's scrollback and the
+terminal's own selection works without a key held, but dragging no longer
+copies through metacodes.
 
 While it is on, the terminal hands the mouse to metacodes:
 
@@ -230,9 +235,15 @@ While it is on, the terminal hands the mouse to metacodes:
 The copied text reaches the clipboard only when the terminal takes OSC 52:
 Apple Terminal ignores it, iTerm2 takes it once Settings › General ›
 Selection › Applications in terminal may access clipboard is on, and tmux
-passes it on only with `set-clipboard on`. In a local macOS session `pbcopy`
-copies the text anyway; over SSH OSC 52 is the only way, and the prompt says
-`Copied to clipboard` either way.
+passes it on only with `set-clipboard on` (its default, `external`, keeps
+what programs send). In a local macOS session `pbcopy` copies the text
+anyway; over SSH OSC 52 is the only way. The prompt says which happened:
+
+| Prompt says | When |
+| --- | --- |
+| `Copied to clipboard` | `pbcopy` took the text (a local macOS session) |
+| `Sent to the terminal's clipboard` | OSC 52 was the only way: whether it arrived depends on the terminal |
+| `tmux did not pass it on: set-clipboard on` | inside tmux, whose `set-clipboard` is not `on` (metacodes asks tmux once at start) |
 
 ## Multiplexers and remote sessions
 
@@ -293,9 +304,27 @@ together and count as a newline (see the start of this page).
 `TERM_PROGRAM` does not travel over SSH, so on the remote side metacodes asks
 the terminal about the keyboard protocol at startup instead of knowing it by
 name; the question goes through SSH to the terminal you see. On a slow link
-the answer can come too late, and the protocol then stays off for the
-session: the footer says `\ + ⏎ for newline`. Drag-to-copy reaches your
-clipboard only through OSC 52 (see above).
+the answer can come after metacodes stopped waiting for it at startup
+(120 ms); the protocol is turned on when it arrives, and until then
+Shift+Enter submits and the footer says `\ + ⏎ for newline`. Drag-to-copy
+reaches your clipboard only through OSC 52 (see above).
+
+## Stopping it and dumb terminals
+
+Ctrl+Z stops metacodes the way it stops other programs started from a shell:
+metacodes first hands the terminal back (bracketed paste, the keyboard
+protocol and mouse reporting off, the usual line editing back), and `fg`
+brings it back with its modes on again and its prompt drawn again. On Windows
+Ctrl+Z does nothing.
+
+With `TERM=dumb`, as in Emacs's `M-x shell`, metacodes draws no interface: it
+reads a line at a time behind a `> ` prompt, as when its input is a pipe, and
+sends no cursor movements, window titles or terminal modes.
+
+The window title shows the directory and whether metacodes is working. At
+start metacodes saves the title the terminal had (`CSI 22;0 t`) and puts it
+back on exit (`CSI 23;0 t`); a terminal without a title stack is left with
+an empty title instead.
 
 ## How this was established
 

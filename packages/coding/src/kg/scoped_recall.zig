@@ -20,7 +20,7 @@ const conv_mod = @import("metacodes-kernel").conversation;
 const AbortSignal = @import("metacodes-base").util.abort.AbortSignal;
 const log = @import("metacodes-base").util.log;
 const retrieval_protocol = @import("retrieval_protocol.zig");
-const jev_advisor = @import("../jev/advisor.zig");
+const jev_advisor = @import("metacodes-jev").advisor;
 const observation = @import("metacodes-guard").tools.observation;
 
 pub const MIN_QUERY_LEN = 16; // 琐碎接话轮门(下界)

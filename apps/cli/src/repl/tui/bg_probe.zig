@@ -5,7 +5,8 @@
 //! 回来或超时 → 还原 termios。每个终端都答 DA1(primary device attributes),而终端按顺序应答:
 //! DA1 到了还没见到 Kitty 应答,就是确定的"不支持",不用等超时;OSC 11 同理。超时(~120ms)
 //! 只是兜底——应答在路上太久(慢 SSH)或终端什么都不答,结果是"不知道",调用方沿用旧默认;
-//! 迟到的应答由 `Late` 接着读掉(终端保持安静,不回显),直到 REPL 接管。
+//! 迟到的应答由 `Late` 接着读掉(终端保持安静,不回显),直到 REPL 接管(`handOver` 把这期间到的
+//! Kitty 应答交给它)。
 //! 查询发出前已经排在队列里的应答(上一个程序没读走的)不算这一轮的。
 //! 背景色:`\x1b]11;rgb:RRRR/GGGG/BBBB\x07`(或 ST `\x1b\\` 结尾)→ 解析高字节 → BT.601 亮度判明暗。
 //!
@@ -682,18 +683,25 @@ pub fn lateAnswersOnly(fd: c_int) bool {
 /// queued is read through its scanner one last time, an answer still cut
 /// short is dropped, and the mode the terminal had before the probe is
 /// returned: the REPL restores it when it leaves raw mode (the terminal is
-/// quiet now). Null when no such round is pending.
-pub fn handOver(fd: c_int) ?platform_term.SavedMode {
+/// quiet now). The keyboard answer comes with it, as it stands now: a Kitty
+/// answer that came after the deadline counts. Null when no such round is
+/// pending.
+pub fn handOver(fd: c_int) ?HandOver {
     const late = if (g_late) |*l| l else return null;
     if (late.fd != fd) return null;
     _ = late.absorb();
     late.giveUp();
     _ = late.replayTyped();
-    const original = late.original;
+    const handed: HandOver = .{ .original = late.original, .keyboard = late.scanner.result.keyboard };
     g_late = null;
     platform_term.cancelRestoreAtExit();
-    return original;
+    return handed;
 }
+
+pub const HandOver = struct {
+    original: platform_term.SavedMode,
+    keyboard: Keyboard,
+};
 
 // ============================================================================
 // 测试
@@ -1117,6 +1125,30 @@ test "Late: answers that come after the deadline are dropped, keys are kept, a c
     try testing.expectEqual(@as(isize, 2), platform_term.readInput(r, &buf));
     try testing.expectEqualStrings("xy", buf[0..2]);
     try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(r, 0));
+}
+
+test "handOver: the keyboard answer goes to the REPL as it stands, a late Kitty answer included" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    defer forgetOwedForTest(r);
+    defer g_late = null;
+    const cases = [_]struct { late: []const u8, keyboard: Keyboard }{
+        .{ .late = "\x1b]11;rgb:0/0/0\x07\x1b[?1u\x1b[?62;22c", .keyboard = .supported },
+        .{ .late = "\x1b[?62;22c", .keyboard = .unsupported },
+        .{ .late = "", .keyboard = .unknown },
+    };
+    for (cases) |case| {
+        g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, ""));
+        try testing.expect(pfs.writeAll(fds[1], case.late));
+        const handed = handOver(r) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(case.keyboard, handed.keyboard);
+        try testing.expect(g_late == null);
+        try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(r, 0));
+    }
 }
 
 /// A test that stops early leaves bytes owed to its pipe's fd, which the
