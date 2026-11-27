@@ -110,7 +110,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 | T11 退出清理 | 无残留边框、show cursor、Goodbye |
 | T12 resize 自适应 | SIGWINCH → 框自动变宽(不按键) |
 | T13 提交回显 | 提交后用户输入留在 scrollback(❯ 行) |
-| T43/T44 缩窄不叠框 | 空闲框 100→60 列分四步缩窄:重排终端里只剩一个框(上方无旧横线、下方无旧 footer);裁剪终端(`XTERM_VERSION`)里框上方一行不丢 |
+| T43/T44/T48/T49 缩窄不叠框 | 空闲框 100→60 列分四步缩窄:重排终端里只剩一个框(上方无旧横线、下方无旧 footer);裁剪终端(`XTERM_VERSION`,或启动探测里 XTVERSION 答 `XTerm(…)`、DA2 答 PuTTY 的 `0;136;0`)里框上方一行不丢 |
 | startup_splash | 启动动画原地重绘、定格字标在 banner 上方且只用 Metask Lab 的字母、任意键跳过且这个键进输入框、启动期间(动画中、动画后 App.init 还在等、不播动画时)敲的键按序进输入框、env/config 开关、窄终端不播(帧字节类断言 Windows 跳过:ConPTY 重编码) |
 | startup_suggestion | 启动建议的 `git log` 卡住(工作目录的 `.git/HEAD` 是没人写的 FIFO)时首个输入框 1.5 s 内出来、不出建议;一次提交的仓库照常出 `suggestion: explain or improve <文件>`(POSIX) |
 | e2e_metask_device(真模型) | Metask 设备码登录(程序化确认)→ 经网关请求真实模型 → 本地账本每请求带 X-Metask-Request-Id → `scripts/metask_reconcile.py` 与网关 /v1/usage 对账零差异;需 METASK_WEB_SESSION_TOKEN、METASK_SITE_URL、METASK_MODELS |

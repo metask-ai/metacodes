@@ -1,6 +1,7 @@
-//! 启动期终端探测:一轮往返问清背景色(OSC 11)与 Kitty 键盘协议(`CSI ? u`),DA1 作哨兵(#327)。
+//! 启动期终端探测:一轮往返问清背景色(OSC 11)、Kitty 键盘协议(`CSI ? u`)和终端是谁
+//! (XTVERSION `CSI > 0 q`、DA2 `CSI > c`),DA1 作哨兵(#327)。
 //!
-//! 机制:进 raw(保留已到的输入)→ 一次写出 `[OSC 11 ?][CSI ? u] CSI c` → 读应答直到 DA1
+//! 机制:进 raw(保留已到的输入)→ 一次写出 `[OSC 11 ?][CSI ? u][CSI > 0 q CSI > c] CSI c` → 读应答直到 DA1
 //! 回来或超时 → 还原 termios。每个终端都答 DA1(primary device attributes),而终端按顺序应答:
 //! DA1 到了还没见到 Kitty 应答,就是确定的"不支持",不用等超时;OSC 11 同理。超时(~120ms)
 //! 只是兜底——应答在路上太久(慢 SSH)或终端什么都不答,结果是"不知道",调用方沿用旧默认;
@@ -75,9 +76,10 @@ fn isHex(c: u8) bool {
 pub const Want = struct {
     background: bool = false,
     keyboard: bool = false,
+    identity: bool = false,
 
     pub fn any(self: Want) bool {
-        return self.background or self.keyboard;
+        return self.background or self.keyboard or self.identity;
     }
 };
 
@@ -87,13 +89,21 @@ pub const osc11_query = "\x1b]11;?\x07";
 pub const kitty_query = "\x1b[?u";
 /// Primary device attributes. Every terminal answers, after everything asked before it.
 pub const da1_query = "\x1b[c";
+pub const identity_query = "\x1b[>0q\x1b[>c";
 
 /// What a round writes for `want`: one write, so the answers come back in one burst.
 pub fn queryFor(want: Want) []const u8 {
-    if (want.background and want.keyboard) return osc11_query ++ kitty_query ++ da1_query;
-    if (want.background) return osc11_query ++ da1_query;
-    if (want.keyboard) return kitty_query ++ da1_query;
-    return "";
+    if (!want.any()) return "";
+    const mask = @as(u3, @intFromBool(want.background)) | @as(u3, @intFromBool(want.keyboard)) << 1 | @as(u3, @intFromBool(want.identity)) << 2;
+    return switch (mask) {
+        inline else => |m| comptime blk: {
+            var query: []const u8 = "";
+            if (m & 1 != 0) query = query ++ osc11_query;
+            if (m & 2 != 0) query = query ++ kitty_query;
+            if (m & 4 != 0) query = query ++ identity_query;
+            break :blk query ++ da1_query;
+        },
+    };
 }
 
 /// Whether the terminal speaks the Kitty keyboard protocol.
@@ -110,8 +120,25 @@ pub const Result = struct {
     /// Null when not asked, not answered, or malformed.
     background: ?Rgb = null,
     keyboard: Keyboard = .unknown,
+    xtversion: Answer = .{},
+    da2: Answer = .{},
     /// DA1 ended the round, not the deadline.
     sentinel: bool = false,
+};
+
+pub const Answer = struct {
+    bytes: [48]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn text(self: *const Answer) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    fn set(self: *Answer, bytes: []const u8) void {
+        const n: u8 = @intCast(@min(bytes.len, self.bytes.len));
+        @memcpy(self.bytes[0..n], bytes[0..n]);
+        self.len = n;
+    }
 };
 
 /// Splits what the terminal sent during a round into its answers and the
@@ -120,10 +147,12 @@ pub const Result = struct {
 /// input parser a stream that looks as if no probe had run.
 ///
 /// A byte is typed input unless it belongs to one of the answer shapes:
-/// `ESC ] 11 ; … (BEL | ESC \)`, `ESC [ ? digits u` (Kitty flags) and
-/// `ESC [ ? digits/semicolons c` (DA1). No key produces those: keys send
-/// `ESC [` with no `?`, and Alt+] typed by hand is followed by anything but
-/// `11;`. A sequence still open when the round ends is typed input as well.
+/// `ESC ] 11 ; … (BEL | ESC \)`, `ESC [ ? digits u` (Kitty flags),
+/// `ESC [ ? digits/semicolons c` (DA1), `ESC [ > digits/semicolons c` (DA2)
+/// and `ESC P > | … ESC \` (XTVERSION). No key produces those: keys send
+/// `ESC [` with no `?` or `>`, Alt+] typed by hand is followed by anything but
+/// `11;`, and Alt+Shift+P by anything but `>|`. A sequence still open when the
+/// round ends is typed input as well.
 pub const Scanner = struct {
     want: Want,
     result: Result = .{},
@@ -138,12 +167,13 @@ pub const Scanner = struct {
     typed: [typed_capacity]u8 = undefined,
     typed_len: usize = 0,
 
-    const State = enum { ground, esc, csi, osc, osc_esc };
+    const State = enum { ground, esc, csi, osc, osc_esc, dcs, dcs_esc };
     /// Longer than any answer: Windows Terminal's DA1 is 42 bytes. A longer
     /// sequence is typed input (or an answer the input parser then skips).
     pub const seq_capacity = 128;
     pub const typed_capacity = platform_term.replay_capacity;
     const osc11_prefix = "11;";
+    const xtversion_prefix = ">|";
 
     pub fn init(want: Want) Scanner {
         return .{ .want = want };
@@ -188,7 +218,8 @@ pub const Scanner = struct {
 
     fn openAnswer(self: *const Scanner) bool {
         const seq = self.seq[0..self.seq_len];
-        return std.mem.startsWith(u8, seq, "\x1b[?") or std.mem.startsWith(u8, seq, "\x1b]" ++ osc11_prefix);
+        return std.mem.startsWith(u8, seq, "\x1b[?") or std.mem.startsWith(u8, seq, "\x1b[>") or
+            std.mem.startsWith(u8, seq, "\x1b]" ++ osc11_prefix) or std.mem.startsWith(u8, seq, "\x1bP" ++ xtversion_prefix);
     }
 
     /// The bytes an OSC 11 answer's colour is written with (`rgb:RRRR/GGGG/BBBB`).
@@ -202,17 +233,21 @@ pub const Scanner = struct {
     /// sequence a key could be is not judged: true.
     pub fn tailFits(self: *const Scanner, next: []const u8) bool {
         if (!self.openAnswer()) return true;
-        if (self.state == .osc_esc) return next.len == 0 or next[0] == '\\';
-        const csi = self.seq[1] == '[';
-        for (next) |b| {
-            if (csi) {
+        if (self.state == .osc_esc or self.state == .dcs_esc) return next.len == 0 or next[0] == '\\';
+        for (next) |b| switch (self.seq[1]) {
+            '[' => {
                 if (b == 'c' or b == 'u') return true;
                 if (std.mem.indexOfScalar(u8, "0123456789;", b) == null) return false;
-            } else {
+            },
+            'P' => {
+                if (b == 0x1b) return true;
+                if (b < 0x20 or b > 0x7e) return false;
+            },
+            else => {
                 if (b == 0x07 or b == 0x1b) return true;
                 if (std.mem.indexOfScalar(u8, osc11_colour, b) == null) return false;
-            }
-        }
+            },
+        };
         return true;
     }
 
@@ -231,6 +266,7 @@ pub const Scanner = struct {
             .esc => switch (b) {
                 '[' => self.advance(b, .csi),
                 ']' => self.advance(b, .osc),
+                'P' => self.advance(b, .dcs),
                 else => self.abort(b),
             },
             .csi => switch (b) {
@@ -255,6 +291,25 @@ pub const Scanner = struct {
                 if (b == '\\') return self.endOsc();
                 // Not ST: the OSC was cut short. What came before the ESC was
                 // typed; the ESC begins whatever follows.
+                self.seq_len -= 1;
+                self.flushSeq();
+                self.begin();
+                self.step(b);
+            },
+            .dcs => {
+                const at = self.seq_len - 2;
+                if (at < xtversion_prefix.len) {
+                    if (b == xtversion_prefix[at]) self.advance(b, .dcs) else self.abort(b);
+                    return;
+                }
+                switch (b) {
+                    0x1b => self.advance(b, .dcs_esc),
+                    0x20...0x7e => self.advance(b, .dcs),
+                    else => self.abort(b),
+                }
+            },
+            .dcs_esc => {
+                if (b == '\\') return self.endDcs();
                 self.seq_len -= 1;
                 self.flushSeq();
                 self.begin();
@@ -305,7 +360,9 @@ pub const Scanner = struct {
         const final = self.seq[self.seq_len - 1];
         const params = self.seq[2 .. self.seq_len - 1];
         const private = params.len >= 2 and params[0] == '?';
-        if (private and final == 'u' and allIn(params[1..], "0123456789")) {
+        if (params.len >= 2 and params[0] == '>' and final == 'c' and allIn(params[1..], "0123456789;")) {
+            if (self.want.identity) self.result.da2.set(params[1..]);
+        } else if (private and final == 'u' and allIn(params[1..], "0123456789")) {
             if (self.want.keyboard) self.result.keyboard = .supported;
         } else if (private and final == 'c' and allIn(params[1..], "0123456789;")) {
             self.result.sentinel = true;
@@ -317,6 +374,12 @@ pub const Scanner = struct {
 
     fn endOsc(self: *Scanner) void {
         if (self.want.background) self.result.background = parseOsc11(self.seq[0..self.seq_len]);
+        self.seq_len = 0;
+        self.state = .ground;
+    }
+
+    fn endDcs(self: *Scanner) void {
+        if (self.want.identity) self.result.xtversion.set(self.seq[2 + xtversion_prefix.len .. self.seq_len - 1]);
         self.seq_len = 0;
         self.state = .ground;
     }
@@ -684,6 +747,30 @@ test "queryFor: one write per round, DA1 last" {
     try testing.expectEqualStrings("\x1b[?u\x1b[c", queryFor(.{ .keyboard = true }));
     try testing.expectEqualStrings("\x1b]11;?\x07\x1b[c", queryFor(.{ .background = true }));
     try testing.expectEqualStrings("", queryFor(.{}));
+}
+
+test "queryFor: the identity questions go right before DA1" {
+    try testing.expectEqualStrings("\x1b]11;?\x07\x1b[?u\x1b[>0q\x1b[>c\x1b[c", queryFor(.{ .background = true, .keyboard = true, .identity = true }));
+    try testing.expectEqualStrings("\x1b[>0q\x1b[>c\x1b[c", queryFor(.{ .identity = true }));
+}
+
+test "Scanner: XTVERSION and DA2 answers name the terminal and are never typed" {
+    var s = scan(.{ .identity = true }, "a\x1bP>|XTerm(390)\x1b\\b\x1b[>41;390;0c\x1b[?64;1c");
+    try testing.expect(s.done());
+    s.finish();
+    try testing.expectEqualStrings("XTerm(390)", s.result.xtversion.text());
+    try testing.expectEqualStrings("41;390;0", s.result.da2.text());
+    try testing.expectEqualStrings("ab", s.typedBytes());
+}
+
+test "Scanner: Alt+Shift+P stays typed; an XTVERSION answer cut by the deadline is dropped" {
+    var typed = scan(.{ .identity = true }, "\x1bPx");
+    typed.finish();
+    try testing.expectEqualStrings("\x1bPx", typed.typedBytes());
+    var cut = scan(.{ .identity = true }, "z\x1bP>|XTe");
+    cut.finish();
+    try testing.expectEqualStrings("z", cut.typedBytes());
+    try testing.expectEqualStrings("", cut.result.xtversion.text());
 }
 
 test "Scanner: a Kitty answer before DA1 is support; DA1 ends the round" {

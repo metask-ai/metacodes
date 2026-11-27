@@ -658,6 +658,14 @@ status, compatibility boundaries, and entry points are defined by
   a flag, counts at least as wide as Terminal.app, tmux and GNU screen draw
   it, so it never wraps unseen.
 
+- **Narrowing the window no longer erases the conversation in st, PuTTY or
+  an xterm reached over SSH.** These terminals cut their lines instead of
+  re-wrapping them, but only an xterm with `XTERM_VERSION` set was known to:
+  each narrowing step climbed past the prompt and erased a line of the
+  conversation above it. `TERM` (`st*`, `putty*`) and the startup probe's
+  XTVERSION and DA2 answers now name them; a terminal nothing names still
+  counts as re-wrapping.
+
 - **`bench pull` also pulls verifier and sidecar images.** It took only the
   first `docker_image` of a task's `task.toml`, which in the FrontierHarness
   tasks is the separate verifier's, so their environment images and the

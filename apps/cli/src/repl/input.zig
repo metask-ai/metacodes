@@ -120,6 +120,7 @@ pub fn pastedByte(key: Key) ?u8 {
 ///   ESC DEL / ESC BS  同批到达 = Alt+Backspace,删上一个词(.ctrl_w)
 ///   ESC O A–D/H/F     同批到达 = SS3 光标键;ESC O P–S(F1–F4)等 → .unknown
 ///   ESC + 其它字节     同批到达 = Alt+该键 → .unknown,不拆成 Esc + 该键
+///   ESC P >… / ESC P 数字… ST  终端的 DCS 应答(XTVERSION `ESC P > | … ESC \`)→ 整条 .unknown
 /// 其它 CSI(私有前缀、更多参数段、认不出的组合)整条吃掉、报一个 .unknown;OSC 应答(`ESC ] 11 ; … BEL`)
 /// 同样整条吃掉——终端应答不会漏成字符。
 pub const KeyParser = struct {
@@ -154,7 +155,7 @@ pub const KeyParser = struct {
     // 背景色 `ESC]11;rgb:…`)。只认数字编号 + `;` 开头的形状:Alt+] 之后敲别的(包括什么都不敲、
     // 等到 ESC 超时)仍是原来那几个键。迟到的背景色应答以前会变成 Esc、字符、Esc——两次 Esc
     // 连按清空了输入框。
-    const State = enum { normal, esc_seen, ss3_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_semi2, csi_num3, csi_skip, sgr_mouse, x10_mouse, osc_seen, osc_ps, osc_body, osc_st };
+    const State = enum { normal, esc_seen, ss3_seen, csi_seen, csi_num1, csi_semi, csi_num2, csi_semi2, csi_num3, csi_skip, sgr_mouse, x10_mouse, osc_seen, osc_ps, osc_body, osc_st, dcs_seen };
 
     const x10_mouse_report_bytes = 3;
 
@@ -208,6 +209,11 @@ pub const KeyParser = struct {
             .esc_seen, .osc_st => .esc,
             .osc_seen, .osc_ps => blk: {
                 self.queueOscPrefix();
+                break :blk .esc;
+            },
+            .dcs_seen => blk: {
+                if (self.esc_burst) break :blk .unknown;
+                self.push(byteToKey('P'));
                 break :blk .esc;
             },
             .ss3_seen, .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_semi2, .csi_num3, .csi_skip, .sgr_mouse, .x10_mouse, .osc_body => null,
@@ -319,6 +325,10 @@ pub const KeyParser = struct {
                     self.osc_digits_len = 0;
                     return null;
                 }
+                if (b == 'P') {
+                    self.state = .dcs_seen;
+                    return null;
+                }
                 self.state = .normal;
                 // Alt+key:ESC 后紧跟字母(meta)。Alt+B / Alt+F 词导航——是单个组合键,不拆。
                 switch (b) {
@@ -346,6 +356,20 @@ pub const KeyParser = struct {
             .ss3_seen => {
                 self.state = .normal;
                 return cursorKey(b);
+            },
+            .dcs_seen => {
+                if (b == '>' or (b >= '0' and b <= '9')) {
+                    self.state = .osc_body;
+                    return null;
+                }
+                self.state = .normal;
+                if (self.esc_burst) {
+                    if (self.feed(b)) |k| self.push(k);
+                    return .unknown;
+                }
+                self.push(byteToKey('P'));
+                if (self.feed(b)) |k| self.push(k);
+                return .esc;
             },
             .csi_seen => {
                 if (b >= '0' and b <= '9') {
@@ -3662,6 +3686,40 @@ test "newlineHint: Shift+Enter once a key record typed text, not for a VT-only t
     // A typed letter as a record: Windows Terminal or conhost.
     platform_term.decodeConsoleInputForTesting("\x1b[65;30;97;1;32;1_\x1b[65;30;97;0;32;1_");
     try testing.expectEqualStrings("shift + \xe2\x8f\x8e for newline", newlineHint());
+}
+
+test "KeyParser: a late XTVERSION answer is swallowed whole, the keys around it stay" {
+    var buf: [16]Key = undefined;
+    const keys = parseAll("a\x1bP>|XTerm(390)\x1b\\b", &buf);
+    try testing.expectEqual(@as(usize, 3), keys.len);
+    try testing.expectEqual(@as(u8, 'a'), keys[0].char);
+    try testing.expect(keys[1] == .unknown);
+    try testing.expectEqual(@as(u8, 'b'), keys[2].char);
+    var p = KeyParser{};
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    for ("P>|XTerm(390)") |b| try testing.expect(p.feedQueued(b, true) == null);
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('\\', false).? == .unknown);
+    try testing.expect(p.drain() == null);
+    try testing.expect(!p.pendingEsc());
+}
+
+test "KeyParser: Alt+Shift+P that starts no DCS answer keeps its meaning" {
+    var p = KeyParser{};
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('P', true) == null);
+    try testing.expect(p.feedQueued('x', false).? == .unknown);
+    try testing.expectEqual(@as(u8, 'x'), p.drain().?.char);
+    try testing.expect(p.drain() == null);
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('P', false) == null);
+    try testing.expect(p.flushEsc().? == .unknown);
+    try testing.expect(p.drain() == null);
+    var buf: [16]Key = undefined;
+    const keys = parseAll("\x1bPx", &buf);
+    try testing.expectEqual(@as(usize, 3), keys.len);
+    try testing.expect(keys[0] == .esc);
+    try testing.expectEqualStrings("Px", &[_]u8{ keys[1].char, keys[2].char });
 }
 
 test "KeyParser: 迟到的背景色应答(OSC 11,BEL 或 ST 结尾)整条吃掉,前后的字照常" {
