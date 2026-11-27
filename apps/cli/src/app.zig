@@ -1514,7 +1514,7 @@ pub const App = struct {
         try w.print("  Credential:  {s}\n", .{origin orelse "unknown"});
         if (app.config.reasoning_effort) |effort| if (effort.active()) try w.print("  Reasoning:   {s}\n", .{effort.name()});
         const window = app.api_client.resolveMaxInputTokens();
-        const used: usize = if (app.conversation.usageAnchor()) |anchor| anchor.context_tokens else app.conversation.totalTokens();
+        const used = app.contextTokens();
         var used_buf: [16]u8 = undefined;
         var window_buf: [16]u8 = undefined;
         try w.print("  Context:     about {s} of {s} tokens ({d}%)\n", .{
@@ -1522,6 +1522,31 @@ pub const App = struct {
             shortTokens(&window_buf, window),
             if (window == 0) 0 else @min(100, used * 100 / window),
         });
+    }
+
+    pub fn contextTokens(app: *const App) usize {
+        const conversation_mod = @import("metacodes-internal").core.conversation;
+        const estimate = conversation_mod.Conversation.estimateTokens;
+        const anchor = app.conversation.usageAnchor() orelse return app.conversation.totalTokens();
+        var total: usize = anchor.context_tokens;
+        for (app.conversation.messages.items[anchor.msg_count..]) |message| {
+            total += 8;
+            for (message.blocks) |block| {
+                total += 12;
+                switch (block) {
+                    .text => |text| total += estimate(text),
+                    .tool_use => |use| total += estimate(use.name) + estimate(use.input),
+                    .tool_result => |result| total += if (@import("metacodes-internal").json.extractImageResult(result.content) != null)
+                        conversation_mod.IMAGE_TOKEN_ESTIMATE
+                    else
+                        estimate(result.content),
+                    .thinking => {},
+                    .image => total += conversation_mod.IMAGE_TOKEN_ESTIMATE,
+                    .reasoning_item => total += conversation_mod.REASONING_ITEM_TOKEN_ESTIMATE,
+                }
+            }
+        }
+        return total;
     }
 
     fn shortTokens(buf: []u8, tokens: usize) []const u8 {

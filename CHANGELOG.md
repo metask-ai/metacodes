@@ -49,7 +49,9 @@ status, compatibility boundaries, and entry points are defined by
 - **`/status` shows what the session runs on.** The model, its provider,
   route (channel and wire) and endpoint, where its credential comes from,
   the reasoning level, and about how much of the context window the
-  conversation fills; `not set` when the session has no model.
+  conversation fills (the provider's measured prompt tokens of the last
+  request plus an estimate of the messages since); `not set` when the
+  session has no model.
 
 - **Bench has a 监控 page for the execution machine.** It shows the machine's
   CPU, load, memory, disks and network rate, whether Docker Hub, ghcr.io,

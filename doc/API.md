@@ -296,6 +296,14 @@ browser on this computer, another device (its page shows a code, typed here
 masked; offered first in an SSH session, and where `--device-code` starts), or
 a key the user already has.
 
+`/status` prints what the session runs on: the model, its provider, the route
+in use (channel and wire) and its endpoint, where the credential comes from,
+the reasoning level, and about how much of the input window the conversation
+fills, counted as the provider's measured prompt tokens of the last request
+plus an estimate of the messages added since (the conversation's own estimate
+when no request has reported usage). A session with no model prints `Model:
+not set — /login, or configure .env` and nothing else.
+
 The picker lists only routes a commit can apply as they are (#488): a route is
 listed when a credential resolves for it now, by the same resolution a commit
 binds with, without a request: the environment, `<state root>/.env`, a key

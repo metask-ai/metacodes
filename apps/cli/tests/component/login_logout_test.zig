@@ -490,6 +490,10 @@ test "/logout: a preset alone in .env is used with its provider's key from the s
         try expectContains(status.written(), "  Credential:  from shell\n");
         try expectContains(status.written(), "  Reasoning:   high\n");
         try expectContains(status.written(), "  Context:     about ");
+        app.conversation.setUsageAnchor(1000);
+        try testing.expectEqual(@as(usize, 1000), app.contextTokens());
+        try app.conversation.appendText(.assistant, "x" ** 400);
+        try testing.expectEqual(@as(usize, 1000 + 8 + 12 + 100), app.contextTokens());
         try sendOneTurn(app);
         const captured = preset_relay.lastRequest() orelse return error.NoRequestCaptured;
         try testing.expectEqualStrings("Bearer " ++ PRESET_KEY, headerValue(captured, "authorization") orelse "");
