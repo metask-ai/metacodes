@@ -2030,15 +2030,17 @@ test "a stored default Metask's list does not have, or that no list can be fetch
     var out = try runCli(&case, cli, &.{}, &.{ "-p", "hi" });
     errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
     try testing.expectEqual(@as(i32, 2), out.exit_code);
-    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the default model stored with /model ({s}) is in neither the built-in models nor Metask's model list; `", .{pin}));
-    try expectContains(out.stderr, try std.fmt.allocPrint(a, " --provider metask` starts on your Metask sign-in without it, or remove \"global_selection\" from {s}\n", .{config_path}));
+    const ways_out = try std.fmt.allocPrint(a, " --provider metask` starts on your Metask sign-in without it), or remove \"global_selection\" from {s}\n", .{config_path});
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the default model stored with /model ({s}) is in neither the built-in models nor Metask's model list.\nPass --provider/--model to choose another route (`", .{pin}));
+    try expectContains(out.stderr, ways_out);
     try testing.expectEqual(@as(usize, 1), gateway.requestCount());
     try testing.expect(std.mem.startsWith(u8, requestLine(gateway.requestAt(0).?), "GET /v1/models"));
 
     try case.storeSession("http://127.0.0.1:9", NEW_SESSION_TOKEN);
     out = try runCli(&case, cli, &.{}, &.{ "-p", "hi" });
     try testing.expectEqual(@as(i32, 2), out.exit_code);
-    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched (no connection); `", .{pin}));
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched: no connection.\nPass --provider/--model to choose another route (`", .{pin}));
+    try expectContains(out.stderr, ways_out);
 
     try case.tmp.dir.deleteFile(testing.io, "state/oauth/metask.json");
     out = try runCli(&case, cli, &.{}, &.{ "login", "status" });
@@ -2047,6 +2049,90 @@ test "a stored default Metask's list does not have, or that no list can be fetch
     out = try runCli(&case, cli, &.{}, &.{ "-p", "hi" });
     try testing.expectEqual(@as(i32, 2), out.exit_code);
     try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the stored selection pins {s}, which the current catalog does not offer;", .{pin}));
+}
+
+test "a gateway that refuses the session for its list gets the session renewed once, as a request would, and the start goes on" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startHttpCassette(
+        &.{ "{\"error\":\"unauthorized\"}", GATEWAY_MODELS, GATEWAY_MODELS, ANTHROPIC_SSE },
+        &.{ "HTTP/1.1 401 Unauthorized", "HTTP/1.1 200 OK", "HTTP/1.1 200 OK", "HTTP/1.1 200 OK" },
+    );
+    defer gateway.stop();
+    const origin = try originOf(a, gateway);
+    _ = try pinGatewayModel(&case, origin, "glm-5-air");
+    try case.storeSession(origin, SESSION_TOKEN);
+    var issuer = try harness.MockServer.startRepeatingStatus(try case.tokenJson(origin, NEW_SESSION_TOKEN), "HTTP/1.1 200 OK", "");
+    defer issuer.stop();
+    const site = try std.fmt.allocPrint(a, "METASK_SITE_URL={s}", .{try originOf(a, issuer)});
+
+    const out = try runCli(&case, cli, &.{site}, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 0), out.exit_code);
+    try testing.expectEqual(@as(usize, 1), issuer.requestCount());
+    try testing.expect(std.mem.startsWith(u8, requestLine(issuer.requestAt(0).?), "POST /api/oauth/token "));
+    try testing.expectEqual(@as(usize, 4), gateway.requestCount());
+    try testing.expectEqualStrings("Bearer " ++ SESSION_TOKEN, headerValue(gateway.requestAt(0).?, "authorization").?);
+    for (1..4) |index| try testing.expectEqualStrings("Bearer " ++ NEW_SESSION_TOKEN, headerValue(gateway.requestAt(index).?, "authorization").?);
+    try testing.expect(std.mem.startsWith(u8, requestLine(gateway.requestAt(3).?), "POST /v1/messages "));
+    try testing.expectEqualStrings("\"glm-5-air\"", gateway.requestAt(3).?.jsonField("model").?);
+}
+
+test "a refused list whose sign-in cannot be renewed stops and says to sign in again" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startHttpCassette(&.{"{\"error\":\"unauthorized\"}"}, &.{"HTTP/1.1 401 Unauthorized"});
+    defer gateway.stop();
+    const origin = try originOf(a, gateway);
+    const pin = try pinGatewayModel(&case, origin, "glm-5-air");
+    const config_path = try std.fs.path.join(a, &.{ case.state, "config.json" });
+    try case.storeSession(origin, SESSION_TOKEN);
+    var issuer = try harness.MockServer.startRepeatingStatus("{\"error\":\"invalid_grant\"}", "HTTP/1.1 400 Bad Request", "");
+    defer issuer.stop();
+    const site = try std.fmt.allocPrint(a, "METASK_SITE_URL={s}", .{try originOf(a, issuer)});
+
+    const out = try runCli(&case, cli, &.{site}, &.{ "-p", "hi" });
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try testing.expectEqual(@as(i32, 2), out.exit_code);
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, "error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched: the Metask sign-in has expired.\nSign in again with `", .{pin}));
+    try expectContains(out.stderr, try std.fmt.allocPrint(a, " login`, pass --provider/--model to choose another route, or remove \"global_selection\" from {s}\n", .{config_path}));
+    try testing.expectEqual(@as(usize, 1), gateway.requestCount());
+    try testing.expectEqual(@as(usize, 1), issuer.requestCount());
+}
+
+test "a start asked for the Metask key path does not fetch Metask's list with the session for a stored default" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const cli = (try cliPath(&case)) orelse return error.SkipZigTest;
+    try case.enter();
+    const a = case.arena();
+    var gateway = try harness.MockServer.startCassette(&.{GATEWAY_MODELS}, 0);
+    defer gateway.stop();
+    const origin = try originOf(a, gateway);
+    const pin = try pinGatewayModel(&case, origin, "glm-5-air");
+    try case.storeSession(origin, SESSION_TOKEN);
+    const stops = try std.fmt.allocPrint(a, "error: the stored selection pins {s}, which the current catalog does not offer;", .{pin});
+
+    const starts = [_]struct { env: []const []const u8, args: []const []const u8 }{
+        .{ .env = &.{"METASK_API_KEY=" ++ METASK_KEY}, .args = &.{ "-p", "hi" } },
+        .{ .env = &.{}, .args = &.{ "--api-key", METASK_KEY, "-p", "hi" } },
+    };
+    for (starts) |start| {
+        const out = try runCli(&case, cli, start.env, start.args);
+        errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+        try testing.expectEqual(@as(i32, 2), out.exit_code);
+        try expectContains(out.stderr, stops);
+    }
+    try testing.expectEqual(@as(usize, 0), gateway.requestCount());
 }
 
 test "--provider naming a provider without a key stops -p with its help, sending nothing (#485)" {

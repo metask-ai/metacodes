@@ -546,37 +546,86 @@ fn applyStoredSelection(config: *types.Config, allocator: std.mem.Allocator, met
     return true;
 }
 
-fn adoptMetaskListing(allocator: std.mem.Allocator, host: *provider_host.Host, state_root: []const u8, listing: MetaskListing) ?[]const u8 {
-    const session = loadStartupMetask(listing.session, listing.gpa, state_root) catch return "the Metask session cannot be read";
-    const bearer = resolveMetaskBearer(session, listing.io) catch return "the Metask session could not be renewed";
+const ListingMiss = struct {
+    reason: []const u8,
+    sign_in_again: bool = false,
+};
+
+fn adoptMetaskListing(allocator: std.mem.Allocator, host: *provider_host.Host, state_root: []const u8, listing: MetaskListing) ?ListingMiss {
+    const session = loadStartupMetask(listing.session, listing.gpa, state_root) catch
+        return .{ .reason = "the Metask session cannot be read", .sign_in_again = true };
+    const bearer = resolveMetaskBearer(session, listing.io) catch |err| return sessionMiss(err);
     defer provider_oauth_mod.secureFree(listing.gpa, bearer);
-    const gateway = (metask_oauth_mod.modelGateway(session.tokens.?.gateway_url) catch null) orelse return "the Metask session names no gateway";
-    const url = std.fmt.allocPrint(allocator, "{s}/v1/models", .{gateway}) catch return "out of memory";
-    const fetched = api_catalog_fetch.fetchModelPages(allocator, listing.io, .{
+    const stored_gateway = (metask_oauth_mod.modelGateway(session.tokens.?.gateway_url) catch null) orelse
+        return .{ .reason = "the Metask session names no model gateway", .sign_in_again = true };
+    const gateway = allocator.dupe(u8, stored_gateway) catch return .{ .reason = "out of memory" };
+    const url = std.fmt.allocPrint(allocator, "{s}/v1/models", .{gateway}) catch return .{ .reason = "out of memory" };
+    var fetched = fetchMetaskListing(allocator, listing.io, url, bearer);
+    if (fetched == .refused) {
+        var site_buf: [1024]u8 = undefined;
+        const token_url = metask_oauth_mod.tokenUrl(metask_oauth_mod.siteUrl(), &site_buf) catch
+            return .{ .reason = "the Metask sign-in was refused", .sign_in_again = true };
+        var exchange = oauth_exchange_mod.MetaskHttpExchange{ .allocator = session.allocator, .io = listing.io, .token_url = token_url };
+        const renewed = session.refreshIfStale(@import("metacodes-internal").util.time.nowUnix(), exchange.exchange(), bearer) catch |err| return sessionMiss(err);
+        defer provider_oauth_mod.secureFree(session.allocator, renewed);
+        fetched = fetchMetaskListing(allocator, listing.io, url, renewed);
+    }
+    const body = switch (fetched) {
+        .body => |value| value,
+        .refused => return .{ .reason = "the Metask sign-in was refused", .sign_in_again = true },
+        .failed => |reason| return .{ .reason = reason },
+    };
+    defer allocator.free(body);
+    host.ingestMetask(gateway, body, .messages_and_chat) catch return .{ .reason = "the answer was not a model list" };
+    return null;
+}
+
+const MetaskListingFetch = union(enum) {
+    body: []u8,
+    refused,
+    failed: []const u8,
+};
+
+fn fetchMetaskListing(allocator: std.mem.Allocator, io: std.Io, url: []const u8, bearer: []const u8) MetaskListingFetch {
+    const fetched = api_catalog_fetch.fetchModelPages(allocator, io, .{
         .url = url,
         .bearer = bearer,
         .timeout_ms = models_cache.STARTUP_WAIT_MS,
     }) catch |err| return switch (err) {
-        error.Unauthorized => "the session was refused",
-        error.RateLimited => "rate limited",
-        error.TimedOut => std.fmt.comptimePrint("no answer within {d} s", .{models_cache.STARTUP_WAIT_MS / 1000}),
-        error.HttpError => "server error",
-        error.TooLarge => "list too large",
-        else => "no connection",
+        error.Unauthorized => .refused,
+        error.RateLimited => .{ .failed = "rate limited" },
+        error.TimedOut => .{ .failed = std.fmt.comptimePrint("no answer within {d} s", .{models_cache.STARTUP_WAIT_MS / 1000}) },
+        error.HttpError => .{ .failed = "server error" },
+        error.TooLarge => .{ .failed = "the list is too large" },
+        else => .{ .failed = "no connection" },
     };
-    defer allocator.free(fetched.body);
-    host.ingestMetask(gateway, fetched.body, .messages_and_chat) catch return "not a model list";
-    return null;
+    return .{ .body = fetched.body };
 }
 
-fn failMissingMetaskDefault(allocator: std.mem.Allocator, selection: provider_selection.RuntimeSelection, config_path: []const u8, fetch_failure: ?[]const u8) noreturn {
+fn sessionMiss(err: MetaskSessionError) ListingMiss {
+    return switch (err) {
+        error.NoSession, error.NoTokens => .{ .reason = "the Metask session holds no token", .sign_in_again = true },
+        error.RefreshRejected => .{ .reason = "the Metask sign-in has expired", .sign_in_again = true },
+        error.GatewayChanged => .{ .reason = "Metask's model gateway changed; start again to use the saved session" },
+        error.RefreshFailed => .{ .reason = "no connection while renewing the Metask session" },
+        error.MalformedTokenResponse => .{ .reason = "Metask's answer to renewing the session was not understood" },
+        error.OutOfMemory, error.PersistFailed, error.NoHome, error.PathTooLong => .{ .reason = "the renewed Metask session could not be saved" },
+    };
+}
+
+fn failMissingMetaskDefault(allocator: std.mem.Allocator, selection: provider_selection.RuntimeSelection, config_path: []const u8, miss: ?ListingMiss) noreturn {
     const pin = storedPin(allocator, selection.target) catch "it";
     const command = invokedCommand(allocator);
-    if (fetch_failure) |why| {
-        std.debug.print("error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched ({s}); `{s} --provider metask` starts on your Metask sign-in without it, or remove \"global_selection\" from {s}\n", .{ pin, why, command, config_path });
+    if (miss) |why| {
+        std.debug.print("error: the default model stored with /model ({s}) is not among the built-in models, and Metask's model list could not be fetched: {s}.\n", .{ pin, why.reason });
+        if (why.sign_in_again) {
+            std.debug.print("Sign in again with `{s} login`, pass --provider/--model to choose another route, or remove \"global_selection\" from {s}\n", .{ command, config_path });
+            std.process.exit(2);
+        }
     } else {
-        std.debug.print("error: the default model stored with /model ({s}) is in neither the built-in models nor Metask's model list; `{s} --provider metask` starts on your Metask sign-in without it, or remove \"global_selection\" from {s}\n", .{ pin, command, config_path });
+        std.debug.print("error: the default model stored with /model ({s}) is in neither the built-in models nor Metask's model list.\n", .{pin});
     }
+    std.debug.print("Pass --provider/--model to choose another route (`{s} --provider metask` starts on your Metask sign-in without it), or remove \"global_selection\" from {s}\n", .{ command, config_path });
     std.process.exit(2);
 }
 

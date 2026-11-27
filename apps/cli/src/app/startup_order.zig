@@ -67,7 +67,7 @@ pub const StoredDefault = union(enum) {
     unresolved: []const u8,
 
     /// A `usable` default: its name (`DeepSeek · deepseek-v4-pro`) and the id
-    /// of its provider, both null when it does not resolve. The provider's key
+    /// of its provider, both null when its route cannot be built. The provider's key
     /// is its own credential, so `login status` does not list that key as a
     /// shell key that chooses no provider.
     pub const Usable = struct {
@@ -75,7 +75,7 @@ pub const StoredDefault = union(enum) {
         provider: ?[]const u8 = null,
     };
 
-    /// Whether the start consults it (`applyPersistedGlobalSelection`).
+    /// Whether the start consults it (`applyStoredSelection`).
     pub fn consulted(self: StoredDefault) bool {
         return self == .usable or self == .unreadable or self == .unresolved;
     }
