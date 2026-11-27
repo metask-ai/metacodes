@@ -1221,18 +1221,29 @@ status, compatibility boundaries, and entry points are defined by
   of `gate:static`, refuses a request with `keep_alive = false` that does not
   make that call before it is sent.
 
-- **Monitor asks before it starts a command, as Bash does.** Monitor runs
-  a shell command in the background and is now classified with Bash as a
-  tool that executes: it asks in `default`, `acceptEdits` and `auto`, is
-  refused in `dontAsk` and runs in `bypassPermissions`. Bash's read-only
-  shortcut does not extend to it, so a Monitor command that only reads
-  asks too.
+### Security
 
-- **EnterWorktree and ExitWorktree ask first.** Entering a worktree
-  creates one with `git worktree add` or makes an existing directory the
-  session's working directory, and leaving one with `remove` deletes it.
-  Both now ask in `default`, `acceptEdits` and `auto`, are refused in
-  `dontAsk` and run in `bypassPermissions`.
+- **Monitor asks before it starts a command.** Monitor runs the shell
+  command it is given in the background, and was permissioned as a read:
+  `default`, `acceptEdits` and `auto` started it without asking. It is now
+  permissioned as executing, so those modes ask before it starts (`-p`,
+  with nobody to ask, refuses it); `dontAsk` and `bypassPermissions` decide
+  it as before. A Monitor command that reads a credential store asks even
+  under an allow rule or in `bypassPermissions`, as a Bash command does. To
+  keep Monitor running without a prompt, allow it:
+  `{"permissions": {"allow": ["Monitor"]}}` in a settings file, or
+  `Monitor(<pattern>)` for the commands that match the pattern. `Bash(...)`
+  rules do not apply to Monitor.
+
+- **EnterWorktree and ExitWorktree ask before they run.** EnterWorktree
+  runs `git worktree add` or makes an existing directory the session's
+  working directory, and ExitWorktree with `remove` runs
+  `git worktree remove`. They were permissioned as reads and are now
+  permissioned as executing: `default`, `acceptEdits` and `auto` ask before
+  they run (`-p` refuses them), and `dontAsk` and `bypassPermissions` decide
+  them as before. Allow them by name
+  (`{"permissions": {"allow": ["EnterWorktree", "ExitWorktree"]}}`) to keep
+  them running without a prompt.
 
 ## 0.13.0 — 2026-11-20
 
