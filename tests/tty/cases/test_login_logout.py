@@ -279,6 +279,8 @@ def test_a_stored_default_on_a_gateway_model_is_found_in_the_list_the_start_fetc
 
 
 def test_a_stored_default_on_a_gateway_model_still_stops_the_tui_without_a_metask_sign_in(bin_path):
+    if IS_WINDOWS:
+        raise SkipTest("the ConPTY driver waits for the TUI's first frame, and this start stops before it draws one")
     with MetaskMock() as mock:
         home, state, env = _case(mock)
         offer = _pin_gateway_model(mock, state)
