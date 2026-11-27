@@ -245,7 +245,7 @@ def test_incomplete_metask_login_opens_unbound(bin_path):
 
 
 ENV_KEYS_NOTICE = (".env has keys for DeepSeek and OpenAI. "
-                   "Choose one with /model; Tab there applies it to every future session.")
+                   'Choose one with /model; press Tab there for "from now on" to keep it.')
 
 
 def _write_two_provider_env(case):

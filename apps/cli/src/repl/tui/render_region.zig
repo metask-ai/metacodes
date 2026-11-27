@@ -1318,13 +1318,13 @@ pub const RenderRegion = struct {
         return rows + self.drawMenuPosition(w, selected_idx, entries.len);
     }
 
-    /// `[n/m]` under a list menu longer than its window, naming the keys that
-    /// reach the rest. Nothing for a list that fits. Returns the rows drawn.
+    /// `[n/m]` under a list menu longer than its window. Nothing for a list
+    /// that fits. Returns the rows drawn.
     fn drawMenuPosition(self: *RenderRegion, w: *std.Io.Writer, selected: usize, len: usize) u16 {
         if (len <= complete.MODEL_MENU_MAX_ROWS) return 0;
         const th = self.theme;
         w.writeAll(ansi.clear.line) catch {};
-        w.print("  {s}[{d}/{d}] · PgUp/PgDn page · Home/End{s}", .{ th.dim, selected + 1, len, th.reset }) catch {};
+        w.print("  {s}[{d}/{d}]{s}", .{ th.dim, selected + 1, len, th.reset }) catch {};
         w.writeAll("\r\n") catch {};
         return 1;
     }
