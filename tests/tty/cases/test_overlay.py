@@ -474,7 +474,7 @@ def test_ctrl_o_autorepeat_debounced_no_altscreen_churn(bin_path):
         return TTYAssert(raw, rows=rows, cols=cols), raw
 
     # 基线:同样的生成→停止,不按 Ctrl+O,等生成完整结束。框顶 = 幂等参照。
-    base_a, _ = trial(["sleep:8.0"])
+    base_a, _ = trial([wait_for("esc to interrupt"), IDLE, "sleep:0.8"])
     box0 = base_a.box_top_row()
 
     # 复现:进入生成态后按住 Ctrl+O(burst)→ 等生成结束、空闲输入框起来 → 再按住 Ctrl+O(burst)。
