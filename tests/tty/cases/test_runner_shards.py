@@ -193,13 +193,13 @@ def test_domain_filtering_and_empty_shard_exit_zero(bin_path):
     env.pop("TTY_DOMAINS", None)
     empty_shard = subprocess.run(
         [sys.executable, runner, "--bin", sys.executable, "--domains", "kg", "--shard", "8/8"],
-        capture_output=True, text=True, env=env, timeout=30,
+        capture_output=True, encoding="utf-8", errors="replace", env=env, timeout=30,
     )
     assert empty_shard.returncode == 0, (empty_shard.returncode, empty_shard.stdout, empty_shard.stderr)
     assert "0 个用例" in empty_shard.stdout, empty_shard.stdout
 
     bad_domain = subprocess.run(
         [sys.executable, runner, "--bin", sys.executable, "--domains", "no_such_domain"],
-        capture_output=True, text=True, env=env, timeout=30,
+        capture_output=True, encoding="utf-8", errors="replace", env=env, timeout=30,
     )
     assert bad_domain.returncode == 2, (bad_domain.returncode, bad_domain.stdout, bad_domain.stderr)
