@@ -497,6 +497,11 @@ status, compatibility boundaries, and entry points are defined by
   starts that turn and reaches the model unchanged; only what the user
   queued during a reply is echoed now.
 
+- **Closing `/model` with no model set no longer names one.** Esc or Ctrl+C
+  in the picker of a session that has no model said `kept
+  claude-sonnet-4-20250514`, the placeholder the clients are built with; it
+  says `no model set`.
+
 - **`/login metask` without the TUI moves the session to the new
   sign-in.** With standard input not a terminal, `/login metask` stored a
   second Metask sign-in and revoked the first (#561), but the session went

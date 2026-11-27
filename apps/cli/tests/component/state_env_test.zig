@@ -1261,8 +1261,12 @@ test "state .env: keys of two providers and no name leave the TUI without a mode
     try expectAbsent(reminder.written(), "sk-relay-two");
     try expectAbsent(reminder.written(), "sk-deepseek-two");
 
-    // /model lists both as ready; Tab makes the pick every future session's.
     var ui: cc.tui_ui_state.UiState = .{};
+    cc.repl_picker_host.open(app, &ui, .unguarded);
+    try testing.expectEqual(cc.repl_picker_host.Result.cancelled, cc.repl_picker_host.onKey(app, &ui, .cancel, .unguarded));
+    try testing.expectEqualStrings("no model set", app.model_picker.notice());
+
+    // /model lists both as ready; Tab makes the pick every future session's.
     cc.repl_picker_host.open(app, &ui, .unguarded);
     _ = try cursorOnProvider(app, &ui, "deepseek");
     cc.repl_picker_host.close(app, &ui, .unguarded);
