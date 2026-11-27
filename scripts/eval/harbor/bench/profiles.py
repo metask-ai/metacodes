@@ -576,6 +576,8 @@ class ProfileManager:
                 raise ValueError("这个评测集是早期版本排的，请在评测配置上重新运行")
             if not tasks:
                 raise ValueError("这个评测集没有要运行的题")
+            if isinstance(item.get("run"), str) and item["run"]:
+                item.setdefault("run_statuses", {})[item["run"]] = item["status"]
             if resume:
                 resumed = current_runs(item)
                 if resumed:
@@ -662,6 +664,8 @@ class ProfileManager:
             current.update(status=run["status"] if run else "interrupted",
                            error=(run or {}).get("error") or (None if run else "运行记录丢失"),
                            finished_at=(run or {}).get("finished_at") or now())
+            if isinstance(current.get("run"), str) and current["run"]:
+                current.setdefault("run_statuses", {})[current["run"]] = current["status"]
             if not record.get("cancel_requested") and not current.get("cancel_requested"):
                 self.queue_invalid_rerun(record, current)
         if record.get("cancel_requested"):
@@ -694,6 +698,9 @@ class ProfileManager:
                 request["features"] = features
             launched = self.runs.launch(request, frozen=record["metacodes"], profile=record["id"],
                                         pinned=pending.get("route"))
+            seq = record.get("next_run_seq", 0)
+            record["next_run_seq"] = seq + 1
+            pending.setdefault("run_seqs", {})[launched["name"]] = seq
             pending.pop("waiting", None)
             pending.update(status="running", run=launched["name"], started_at=now(), concurrency=concurrency)
             record["status"] = "running"
@@ -800,13 +807,20 @@ def forget_item_run(item: Dict[str, Any], name: str) -> bool:
             else:
                 item.pop(field, None)
             changed = True
+    for field in ("run_seqs", "run_statuses"):
+        mapping = item.get(field)
+        if isinstance(mapping, dict) and name in mapping:
+            mapping.pop(name, None)
+            if not mapping:
+                item.pop(field, None)
+            changed = True
     return changed
 
 
 def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int) -> Dict[str, Any]:
     again = {key: value for key, value in item.items()
              if key not in ("index", "waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry",
-                            "concurrency", "resumed_runs", "previous_runs")}
+                            "concurrency", "resumed_runs", "previous_runs", "run_seqs", "run_statuses")}
     request = {key: value for key, value in item["request"].items() if key != "concurrency"}
     again.update(request={**request, "tasks": list(tasks)}, tasks=list(tasks), status="pending",
                  run=None, error=None, started_at=None, finished_at=None)
@@ -890,4 +904,6 @@ def public(record: Dict[str, Any]) -> Dict[str, Any]:
                 item["resume_tasks_count"] = len(request_tasks)
         item.pop("request", None)
         item.pop("route", None)
+        item.pop("run_seqs", None)
+        item.pop("run_statuses", None)
     return value

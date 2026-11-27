@@ -1240,6 +1240,90 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(resumed['items'][0]['resume_tasks_count'], 1)
         self.assertEqual(self.manager.profiles.get(pid)['items'][0]['request']['tasks'], ['cancel-async-tasks'])
 
+    def test_rerunning_an_earlier_item_makes_its_new_run_latest_over_later_items(self):
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        first = self.wait_profile(self.client.request('api/profiles/run', one)['id'])
+        pid = first['id']
+        run_a = first['items'][0]['run']
+        second = self.wait_profile(self.client.request('api/profiles/run', {**one, 'profile': pid, 'name': None})['id'])
+        run_b = second['items'][1]['run']
+        _write(self.manager.jobs_dir / run_b / 'fix-git__fake' / 'result.json', {
+            'task_name': 'terminal-bench/fix-git', 'started_at': '2026-11-16T00:00:00Z',
+            'finished_at': '2026-11-16T00:01:00Z', 'verifier_result': {'rewards': {'reward': 0.0}}})
+        self.workbench.library.sync()
+        before = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(before['tasks'][0]['job'], run_b)
+        self.assertEqual(before['summary']['counts']['fail'], 1)
+
+        self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'run'})
+        after_record = self.wait_profile(pid)
+        self.assertEqual(len(after_record['items']), 2)
+        run_c = after_record['items'][0]['run']
+        self.assertEqual(after_record['items'][1]['run'], run_b)
+        self.workbench.library.sync()
+
+        view = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(view['tasks'][0]['job'], run_c)
+        self.assertEqual(view['tasks'][0]['history'], [run_a, run_b])
+        self.assertEqual((view['summary']['counts']['pass'], view['summary']['counts']['fail']), (1, 0))
+        scoped = self.client.request('api/jobs?profile=' + pid)
+        card = next(p for p in scoped['profiles'] if p['id'] == pid)
+        self.assertEqual((card['summary']['counts']['pass'], card['summary']['counts']['fail']), (1, 0))
+
+    def test_archived_failed_run_with_finished_harbor_view_still_preserves_earlier_pass(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        one = self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}])
+        created = self.client.request('api/profiles/run', one)
+        pid = created['id']
+        run_a, run_b = 'bench-pass-a', 'bench-fail-b'
+        for name, reward in ((run_a, {'reward': 1.0}), (run_b, None)):
+            job = self.manager.jobs_dir / name
+            _write(job / 'config.json', {'agents': [{'model_name': 'tokenjoy/test-model'}], 'n_attempts': 1})
+            _write(job / 'result.json', {'started_at': '2026-11-16T00:00:00Z', 'finished_at': '2026-11-16T00:01:00Z',
+                                         'n_total_trials': 1})
+            _write(job / 'fix-git__x' / 'config.json', {})
+            _write(job / 'fix-git__x' / 'result.json', {
+                'task_name': 'terminal-bench/fix-git', 'started_at': '2026-11-16T00:00:00Z',
+                'finished_at': '2026-11-16T00:01:00Z',
+                **({'verifier_result': {'rewards': reward}} if reward else {})})
+        atomic_json(self.manager.records / (run_a + '.json'), {
+            'name': run_a, 'status': 'finished', 'profile': pid, 'suite': 'terminal-bench-2.1',
+            'model': 'tokenjoy/test-model', 'finished_at': '2026-11-16T00:01:00Z'})
+        atomic_json(self.manager.records / (run_b + '.json'), {
+            'name': run_b, 'status': 'failed', 'profile': pid, 'suite': 'terminal-bench-2.1',
+            'model': 'tokenjoy/test-model', 'finished_at': '2026-11-16T00:02:00Z', 'error': 'harbor exited 1'})
+        record = self.manager.profiles.get(pid)
+        record['status'] = 'finished'
+        record['next_run_seq'] = 2
+        record['items'][0].update(status='failed', run=run_b, previous_runs=[run_a],
+                                  run_seqs={run_a: 0, run_b: 1}, run_statuses={run_a: 'finished'},
+                                  error='harbor exited 1', finished_at='2026-11-16T00:02:00Z')
+        self.manager.profiles.save(record)
+        self.workbench.library.sync()
+
+        before = self.client.request('api/profile?id=' + pid)
+        self.assertEqual((before['summary']['counts']['pass'], before['summary']['counts']['invalid']), (1, 0))
+        self.assertEqual(before['tasks'][0]['job'], run_a)
+        self.assertEqual(self.client.request('api/job?name=' + run_b)['execution_status'], 'failed')
+
+        self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'run'})
+        queued = self.client.request('api/profile?id=' + pid)
+        self.assertEqual((queued['summary']['counts']['pass'], queued['summary']['counts']['invalid']), (1, 0))
+        self.assertEqual(queued['tasks'][0]['job'], run_a)
+        self.assertEqual(self.manager.profiles.get(pid)['items'][0]['run_statuses'][run_b], 'failed')
+
+        with patch.object(self.manager, 'launch', side_effect=ValueError('launch blocked')):
+            self.manager.profiles.advance()
+        failed_launch = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(failed_launch['items'][0]['status'], 'failed')
+        self.assertIsNone(failed_launch['items'][0]['run'])
+        self.assertEqual((failed_launch['summary']['counts']['pass'], failed_launch['summary']['counts']['invalid']), (1, 0))
+        self.assertEqual(failed_launch['tasks'][0]['job'], run_a)
+        scoped = self.client.request('api/jobs?profile=' + pid)
+        card = next(p for p in scoped['profiles'] if p['id'] == pid)
+        self.assertEqual((card['summary']['counts']['pass'], card['summary']['counts']['invalid']), (1, 0))
+
     def test_delete_last_submission_preserves_legacy_profile_concurrency(self):
         self.manager.profiles.stop()
         self.manager.profiles._thread.join()

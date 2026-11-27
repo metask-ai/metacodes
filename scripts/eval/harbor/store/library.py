@@ -247,6 +247,13 @@ class StoreLibrary:
                                 else:
                                     item.pop(field, None)
                                 changed = True
+                        for field in ("run_seqs", "run_statuses"):
+                            mapping = item.get(field)
+                            if isinstance(mapping, dict) and job in mapping:
+                                mapping.pop(job, None)
+                                if not mapping:
+                                    item.pop(field, None)
+                                changed = True
                     if changed:
                         tx.execute("UPDATE profiles SET record_json = ? WHERE id = ?", (ingest._json(record), profile))
 

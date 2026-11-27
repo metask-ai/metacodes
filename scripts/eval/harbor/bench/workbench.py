@@ -53,28 +53,43 @@ def task_group(task, rows, item, job):
     return group
 
 
-def _merge_item_runs(item, names, views, latest, history=None):
+def _run_order_key(item, name, item_pos, run_pos, views):
+    seqs = item.get("run_seqs")
+    if isinstance(seqs, dict) and type(seqs.get(name)) is int:
+        return (1, seqs[name], item_pos, run_pos)
+    started = (views.get(name) or {}).get("started_at") or ""
+    return (0, started, item_pos, run_pos)
+
+
+def _merge_run(item, name, is_last, views, latest, history=None):
+    view = views.get(name)
+    if view is None:
+        return
     resumed = set(item.get("resumed_runs") or ())
-    for index, name in enumerate(names):
-        view = views.get(name)
-        if view is None:
+    statuses = item.get("run_statuses") or {}
+    recorded = item["status"] if is_last else statuses.get(name)
+    stopped = (recorded in ("cancelled", "interrupted", "failed", "skipped")
+               or view.get("execution_status") in ("cancelled", "interrupted", "failed")
+               or (not is_last and name in resumed))
+    by_task = {}
+    for row in view.get("rows") or []:
+        by_task.setdefault(row["task"], []).append(row)
+    by_task.update(view.get("task_summaries") or {})
+    for task, rows in by_task.items():
+        key = (item["suite"], item.get("model"), task)
+        invalid = rows["counts"]["invalid"] == rows["trials"] if isinstance(rows, dict) else all(
+            row["status"] == "invalid" for row in rows)
+        if key in latest and stopped and invalid:
             continue
+        if key in latest and history is not None:
+            history.setdefault(key, []).append(latest[key][1])
+        latest[key] = (item, view["name"], rows)
+
+
+def _merge_item_runs(item, names, views, latest, history=None):
+    for index, name in enumerate(names):
         is_last = index == len(names) - 1 and name == item.get("run")
-        stopped = (item["status"] in ("cancelled", "interrupted", "failed", "skipped")
-                   if is_last else name in resumed or view.get("execution_status") in ("cancelled", "interrupted", "failed"))
-        by_task = {}
-        for row in view.get("rows") or []:
-            by_task.setdefault(row["task"], []).append(row)
-        by_task.update(view.get("task_summaries") or {})
-        for task, rows in by_task.items():
-            key = (item["suite"], item.get("model"), task)
-            invalid = rows["counts"]["invalid"] == rows["trials"] if isinstance(rows, dict) else all(
-                row["status"] == "invalid" for row in rows)
-            if key in latest and stopped and invalid:
-                continue
-            if key in latest and history is not None:
-                history.setdefault(key, []).append(latest[key][1])
-            latest[key] = (item, view["name"], rows)
+        _merge_run(item, name, is_last, views, latest, history)
 
 
 def _item_job(item, views):
@@ -110,9 +125,16 @@ def _item_job(item, views):
 
 
 def latest_results(record, views):
+    entries = []
+    for item_pos, item in enumerate(record.get("items") or []):
+        names = item_runs(item)
+        for run_pos, name in enumerate(names):
+            is_last = run_pos == len(names) - 1 and name == item.get("run")
+            entries.append((_run_order_key(item, name, item_pos, run_pos, views), item, name, is_last))
+    entries.sort(key=lambda entry: entry[0])
     latest, history = {}, {}
-    for item in record.get("items") or []:
-        _merge_item_runs(item, item_runs(item), views, latest, history)
+    for _, item, name, is_last in entries:
+        _merge_run(item, name, is_last, views, latest, history)
     return latest, history
 
 
@@ -352,23 +374,24 @@ class Workbench:
         if isinstance(judge, dict) and isinstance(judge.get("model"), str):
             # Which LLM judge scored the run (model id and route, no secret).
             view["judge"] = {"model": judge["model"], "via": judge.get("via")}
-        if run and run["status"] in {"failed", "cancelled", "interrupted"} and view["running"]:
-            # Harbor may be interrupted before it writes a final result.
-            # Preserve those files, and display the durable worker outcome.
-            view["running"] = False
+        if run and run["status"] in {"failed", "cancelled", "interrupted"}:
             view["execution_status"] = run["status"]
-            for row in view.get("rows", []):
-                if row["status"] == "running":
-                    row.update(status="invalid", cause="execution: " + run["status"])
-            if "rows" in view:
-                view["summary"] = data.summarize(view["rows"])
-            else:
-                view["summary"] = results.stopped_summary(view["summary"])
-                view["task_summaries"] = {t: results.stopped_summary(g) for t, g in view["task_summaries"].items()}
-            started, finished = data.parse_time(view.get("started_at")), data.parse_time(run.get("finished_at"))
-            if finished:
-                view["finished_at"] = finished.isoformat()
-                view["wall_s"] = (finished - started).total_seconds() if started else None
+            if view["running"]:
+                # Harbor may be interrupted before it writes a final result.
+                # Preserve those files, and display the durable worker outcome.
+                view["running"] = False
+                for row in view.get("rows", []):
+                    if row["status"] == "running":
+                        row.update(status="invalid", cause="execution: " + run["status"])
+                if "rows" in view:
+                    view["summary"] = data.summarize(view["rows"])
+                else:
+                    view["summary"] = results.stopped_summary(view["summary"])
+                    view["task_summaries"] = {t: results.stopped_summary(g) for t, g in view["task_summaries"].items()}
+                started, finished = data.parse_time(view.get("started_at")), data.parse_time(run.get("finished_at"))
+                if finished:
+                    view["finished_at"] = finished.isoformat()
+                    view["wall_s"] = (finished - started).total_seconds() if started else None
         view["profile"] = (run or {}).get("profile")
         view["metacodes"] = (run or {}).get("metacodes")
         if not with_rows:
@@ -399,7 +422,9 @@ class Workbench:
         value["progress"] = {"done": done, "planned": planned} if planned else None
         value["models"] = sorted({i.get("model") for i in value["items"] if i.get("model")})
         value["suites"] = sorted({i["suite"] for i in value["items"]})
-        value["last_run_at"] = max((i.get("started_at") or "" for i in value["items"]), default="") or None
+        run_starts = [views[n].get("started_at") or "" for item in record.get("items") or []
+                      for n in item_runs(item) if n in views]
+        value["last_run_at"] = max([*(i.get("started_at") or "" for i in value["items"]), *run_starts], default="") or None
         return value
 
     def jobs(self, scope="all") -> Dict[str, Any]:
