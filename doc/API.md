@@ -641,9 +641,15 @@ terminal, and from asking the terminal about them at startup
 On macOS and Linux the interactive TUI reports the mouse (`ESC[?1002h`,
 `ESC[?1006h`) while it reads keys, so dragging with the left button copies
 the text under the drag when the button is released: the TUI sends it as OSC
-52 and, in a local session on macOS, also to `pbcopy`, and the prompt shows
-`Copied to clipboard`. The TUI keeps a copy of the text it printed and asks
-the terminal for the cursor position (`ESC[6n`) to place it on the screen.
+52 and, in a local session on macOS, also to `pbcopy`. The prompt then shows
+`Copied to clipboard` when `pbcopy` took it, `Sent to the terminal's
+clipboard` when OSC 52 was the only way, and, inside a tmux whose
+`set-clipboard` is not `on` (asked once at start with `tmux show-options -sv
+set-clipboard`), `tmux did not pass it on: set-clipboard on`.
+`METACODES_NO_MOUSE` (any value) or `"mouse": false` in
+`<state root>/config.json` keeps mouse reporting and drag-to-copy off. The
+TUI keeps a copy of the text it printed and asks the terminal for the cursor
+position (`ESC[6n`) to place it on the screen.
 Text that other programs printed may not match what the drag covered. While
 the mouse is reported, the wheel no longer scrolls the terminal's scrollback
 and the terminal's own selection needs its modifier key (Shift in most

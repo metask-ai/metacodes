@@ -403,6 +403,7 @@ pub const tui_term = @import("repl/tui/term.zig");
 pub const tool_card = @import("repl/tui/widget/tool_card.zig");
 pub const tui_test_capture = @import("repl/tui/test_capture.zig");
 pub const repl_input = @import("repl/input.zig");
+pub const tui_copy_select = @import("repl/tui/copy_select.zig");
 pub const repl_complete = @import("repl/complete.zig");
 pub const repl_model_picker = @import("repl/model_picker.zig");
 pub const repl_model_picker_view = @import("repl/model_picker_view.zig");
@@ -1877,7 +1878,7 @@ pub fn main(init: std.process.Init) !void {
         break :app try app_mod.App.initWithOptions(gpa, init.io, config, api_key, init_options);
     };
     defer app.deinit();
-    if (interactive_tui) @import("repl/tui/copy_select.zig").enable(2);
+    if (interactive_tui) @import("repl/tui/copy_select.zig").enable(gpa, app.stateRoot(), 2);
 
     app.installSigintHandler() catch |err| {
         repl.stopSplash(splash);

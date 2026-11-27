@@ -27,7 +27,6 @@ pub const Key = union(enum) {
     char: u8,
     enter,
     shift_enter, // 插入换行而非提交（CSI u: ESC [ 13;2 u）
-    ctrl_enter, // 同上（CSI u: ESC [ 13;5 u）
     backspace,
     ctrl_a,
     ctrl_e,
@@ -59,6 +58,7 @@ pub const Key = union(enum) {
     ctrl_x, // Ctrl+X 前缀(配合 Ctrl+K kill 后台)
     ctrl_g, // 外部编辑器编辑当前 buffer
     ctrl_underscore, // Ctrl+_ / Ctrl+Shift+- (0x1f): undo
+    ctrl_z,
     paste_begin, // 括号粘贴起始 ESC[200~
     paste_end, // 括号粘贴结束 ESC[201~
     mouse: Mouse,
@@ -111,7 +111,7 @@ pub fn pastedByte(key: Key) ?u8 {
 ///   ESC [ 27;<mod>;<num> ~  xterm modifyOtherKeys,与 CSI u 同一张表(decodeModifiedKey)
 ///     - 9;2 = Shift+Tab
 ///     - 13;2 = Shift+Enter
-///     - 13;5 = Ctrl+Enter
+///     - 13;5 = Ctrl+Enter,和 Shift+Enter 一样换行
 ///   ESC [ < b;x;y M/m  SGR 鼠标报告(按下/拖动 M,松开 m)→ .mouse
 ///   ESC [ row;col R   光标位置应答(DSR 6n)→ .cursor_position
 ///   ESC [ M b x y     X10 鼠标报告(GNU screen 没把 SGR 鼠标模式转给外层终端时)→ 整条 .unknown
@@ -706,8 +706,7 @@ fn decodeModifiedKey(codepoint: u32, modifier: KeyModifier) Key {
             else => .unknown,
         },
         13 => if (modifier.alt) .shift_enter else switch (modifier) {
-            KeyModifier.shift_only => .shift_enter,
-            KeyModifier.ctrl_only => .ctrl_enter,
+            KeyModifier.shift_only, KeyModifier.ctrl_only => .shift_enter,
             else => .enter,
         },
         // 带修饰的 Esc(Shift/Ctrl+Esc)仍是 Esc:取消、关闭对它的每个使用方都一样
@@ -755,6 +754,7 @@ fn ctrlLetterKey(codepoint: u32) Key {
         108, 76 => .ctrl_l, // 'l' — external edit
         119, 87 => .ctrl_w, // 'w'
         121, 89 => .ctrl_y, // 'y'
+        122, 90 => .ctrl_z,
         95 => .ctrl_underscore, // '_' — undo
         47 => .ctrl_underscore,
         104, 72 => .backspace,
@@ -822,6 +822,7 @@ fn byteToKey(b: u8) Key {
         0x19 => .ctrl_y,
         0x0c => .ctrl_l,
         0x1f => .ctrl_underscore, // Ctrl+_ / Ctrl+Shift+- : undo
+        0x1a => .ctrl_z,
         // 可打印 ASCII：0x20-0x7E
         // UTF-8 多字节：0x80+（首字节 0xC0-0xFF，延续字节 0x80-0xBF）——逐字节作为 .char 透传
         // 终端在显示时会把完整 UTF-8 序列组合成一个字符
@@ -1329,6 +1330,11 @@ pub fn rescueTerminal() void {
     platform_term.restoreModeKeepingInput(g_rescue_fd, g_rescue_mode);
 }
 
+pub fn stopSelf() void {
+    if (@import("builtin").os.tag == .windows) return;
+    std.posix.raise(.TSTP) catch {};
+}
+
 const rescue_signals = struct {
     const fatal = [_]std.posix.SIG{ .ABRT, .QUIT, .ALRM, .SEGV, .BUS, .ILL, .FPE, .TRAP };
     var previous: [fatal.len]std.posix.Sigaction = undefined;
@@ -1576,9 +1582,6 @@ pub const LineEditor = struct {
                 self.cursor += 1;
                 return .redraw;
             },
-            // Ctrl+Enter(CSI-u 13;5u):真 cc v2.1.172 实测**不换行**(整个序列被吞:既不插
-            // \n 也不插字符),只 Shift+Enter 换行。对齐 → no-op。
-            .ctrl_enter => return .none,
             .backspace => {
                 if (self.cursor == 0) return .none;
                 const start = prevCharBoundary(self.buf.items, self.cursor);
@@ -1696,9 +1699,9 @@ pub const LineEditor = struct {
             // Esc is the prompt's double press (`ui.dispatch`: a second Esc
             // clears the draft) or, during a reply, the watcher's interrupt.
             .esc => return .none,
-            // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)由 dispatch(ui.zig)拦截,
+            // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L/Z)由 dispatch(ui.zig)拦截,
             // editor 正常收不到;此处兜底返 .none(防御:vim/边界路径若漏到这不崩)。
-            .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_b, .ctrl_g, .ctrl_x, .ctrl_l => return .none,
+            .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_b, .ctrl_g, .ctrl_x, .ctrl_l, .ctrl_z => return .none,
             .page_up, .page_down => return .none, // viewing 视口翻页键,editor 不处理(dispatch 拦截)
             .mouse, .cursor_position, .unknown => return .none,
         }
@@ -2138,10 +2141,18 @@ test "KeyParser: Shift+Enter via CSI u" {
     try testing.expect(p.feed('u').? == .shift_enter);
 }
 
-test "KeyParser: Ctrl+Enter via CSI u" {
+test "KeyParser: Ctrl+Z is one key as the legacy byte, CSI u and modifyOtherKeys send it" {
+    var p = KeyParser{};
+    try testing.expectEqual(Key.ctrl_z, p.feed(0x1a).?);
+    try expectSequence("\x1b[122;5u", .ctrl_z);
+    try expectSequence("\x1b[90;5u", .ctrl_z);
+    try expectSequence("\x1b[27;5;122~", .ctrl_z);
+}
+
+test "KeyParser: Ctrl+Enter via CSI u is a new line, as Shift+Enter is" {
     var p = KeyParser{};
     for ([_]u8{ 0x1b, '[', '1', '3', ';', '5' }) |b| try testing.expect(p.feed(b) == null);
-    try testing.expect(p.feed('u').? == .ctrl_enter);
+    try testing.expect(p.feed('u').? == .shift_enter);
 }
 
 test "KeyParser: 无 mod CSI-u 文本键还原(Kitty disambiguate)" {
@@ -2197,15 +2208,6 @@ test "LineEditor: shift_enter inserts newline without commit" {
     try testing.expectEqualStrings("a\nb", ed.view());
     // 真 enter 才 commit
     try testing.expect((try ed.handle(.enter)) == .commit);
-}
-
-test "LineEditor: ctrl_enter is no-op (对齐真 cc:只 shift_enter 换行)" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    _ = try ed.handle(Key{ .char = 'x' });
-    const action = try ed.handle(.ctrl_enter);
-    try testing.expect(action == .none); // 不换行、不提交
-    try testing.expectEqualStrings("x", ed.view()); // 缓冲不变,无 \n
 }
 
 test "LineEditor: no-op actions (esc / unknown)" {
@@ -2352,7 +2354,7 @@ test "KeyParser: modifyOtherKeys CSI 27;mod;key~ decodes through the CSI u table
     try expectSequence("\x1b[27;2;9~", .shift_tab);
     try expectSequence("\x1b[27;1;9~", .tab);
     try expectSequence("\x1b[27;2;13~", .shift_enter);
-    try expectSequence("\x1b[27;5;13~", .ctrl_enter);
+    try expectSequence("\x1b[27;5;13~", .shift_enter);
     try expectSequence("\x1b[27;1;13~", .enter);
     try expectSequence("\x1b[27;5;27~", .esc);
     try expectSequence("\x1b[27;5;99~", .ctrl_c);
@@ -2397,7 +2399,7 @@ test "KeyParser: Enter with the Alt bit is Shift+Enter in CSI u and modifyOtherK
     try testing.expect(p.feedQueued(0x1b, true) == null);
     try testing.expectEqual(Key.shift_enter, p.feedQueued('\r', false).?);
     try expectBothEncodings(13, 2, .shift_enter);
-    try expectBothEncodings(13, 5, .ctrl_enter);
+    try expectBothEncodings(13, 5, .shift_enter);
     try expectBothEncodings(13, 1, .enter);
     try expectBothEncodings(13, 6, .enter);
     try expectBothEncodings(13, 9, .enter);

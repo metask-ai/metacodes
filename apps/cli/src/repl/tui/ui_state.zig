@@ -217,6 +217,8 @@ pub const MenuDismissal = struct {
     }
 };
 
+pub const CopyNotice = enum { system_clipboard, terminal_clipboard, tmux_dropped };
+
 /// 每个交互阶段(input 与 generating)各自拥有一份、进入阶段时重建的交互状态。
 /// 键盘分发两期共用这一份语义,所以它是两个阶段 payload 的公共部分,而不是会话状态。
 pub const Interaction = struct {
@@ -252,7 +254,7 @@ pub const InputPhase = struct {
     /// Ctrl+U/K/W 杀行后显 `Ctrl+Y to paste deleted text` 提示(对齐 cc,框上方右对齐)。
     /// 杀行键置 true,下次打字(char)清 false。
     paste_hint: bool = false,
-    copied: bool = false,
+    copied: ?CopyNotice = null,
     /// Idle-prompt double-press confirmation (Ctrl+C / Ctrl+D exit, Esc clear).
     press: DoublePress = .{},
     /// Suggestion menus closed with Esc for the current draft.

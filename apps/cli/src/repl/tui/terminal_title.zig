@@ -3,7 +3,8 @@
 //! 对齐 codex `codex-rs/tui/src/terminal_title.rs`(参考实现)。机制:向 stdout 写一条
 //! OSC 0 序列 `\x1b]0;<title>\x07`,内容随 REPL 状态切换(idle / working / 需要输入)。
 //!
-//! **不读取/不恢复**终端原标题(跨终端不可移植);退出时清空我们写的标题(clear)。
+//! 进 REPL 时用标题栈存下原标题(save:XTWINOPS `CSI 22;0 t`),退出时清空我们写的标题再出栈
+//! (restore:`CSI 23;0 t`):认标题栈的终端回到原标题,不认的终端忽略出栈、留下空标题。
 //!
 //! **消毒**:标题从不可信来源拼装(cwd/model 文本),写进 OSC 前必须剥离:
 //! - 控制字符(会截断/重塑转义序列)
@@ -45,10 +46,15 @@ fn buildSequence(out: []u8, sanitized: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(out, "\x1b]0;{s}\x07", .{sanitized}) catch null;
 }
 
-/// 清空我们写的标题(退出 REPL 时)。不恢复 shell/前一个程序设的原标题(不可移植)。
-pub fn clear() void {
-    if (!platform_term.isatty(1)) return;
-    writeAll(1, "\x1b]0;\x07");
+pub const save_sequence = "\x1b[22;0t";
+pub const restore_sequence = "\x1b]0;\x07" ++ "\x1b[23;0t";
+
+pub fn save() void {
+    if (enabled()) writeAll(1, save_sequence);
+}
+
+pub fn restore() void {
+    if (enabled()) writeAll(1, restore_sequence);
 }
 
 /// 门控:stdout 是 tty 且未经 METACODES_NO_TERMINAL_TITLE 关闭。
