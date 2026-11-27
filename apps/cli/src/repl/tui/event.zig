@@ -101,6 +101,7 @@ pub const KeyEvent = struct {
     /// Monotonic milliseconds of the press; the idle prompt's double-press
     /// confirmations (Ctrl+C, Ctrl+D, Esc) measure their window with it.
     now_ms: i64 = 0,
+    pasted: bool = false,
 };
 pub const ResizeEvent = struct { cols: u16, rows: u16 };
 pub const UsageEvent = struct {

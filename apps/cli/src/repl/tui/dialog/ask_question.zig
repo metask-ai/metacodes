@@ -580,7 +580,7 @@ fn runTimed(
     var drawn: ?reflow.Anchor = null;
     const reflows = term.reflowFromEnv();
     var parser = input_mod.KeyParser{};
-    var gate = answer_gate.Gate.init(timing, util_time.nowNs());
+    var gate = answer_gate.Gate.init(timing);
     while (true) {
         for (qs[0..nq], 0..) |s, qi| answered_flags[qi] = s.answered;
         // 单问完成:advanceView 把 view 推过末尾(== nq)→ finalize 返回(无 Submit 视图)。
@@ -625,6 +625,7 @@ fn runTimed(
         defer alloc.free(r.frame);
         writeAll(out_fd, r.frame);
         drawn = reflow.Anchor.atEnd(r.frame, frame_cols);
+        gate.shown(util_time.nowNs());
 
         const key = switch (input_mod.readKey(in_fd, &parser)) {
             .key => |key| key,
@@ -1427,4 +1428,61 @@ test "run answers only a key that follows a quiet spell: Enter typed as the box 
             try testing.expectError(error.InputAborted, result);
         }
     }
+}
+
+test "run counts the quiet spell from when the box is on screen: a key typed while a slow terminal takes the first frame does not pick an option" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const sync = @import("metacodes-internal").platform.sync;
+    var screen: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&screen));
+    defer _ = std.c.close(screen[0]);
+    const blocking = std.c.fcntl(screen[1], std.c.F.GETFL);
+    try testing.expect(blocking >= 0);
+    const nonblocking_bit: c_int = @bitCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+    try testing.expect(std.c.fcntl(screen[1], std.c.F.SETFL, blocking | nonblocking_bit) >= 0);
+    try testing.expect(std.c.fcntl(screen[1], std.c.F.GETFL) & nonblocking_bit != 0);
+    const filler = [_]u8{'.'} ** 512;
+    while (pfs.write(screen[1], &filler) > 0) {}
+    while (pfs.write(screen[1], filler[0..1]) > 0) {}
+    try testing.expect(std.c.fcntl(screen[1], std.c.F.SETFL, blocking) >= 0);
+    const Terminal = struct {
+        fn takeFramesAfter(fd: c_int, stall_ms: u32) void {
+            sync.sleepMs(stall_ms);
+            var taken: [4096]u8 = undefined;
+            while (pfs.read(fd, &taken) != 0) {}
+        }
+        fn typeKeys(fd: c_int) void {
+            sync.sleepMs(300);
+            _ = pfs.writeAll(fd, "2");
+            sync.sleepMs(700);
+            _ = pfs.writeAll(fd, "1");
+            sync.sleepMs(300);
+            _ = std.c.close(fd);
+        }
+    };
+    const opts = [_]ctx.AskOption{ mkOpt("Red", ""), mkOpt("Blue", "") };
+    const one = [_]ctx.AskQuestion{.{ .question = "Color?", .header = "C", .multi = false, .options = &opts }};
+    var keys: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&keys));
+    defer _ = std.c.close(keys[0]);
+    var answers: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (answers.items) |it| a.free(@constCast(it));
+        answers.deinit(a);
+    }
+    const terminal = try std.Thread.spawn(.{}, Terminal.takeFramesAfter, .{ screen[0], 600 });
+    const typist = try std.Thread.spawn(.{}, Terminal.typeKeys, .{keys[1]});
+    const timing: answer_gate.Timing = .{ .quiet_ms = 200, .paste_gap_ms = answer_gate.Timing.interactive.paste_gap_ms };
+    const saved_fd2 = std.c.dup(2);
+    _ = std.c.dup2(screen[1], 2);
+    const result = runTimed(a, theme_mod.monochrome, keys[0], &one, &answers, 80, timing);
+    _ = std.c.dup2(saved_fd2, 2);
+    _ = std.c.close(saved_fd2);
+    _ = std.c.close(screen[1]);
+    terminal.join();
+    typist.join();
+    try result;
+    try testing.expectEqual(@as(usize, 1), answers.items.len);
+    try testing.expectEqualStrings("Red", answers.items[0]);
 }

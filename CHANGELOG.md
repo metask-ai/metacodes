@@ -787,6 +787,26 @@ status, compatibility boundaries, and entry points are defined by
   protocol and entry point. An interrupt while the answer is awaited no
   longer prints an error line.
 
+- **A paste without bracketed paste markers is typed as text, not as
+  keys that open or pick from menus.** In a terminal that sends pastes
+  unmarked (GNU screen 4, for one), a paste starting with `?` opened the
+  shortcut panel and lost the `?`, a Tab in it ran completion (and was
+  dropped during a reply), and once its text opened the `/` or `@` menu
+  the next line break in it picked the highlighted command or file:
+  pasting `/he` and a second line ran `/help`, `/c` and a line ran
+  `/clear`. The keys of such a paste, text that arrives together, now go
+  into the input box as a marked paste would: `?` and Tab stay in the
+  text, line breaks break the line, and the Enter that ends a one-line
+  paste sends what was pasted. Keys typed one at a time open the panel,
+  complete and pick from the menus as before.
+
+- **A dialog drawn on a slow terminal no longer takes a key typed while it
+  appeared as its answer.** The permission and AskUserQuestion dialogs
+  started their 400 ms wait before their box was written, so when the
+  terminal took longer than that to show it, a key typed in the meantime
+  answered the dialog. The wait now starts when the box is on screen, and
+  a redraw while the dialog is still waiting starts it again.
+
 - **Signing in over SSH no longer waits forever for a browser that cannot come
   back** (#722). `metacodes login` and `/login` sent the browser back to
   `http://localhost:1455`, which on a machine reached over SSH is not where

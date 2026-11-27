@@ -704,9 +704,9 @@ pub const TuiBackend = struct {
             if (rc <= 0) {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
-                    self.routeKey(snap, k, editor, &paste);
+                    self.routeKey(snap, k, parser.pasting(), editor, &paste);
                     // Alt+] 兑现成 ESC 后,']'(和其后的数字)在 pending 里。
-                    while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &paste);
+                    while (parser.drain()) |k2| self.routeKey(snap, k2, parser.pasting(), editor, &paste);
                 } else {
                     // Ctrl+C 走 SIGINT handler,只能置原子标志;标志只在流事件之间被检查,
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
@@ -741,14 +741,14 @@ pub const TuiBackend = struct {
             }
             dead_reads = 0;
 
-            const key = (if (self.region.escapeClosesOverlay()) parser.feedRead(fd, b[0]) else parser.feedEditorRead(fd, b[0])) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
-            self.routeKey(snap, key, editor, &paste);
+            const key = (if (self.region.overlayTakesKeys()) parser.feedRead(fd, b[0]) else parser.feedEditorRead(fd, b[0])) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
+            self.routeKey(snap, key, parser.pasting(), editor, &paste);
             // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
-            while (parser.drain()) |k2| self.routeKey(snap, k2, editor, &paste);
+            while (parser.drain()) |k2| self.routeKey(snap, k2, parser.pasting(), editor, &paste);
         }
     }
 
-    fn routeKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, ed: *input.LineEditor, paste: *?ReplyPaste) void {
+    fn routeKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, from_paste: bool, ed: *input.LineEditor, paste: *?ReplyPaste) void {
         if (paste.*) |*open| {
             if (key != .paste_end) {
                 if (input.pastedByte(key)) |byte| open.add(byte);
@@ -774,7 +774,7 @@ pub const TuiBackend = struct {
             }
             return;
         }
-        self.handleKey(snap, key, ed);
+        self.handleKey(snap, key, from_paste, ed);
     }
 
     fn pasteIntoPicker(self: *TuiBackend, snap: InputCtx.Snapshot, text: []const u8) void {
@@ -819,9 +819,9 @@ pub const TuiBackend = struct {
     /// 关键:enter/esc 也经 dispatch 先过一遍 → overlay/help 开着时它们被 dispatch 路由消费
     /// (transcript 期 enter 被 dispatchTranscriptKey 忽略,不会误入队;help 期 esc 只关 help)。
     /// esc 优先级:overlay 开→关 overlay;help 开→关 help;都关→中断(先关弹层再中断)。
-    fn handleKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, ed: *input.LineEditor) void {
+    fn handleKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, pasted: bool, ed: *input.LineEditor) void {
         const app = snap.app orelse return;
-        const eff = self.region.applyGenKey(app, &app.conversation, key, ed.view(), ed.cursor);
+        const eff = self.region.applyGenKey(app, &app.conversation, key, pasted, ed.view(), ed.cursor);
 
         // dispatch 上抛的全局 LoopAction:生成期能执行的(两期共享:cycle_perm_mode/redraw_screen/
         // kill_background)在此处理,IO 体属生成期调用方。dispatch 已 gate 掉生成期无意义的键
@@ -998,19 +998,19 @@ test "a paste during a reply reaches an open picker as one event: no key of it, 
     defer if (paste) |*open| open.deinit();
 
     region.ui.interaction().?.picker_open = true;
-    backend.routeKey(snap, .paste_begin, &editor, &paste);
+    backend.routeKey(snap, .paste_begin, false, &editor, &paste);
     try std.testing.expect(paste != null and paste.? == .picker);
-    for ("zai") |byte| backend.routeKey(snap, .{ .char = byte }, &editor, &paste);
-    backend.routeKey(snap, .enter, &editor, &paste);
-    backend.routeKey(snap, .{ .char = 'x' }, &editor, &paste);
+    for ("zai") |byte| backend.routeKey(snap, .{ .char = byte }, false, &editor, &paste);
+    backend.routeKey(snap, .enter, false, &editor, &paste);
+    backend.routeKey(snap, .{ .char = 'x' }, false, &editor, &paste);
     try std.testing.expectEqualStrings("zai", paste.?.picker.text());
     try std.testing.expect(paste.?.picker.ended);
-    backend.routeKey(snap, .paste_end, &editor, &paste);
+    backend.routeKey(snap, .paste_end, false, &editor, &paste);
     try std.testing.expect(paste == null);
     try std.testing.expectEqualStrings("queued draft", editor.view());
 
     region.ui.interaction().?.picker_open = false;
-    backend.routeKey(snap, .paste_begin, &editor, &paste);
+    backend.routeKey(snap, .paste_begin, false, &editor, &paste);
     try std.testing.expect(paste != null and paste.? == .draft);
 }
 
@@ -1027,12 +1027,12 @@ test "a paste during a reply with no picker open goes into the draft whole, its 
     var paste: ?ReplyPaste = null;
     defer if (paste) |*open| open.deinit();
 
-    backend.routeKey(snap, .paste_begin, &editor, &paste);
-    for ("one") |byte| backend.routeKey(snap, .{ .char = byte }, &editor, &paste);
-    backend.routeKey(snap, .enter, &editor, &paste);
-    for ("two") |byte| backend.routeKey(snap, .{ .char = byte }, &editor, &paste);
+    backend.routeKey(snap, .paste_begin, false, &editor, &paste);
+    for ("one") |byte| backend.routeKey(snap, .{ .char = byte }, false, &editor, &paste);
+    backend.routeKey(snap, .enter, false, &editor, &paste);
+    for ("two") |byte| backend.routeKey(snap, .{ .char = byte }, false, &editor, &paste);
     try std.testing.expectEqualStrings("draft: ", editor.view());
-    backend.routeKey(snap, .paste_end, &editor, &paste);
+    backend.routeKey(snap, .paste_end, false, &editor, &paste);
     try std.testing.expect(paste == null);
     try std.testing.expectEqualStrings("draft: one\ntwo", editor.view());
     try std.testing.expectEqual(editor.view().len, editor.cursor);
@@ -1063,9 +1063,9 @@ test "a long paste during a reply is held as a placeholder, and the queued messa
     defer if (paste) |*open| open.deinit();
 
     const text = "l1\nl2\nl3\nl4\nl5";
-    backend.routeKey(snap, .paste_begin, &editor, &paste);
-    for (text) |byte| backend.routeKey(snap, if (byte == '\n') .enter else .{ .char = byte }, &editor, &paste);
-    backend.routeKey(snap, .paste_end, &editor, &paste);
+    backend.routeKey(snap, .paste_begin, false, &editor, &paste);
+    for (text) |byte| backend.routeKey(snap, if (byte == '\n') .enter else .{ .char = byte }, false, &editor, &paste);
+    backend.routeKey(snap, .paste_end, false, &editor, &paste);
     try std.testing.expect(std.mem.startsWith(u8, editor.view(), "[Pasted text #"));
     try std.testing.expect(std.mem.endsWith(u8, editor.view(), " +4 lines]"));
 
