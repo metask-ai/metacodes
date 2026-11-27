@@ -125,7 +125,7 @@ def test_logout_onto_a_preset_without_its_key_says_which_key_and_where(bin_path)
                   term_size=(30, 160))
         screen = _screen(TTYAssert(raw, rows=30, cols=160))
         assert "No model is set up now: the preset fast needs a key for Prov B." in screen, screen
-        assert f"Set PROV_B_TOKEN in {os.path.join(state, '.env')}" in screen, screen
+        assert f"/login prov-b, or set PROV_B_TOKEN in {os.path.join(state, '.env')}" in screen, screen
         assert "Switched to" not in screen, screen
         assert preset_relay.requests == [] and relay.requests == [] and mock.messages == [], \
             (preset_relay.requests, relay.requests, mock.messages)
