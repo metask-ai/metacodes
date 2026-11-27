@@ -498,6 +498,9 @@ pub const App = struct {
     /// Borrowed from the host.
     startup_notice: ?[]const u8 = null,
     command_name: []const u8 = "",
+    command_line_endpoint: ?CommandLineEndpoint = null,
+    handed_key: ?[]const u8 = null,
+    handed_key_owner: ?provider_ids_mod.Slug = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
@@ -832,6 +835,24 @@ pub const App = struct {
         /// `App.startup_notice`; borrowed for the App's life.
         startup_notice: ?[]const u8 = null,
         command_name: []const u8 = "",
+        command_line_base_url: ?[]const u8 = null,
+        handed_key: ?[]const u8 = null,
+    };
+
+    pub const CommandLineEndpoint = struct {
+        base_url: []u8,
+        endpoint: []u8,
+
+        fn init(allocator: std.mem.Allocator, base_url: []const u8, endpoint: []const u8) error{OutOfMemory}!CommandLineEndpoint {
+            const url = try allocator.dupe(u8, base_url);
+            errdefer allocator.free(url);
+            return .{ .base_url = url, .endpoint = try allocator.dupe(u8, endpoint) };
+        }
+
+        fn deinit(self: CommandLineEndpoint, allocator: std.mem.Allocator) void {
+            allocator.free(self.base_url);
+            allocator.free(self.endpoint);
+        }
     };
 
     pub const LocalRoute = presets_mod.LocalRoute;
@@ -905,6 +926,8 @@ pub const App = struct {
             .local_route = options.local_route,
             .startup_notice = options.startup_notice,
             .command_name = options.command_name,
+            .handed_key = options.handed_key,
+            .handed_key_owner = if (options.handed_key != null) startProvider(config) else null,
             .openrouter_background = options.models_cache and std.c.getenv("METACODES_NO_PROBE") == null,
             // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
             // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
@@ -1299,7 +1322,7 @@ pub const App = struct {
             .dialect_resolver = app_dialect_resolver,
             .limits = model_limits,
             .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
-            .teammate_args = .{ .ctx = app, .appendFn = appendTeammateArgs },
+            .teammate_args = .{ .ctx = app, .appendFn = appendTeammateArgs, .handedKeyFn = handedTeammateKey },
         };
 
         // LSP 服务(默认开,`--no-lsp` 关)。**建 Service ≠ 起 language server**:这里只装一个
@@ -1340,6 +1363,10 @@ pub const App = struct {
             .observer = .{ .ctx = app, .changed = goalChanged },
         };
         app.user_context = app.buildUserContext();
+
+        if (options.command_line_base_url) |url| {
+            app.command_line_endpoint = CommandLineEndpoint.init(allocator, url, app.api_client.base_url) catch null;
+        }
 
         // The process OTLP exporter lives while any App does; the last
         // `deinit` flushes it (telemetry.zig). Nothing fails after this point.
@@ -1461,20 +1488,46 @@ pub const App = struct {
         return app.appendTeammateRouteArgs(arena, out);
     }
 
+    fn handedTeammateKey(ctx: *anyopaque) ?[]const u8 {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        return app.teammateKey();
+    }
+
+    pub fn teammateKey(app: *App) ?[]const u8 {
+        const handed = app.handed_key orelse return null;
+        if (handed.len == 0 or handed.len > @import("metacodes-internal").swarm.teammate_process.max_handed_key_bytes) return null;
+        if (app.unbound() != null or !std.mem.eql(u8, app.api_key, handed)) return null;
+        const owner = app.handed_key_owner orelse return null;
+        const named = app.leadRoute().provider orelse return null;
+        return if (owner.eqlText(named)) handed else null;
+    }
+
+    fn teammateBaseUrl(app: *const App) ?[]const u8 {
+        const kept = app.command_line_endpoint orelse return null;
+        return if (std.mem.eql(u8, app.api_client.base_url, kept.endpoint)) kept.base_url else null;
+    }
+
     fn teammateRoute(app: *App) teammate_route.Route {
+        var route = app.leadRoute();
+        if (app.teammateKey() != null) route.base_url = app.teammateBaseUrl();
+        return route;
+    }
+
+    fn leadRoute(app: *App) teammate_route.Route {
         const effort = app.config.reasoning_effort;
-        if (app.provider_host) |host| {
-            if (host.kernel.currentOfferId()) |current| {
-                const found = host.kernel.catalogSnapshot().find(current) orelse
-                    (if (host.retired) |*previous| previous.find(current) else null);
-                if (found) |offer| return .ofOffer(offer, effort);
-            }
-        }
-        return .{
+        var route: teammate_route.Route = .{
             .provider = app.config.resolved_provider_id orelse app.config.provider_profile,
             .model = app.activeModel(),
             .reasoning_effort = effort,
         };
+        if (app.provider_host) |host| {
+            if (host.kernel.currentOfferId()) |current| {
+                const found = host.kernel.catalogSnapshot().find(current) orelse
+                    (if (host.retired) |*previous| previous.find(current) else null);
+                if (found) |offer| route = .ofOffer(offer, effort);
+            }
+        }
+        return route;
     }
 
     /// The banner's model line: `not set — /login, or configure .env`, or the
@@ -2536,6 +2589,8 @@ pub const App = struct {
         const allocator = app.allocator;
         const state_root_default = app.state_root_default;
         defer if (state_root_default) |owned| allocator.free(owned);
+        const command_line_endpoint = app.command_line_endpoint;
+        defer if (command_line_endpoint) |kept| kept.deinit(allocator);
         // Every background worker stops (and is joined) before anything it
         // shares is freed; a host may already have done this (idempotent).
         app.stopBackgroundWork();
@@ -3834,11 +3889,12 @@ pub const App = struct {
     /// provider instead of falling back to Metask.
     fn cliApiKey(config: types.Config) ?provider_binding_mod.ScopedSecret {
         const secret = config.api_key orelse return null;
-        const owner = if (config.provider_profile == null)
-            provider_ids_mod.Slug.lit("metask")
-        else
-            provider_ids_mod.Slug.parse(config.resolved_provider_id orelse return null) catch return null;
-        return .{ .provider_id = owner, .secret = secret };
+        return .{ .provider_id = startProvider(config) orelse return null, .secret = secret };
+    }
+
+    fn startProvider(config: types.Config) ?provider_ids_mod.Slug {
+        if (config.provider_profile == null) return provider_ids_mod.Slug.lit("metask");
+        return provider_ids_mod.Slug.parse(config.resolved_provider_id orelse return null) catch null;
     }
 
     /// Move the live session onto a committed selection.

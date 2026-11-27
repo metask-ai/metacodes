@@ -44,6 +44,13 @@ LEAD_TURNS = [
     _sse([("text", "LEAD-SAW-TEAMMATE")]),
 ]
 LEAD_TURNS_WITHOUT_A_MESSAGE = [LEAD_TURNS[0], LEAD_TURNS[1], LEAD_TURNS[3], LEAD_TURNS[4]]
+LEAD_TURNS_NAMING_A_MODEL = [
+    LEAD_TURNS[0],
+    _sse([("text", "spawning"), ("tool", ("Task", {"name": "worker", "description": "w",
+                                                    "prompt": MARK + " reply briefly", "model": "a-model-2"}))]),
+    LEAD_TURNS[3],
+    LEAD_TURNS[4],
+]
 TEAMMATE_TURN = _sse([("text", "TEAMMATE-REPLY")])
 
 
@@ -107,7 +114,8 @@ def _provider(letter, origin):
     return {"display_name": "Prov " + letter.upper(), "credential_kinds": ["api_key"],
             "env_aliases": [{"name": "PROV_%s_TOKEN" % letter.upper(), "kind": "api_key", "canonical": True}],
             "channels": [{"id": "primary", "base_url": "%s/%s" % (origin, letter), "protocol": "anthropic_messages"}],
-            "models": [{"request_model_id": letter + "-model", "display_name": letter.upper() + " model"}]}
+            "models": [{"request_model_id": letter + "-model", "display_name": letter.upper() + " model"},
+                       {"request_model_id": letter + "-model-2", "display_name": letter.upper() + " model 2"}]}
 
 
 def _workspace(origin, global_default):
@@ -186,3 +194,13 @@ def test_a_process_teammate_starts_on_its_task_prompt_without_a_message_from_the
     first = json.dumps(seen[0].first_teammate_messages[0])
     assert MARK + " reply briefly" in first, "the teammate's first turn is not its Task prompt: %s" % first
     assert len(lead) >= 4, "the lead was not woken by the teammate's report: %d requests" % len(lead)
+
+
+def test_a_process_teammate_asks_for_the_model_its_task_names_without_the_leads_effort(bin_path):
+    lead, teammate = _run_team(bin_path, global_default=True, lead_turns=LEAD_TURNS_NAMING_A_MODEL)
+    assert lead and lead[0]["output_config"], "the lead should run at the preset's reasoning effort: %r" % lead
+    assert teammate, "the process teammate sent no request"
+    for seen in teammate:
+        assert seen["path"] == "/a/v1/messages", "the teammate went to another provider: %r" % seen
+        assert seen["model"] == "a-model-2", "the teammate did not ask for the model its Task named: %r" % seen
+        assert seen["output_config"] is None, "a model the Task names runs at its own default effort: %r" % seen
