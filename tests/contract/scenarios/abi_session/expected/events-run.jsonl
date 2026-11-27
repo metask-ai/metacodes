@@ -3,9 +3,8 @@
 {"run_state":{"run_id":1,"transition_seq":2,"phase":"generating","turn":1,"tool_calls":0,"in_flight_tools":[]}}
 {"progress":{"turn":1,"tool_name":"","tool_input":"","tool_calls":0}}
 {"output_segment_begin":{"index":0,"turn":1,"group":0}}
-{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"text_chunk":"Reading the notes."}
-{"usage":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+{"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"stream_done":{}}
 {"output_segment_end":{"index":0,"turn":1,"group":0,"disposition":"commentary","bytes":18}}
 {"run_state":{"run_id":1,"transition_seq":3,"phase":"executing_tools","turn":1,"tool_calls":0,"in_flight_tools":[{"tool_call_id":"toolu_01","name":"Read"}]}}
@@ -15,9 +14,8 @@
 {"run_state":{"run_id":1,"transition_seq":5,"phase":"generating","turn":2,"tool_calls":1,"in_flight_tools":[]}}
 {"progress":{"turn":2,"tool_name":"","tool_input":"","tool_calls":1}}
 {"output_segment_begin":{"index":1,"turn":2,"group":1}}
-{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"text_chunk":"The notes say alpha."}
-{"usage":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+{"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"stream_done":{}}
 {"output_segment_end":{"index":1,"turn":2,"group":1,"disposition":"final","bytes":20}}
 {"run_state":{"run_id":1,"transition_seq":6,"phase":"finalizing","turn":2,"tool_calls":1,"in_flight_tools":[]}}
