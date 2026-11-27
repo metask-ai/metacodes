@@ -42,6 +42,7 @@ const log = @import("metacodes-base").util.log;
 const pfs = @import("platform").fs;
 const process_mod = @import("platform").process;
 const SessionId = @import("metacodes-kernel").session_id.SessionId;
+const ReasoningEffort = @import("metacodes-ai").types.ReasoningEffort;
 
 pub const Identity = struct {
     name: []const u8, // 未清洗(内部 sanitize)
@@ -443,7 +444,76 @@ pub const SpawnProcessParams = struct {
     state_root: []const u8,
     /// 额外 CLI flag 透传(如 --agent-teams --model X);借用。
     extra_flags: []const []const u8 = &.{},
+    handed_key: ?[]const u8 = null,
+    drop_env: []const []const u8 = &.{},
 };
+
+pub const TaskEffort = union(enum) {
+    lead,
+    model_default,
+    level: ReasoningEffort,
+};
+
+pub const TaskRoute = struct {
+    model: ?[]const u8 = null,
+    effort: TaskEffort = .lead,
+};
+
+pub const handed_key_fd: c_int = 3;
+pub const max_handed_key_bytes = 4096;
+const key_fd_variable = "METACODES_API_KEY_FD";
+
+fn applyTaskRoute(arena: std.mem.Allocator, flags: *std.ArrayList([]const u8), route: TaskRoute) error{OutOfMemory}!void {
+    if (route.model) |model| try flags.appendSlice(arena, &.{ "--model", try arena.dupe(u8, model) });
+    switch (route.effort) {
+        .lead => {},
+        .model_default => dropFlagWithValue(flags, "--reasoning-effort"),
+        .level => |level| try flags.appendSlice(arena, &.{ "--reasoning-effort", level.name() }),
+    }
+}
+
+fn dropFlagWithValue(flags: *std.ArrayList([]const u8), flag: []const u8) void {
+    var i: usize = 0;
+    while (i < flags.items.len) {
+        if (!std.mem.eql(u8, flags.items[i], flag)) {
+            i += 1;
+            continue;
+        }
+        _ = flags.orderedRemove(i);
+        if (i < flags.items.len) _ = flags.orderedRemove(i);
+    }
+}
+
+pub fn buildTeammateEnv(a: std.mem.Allocator, environ: [*:null]const ?[*:0]const u8, key_fd: ?c_int, drop: []const []const u8) ![]?[*:0]const u8 {
+    var list: std.ArrayList(?[*:0]const u8) = .empty;
+    errdefer list.deinit(a);
+    var i: usize = 0;
+    while (environ[i]) |entry| : (i += 1) {
+        const text = std.mem.span(entry);
+        if (namesVariable(text, key_fd_variable)) continue;
+        if (for (drop) |name| {
+            if (namesVariable(text, name)) break true;
+        } else false) continue;
+        try list.append(a, entry);
+    }
+    var owned: ?[:0]u8 = null;
+    errdefer if (owned) |entry| a.free(entry);
+    if (key_fd) |fd| {
+        owned = try std.fmt.allocPrintSentinel(a, key_fd_variable ++ "={d}", .{fd}, 0);
+        try list.append(a, owned.?.ptr);
+    }
+    try list.append(a, null);
+    return list.toOwnedSlice(a);
+}
+
+fn namesVariable(entry: []const u8, name: []const u8) bool {
+    return entry.len > name.len and entry[name.len] == '=' and std.mem.eql(u8, entry[0..name.len], name);
+}
+
+pub fn freeTeammateEnv(a: std.mem.Allocator, env: []?[*:0]const u8, key_fd: ?c_int) void {
+    if (key_fd != null and env.len >= 2) if (env[env.len - 2]) |entry| a.free(std.mem.span(entry));
+    a.free(env);
+}
 
 /// 构造 teammate 子进程 argv(可测)。exe = 自身可执行文件;身份 + cwd + 透传 flag。
 /// 返回 owned `[]?[*:0]const u8`(execve 格式,末尾 null);字符串挂 allocator,caller free(freeArgv)。
@@ -572,6 +642,7 @@ pub fn spawnTeammateProcess(
     /// lead 的 LSP 是否在位。false → 给子进程带上 `--no-lsp`。LSP 默认开之后不带就等于
     /// "lead 关了、teammate 照样起 rust-analyzer",逃生口在进程边界上漏掉。
     lsp_enabled: bool,
+    task_route: TaskRoute,
 ) !i64 {
     const a = sw.allocator;
     const parent_id = SessionId.fromSlice(parent_session) orelse return error.InvalidSession;
@@ -647,6 +718,8 @@ pub fn spawnTeammateProcess(
     try flags.append(fa, "--no-preview");
     if (!sw.preview.eql(.none)) try flags.append(fa, sw.preview.enableArg(&preview_arg));
     if (sw.teammate_args) |host_args| try host_args.append(fa, &flags);
+    try applyTaskRoute(fa, &flags, task_route);
+    const handed: ?swarm_ctx.HandedKey = if (sw.teammate_args) |host_args| host_args.handedKey() else null;
     const pid = try spawn_fn(a, .{
         .name = name_s,
         .team = sw.team_sanitized,
@@ -655,6 +728,8 @@ pub fn spawnTeammateProcess(
         .cwd = effective_wt,
         .state_root = sw.state_root,
         .extra_flags = flags.items,
+        .handed_key = if (handed) |h| h.key else null,
+        .drop_env = if (handed) |h| h.drop_env else &.{},
     });
     // The child is live but not yet owned by process_teammates. Any
     // allocation/append failure below must terminate and reap it before the
@@ -700,23 +775,37 @@ pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !i64 {
     if (@import("builtin").os.tag == .windows) return error.Unsupported;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = selfExePath(&exe_buf) orelse return error.NoSelfExe;
+    return forkExecTeammateAt(a, exe, p);
+}
+
+pub fn forkExecTeammateAt(a: std.mem.Allocator, exe: []const u8, p: SpawnProcessParams) !i64 {
+    if (@import("builtin").os.tag == .windows) return error.Unsupported;
+    if (p.handed_key) |key| if (key.len == 0 or key.len > max_handed_key_bytes) return error.HandedKeyTooLong;
     // **全部分配在 fork 之前**(Linus SW6:fork 与 execve 之间只允许 async-signal-safe 调用,
     // 分配器加锁非 async-signal-safe,子进程里 dupeZ 可能死锁)。argv[0] 已是 exe 的 [*:0],
     // execve 直接用它,子进程不再分配。
     const argv = try buildTeammateArgv(a, exe, p);
     defer freeArgv(a, argv);
     const exe_path_z: [*:0]const u8 = argv[0].?; // argv[0] = dupeZ(exe),NUL 结尾
+    const key_fd: ?c_int = if (p.handed_key != null) handed_key_fd else null;
+    const envp = try buildTeammateEnv(a, @ptrCast(std.c.environ), key_fd, p.drop_env);
+    defer freeTeammateEnv(a, envp, key_fd);
 
     // 与 platform/process 的 spawn 共用 fork 串行锁:这个 fork 不能落在别处"建了 pipe
     // 还没关子进程侧"的窗口里,否则那条 pipe 会跟着进 teammate 进程,对方永远等不到 EOF。
     process_mod.forkSerialLock();
+    const key_read: c_int = if (p.handed_key) |key| keyPipe(key) catch |err| {
+        process_mod.forkSerialUnlock();
+        return err;
+    } else -1;
     const pid = std.c.fork();
     if (pid < 0) {
         process_mod.forkSerialUnlock();
+        if (key_read >= 0) _ = std.c.close(key_read);
         return error.ForkFailed;
     }
     if (pid == 0) {
-        // 子进程:只用 async-signal-safe 调用(setsid/open/dup2/close/execve),不分配。
+        // 子进程:只用 async-signal-safe 调用(setsid/open/dup2/fcntl/close/execve),不分配。
         _ = std.c.setsid();
         const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
         if (devnull >= 0) {
@@ -725,12 +814,42 @@ pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !i64 {
             _ = std.c.dup2(devnull, 2);
             if (devnull > 2) _ = std.c.close(devnull);
         }
+        if (key_read >= 0) {
+            if (key_read == handed_key_fd) {
+                _ = std.c.fcntl(handed_key_fd, std.c.F.SETFD, @as(c_int, 0));
+            } else if (std.c.dup2(key_read, handed_key_fd) < 0) std.c._exit(127);
+        }
         @import("platform").signal.defaultBrokenPipeInChild();
-        _ = std.c.execve(exe_path_z, @ptrCast(argv.ptr), @ptrCast(std.c.environ));
+        _ = std.c.execve(exe_path_z, @ptrCast(argv.ptr), @ptrCast(envp.ptr));
         std.c._exit(127); // execve 失败
     }
     process_mod.forkSerialUnlock();
+    if (key_read >= 0) _ = std.c.close(key_read);
     return @intCast(pid); // 父进程:返回子 pid(i64 平台中立)
+}
+
+fn keyPipe(key: []const u8) !c_int {
+    var fds: [2]c_int = undefined;
+    if (std.c.pipe(&fds) != 0) return error.KeyPipeFailed;
+    errdefer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    for (fds) |fd| {
+        if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0) return error.KeyPipeFailed;
+    }
+    var rest = key;
+    while (rest.len > 0) {
+        const n = std.c.write(fds[1], rest.ptr, rest.len);
+        if (n < 0) {
+            if (pfs.lastErrnoIs(.INTR)) continue;
+            return error.KeyPipeFailed;
+        }
+        rest = rest[@intCast(n)..];
+    }
+    if (fds[0] > 2) return fds[0];
+    const above_stdio = std.c.fcntl(fds[0], std.c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+    if (above_stdio < 0) return error.KeyPipeFailed;
+    _ = std.c.close(fds[0]);
+    return above_stdio;
 }
 
 // ============================================================================
@@ -826,6 +945,49 @@ test "process ownership requires lead session and per-spawn lease" {
     try testing.expect(!ownsPersistedMember(a, cfg, "worker", session, other_lease, ""));
     try testing.expect(!ownsPersistedMember(a, cfg, "worker", other_lease, lease, ""));
     try testing.expect(!ownsPersistedMember(a, cfg, "worker", session, lease, "/wrong-worktree"));
+}
+
+test "buildTeammateEnv: a handed key puts its descriptor in METACODES_API_KEY_FD and drops what the host names, and without one a stale number is dropped" {
+    const a = testing.allocator;
+    const environ = [_:null]?[*:0]const u8{ "HOME=/home/lead", "METACODES_API_KEY_FD=9", "PATH=/bin", "METACODES_API_KEY_FDX=1", "METASK_API_KEY=sk-ambient", "METASK_API_KEY_OTHER=x" };
+    for ([_]?c_int{ handed_key_fd, null }) |key_fd| {
+        const drop: []const []const u8 = if (key_fd != null) &.{"METASK_API_KEY"} else &.{};
+        const env = try buildTeammateEnv(a, &environ, key_fd, drop);
+        defer freeTeammateEnv(a, env, key_fd);
+        var names: std.ArrayList(u8) = .empty;
+        defer names.deinit(a);
+        for (env[0 .. env.len - 1]) |entry| {
+            try names.appendSlice(a, std.mem.span(entry.?));
+            try names.append(a, ';');
+        }
+        try testing.expect(env[env.len - 1] == null);
+        const expected = if (key_fd != null)
+            "HOME=/home/lead;PATH=/bin;METACODES_API_KEY_FDX=1;METASK_API_KEY_OTHER=x;METACODES_API_KEY_FD=3;"
+        else
+            "HOME=/home/lead;PATH=/bin;METACODES_API_KEY_FDX=1;METASK_API_KEY=sk-ambient;METASK_API_KEY_OTHER=x;";
+        try testing.expectEqualStrings(expected, names.items);
+    }
+}
+
+test "applyTaskRoute: the Task's model and effort come after the lead's, and a named model without an effort drops the lead's" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const fa = arena_state.allocator();
+    const lead = [_][]const u8{ "--no-preview", "--model", "lead-model", "--reasoning-effort", "high" };
+    const Case = struct { route: TaskRoute, expected: []const []const u8 };
+    const cases = [_]Case{
+        .{ .route = .{}, .expected = &lead },
+        .{ .route = .{ .model = "task-model", .effort = .{ .level = .low } }, .expected = &.{ "--no-preview", "--model", "lead-model", "--reasoning-effort", "high", "--model", "task-model", "--reasoning-effort", "low" } },
+        .{ .route = .{ .model = "task-model", .effort = .model_default }, .expected = &.{ "--no-preview", "--model", "lead-model", "--model", "task-model" } },
+        .{ .route = .{ .effort = .{ .level = .max } }, .expected = &.{ "--no-preview", "--model", "lead-model", "--reasoning-effort", "high", "--reasoning-effort", "max" } },
+    };
+    for (cases) |case| {
+        var flags: std.ArrayList([]const u8) = .empty;
+        try flags.appendSlice(fa, &lead);
+        try applyTaskRoute(fa, &flags, case.route);
+        try testing.expectEqual(case.expected.len, flags.items.len);
+        for (case.expected, flags.items) |want, got| try testing.expectEqualStrings(want, got);
+    }
 }
 
 test "selfExePath 返回非空(macos/linux/windows)" {

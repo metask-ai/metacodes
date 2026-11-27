@@ -4956,10 +4956,15 @@ metacodes-core.swarm_context.ProcessTeammate.repo: []u8
 metacodes-core.swarm_context.Scheduler: enum
 metacodes-core.swarm_context.Scheduler.in_process
 metacodes-core.swarm_context.Scheduler.host
+metacodes-core.swarm_context.HandedKey: struct
+metacodes-core.swarm_context.HandedKey.key: []const u8
+metacodes-core.swarm_context.HandedKey.drop_env: []const []const u8 = &.{}
 metacodes-core.swarm_context.TeammateArgs: struct
 metacodes-core.swarm_context.TeammateArgs.ctx: *anyopaque
 metacodes-core.swarm_context.TeammateArgs.appendFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void
+metacodes-core.swarm_context.TeammateArgs.handedKeyFn: *const fn (ctx: *anyopaque) ?HandedKey = handsNoKey
 metacodes-core.swarm_context.TeammateArgs.append: fn append(self: TeammateArgs, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void
+metacodes-core.swarm_context.TeammateArgs.handedKey: fn handedKey(self: TeammateArgs) ?HandedKey
 metacodes-core.swarm_context.SpawnRequest: struct
 metacodes-core.swarm_context.SpawnRequest.name: []u8
 metacodes-core.swarm_context.SpawnRequest.prompt: []u8

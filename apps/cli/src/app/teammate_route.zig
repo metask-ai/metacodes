@@ -7,6 +7,7 @@ pub const Route = struct {
     channel: ?[]const u8 = null,
     model: []const u8 = "",
     reasoning_effort: ?ReasoningEffort = null,
+    base_url: ?[]const u8 = null,
 
     pub fn ofOffer(offer: *const ModelOffer, reasoning_effort: ?ReasoningEffort) Route {
         return .{
@@ -27,6 +28,9 @@ pub fn appendArgs(out: *std.ArrayList([]const u8), arena: std.mem.Allocator, rou
     }
     if (route.model.len > 0) try appendPair(out, arena, "--model", route.model);
     if (route.reasoning_effort) |level| try appendPair(out, arena, "--reasoning-effort", level.name());
+    if (route.base_url) |url| {
+        if (url.len > 0) try appendPair(out, arena, "--base-url", url);
+    }
 }
 
 fn appendPair(out: *std.ArrayList([]const u8), arena: std.mem.Allocator, flag: []const u8, value: []const u8) error{OutOfMemory}!void {
@@ -48,6 +52,16 @@ test "a route on a provider's channel becomes the flags a start names it with, e
     const expected = [_][]const u8{ "--provider", "prov-a", "--channel", "primary", "--model", "a-model", "--reasoning-effort", "high" };
     try testing.expectEqual(expected.len, args.len);
     for (expected, args) |want, got| try testing.expectEqualStrings(want, got);
+}
+
+test "the endpoint the lead was started with on the command line goes to the teammate as --base-url" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const args = try argsOf(arena_state.allocator(), .{ .model = "a-model", .base_url = "http://127.0.0.1:9/v1" });
+    const expected = [_][]const u8{ "--model", "a-model", "--base-url", "http://127.0.0.1:9/v1" };
+    try testing.expectEqual(expected.len, args.len);
+    for (expected, args) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expectEqual(@as(usize, 2), (try argsOf(arena_state.allocator(), .{ .model = "a-model", .base_url = "" })).len);
 }
 
 test "what a route does not name is left out, and values are copies the caller's arena owns" {

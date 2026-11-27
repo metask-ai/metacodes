@@ -441,6 +441,29 @@ status, compatibility boundaries, and entry points are defined by
   sent it a message. The prompt now goes to the teammate's inbox from the
   lead as soon as it is started, the way a message from the lead does.
 
+- **A process teammate gets the lead's key and `--base-url`, and the model
+  and effort its Task names.** A teammate started with
+  `--teammate-mode process` resolved its credential again: with a lead that
+  had `--api-key` or `METACODES_API_KEY_FD` it had no key, or read the
+  lead's spent descriptor number. It used the provider's own endpoint
+  instead of the lead's `--base-url`, and it ignored the model and effort
+  the `Task` named. While the lead still sends the key it was started with,
+  it now hands that key over on an inherited descriptor
+  (`METACODES_API_KEY_FD`, never in the arguments or the environment) and
+  leaves `METASK_API_KEY` out of the teammate's environment. On a Metask
+  route whose `.env` holds a Metask key it hands none, and the teammate
+  signs in with that key as before. The lead adds `--base-url` while it is
+  on the endpoint that flag set, and the Task's `--model` and
+  `--reasoning-effort` follow the lead's. Process teammates stay POSIX-only.
+
+- **`METACODES_API_KEY_FD` works with a named provider.** A start that named
+  a provider (`--provider`, a preset, a stored default) ignored the key on
+  that descriptor and looked for the provider's environment variables,
+  saved key or sign-in instead. It now reads the descriptor once and uses
+  its key ahead of the environment variables, as the Metask route does.
+  Passing it together with `--api-key`, or with `METASK_API_KEY` set, is
+  refused as ambiguous, as there.
+
 - **A process teammate runs on the lead's route.** A teammate started with
   `--teammate-mode process` chose its route again in its own worktree: it
   could land on another provider or model than the lead, without the lead's

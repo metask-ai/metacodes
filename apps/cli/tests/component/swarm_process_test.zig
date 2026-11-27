@@ -1,11 +1,15 @@
 //! L2 组件测试:SW6 进程外 teammate(单元/隔离面)。
 //!  A CLI 解析:--teammate --agent-name/--team-name/--parent-session-id/--teammate-cwd → config。
 //!  B worktree 隔离:createWorktree/removeWorktree 真 git(临时 repo)。
-//! 完整 lead→fork+exec 真 metacodes --teammate→处理消息 e2e 归 SW7 进程 e2e harness——
-//! 在带 live MockServer 线程的组件测试里 fork() 多线程进程不安全,须用干净的进程 harness。
+//! 交 key、--base-url 的用例经 forkExecTeammateAt 起真的 metacodes --teammate:fork 与 execve 之间
+//! 子进程只做 async-signal-safe 调用,live MockServer 的线程不碍事。真 lead 起 teammate 的完整 e2e
+//! 在 tests/tty/cases/test_teammate_process_route.py。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cc = @import("cc");
+const harness = @import("harness");
+const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 const tp = cc.swarm_teammate_process;
@@ -21,8 +25,8 @@ var g_mock_cwd_len: usize = 0;
 /// flag 按**字节**存,不存 slice:`extra_flags` 由 spawnTeammateProcess 在栈上组装,
 /// 断言发生在它返回之后。今天元素恰好都是静态字面量所以存 slice 也不会崩,但那是巧合,
 /// 不是契约——将来有人改成堆上拼的 flag,存 slice 的测试就读到已释放内存了。
-var g_mock_flags: [8][128]u8 = undefined;
-var g_mock_flag_lens: [8]usize = undefined;
+var g_mock_flags: [16][128]u8 = undefined;
+var g_mock_flag_lens: [16]usize = undefined;
 var g_mock_flags_len: usize = 0;
 
 fn mockSpawn(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
@@ -63,7 +67,7 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     defer sw.deinit();
 
     g_mock_name_len = 0;
-    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true);
+    const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true, .{});
     try std.testing.expectEqual(@as(i64, 99999), pid);
     // mock 收到 name。
     try std.testing.expectEqualStrings("worker", g_mock_name[0..g_mock_name_len]);
@@ -93,7 +97,7 @@ test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {
     try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
     var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
-    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true));
+    try std.testing.expectError(error.ReservedName, tp.spawnTeammateProcess(&sw, "Team-Lead", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true, .{}));
 }
 
 test "L2 SW6: process teammate rejects a parent session different from swarm routing" {
@@ -111,7 +115,7 @@ test "L2 SW6: process teammate rejects a parent session different from swarm rou
     defer sw.deinit();
     try std.testing.expectError(
         error.SessionMismatch,
-        tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "fedcba987654321001234567", null, &mockSpawn, true),
+        tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "fedcba987654321001234567", null, &mockSpawn, true, .{}),
     );
     var cfg: [std.fs.max_path_bytes]u8 = undefined;
     var after = team.load(a, team.configPath(home, "proj", &cfg)) orelse return error.NoConfig;
@@ -300,7 +304,7 @@ test "L2: lead LSP and preview settings reach the teammate process" {
         sw.preview = scenario.preview;
 
         g_mock_flags_len = 0;
-        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, scenario.lsp);
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, scenario.lsp, .{});
         // 两侧都断言:开着时不得平白多塞 flag,关着时必须带上。
         try std.testing.expectEqual(!scenario.lsp, mockSawFlag("--no-lsp"));
         try std.testing.expect(mockSawFlag("--no-preview"));
@@ -345,7 +349,7 @@ test "L2: the arguments the host adds for a process teammate follow the lead's o
         if (with_host) sw.teammate_args = .{ .ctx = &host, .appendFn = RouteHost.append };
 
         g_mock_flags_len = 0;
-        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, false);
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, false, .{});
         if (with_host) {
             try std.testing.expectEqual(@as(usize, 1), host.calls);
             try expectMockFlags(&.{ "--no-lsp", "--no-preview", "--provider", "prov-x", "--model", "x-model", "--reasoning-effort", "high" });
@@ -370,7 +374,7 @@ test "L2: a process teammate's inbox holds its Task prompt from the lead once it
 
     var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
     defer sw.deinit();
-    _ = try tp.spawnTeammateProcess(&sw, "worker", "Count the files under src/", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true);
+    _ = try tp.spawnTeammateProcess(&sw, "worker", "Count the files under src/", "", "", "", "0123456789abcdef01234567", null, &mockSpawn, true, .{});
 
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
     var unread = try cc.swarm_mailbox.readUnread(a, team.inboxPath(home, "proj", "worker", &inbox_buf));
@@ -444,4 +448,398 @@ test "L2: buildTeammateArgv 写出的 argv,teammate 自己的解析器真的认 
     try std.testing.expectEqualStrings("bob", config.teammate_name); // 身份没被挤掉
     // The child resolves the lead's state root, not its own default.
     try std.testing.expectEqualStrings("/srv/lead-state", config.state_dir.?);
+}
+
+const ANSWER_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const EnvGuard = struct {
+    name: [*:0]const u8,
+    previous: ?[:0]u8,
+
+    fn set(name: [*:0]const u8, value: ?[*:0]const u8) !EnvGuard {
+        const previous = if (std.c.getenv(name)) |raw| try std.testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+        if (value) |v| ppaths.setEnv(name, v) else ppaths.unsetEnv(name);
+        return .{ .name = name, .previous = previous };
+    }
+
+    fn restore(self: EnvGuard) void {
+        if (self.previous) |previous| {
+            ppaths.setEnv(self.name, previous.ptr);
+            std.testing.allocator.free(previous);
+        } else ppaths.unsetEnv(self.name);
+    }
+};
+
+const LeadHost = struct {
+    base_url: []const u8,
+    key: ?[]const u8,
+
+    fn append(ctx: *anyopaque, arena: std.mem.Allocator, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
+        const self: *LeadHost = @ptrCast(@alignCast(ctx));
+        try out.appendSlice(arena, &.{ "--base-url", try arena.dupe(u8, self.base_url), "--model", "lead-model", "--reasoning-effort", "low" });
+    }
+
+    fn handedKey(ctx: *anyopaque) ?swctx.HandedKey {
+        const self: *LeadHost = @ptrCast(@alignCast(ctx));
+        const key = self.key orelse return null;
+        return .{ .key = key };
+    }
+};
+
+var g_cli_exe: []const u8 = "";
+var g_key_in_argv = false;
+
+fn spawnRealCli(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
+    g_key_in_argv = false;
+    if (p.handed_key) |key| for (p.extra_flags) |flag| {
+        if (std.mem.indexOf(u8, flag, key) != null) g_key_in_argv = true;
+    };
+    return tp.forkExecTeammateAt(a, g_cli_exe, p);
+}
+
+const RealTeammate = struct {
+    arena_state: std.heap.ArenaAllocator,
+    home: []const u8,
+    work: []const u8,
+    server: *harness.MockServer,
+    guards: [9]EnvGuard,
+
+    fn start(self: *RealTeammate, buf: []u8, tag: []const u8, stale_fd: ?[*:0]const u8, env_key: ?[*:0]const u8) !void {
+        if (builtin.os.tag == .windows) return error.SkipZigTest;
+        const raw_cli = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
+        self.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer self.arena_state.deinit();
+        const a = self.arena_state.allocator();
+        g_cli_exe = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, std.mem.span(raw_cli), a);
+        self.home = cc.util_fs.testing.uniqueDir(buf, tag);
+        errdefer cc.util_fs.testing.rmrfBestEffort(self.home);
+        self.work = try std.fs.path.join(a, &.{ self.home, "work" });
+        try cc.util_fs.mkdirParents(self.work);
+        var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try cc.util_fs.mkdirParents(team.teamDirPath(self.home, "proj", &dirbuf));
+        var tf = team.TeamFile{ .allocator = std.testing.allocator, .name = try std.testing.allocator.dupe(u8, "proj"), .lead_agent_id = try std.testing.allocator.dupe(u8, "team-lead@proj"), .lead_session_id = try std.testing.allocator.dupe(u8, test_session.asSlice()) };
+        defer tf.deinit();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try team.save(std.testing.allocator, &tf, team.configPath(self.home, "proj", &pbuf));
+        const home_z = try a.dupeZ(u8, self.home);
+        self.guards = .{
+            try EnvGuard.set("HOME", home_z.ptr),
+            try EnvGuard.set("METACODES_KG_AUTOSTART", "0"),
+            try EnvGuard.set("METACODES_JEV_URL", "off"),
+            try EnvGuard.set("METACODES_NO_PROBE", "1"),
+            try EnvGuard.set("METACODES_BASE_URL", null),
+            try EnvGuard.set("METACODES_PRESET", null),
+            try EnvGuard.set("METACODES_PROVIDER", null),
+            try EnvGuard.set("METASK_API_KEY", env_key),
+            try EnvGuard.set("METACODES_API_KEY_FD", stale_fd),
+        };
+        self.server = try harness.MockServer.startCassette(&.{ANSWER_SSE}, 0);
+    }
+
+    fn stop(self: *RealTeammate) void {
+        self.server.stop();
+        var i = self.guards.len;
+        while (i > 0) {
+            i -= 1;
+            self.guards[i].restore();
+        }
+        cc.util_fs.testing.rmrfBestEffort(self.home);
+        self.arena_state.deinit();
+    }
+
+    fn spawn(self: *RealTeammate, sw: *swctx.SwarmContext, host: *LeadHost, route: tp.TaskRoute) !void {
+        host.base_url = try self.server.urlOwned(self.arena_state.allocator());
+        sw.teammate_args = .{ .ctx = host, .appendFn = LeadHost.append, .handedKeyFn = LeadHost.handedKey };
+        _ = try tp.spawnTeammateProcess(sw, "worker", "Reply with done.", self.work, "", "", test_session.asSlice(), null, &spawnRealCli, false, route);
+    }
+
+    fn writeDotEnv(self: *RealTeammate, text: []const u8) !void {
+        const path = try std.fs.path.join(self.arena_state.allocator(), &.{ self.home, ".env" });
+        const path_z = try self.arena_state.allocator().dupeZ(u8, path);
+        const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.DotEnvNotWritten;
+        defer _ = pfs.close(fd);
+        if (!pfs.writeAll(fd, text)) return error.DotEnvNotWritten;
+    }
+
+    fn firstRequest(self: *RealTeammate) !harness.CapturedRequest {
+        var waited: u64 = 0;
+        while (self.server.requestCount() == 0) : (waited += 50) {
+            if (waited >= 30_000) return error.TeammateSentNoRequest;
+            cc.util_time.sleepMs(50);
+        }
+        return self.server.requestAt(0).?;
+    }
+};
+
+const AppLead = struct {
+    io_rt: std.Io.Threaded,
+    arena_state: std.heap.ArenaAllocator,
+    app: *cc.app_module.App,
+
+    fn start(self: *AppLead, real: *RealTeammate, args: []const []const u8, api_key: []const u8, options: cc.app_module.App.InitOptions) !void {
+        self.io_rt = @import("platform").signal.threadedIo(std.testing.allocator, .{});
+        errdefer self.io_rt.deinit();
+        self.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer self.arena_state.deinit();
+        const arena = self.arena_state.allocator();
+        var argv: std.ArrayList([*:0]const u8) = .empty;
+        for (args) |arg| try argv.append(arena, (try arena.dupeZ(u8, arg)).ptr);
+        var config = cc.parseArgsForTest(argv.items, arena);
+        config.state_root = real.home;
+        self.app = try cc.app_module.App.initWithOptions(std.testing.allocator, self.io_rt.io(), config, api_key, options);
+        errdefer self.app.deinit();
+        var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try cc.util_fs.mkdirParents(team.teamDirPath(real.home, "proj", &dirbuf));
+        var tf = team.TeamFile{ .allocator = std.testing.allocator, .name = try std.testing.allocator.dupe(u8, "proj"), .lead_agent_id = try std.testing.allocator.dupe(u8, "team-lead@proj"), .lead_session_id = try std.testing.allocator.dupe(u8, self.app.session_id.asSlice()) };
+        defer tf.deinit();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try team.save(std.testing.allocator, &tf, team.configPath(real.home, "proj", &pbuf));
+        self.app.swarm.team_sanitized = try self.app.swarm.allocator.dupe(u8, "proj");
+    }
+
+    fn spawn(self: *AppLead, real: *RealTeammate, route: tp.TaskRoute) !void {
+        _ = try tp.spawnTeammateProcess(&self.app.swarm, "worker", "Reply with done.", real.work, "", "", self.app.session_id.asSlice(), null, &spawnRealCli, false, route);
+    }
+
+    fn stop(self: *AppLead) void {
+        self.app.deinit();
+        self.arena_state.deinit();
+        self.io_rt.deinit();
+    }
+};
+
+fn headersOf(request: harness.CapturedRequest) []const u8 {
+    const end = std.mem.indexOf(u8, request.raw, "\r\n\r\n") orelse request.raw.len;
+    return request.raw[0..end];
+}
+
+test "L2: a lead on a Metask route hands its teammate the key it started with on a descriptor, with its --base-url and the Task's model and effort" {
+    var buf: [256]u8 = undefined;
+    var real: RealTeammate = undefined;
+    try real.start(&buf, "cc-zig-sw6-handed-key", null, "sk-ambient-metask-key");
+    defer real.stop();
+    const url = try real.server.urlOwned(real.arena_state.allocator());
+    var lead: AppLead = undefined;
+    try lead.start(&real, &.{ "metacodes", "--base-url", url, "--model", "lead-model" }, "sk-start-key", .{
+        .command_line_base_url = url,
+        .handed_key = "sk-start-key",
+    });
+    defer lead.stop();
+    try lead.spawn(&real, .{ .model = "task-model", .effort = .{ .level = .high } });
+    try std.testing.expect(!g_key_in_argv);
+
+    const request = try real.firstRequest();
+    errdefer std.debug.print("teammate request:\n{s}\n", .{request.raw});
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-start-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.raw, "sk-ambient-metask-key") == null);
+    try std.testing.expectEqualStrings("\"task-model\"", request.jsonField("model") orelse "");
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "\"effort\":\"high\"") != null);
+}
+
+test "L2: a lead on a Metask route whose .env holds a Metask key hands no key, and its teammate starts on the .env key" {
+    var buf: [256]u8 = undefined;
+    var real: RealTeammate = undefined;
+    try real.start(&buf, "cc-zig-sw6-dotenv-key", null, null);
+    defer real.stop();
+    try real.writeDotEnv("METASK_API_KEY=sk-dotenv-key\n");
+    const url = try real.server.urlOwned(real.arena_state.allocator());
+    var lead: AppLead = undefined;
+    try lead.start(&real, &.{ "metacodes", "--base-url", url, "--model", "lead-model" }, "sk-start-key", .{
+        .command_line_base_url = url,
+        .handed_key = "sk-start-key",
+        .local_metask_key = true,
+    });
+    defer lead.stop();
+    try std.testing.expect(lead.app.teammateKey() == null);
+    try lead.spawn(&real, .{});
+
+    const request = try real.firstRequest();
+    errdefer std.debug.print("teammate request:\n{s}\n", .{request.raw});
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-dotenv-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.raw, "sk-start-key") == null);
+}
+
+test "L2: a METACODES_API_KEY_FD left in the lead's environment does not reach a process teammate that gets no key" {
+    var buf: [256]u8 = undefined;
+    var real: RealTeammate = undefined;
+    try real.start(&buf, "cc-zig-sw6-stale-fd", "987", "sk-env-teammate-key");
+    defer real.stop();
+    var sw = swctx.SwarmContext{ .allocator = std.testing.allocator, .session = test_session, .state_root = real.home, .team_sanitized = try std.testing.allocator.dupe(u8, "proj") };
+    defer sw.deinit();
+    var host: LeadHost = .{ .base_url = "", .key = null };
+    try real.spawn(&sw, &host, .{});
+
+    const request = try real.firstRequest();
+    errdefer std.debug.print("teammate request:\n{s}\n", .{request.raw});
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-env-teammate-key") != null);
+    try std.testing.expectEqualStrings("\"lead-model\"", request.jsonField("model") orelse "");
+}
+
+test "L2: the Task's model and effort reach the teammate's own parser after the lead's route" {
+    const a = std.testing.allocator;
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-task-route");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    const Case = struct { route: tp.TaskRoute, model: []const u8, effort: ?cc.types_mod.ReasoningEffort };
+    for ([_]Case{
+        .{ .route = .{}, .model = "x-model", .effort = .high },
+        .{ .route = .{ .model = "y-model", .effort = .{ .level = .low } }, .model = "y-model", .effort = .low },
+        .{ .route = .{ .model = "y-model", .effort = .model_default }, .model = "y-model", .effort = null },
+    }) |case| {
+        var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try cc.util_fs.mkdirParents(team.teamDirPath(home, "proj", &dirbuf));
+        var tf = team.TeamFile{ .allocator = a, .name = try a.dupe(u8, "proj"), .lead_agent_id = try a.dupe(u8, "team-lead@proj"), .lead_session_id = try a.dupe(u8, test_session.asSlice()) };
+        defer tf.deinit();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        try team.save(a, &tf, team.configPath(home, "proj", &pbuf));
+        var sw = swctx.SwarmContext{ .allocator = a, .session = test_session, .state_root = home, .team_sanitized = try a.dupe(u8, "proj") };
+        defer sw.deinit();
+        var host: RouteHost = .{};
+        sw.teammate_args = .{ .ctx = &host, .appendFn = RouteHost.append };
+
+        g_mock_flags_len = 0;
+        _ = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", "", test_session.asSlice(), null, &mockSpawn, true, case.route);
+        var flags: [16][]const u8 = undefined;
+        for (0..g_mock_flags_len) |i| flags[i] = g_mock_flags[i][0..g_mock_flag_lens[i]];
+        const argv = try tp.buildTeammateArgv(a, "/usr/local/bin/metacodes", .{ .name = "worker", .team = "proj", .state_root = home, .extra_flags = flags[0..g_mock_flags_len] });
+        defer tp.freeArgv(a, argv);
+        var parse_argv: std.ArrayList([*:0]const u8) = .empty;
+        defer parse_argv.deinit(a);
+        for (argv) |item| try parse_argv.append(a, item orelse continue);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const config = cc.parseArgsForTest(parse_argv.items, arena.allocator());
+        try std.testing.expect(config.parse_error == null);
+        try std.testing.expectEqualStrings(case.model, config.model);
+        try std.testing.expectEqual(case.effort, config.reasoning_effort);
+    }
+}
+
+test "L2: a process teammate gets the lead's command-line --base-url and start key only while the lead still uses them" {
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-sw6-lead-route");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    const guards = [_]EnvGuard{
+        try EnvGuard.set("HOME", home.ptr),
+        try EnvGuard.set("METACODES_NO_PROBE", "1"),
+        try EnvGuard.set("METACODES_KG_AUTOSTART", "0"),
+    };
+    defer for (guards) |guard| guard.restore();
+    var io_runtime = @import("platform").signal.threadedIo(std.testing.allocator, .{});
+    defer io_runtime.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const url = "http://127.0.0.1:9/v1";
+    var config = cc.parseArgsForTest(&.{ "metacodes", "--base-url", url, "--model", "flag-model" }, arena);
+    config.state_root = home;
+    const app = try cc.app_module.App.initWithOptions(std.testing.allocator, io_runtime.io(), config, "sk-start-key", .{
+        .command_line_base_url = url,
+        .handed_key = "sk-start-key",
+    });
+    defer app.deinit();
+
+    const handed = app.teammateKey() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("sk-start-key", handed.key);
+    try std.testing.expectEqual(@as(usize, 1), handed.drop_env.len);
+    try std.testing.expectEqualStrings("METASK_API_KEY", handed.drop_env[0]);
+    var args: std.ArrayList([]const u8) = .empty;
+    try app.appendTeammateRouteArgs(arena, &args);
+    const at = for (args.items, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--base-url")) break i;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(url, args.items[at + 1]);
+
+    app.api_key = "sk-moved-key";
+    app.api_client.base_url = "http://127.0.0.1:10/elsewhere";
+    args.clearRetainingCapacity();
+    try app.appendTeammateRouteArgs(arena, &args);
+    for (args.items) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--base-url"));
+    try std.testing.expect(app.teammateKey() == null);
+
+    app.api_key = "sk-start-key";
+    try std.testing.expectEqualStrings("sk-start-key", (app.teammateKey() orelse return error.TestExpectedEqual).key);
+    app.local_metask_key = true;
+    try std.testing.expect(app.teammateKey() == null);
+}
+
+fn writeFile(arena: std.mem.Allocator, dir: []const u8, name: []const u8, text: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(arena, &.{ dir, name });
+    const path_z = try arena.dupeZ(u8, path);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.FileNotWritten;
+    defer _ = pfs.close(fd);
+    if (!pfs.writeAll(fd, text)) return error.FileNotWritten;
+    return path;
+}
+
+fn writeNamedProvider(arena: std.mem.Allocator, state_root: []const u8, port: u16) !void {
+    const config = try std.fmt.allocPrint(arena,
+        \\{{"custom_providers":{{"prov-x":{{"display_name":"Prov X","credential_kinds":["api_key"],"env_aliases":[{{"name":"PROV_X_TOKEN","kind":"api_key","canonical":true}}],"channels":[{{"id":"primary","base_url":"http://127.0.0.1:{d}/x","protocol":"anthropic_messages"}}],"models":[{{"request_model_id":"x-model","display_name":"X model"}}]}}}}}}
+    , .{port});
+    _ = try writeFile(arena, state_root, "config.json", config);
+}
+
+test "L2: a lead started with --provider and METACODES_API_KEY_FD sends the key on the descriptor" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const raw_cli = std.c.getenv("METACODES_TEST_CLI_BIN") orelse return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-fd-named-provider");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    try cc.util_fs.mkdirParents(home);
+    var server = try harness.MockServer.startCassette(&.{ANSWER_SSE}, 0);
+    defer server.stop();
+    try writeNamedProvider(a, home, server.port);
+    const key_path = try writeFile(a, home, "key", "sk-descriptor-key");
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, std.mem.span(raw_cli), a);
+    const args = [_][]const u8{
+        "/usr/bin/env",                                                                    "-i",
+        try std.fmt.allocPrint(a, "HOME={s}", .{home}),                                    "PATH=/usr/bin:/bin",
+        "METACODES_KG_AUTOSTART=0",                                                        "METACODES_JEV_URL=off",
+        "METACODES_NO_PROBE=1",                                                            "METACODES_API_KEY_FD=3",
+        "/bin/sh",                                                                         "-c",
+        "exec \"$0\" --state-dir \"$1\" --provider prov-x --model x-model -p hi 3<\"$2\"", cli,
+        home,                                                                              key_path,
+    };
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    for (args) |arg| try argv.append(a, (try a.dupeZ(u8, arg)).ptr);
+    try argv.append(a, null);
+    const out = try cc.tools_common.spawnCaptureWithStderrTimed(argv.items, a, null, 60_000, null, cc.tools_common.MAX_SPAWN_CAPTURE_BYTES, home);
+    errdefer std.debug.print("exit {d}; stderr:\n{s}\n", .{ out.exit_code, out.stderr });
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    const request = server.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.startsWith(u8, request.raw, "POST /x/v1/messages"));
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-descriptor-key") != null);
+}
+
+test "L2: a lead on a named provider hands its teammate the key it started with, and the teammate sends it" {
+    var buf: [256]u8 = undefined;
+    var real: RealTeammate = undefined;
+    try real.start(&buf, "cc-zig-sw6-named-provider", null, "sk-ambient-metask-key");
+    defer real.stop();
+    try writeNamedProvider(real.arena_state.allocator(), real.home, real.server.port);
+    var lead: AppLead = undefined;
+    try lead.start(&real, &.{ "metacodes", "--provider", "prov-x", "--model", "x-model" }, "sk-start-key", .{
+        .route_state = .{ .bound = .flag },
+        .handed_key = "sk-start-key",
+    });
+    defer lead.stop();
+    try lead.spawn(&real, .{});
+    try std.testing.expect(!g_key_in_argv);
+
+    const request = try real.firstRequest();
+    errdefer std.debug.print("teammate request:\n{s}\n", .{request.raw});
+    try std.testing.expect(std.mem.startsWith(u8, request.raw, "POST /x/v1/messages"));
+    try std.testing.expect(std.mem.indexOf(u8, headersOf(request), "sk-start-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.raw, "sk-ambient-metask-key") == null);
 }

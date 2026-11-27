@@ -1408,6 +1408,7 @@ pub fn main(init: std.process.Init) !void {
     log.initFromEnv();
     if (config.verbose) log.enableVerbose();
 
+    const command_line_base_url = config.base_url;
     // --- env fallback:base_url / record_dir(CLI flag 优先,env 兜底)---
     if (config.base_url == null) {
         if (std.c.getenv("METACODES_BASE_URL")) |c| config.base_url = std.mem.span(c);
@@ -1640,6 +1641,9 @@ pub fn main(init: std.process.Init) !void {
     // session authoritative even if that ambient alias is present.
     const metask_legacy_explicit = metask_legacy_requested;
     var provider_secret: ?[]u8 = null;
+    var start_key_from_flag = false;
+    var runtime_fd_credential: ?auth.ResolvedCredential = null;
+    defer if (runtime_fd_credential) |*credential| credential.deinit(allocator);
     var metask_oauth_selected = false;
     // Same handling as `ResolvedCredential.deinit`: zero the bytes before
     // returning them to the allocator so key material does not linger in freed
@@ -1698,15 +1702,25 @@ pub fn main(init: std.process.Init) !void {
         metask_oauth_selected = provider_secret != null and !browser_key;
         if (metask_oauth_selected) config.metask_session_gateway = try allocator.dupe(u8, session.tokens.?.gateway_url orelse "");
     } else if (resolves_credential and metask_scope and metask_legacy_explicit) {
-        provider_secret = resolveProviderScopedSecret(allocator, config, "metask") catch |err| return err;
+        const scoped = resolveProviderScopedCredential(allocator, config, "metask") catch |err| return err;
+        provider_secret = scoped.secret;
+        start_key_from_flag = scoped.origin == .flag;
     } else if (resolves_credential and !metask_scope) {
         // Level 1 (and 2 to 4 and 6, which name their provider the same way): a
         // provider without a key opens the TUI unbound, naming the key it
         // needs (#485, 第十节第 3 条); `-p` and the rest stop with its help.
         const report: CredentialReport = if (may_open_unbound) .quiet else .print_help;
+        if (std.c.getenv(auth.RUNTIME_API_KEY_FD_ENV) != null) {
+            runtime_fd_credential = auth.resolveRuntimeCredential(allocator, config.state_root, config.api_key, config.auth_precedence) catch |err| {
+                std.debug.print("error: the key passed on METACODES_API_KEY_FD cannot be used: {s}\n", .{@errorName(err)});
+                return err;
+            };
+            config.api_key = runtime_fd_credential.?.bearer_token;
+        }
         if (resolveProviderScopedCredentialReporting(allocator, config, config.provider_profile.?, report)) |scoped| {
             provider_secret = scoped.secret;
             credential_origin = scoped.origin;
+            start_key_from_flag = scoped.origin == .flag;
         } else |err| {
             if (!may_open_unbound or err != error.MissingCredentials) {
                 // Any other refusal (conflicting variables) still stops the
@@ -1759,6 +1773,7 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     defer if (resolved_credential) |*credential| credential.deinit(allocator);
+    if (resolved_credential) |credential| start_key_from_flag = credential.source == .cli_api_key or credential.source == .fd_api_key;
     config.metask_oauth_selected = metask_oauth_selected;
 
     // The stored Metask login carries a Metask model and reasoning effort;
@@ -1863,6 +1878,9 @@ pub fn main(init: std.process.Init) !void {
         .local_route = local_route,
         .startup_notice = startup_notice,
         .command_name = invokedCommand(allocator),
+        .command_line_base_url = command_line_base_url,
+        .handed_key = if (start_key_from_flag and unbound == null) api_key else null,
+        .local_metask_key = local_metask_key != null,
     };
     if (interactive_tui) {
         const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
