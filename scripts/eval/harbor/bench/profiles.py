@@ -565,19 +565,41 @@ class ProfileManager:
         self.wake()
         return {"id": record["id"], "index": index, "status": item["status"]}
 
-    def requeue_item(self, profile: Any, index: Any, tasks: List[str]) -> Dict[str, Any]:
-        """Queue an ended dataset again on its profile with `tasks`."""
+    def requeue_item(self, profile: Any, index: Any, tasks: List[str], *, resume: bool = False) -> Dict[str, Any]:
         with self.lock:
             record, item = self.record_item(profile, index)
+            if record["status"] == "cancelling":
+                raise ValueError("评测配置正在停止，请等它停止后再运行")
             if item["status"] not in ITEM_DONE:
                 raise ValueError("这个评测集还在等待或运行")
             if not isinstance(item.get("request"), dict):
                 raise ValueError("这个评测集是早期版本排的，请在评测配置上重新运行")
             if not tasks:
                 raise ValueError("这个评测集没有要运行的题")
-            again = rerun(item, tasks, 0)
-            record = self._append({"id": record["id"]}, None, [{**again, "retry": True}],
-                                  submission=item["submission"])
+            if resume:
+                resumed = current_runs(item)
+                if resumed:
+                    item["resumed_runs"] = resumed
+                else:
+                    item.pop("resumed_runs", None)
+            else:
+                previous = item_runs(item)
+                if previous:
+                    item["previous_runs"] = previous
+                else:
+                    item.pop("previous_runs", None)
+                item.pop("resumed_runs", None)
+            for key in ("waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "concurrency"):
+                item.pop(key, None)
+            request = {key: value for key, value in item["request"].items() if key != "concurrency"}
+            request["tasks"] = list(tasks)
+            item.update(request=request, status="pending", run=None, error=None, started_at=None, finished_at=None)
+            if not item.get("queued_at"):
+                item["queued_at"] = now()
+            if record["status"] not in PROFILE_ACTIVE:
+                record.update(status="queued", cancel_requested=False, finished_at=None)
+            record["concurrency"] = profile_concurrency(record)
+            self.save(record)
         self.wake()
         return public(record)
 
@@ -748,9 +770,43 @@ class ProfileManager:
             pass
 
 
+def current_runs(item: Dict[str, Any]) -> List[str]:
+    names = [name for name in item.get("resumed_runs") or [] if isinstance(name, str) and name]
+    run = item.get("run")
+    if isinstance(run, str) and run and run not in names:
+        names.append(run)
+    return names
+
+
+def item_runs(item: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    for name in (*(item.get("previous_runs") or ()), *current_runs(item)):
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
+def forget_item_run(item: Dict[str, Any], name: str) -> bool:
+    changed = False
+    if item.get("run") == name:
+        item["run"] = None
+        changed = True
+    for field in ("resumed_runs", "previous_runs"):
+        values = item.get(field)
+        if isinstance(values, list) and name in values:
+            kept = [entry for entry in values if entry != name]
+            if kept:
+                item[field] = kept
+            else:
+                item.pop(field, None)
+            changed = True
+    return changed
+
+
 def rerun(item: Dict[str, Any], tasks: List[str], auto_round: int) -> Dict[str, Any]:
     again = {key: value for key, value in item.items()
-             if key not in ("index", "waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry", "concurrency")}
+             if key not in ("index", "waiting", "auto_rerun", "auto_rerun_error", "cancel_requested", "retry",
+                            "concurrency", "resumed_runs", "previous_runs")}
     request = {key: value for key, value in item["request"].items() if key != "concurrency"}
     again.update(request={**request, "tasks": list(tasks)}, tasks=list(tasks), status="pending",
                  run=None, error=None, started_at=None, finished_at=None)
@@ -798,7 +854,7 @@ def runs_of(record: Dict[str, Any], receipts: List[Dict[str, Any]]) -> List[str]
     """Every run a profile owns: its queued datasets, and any receipt that
     names it (or one of the batches merged into it)."""
     owners = {record["id"], *(record.get("batches") or [])}
-    names = {item.get("run") for item in record.get("items") or []}
+    names = {name for item in record.get("items") or [] for name in item_runs(item)}
     names |= {r.get("name") for r in receipts if r.get("profile") in owners or r.get("batch") in owners}
     return sorted(n for n in names if isinstance(n, str) and data.NAME.fullmatch(n))
 
@@ -828,6 +884,10 @@ def public(record: Dict[str, Any]) -> Dict[str, Any]:
                 item["concurrency"] = dataset_concurrency(item["suite"], value["concurrency"])
             except ValueError:
                 item["concurrency"] = value["concurrency"]
+        if item.get("resumed_runs") and isinstance(item.get("request"), dict):
+            request_tasks = item["request"].get("tasks") or []
+            if item.get("status") in ("pending", "running") and request_tasks:
+                item["resume_tasks_count"] = len(request_tasks)
         item.pop("request", None)
         item.pop("route", None)
     return value

@@ -1436,8 +1436,11 @@ its original evaluations together (`POST /api/profile/submission` with `id`,
 `submission` and `action` of `cancel`, `run` or `delete`). Deleting an ended submission removes
 its evaluations and retries from the profile and preserves stored run results.
 Item controls use the evaluation’s returned `index` across deletions. Rerunning a whole job
-creates a new job on its recorded executor. A single evaluation retry and an
-automatic retry stay in the original job. For older records, the workbench
+creates a new job on its recorded executor. Resuming (`resume`) or rerunning (`run`) an ended
+evaluation updates that evaluation row in place in its original job rather than appending a new
+row: `resume` keeps the earlier run's finished tasks on that row and runs only the unfinished
+ones, while `run` resets the row to run all of its tasks again while keeping prior runs in task
+history. Automatic invalid-task retries stay in the original job. For older records, the workbench
 groups evaluations by their original queue timestamp and assigns automatic
 retries to their source submission when the recorded history identifies it.
 

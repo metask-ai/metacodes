@@ -402,16 +402,23 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([i['status'] for i in record['items']], ['cancelled', 'skipped'])
         with self.assertRaisesRegex(ValueError, '不在等待'):
             self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'cancel'})
-        # Stopped before Harbor wrote any result: every task is still to run.
         with patch.object(self.workbench, 'job_view', return_value=None):
+            resumed = self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
+        self.assertEqual(len(resumed['items']), 2)
+        self.assertEqual(resumed['items'][0]['resumed_runs'], [record['items'][0]['run']])
+        self.assertEqual(resumed['items'][0]['status'], 'pending')
+        with self.assertRaisesRegex(ValueError, '还在等待或运行'):
             self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
-        self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'run'})
+        rerun = self.client.request('api/profile/item', {'id': created['id'], 'index': 1, 'action': 'run'})
+        self.assertEqual(len(rerun['items']), 2)
+        self.assertEqual(rerun['items'][1]['status'], 'pending')
         record = self.wait_profile(created['id'])
-        self.assertEqual([(i['suite'], i['status']) for i in record['items'][2:]],
+        self.assertEqual(len(record['items']), 2)
+        self.assertEqual([(i['suite'], i['status']) for i in record['items']],
                          [('terminal-bench-2.1', 'finished'), ('terminal-bench-2.0', 'finished')])
-        self.assertEqual(record['items'][2]['tasks'], ['fix-git'])
+        self.assertEqual(record['items'][0]['tasks'], ['fix-git'])
         with self.assertRaisesRegex(ValueError, '没有要运行的题'):
-            self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'resume'})
+            self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'resume'})
 
     def test_auto_rerun_queues_invalid_tasks_of_a_finished_dataset_at_most_twice(self):
         created = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
@@ -424,12 +431,14 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([(i['status'], i.get('auto_rerun'), i['tasks']) for i in record['items']],
                          [('finished', None, ['fix-git']), ('finished', 1, ['fix-git']), ('finished', 2, ['fix-git'])])
         self.assertEqual(invalid.call_count, 2)
+        prior_run = record['items'][2]['run']
         self.client.request('api/profile/item', {'id': created['id'], 'index': 2, 'action': 'run'})
         self.client.request('api/profile/auto-rerun', {'id': created['id'], 'enabled': False})
         with patch.object(self.manager.profiles, 'invalid_tasks', return_value=['fix-git']) as invalid:
             record = self.wait_profile(created['id'])
-        self.assertEqual(len(record['items']), 4)
-        self.assertNotIn('auto_rerun', record['items'][3])
+        self.assertEqual(len(record['items']), 3)
+        self.assertNotIn('auto_rerun', record['items'][2])
+        self.assertEqual(record['items'][2]['previous_runs'], [prior_run])
         invalid.assert_not_called()
 
     def test_an_unreadable_result_skips_the_auto_rerun_and_the_queue_goes_on(self):
@@ -511,7 +520,7 @@ class ProfileTest(unittest.TestCase):
         self.client.request('api/profile/item', {'id': created['id'], 'index': 0, 'action': 'run'})
         record = self.wait_profile(created['id'])
         self.assertEqual([i['concurrency'] for i in self.client.request('api/profile?id=' + created['id'])['items']],
-                         [10, 3, 3])
+                         [3, 3])
         # A profile saved before it had one keeps its latest dataset's.
         legacy = {k: v for k, v in record.items() if k != 'concurrency'}
         self.assertEqual(profiles.profile_concurrency(legacy), 3)
@@ -1086,14 +1095,150 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual([i['status'] for i in ended['items'][1:]], ['skipped', 'finished', 'finished'])
         self.assertNotEqual(group, ended['items'][2]['submission'])
         again = self.client.request('api/profile/item', {'id': pid, 'index': 1, 'action': 'run'})
-        self.assertEqual(again['items'][-1]['submission'], group)
+        self.assertEqual(len(again['items']), 4)
+        self.assertEqual((again['items'][1]['submission'], again['items'][1]['status']), (group, 'pending'))
         self.wait_profile(pid)
         replay = self.client.request('api/profile/submission', {**command, 'action': 'run'})
-        self.assertEqual(len(replay['items']), 7)
+        self.assertEqual(len(replay['items']), 6)
         left, right = replay['items'][-2:]
         self.assertEqual(left['submission'], right['submission'])
         self.assertNotIn(left['submission'], {group, ended['items'][2]['submission']})
         self.assertEqual([i['suite'] for i in replay['items'][-2:]], [i['suite'] for i in first['items']])
+
+    def test_resume_and_run_update_item_in_place_and_preserve_prior_results(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        created = self.client.request('api/profiles/run', self.request(
+            items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git', 'cancel-async-tasks']}]))
+        pid = created['id']
+        run_a = 'bench-resumed-a'
+        job_a = self.manager.jobs_dir / run_a
+        _write(job_a / 'config.json', {'agents': [{'model_name': 'tokenjoy/test-model'}], 'n_attempts': 1})
+        _write(job_a / 'result.json', {'started_at': '2026-11-16T00:00:00Z', 'finished_at': None,
+                                       'n_total_trials': 2})
+        _write(job_a / 'fix-git__a' / 'config.json', {})
+        _write(job_a / 'fix-git__a' / 'result.json', {
+            'task_name': 'terminal-bench/fix-git', 'started_at': '2026-11-16T00:00:00Z',
+            'finished_at': '2026-11-16T00:00:30Z', 'verifier_result': {'rewards': {'reward': 1.0}}})
+        _write(job_a / 'cancel-async-tasks__a' / 'config.json', {})
+        _write(job_a / 'cancel-async-tasks__a' / 'result.json', {
+            'task_name': 'terminal-bench/cancel-async-tasks', 'started_at': '2026-11-16T00:00:30Z',
+            'finished_at': None})
+        atomic_json(self.manager.records / (run_a + '.json'), {
+            'name': run_a, 'status': 'interrupted', 'profile': pid, 'suite': 'terminal-bench-2.1',
+            'model': 'tokenjoy/test-model', 'finished_at': '2026-11-16T00:01:00Z'})
+        record = self.manager.profiles.get(pid)
+        record['status'] = 'finished'
+        record['items'][0].update(status='interrupted', run=run_a, error='执行进程已停止更新，请检查运行日志',
+                                  started_at='2026-11-16T00:00:00Z', finished_at='2026-11-16T00:01:00Z')
+        self.manager.profiles.save(record)
+
+        resumed = self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'resume'})
+        self.assertEqual(len(resumed['items']), 1)
+        item = resumed['items'][0]
+        self.assertEqual((item['status'], item['run'], item['resumed_runs'], item['resume_tasks_count']),
+                         ('pending', None, [run_a], 1))
+        self.assertEqual(item['tasks'], ['fix-git', 'cancel-async-tasks'])
+        self.assertEqual(self.manager.profiles.get(pid)['items'][0]['request']['tasks'], ['cancel-async-tasks'])
+
+        pending_view = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(pending_view['items'][0]['job']['planned'], 2)
+        self.assertEqual(pending_view['items'][0]['job']['summary']['counts']['pass'], 1)
+        self.assertEqual(pending_view['progress'], {'done': 2, 'planned': 2})
+
+        self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'cancel'})
+        cancelled = self.manager.profiles.get(pid)['items'][0]
+        self.assertEqual((cancelled['status'], cancelled['resumed_runs']), ('skipped', [run_a]))
+        again_resumed = self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'resume'})
+        self.assertEqual(len(again_resumed['items']), 1)
+        self.assertEqual(again_resumed['items'][0]['resumed_runs'], [run_a])
+        self.assertEqual(self.manager.profiles.get(pid)['items'][0]['request']['tasks'], ['cancel-async-tasks'])
+
+        ended = self.wait_profile(pid)
+        self.assertEqual(len(ended['items']), 1)
+        run_b = ended['items'][0]['run']
+        argv_b = json.loads((self.manager.jobs_dir / run_b / 'argv.json').read_text())
+        self.assertIn('terminal-bench/cancel-async-tasks', argv_b)
+        self.assertNotIn('terminal-bench/fix-git', argv_b)
+        _write(self.manager.jobs_dir / run_b / 'cancel-async-tasks__b' / 'config.json', {})
+        _write(self.manager.jobs_dir / run_b / 'cancel-async-tasks__b' / 'result.json', {
+            'task_name': 'terminal-bench/cancel-async-tasks', 'started_at': '2026-11-16T00:02:00Z',
+            'finished_at': '2026-11-16T00:02:30Z', 'verifier_result': {'rewards': {'reward': 1.0}}})
+        shutil.rmtree(self.manager.jobs_dir / run_b / 'fix-git__fake')
+        self.workbench.library.sync()
+
+        view = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(len(view['items']), 1)
+        self.assertEqual(view['items'][0]['job']['planned'], 2)
+        self.assertEqual(view['items'][0]['job']['summary']['counts']['pass'], 2)
+        self.assertEqual({t['task']: t['job'] for t in view['tasks']},
+                         {'fix-git': run_a, 'cancel-async-tasks': run_b})
+        with self.assertRaisesRegex(ValueError, '没有要运行的题'):
+            self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'resume'})
+
+        full = self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'run'})
+        self.assertEqual(len(full['items']), 1)
+        self.assertEqual(full['items'][0]['previous_runs'], [run_a, run_b])
+        self.assertNotIn('resumed_runs', full['items'][0])
+        self.assertEqual(self.manager.profiles.get(pid)['items'][0]['request']['tasks'],
+                         ['fix-git', 'cancel-async-tasks'])
+        final = self.wait_profile(pid)
+        run_c = final['items'][0]['run']
+        argv_c = json.loads((self.manager.jobs_dir / run_c / 'argv.json').read_text())
+        self.assertIn('terminal-bench/fix-git', argv_c)
+        self.assertIn('terminal-bench/cancel-async-tasks', argv_c)
+
+        self.workbench.library.sync()
+        self.client.request('api/job/delete', {'name': run_a})
+        after_delete = self.manager.profiles.get(pid)
+        self.assertEqual(after_delete['items'][0]['previous_runs'], [run_b])
+        stored = next(r for r in self.workbench.library.profile_records() if r['id'] == pid)
+        self.assertEqual(stored['items'][0]['previous_runs'], [run_b])
+
+        deleted = self.client.request('api/profile/delete', {'id': pid})
+        self.assertEqual(sorted(deleted['runs']), sorted([run_b, run_c]))
+
+    def test_resume_uses_worker_summary_and_refuses_cancelling_profile(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        created = self.client.request('api/profiles/run', self.request(
+            attempts=2,
+            items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git', 'cancel-async-tasks']}]))
+        pid = created['id']
+        run_w = 'bench-worker-a'
+        from scripts.eval.harbor.bench import results
+        base = {'phases': {}, 'cause': None, 'elapsed_s': 1.0, 'total_tokens': 10, 'input_tokens': 5,
+                'output_tokens': 5, 'cache_tokens': 0, 'cache_creation_tokens': 0, 'cost_usd': None,
+                'turns': 1, 'tool_calls': 0}
+        done_rows = [{**base, 'trial': 'fix-git__1', 'task': 'fix-git', 'status': 'pass', 'reward': 1.0},
+                     {**base, 'trial': 'fix-git__2', 'task': 'fix-git', 'status': 'fail', 'reward': 0.0}]
+        partial_rows = [{**base, 'trial': 'cancel-async-tasks__1', 'task': 'cancel-async-tasks', 'status': 'pass', 'reward': 1.0},
+                        {**base, 'trial': 'cancel-async-tasks__2', 'task': 'cancel-async-tasks', 'status': 'running', 'reward': None}]
+        snapshot = {
+            'store_id': '0' * 32, 'source': '/remote/jobs/' + run_w,
+            'view': {'name': run_w, 'agent': 'MetacodesAgent', 'model': 'tokenjoy/test-model',
+                     'dataset': 'terminal-bench-2-1', 'attempts': 2, 'concurrency': 1, 'planned': 4,
+                     'started_at': '2026-11-16T00:00:00Z', 'finished_at': None, 'running': True,
+                     'wall_s': 30.0, 'summary': results.aggregate(done_rows + partial_rows)},
+            'tasks': {'fix-git': results.aggregate(done_rows),
+                      'cancel-async-tasks': results.aggregate(partial_rows)},
+        }
+        atomic_json(self.manager.records / (run_w + '.json'), {
+            'name': run_w, 'status': 'interrupted', 'profile': pid, 'suite': 'terminal-bench-2.1',
+            'model': 'tokenjoy/test-model', 'result_owner': 'gpu', 'finished_at': '2026-11-16T00:01:00Z',
+            'worker_summary': snapshot})
+        record = self.manager.profiles.get(pid)
+        record['status'] = 'cancelling'
+        record['items'][0].update(status='interrupted', run=run_w)
+        self.manager.profiles.save(record)
+        with self.assertRaisesRegex(ValueError, '正在停止'):
+            self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'resume'})
+        record['status'] = 'finished'
+        self.manager.profiles.save(record)
+        resumed = self.client.request('api/profile/item', {'id': pid, 'index': 0, 'action': 'resume'})
+        self.assertEqual(len(resumed['items']), 1)
+        self.assertEqual(resumed['items'][0]['resume_tasks_count'], 1)
+        self.assertEqual(self.manager.profiles.get(pid)['items'][0]['request']['tasks'], ['cancel-async-tasks'])
 
     def test_delete_last_submission_preserves_legacy_profile_concurrency(self):
         self.manager.profiles.stop()

@@ -15,7 +15,8 @@ from typing import Any, Dict, Optional
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.suites import leaderboards
 from scripts.eval.harbor.bench import builds, data, executors, monitor, results
-from scripts.eval.harbor.bench.profiles import PROFILE_ACTIVE, ProfileManager, public as public_profile, runs_of
+from scripts.eval.harbor.bench.profiles import (ITEM_DONE, PROFILE_ACTIVE, ProfileManager, current_runs, forget_item_run,
+                                                 item_runs, public as public_profile, runs_of)
 from scripts.eval.harbor.bench.runner import ACTIVE, atomic_json, runtime_env, settings
 from scripts.eval.harbor.bench.setup import LoginManager, SetupManager
 from scripts.eval.harbor.store import config as store_config
@@ -52,17 +53,15 @@ def task_group(task, rows, item, job):
     return group
 
 
-def latest_results(record, views):
-    """Per (suite, model, task), the rows of the last run that has them: a
-    rerun replaces the earlier result, which stays in `history` (job names,
-    oldest first). A run that stopped (cancelled, interrupted, failed) with
-    only invalid attempts of a task leaves that task's earlier result."""
-    latest, history = {}, {}
-    for item in record.get("items") or []:
-        view = views.get(item.get("run")) if item.get("run") else None
+def _merge_item_runs(item, names, views, latest, history=None):
+    resumed = set(item.get("resumed_runs") or ())
+    for index, name in enumerate(names):
+        view = views.get(name)
         if view is None:
             continue
-        stopped = item["status"] in ("cancelled", "interrupted", "failed")
+        is_last = index == len(names) - 1 and name == item.get("run")
+        stopped = (item["status"] in ("cancelled", "interrupted", "failed", "skipped")
+                   if is_last else name in resumed or view.get("execution_status") in ("cancelled", "interrupted", "failed"))
         by_task = {}
         for row in view.get("rows") or []:
             by_task.setdefault(row["task"], []).append(row)
@@ -73,9 +72,47 @@ def latest_results(record, views):
                 row["status"] == "invalid" for row in rows)
             if key in latest and stopped and invalid:
                 continue
-            if key in latest:
+            if key in latest and history is not None:
                 history.setdefault(key, []).append(latest[key][1])
             latest[key] = (item, view["name"], rows)
+
+
+def _item_job(item, views):
+    names = current_runs(item)
+    active_views = [views[name] for name in names if name in views]
+    if not active_views:
+        return None
+    if not item.get("resumed_runs") and len(active_views) == 1:
+        view = active_views[0]
+        job = {k: view.get(k) for k in ("name", "planned", "running", "wall_s", "started_at",
+                                        "finished_at", "dataset", "execution_status")}
+        job["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
+        return job
+    merged = {}
+    _merge_item_runs(item, names, views, merged)
+    summary = group_summary({key: group for key, (_, _, group) in merged.items()})
+    summary = {k: v for k, v in summary.items() if k not in ("ttft_samples_ms", "ttft_histogram")}
+    last = active_views[-1]
+    wall_values = [v["wall_s"] for v in active_views if v.get("wall_s") is not None]
+    planned = len(item.get("tasks") or []) * int(item.get("attempts") or 1)
+    active = item["status"] in ("pending", "running")
+    return {
+        "name": last["name"],
+        "planned": planned or last.get("planned"),
+        "running": any(v.get("running") for v in active_views),
+        "wall_s": sum(wall_values) if wall_values else None,
+        "started_at": active_views[0].get("started_at"),
+        "finished_at": None if active else last.get("finished_at"),
+        "dataset": last.get("dataset"),
+        "execution_status": None if active else last.get("execution_status"),
+        "summary": summary,
+    }
+
+
+def latest_results(record, views):
+    latest, history = {}, {}
+    for item in record.get("items") or []:
+        _merge_item_runs(item, item_runs(item), views, latest, history)
     return latest, history
 
 
@@ -91,8 +128,8 @@ def _profile_lookup(records):
         }
         by_id[pub["id"]] = meta
         for item in pub.get("items") or []:
-            if item.get("run"):
-                by_job[item["run"]] = meta
+            for run_name in item_runs(item):
+                by_job[run_name] = meta
     return by_id, by_job
 
 
@@ -345,21 +382,17 @@ class Workbench:
         return sorted(found.values(), key=lambda r: r.get("created_at") or "", reverse=True)
 
     def profile_summary(self, record, views) -> Dict[str, Any]:
-        """A profile's card: its record, each queued dataset's job, and the
-        summary of every task's latest result. `views` carry their rows."""
         value = public_profile(record)
         done, planned = 0, 0
         for item in value["items"]:
-            view = views.get(item.get("run")) if item.get("run") else None
+            job = _item_job(item, views)
             waiting = item["status"] in ("pending", "running")
             if waiting:
                 planned += len(item.get("tasks") or []) * int(item.get("attempts") or 1)
-            if view is not None:
+            if job is not None:
                 if waiting:
-                    done += view["summary"]["trials"] - view["summary"]["counts"]["running"]
-                item["job"] = {k: view.get(k) for k in ("name", "planned", "running", "wall_s", "started_at",
-                                                        "finished_at", "dataset", "execution_status")}
-                item["job"]["summary"] = {k: v for k, v in view["summary"].items() if k != "ttft_samples_ms"}
+                    done += job["summary"]["trials"] - job["summary"]["counts"]["running"]
+                item["job"] = job
         latest, _ = latest_results(record, views)
         value["summary"] = group_summary({key: group for key, (_, _, group) in latest.items()})
         value["by_model"], value["common_tasks"] = model_comparison(latest)
@@ -493,9 +526,11 @@ class Workbench:
         local_names = {r["name"] for r in runs}
         full = {}
         for item in record["items"]:
-            view = self.job_view(item["run"], runs=runs) if item.get("run") else None
-            if view is not None:
-                full[view["name"]] = view
+            for run_name in item_runs(item):
+                if run_name not in full:
+                    view = self.job_view(run_name, runs=runs)
+                    if view is not None:
+                        full[view["name"]] = view
         value = self.profile_summary(record, full)
         latest, history = latest_results(record, full)
         tasks = [{**task_group(task, rows, item, job), "history": history.get(key, [])}
@@ -547,10 +582,30 @@ class Workbench:
             raise ValueError(READ_ONLY)
         return self.profiles.submission_action(profile, submission, action)
 
+    def _unfinished_tasks(self, item):
+        tasks = list(item.get("tasks") or [])
+        attempts = int(item.get("attempts") or 1)
+        names = current_runs(item)
+        if not names:
+            return tasks
+        self.library.maybe_sync()
+        runs = self.runs()
+        views = {}
+        for name in names:
+            view = self.job_view(name, runs=runs, aggregate=True)
+            if view is not None:
+                views[name] = view
+        latest = {}
+        _merge_item_runs(item, names, views, latest)
+        finished = {}
+        for (_, _, task), (_, _, rows) in latest.items():
+            if isinstance(rows, dict):
+                finished[task] = rows.get("valid", 0)
+            else:
+                finished[task] = sum(1 for row in rows if row["status"] not in ("running", "invalid"))
+        return [t for t in tasks if finished.get(t, 0) < attempts]
+
     def profile_item(self, profile, index, action) -> Dict[str, Any]:
-        """Act on one queued dataset: `cancel` a waiting one, `stop` the running
-        one, `resume` a stopped one with the tasks it has not finished, `run`
-        an ended one again with all its tasks."""
         if not self.manager:
             raise ValueError(READ_ONLY)
         if action == "cancel":
@@ -560,15 +615,10 @@ class Workbench:
         if action not in ("resume", "run"):
             raise ValueError("action 只能是 cancel、stop、resume 或 run")
         _, item = self.profiles.record_item(profile, index)
-        tasks = item.get("tasks") or []
-        if action == "resume":
-            view = self.job_view(item["run"]) if item.get("run") else None
-            finished = {}
-            for row in view["rows"] if view else []:
-                if row["status"] not in ("running", "invalid"):
-                    finished[row["task"]] = finished.get(row["task"], 0) + 1
-            tasks = [t for t in tasks if finished.get(t, 0) < (item.get("attempts") or 1)]
-        return self.profiles.requeue_item(profile, index, tasks)
+        if item["status"] not in ITEM_DONE:
+            raise ValueError("这个评测集还在等待或运行")
+        tasks = self._unfinished_tasks(item) if action == "resume" else list(item.get("tasks") or [])
+        return self.profiles.requeue_item(profile, index, tasks, resume=action == "resume")
 
     def set_profile_concurrency(self, profile, concurrency) -> Dict[str, Any]:
         if not self.manager:
@@ -627,10 +677,11 @@ class Workbench:
 
     def _forget_run(self, name, worker_jobs) -> None:
         for record in self.profiles.records():
-            items = [item for item in record["items"] if item.get("run") == name]
-            for item in items:
-                item["run"] = None
-            if items:
+            changed = False
+            for item in record["items"]:
+                if forget_item_run(item, name):
+                    changed = True
+            if changed:
                 self.profiles.save(record)
         self._remove_run_files([name], worker_jobs)
 

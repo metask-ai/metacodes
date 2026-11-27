@@ -233,10 +233,21 @@ class StoreLibrary:
                                     (str(jobs_dir / ingest.PROFILES_DIR),))
                 for profile, record_json in profiles:
                     record = json.loads(record_json)
-                    items = [item for item in record.get("items") or [] if item.get("run") == job]
-                    for item in items:
-                        item["run"] = None
-                    if items:
+                    changed = False
+                    for item in record.get("items") or []:
+                        if item.get("run") == job:
+                            item["run"] = None
+                            changed = True
+                        for field in ("resumed_runs", "previous_runs"):
+                            values = item.get(field)
+                            if isinstance(values, list) and job in values:
+                                kept = [entry for entry in values if entry != job]
+                                if kept:
+                                    item[field] = kept
+                                else:
+                                    item.pop(field, None)
+                                changed = True
+                    if changed:
                         tx.execute("UPDATE profiles SET record_json = ? WHERE id = ?", (ingest._json(record), profile))
 
     def _owned_sources(self, owners, label: str):
