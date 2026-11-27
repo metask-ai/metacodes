@@ -1049,6 +1049,7 @@ pub const RenderRegion = struct {
 
         // -- issue #16 model picker:开着时独占菜单区。旧的 /model 与 /models 菜单
         //    占同一块屏幕位置,同时画会互相盖掉。--
+        const picker_top: u16 = new_rows;
         const picker_rows: u16 = if (self.pickerOpenLocked())
             model_picker_view.render(&app.model_picker, w, self.theme, self.cols)
         else
@@ -1102,15 +1103,16 @@ pub const RenderRegion = struct {
         const body_cursor: usize = if (shell and cursor > 0) cursor - 1 else cursor;
         const loc = RenderRegion.locateCursor(body, body_cursor, &vlines);
         const hint_rows: u16 = if (self.aboveBoxNotice() != null) 1 else 0;
-        const target_row: u16 = task_tab_rows + hint_rows + 1 + @as(u16, @intCast(loc.vline));
-        // 最底行 = new_rows-1(footer + 可能的 agent switcher 行)。光标从最底回输入行。
+        const caret = if (picker_rows > 0) model_picker_view.filterCaret(&app.model_picker, self.cols) else null;
+        const target_row: u16 = if (caret) |c| picker_top + c.row else task_tab_rows + hint_rows + 1 + @as(u16, @intCast(loc.vline));
+        // 最底行 = new_rows-1(footer + 可能的 agent switcher 行)。光标从最底回输入行,model picker 开着时回它的过滤框。
         const footer_row: u16 = new_rows - 1;
         if (footer_row > target_row) {
             w.writeAll(ansi.cursor.up(footer_row - target_row, &nbuf)) catch {};
         }
         w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
         const prefix_w: u32 = 2;
-        const cursor_col: u16 = @intCast(prefix_w + loc.vcol);
+        const cursor_col: u16 = if (caret) |c| c.col else @intCast(prefix_w + loc.vcol);
         w.writeAll(ansi.cursor.forward(cursor_col, &nbuf)) catch {};
 
         // 4. show + 记不变式
@@ -2398,7 +2400,7 @@ pub const RenderRegion = struct {
     }
 
     /// 擦掉固定区(R 行),光标回"文本续接点"。
-    /// **不变式**:drawGenRegion 末尾把光标停在 editor 编辑点,并记 anchor(距区顶行数 + 上方各行宽);
+    /// **不变式**:drawGenRegion 末尾把光标停在 editor 编辑点(model picker 开着时停在它的过滤框),并记 anchor(距区顶行数 + 上方各行宽);
     /// 此处先 UP(anchor.climb())+\r 回区顶,再 ED0 一次清到屏底。draw/erase 之间无 print 滚动
     /// → anchor 不失效(只 writeGenText 的 print 滚动,且发生在 erase 之后,区已不在屏)。resize 不滚动
     /// 但会把宽行重排成多行:climb 按终端现在的宽度数(调用方先 observeResize 量过)。
@@ -2436,7 +2438,7 @@ pub const RenderRegion = struct {
     }
 
     /// 画生成期固定区(spinner + 队列预览 + 上框 + ❯editor(多行) + 下框 + footer),文本流末尾下方。
-    /// 前置 region_drawn=false;后置 region_drawn=true,**光标停在 editor 编辑点**(供 IME 候选窗对齐),
+    /// 前置 region_drawn=false;后置 region_drawn=true,**光标停在 editor 编辑点**(model picker 开着时停在它的过滤框;供 IME 候选窗对齐),
     /// 并记 anchor(距区顶行数 + 上方各行宽)供 eraseRegion 回顶。半行文本尾先 \n 封口让区独占整行。
     fn drawGenRegion(self: *RenderRegion, app: *const app_mod.App) void {
         // 固定区的生成形态只属于生成期:离开生成期后不再有它可画(region_drawn 保持 false)。
@@ -2532,9 +2534,12 @@ pub const RenderRegion = struct {
         w.writeAll("\r\n") catch {};
 
         // -- issue #16 model picker(生成期也可用:改选择只影响下一轮)--
-        if (g.interaction.picker_open) {
-            R += model_picker_view.render(&app.model_picker, w, self.theme, self.cols);
-        }
+        const picker_top: u16 = R;
+        const picker_rows: u16 = if (g.interaction.picker_open)
+            model_picker_view.render(&app.model_picker, w, self.theme, self.cols)
+        else
+            0;
+        R += picker_rows;
 
         // -- footer(末行不 \r\n)或 help 菜单(help_open 时原地展开,对齐输入期 renderFrameInner)--
         if (g.interaction.help_open) {
@@ -2556,17 +2561,18 @@ pub const RenderRegion = struct {
         // 光标在 footer 行末 = 区最后一行(第 R-1 行)。区下方的陈旧尾行已由开头的 ESC[0J 清净
         // (单一机制),不再需要旧的 per-shrink 尾行擦除。
 
-        // -- 光标落在 editor 编辑点(供 IME 候选窗对齐)--
+        // -- 光标落在 editor 编辑点,model picker 开着时落在它的过滤框(供 IME 候选窗对齐)--
         // 编辑点区内行号 = 上边框行号 + 1(❯ 行)+ loc.vline;列 = 2(prefix)+ loc.vcol。
         const loc = RenderRegion.locateCursor(content, g.interaction.editor.cursor, &vlines);
-        const edit_row: u16 = top_border_rownum + 1 + @as(u16, @intCast(loc.vline));
+        const caret = if (picker_rows > 0) model_picker_view.filterCaret(&app.model_picker, self.cols) else null;
+        const edit_row: u16 = if (caret) |c| picker_top + c.row else top_border_rownum + 1 + @as(u16, @intCast(loc.vline));
         const footer_rownum: u16 = R - 1;
         if (footer_rownum > edit_row) {
             w.writeAll(ansi.cursor.up(footer_rownum - edit_row, &nb)) catch {};
         }
         w.writeAll(ansi.cursor.column(1, &nb)) catch {};
         const prefix_w: u32 = 2;
-        const cursor_col: u16 = @intCast(prefix_w + loc.vcol);
+        const cursor_col: u16 = if (caret) |c| c.col else @intCast(prefix_w + loc.vcol);
         w.writeAll(ansi.cursor.forward(cursor_col, &nb)) catch {};
 
         w.writeAll(ansi.cursor.show) catch {};
