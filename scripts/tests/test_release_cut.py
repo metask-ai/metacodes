@@ -676,6 +676,54 @@ class VersionGateStepTest(unittest.TestCase):
             self.assertIn("labels=[unset] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)
             self.assertEqual(calls, [], job)
 
+    def test_posix_release_leg_runs_rehearsal_before_release_layout(self):
+        """A release PR that falls back to the full path needs the local
+        rehearsal tag on the POSIX `release` leg as well as `checks`, while
+        still skipping `release` on fast-path or narrowed scopes."""
+        try:
+            import yaml
+        except ImportError:  # requirements-dev.txt
+            self.skipTest("PyYAML is not installed")
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+
+        def evaluates(condition: str, leg: dict, fast_path: str, release: str) -> bool:
+            values = {
+                "matrix.checks": bool(leg.get("checks")),
+                "matrix.release": bool(leg.get("release")),
+                "matrix.units": bool(leg.get("units")),
+                "matrix.product": bool(leg.get("product")),
+                "env.FAST_PATH": fast_path,
+                "env.RELEASE": release,
+            }
+            expr = re.sub(r"\b(?:env|matrix)\.\w+", lambda m: repr(values[m.group()]), condition)
+            expr = expr.replace("&&", "and").replace("||", "or")
+            return bool(eval(expr, {"__builtins__": {}}, {}))
+
+        for job in ("gates-linux", "gates-macos"):
+            steps = workflow["jobs"][job]["steps"]
+            gate_idx = next(i for i, s in enumerate(steps) if s.get("name") == self.STEP)
+            release_idx = next(i for i, s in enumerate(steps) if s.get("name") == "Release layout prefix")
+            self.assertLess(gate_idx, release_idx, job)
+            condition = steps[gate_idx]["if"]
+            legs = {entry["leg"]: entry for entry in workflow["jobs"][job]["strategy"]["matrix"]["include"]}
+            release_leg = legs["release"]
+            checks_leg = legs["checks"] if "checks" in legs else legs["units-checks"]
+            product_leg = legs["product"]
+
+            # Release leg rehearses on full path (and fail-open empty outputs), skips on fast-path or RELEASE=false.
+            self.assertTrue(evaluates(condition, release_leg, "false", "true"), job)
+            self.assertTrue(evaluates(condition, release_leg, "", ""), job)
+            self.assertFalse(evaluates(condition, release_leg, "true", "true"), job)
+            self.assertFalse(evaluates(condition, release_leg, "false", "false"), job)
+            # Checks leg always runs the gate (including fast-path and docs/narrowed scopes).
+            self.assertTrue(evaluates(condition, checks_leg, "false", "true"), job)
+            self.assertTrue(evaluates(condition, checks_leg, "true", "true"), job)
+            self.assertTrue(evaluates(condition, checks_leg, "false", "false"), job)
+            # Unrelated legs never run the gate.
+            self.assertFalse(evaluates(condition, product_leg, "false", "true"), job)
+            if "units" in legs:
+                self.assertFalse(evaluates(condition, legs["units"], "false", "true"), job)
+
 
 if __name__ == "__main__":
     unittest.main()
