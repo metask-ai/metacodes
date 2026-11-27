@@ -2343,6 +2343,23 @@ def _reject_workbench_only_keys(values: object, *, label: str) -> None:
         )
 
 
+def _metered_tokens(
+    prompt: int,
+    completion: int,
+    cache_read: int,
+    cache_create: int,
+    extra: Mapping[str, Any],
+    *,
+    label: str,
+) -> int:
+    includes_cache = extra.get("prompt_tokens_include_cache")
+    if includes_cache is None or includes_cache is False:
+        return prompt + completion + cache_read + cache_create
+    if includes_cache is not True or prompt < cache_read + cache_create:
+        raise LaunchError(f"{label} has inconsistent cached prompt token usage")
+    return prompt + completion
+
+
 def _validate_project_control_kwargs(
     kwargs: object, expected: Mapping[str, object], *, label: str
 ) -> None:
@@ -2904,7 +2921,14 @@ def _collect_usage(
                 "completion": completion,
                 "cache_read": cache_read,
                 "cache_create": cache_create,
-                "metered": prompt + completion + cache_read + cache_create,
+                "metered": _metered_tokens(
+                    prompt,
+                    completion,
+                    cache_read,
+                    cache_create,
+                    extra,
+                    label=f"trajectory {trajectory_path}",
+                ),
                 "metacodes_turns": extra.get("metacodes_turns"),
                 "websearch_dispatches": websearch_dispatches,
                 "transcript_sha256": control_metrics["source"]["transcript_sha256"],
@@ -3209,8 +3233,13 @@ def _collect_usage(
                 attempt_usage["cost_microusd"] = usd_to_microusd_ceiling(
                     float(t_cost)
                 )
-                attempt_usage["metered_tokens"] = (
-                    t_prompt + t_completion + t_cached + t_cache_create
+                attempt_usage["metered_tokens"] = _metered_tokens(
+                    t_prompt,
+                    t_completion,
+                    t_cached,
+                    t_cache_create,
+                    t_extra,
+                    label=f"tainted attempt-1 trajectory for {row['task']}",
                 )
             else:
                 attempt_usage["cost_microusd"] = None
@@ -4673,15 +4702,20 @@ def resume_trials(
             return 0, 0
         cost = final.get("total_cost_usd") or 0.0
         extra = final.get("extra") or {}
-        tokens = 0
-        for value in (
-            final.get("total_prompt_tokens"),
-            final.get("total_completion_tokens"),
-            final.get("total_cached_tokens"),
-            extra.get("cache_creation_input_tokens"),
-        ):
-            if isinstance(value, int) and not isinstance(value, bool):
-                tokens += max(value, 0)
+        if not isinstance(extra, Mapping):
+            extra = {}
+
+        def _nonneg_int(value: object) -> int:
+            return max(value, 0) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+        prompt_n = _nonneg_int(final.get("total_prompt_tokens"))
+        completion_n = _nonneg_int(final.get("total_completion_tokens"))
+        cache_read_n = _nonneg_int(final.get("total_cached_tokens"))
+        cache_create_n = _nonneg_int(extra.get("cache_creation_input_tokens"))
+        if extra.get("prompt_tokens_include_cache") is True:
+            tokens = max(prompt_n, cache_read_n + cache_create_n) + completion_n
+        else:
+            tokens = prompt_n + completion_n + cache_read_n + cache_create_n
         if not isinstance(cost, (int, float)) or isinstance(cost, bool):
             return 0, tokens
         return usd_to_microusd_ceiling(max(float(cost), 0.0)), tokens

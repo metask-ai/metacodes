@@ -421,6 +421,41 @@ status, compatibility boundaries, and entry points are defined by
   it runs at it, reruns included. A profile saved earlier keeps its latest
   dataset's value. `bench run` on the CLI still takes `--concurrency`.
 
+- **List hints name only keys a laptop has.** The position line under a
+  long `/model` list or slash menu reads `[12/315] · type to filter` instead
+  of also naming PgUp/PgDn and Home/End, which most laptop keyboards reach
+  only through Fn. The keys still work, and the `?` shortcuts now list them
+  (`pgup / pgdn, home / end in lists`).
+
+- **The banner calls `/model`'s lasting choice by the name the picker uses.**
+  With keys of several providers in `.env` and none named, the notice under
+  the banner (and the `-p` refusal) said "Tab there applies it to every
+  future session", while the picker's header calls that choice "from now
+  on". It now says `press Tab there for "from now on" to keep it`.
+
+- **`/model` lists only the region a stored key works in.** GLM Coding Plan,
+  Kimi, Kimi Code, MiniMax and Qwen each run a China and a Global site, and
+  a key works on the site it was made on. A key `/login` stored records that
+  page, yet the picker listed every model's routes on both sites
+  (`cn-anthropic`, `global-openai`, …), half of which the key cannot use. It
+  now lists only the routes of the key's site; a key from the environment or
+  `.env`, whose site is not known, still lists both.
+
+- **`/model` lists one route per site.** A model a provider serves on its
+  China and Global sites over two wires each (Kimi Code's `cn-responses`,
+  `cn-chat`, `global-responses`, `global-chat`) listed four routes under it.
+  It lists one per site: the route in use there, else the site's first.
+  With the cursor on a site's route, that site's other wires are listed
+  under it, and a second account on a site is still a route of its own.
+
+- **A long OpenRouter list opens on the models you would pick.** `/model`
+  listed all of OpenRouter's 300-odd models in one list. A provider listing
+  more than 40 models that marks its own latest ones (OpenRouter's
+  `~vendor/…-latest` ids, such as `~anthropic/claude-sonnet-latest`) now
+  opens on the model in use and those, with the rest folded under `All
+  models · N more`. Enter there shows them grouped by vendor, and Esc folds
+  them again. Typing still searches every model.
+
 - **Bench profiles replace batches.** A profile (评测配置) is one frozen
   metacodes version with a fixed set of advanced features, and every run
   belongs to one; the same version with the same features is always the same
@@ -523,6 +558,17 @@ status, compatibility boundaries, and entry points are defined by
   `❯ <teammate-message …>`, like a prompt the user had written. It still
   starts that turn and reaches the model unchanged; only what the user
   queued during a reply is echoed now.
+
+- **Closing `/model` with no model set no longer names one.** Esc or Ctrl+C
+  in the picker of a session that has no model said `kept
+  claude-sonnet-4-20250514`, the placeholder the clients are built with; it
+  says `no model set`.
+
+- **Ctrl+C during a reply closes an open `/model` first.** With the picker
+  open over a running reply, Ctrl+C interrupted the reply and cleared the
+  queued draft while the picker stayed open. It now closes the picker, as it
+  already did at the prompt (#607); the next Ctrl+C interrupts the reply.
+  Ctrl+D is still never taken by the picker.
 
 - **`/login metask` without the TUI moves the session to the new
   sign-in.** With standard input not a terminal, `/login metask` stored a

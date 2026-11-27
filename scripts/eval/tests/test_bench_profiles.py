@@ -1467,6 +1467,52 @@ class ModelPriceTest(unittest.TestCase):
                                                                  "other/model": {"prompt": "1", "completion": "1"}}),
                          {"openrouter_id": "acme/model", "input": 1.0, "output": 2.0})
 
+    def test_price_for_matches_hyphenated_versions_and_dated_snapshots_without_breaking_exact_or_ambiguous(self):
+        from scripts.eval.harbor.bench import prices
+        catalog = {
+            "anthropic/claude-opus-4.6": {"prompt": "0.000005", "completion": "0.000025",
+                                          "input_cache_read": "0.0000005", "input_cache_write": "0.00000625"},
+            "anthropic/claude-sonnet-4.6": {"prompt": "0.000003", "completion": "0.000015"},
+            "anthropic/claude-haiku-4.5": {"prompt": "0.000001", "completion": "0.000005"},
+            "anthropic/claude-opus-5.5": {"prompt": "0.000004", "completion": "0.00002"},
+            "deepseek/deepseek-v4.1-flash-1017": {"prompt": "0.0000003", "completion": "0.0000012"},
+            "deepseek/deepseek-v4.1-flash": {"prompt": "0.00000014", "completion": "0.0000006"},
+            "openai/gpt-4o": {"prompt": "0.0000025", "completion": "0.00001"},
+            "openai/gpt-4o-2024-05-13": {"prompt": "0.000005", "completion": "0.000015"},
+            "openai/gpt-5.2": {"prompt": "0.00000175", "completion": "0.000014"},
+            "qwen/qwen3.5-plus-20260420": {"prompt": "0.0000004", "completion": "0.0000012"},
+            "qwen/qwen3.5-35b-a3b": {"prompt": "0.0000002", "completion": "0.0000008"},
+            "a/dup-4.6": {"prompt": "0.000001", "completion": "0.000002"},
+            "b/dup-4.6": {"prompt": "0.000003", "completion": "0.000004"},
+        }
+        self.assertEqual(
+            prices.price_for("metask/claude-opus-4-6", catalog),
+            {"openrouter_id": "anthropic/claude-opus-4.6", "input": 5.0, "output": 25.0,
+             "cached_input": 0.5, "cache_write": 6.25},
+        )
+        self.assertEqual(prices.price_for("metask/claude-sonnet-4-6", catalog)["openrouter_id"], "anthropic/claude-sonnet-4.6")
+        self.assertEqual(prices.price_for("metask/claude-opus-5-5", catalog)["openrouter_id"], "anthropic/claude-opus-5.5")
+        self.assertEqual(prices.price_for("openrouter/anthropic/claude-opus-4-6", catalog)["openrouter_id"], "anthropic/claude-opus-4.6")
+        self.assertIsNone(prices.price_for("gateway/other/claude-opus-4-6", catalog))
+        self.assertEqual(prices.price_for("metask/claude-haiku-4-5-20251001", catalog)["openrouter_id"], "anthropic/claude-haiku-4.5")
+        self.assertEqual(prices.price_for("metask/claude-haiku-4-5@20251001", catalog)["openrouter_id"], "anthropic/claude-haiku-4.5")
+        self.assertEqual(prices.price_for("metask/gpt-5.2-2025-12-11", catalog)["openrouter_id"], "openai/gpt-5.2")
+        self.assertEqual(prices.price_for("metask/gpt-5-2-2025-12-11", catalog)["openrouter_id"], "openai/gpt-5.2")
+        self.assertEqual(prices.price_for("metask/gpt-4o-2024-05-13", catalog)["openrouter_id"], "openai/gpt-4o-2024-05-13")
+        self.assertEqual(prices.price_for("metask/gpt-4o-2025-01-01", catalog)["openrouter_id"], "openai/gpt-4o")
+        self.assertEqual(prices.price_for("metask/qwen3-5-plus-20260420", catalog)["openrouter_id"], "qwen/qwen3.5-plus-20260420")
+        self.assertEqual(prices.price_for("metask/qwen3-5-35b-a3b", catalog)["openrouter_id"], "qwen/qwen3.5-35b-a3b")
+        self.assertEqual(prices.price_for("metask/deepseek-v4-1-flash-1017", catalog)["openrouter_id"], "deepseek/deepseek-v4.1-flash-1017")
+        self.assertIsNone(prices.price_for("metask/deepseek-v4.1-flash-9999", catalog))
+        self.assertIsNone(prices.price_for("metask/dup-4-6", catalog))
+        self.assertEqual(
+            prices.price_for("metask/exact-4-6", {
+                "a/exact-4.6": {"prompt": "0.000001", "completion": "0.000002"},
+                "b/exact-4-6": {"prompt": "0.000003", "completion": "0.000004"},
+            })["openrouter_id"],
+            "b/exact-4-6",
+        )
+
     def test_the_catalog_is_cached_for_a_day_and_a_failed_fetch_keeps_the_cached_copy(self):
         from scripts.eval.harbor.bench import prices
         calls = []
@@ -1503,6 +1549,287 @@ class ModelPriceTest(unittest.TestCase):
         self.assertEqual([a for a in command(spec) if a.startswith("model_price=")],
                          ['model_price={"input":0.15,"output":0.6}'])
         self.assertFalse([a for a in command({**spec, "model_price": None}) if a.startswith("model_price=")])
+
+    def test_baseten_catalog_and_compute_cost_cover_frontier_harness_models(self):
+        from scripts.eval.harbor.bench import prices
+        for model, expected_id in (
+            ("metask/DeepSeek-V4.1-Flash-1017", "deepseek-ai/deepseek-v4.1-flash-1017"),
+            ("metask/GLM-5.3", "zai-org/glm-5.3"),
+            ("metask/glm-5-3-flash", "zai-org/glm-5.3-flash"),
+            ("metask/Kimi-K3", "moonshotai/kimi-k3"),
+            ("metask/muse-spark-open", "meta-models/muse-spark-open"),
+        ):
+            found = prices.baseten_price_for(model)
+            self.assertIsNotNone(found, model)
+            self.assertEqual(found["baseten_id"], expected_id)
+        self.assertIsNone(prices.baseten_price_for("metask/claude-opus-4-6"))
+        baseten_rate = prices.rate_for("metask/DeepSeek-V4.1-Flash-1017", prices.BASETEN)
+        cost = prices.compute_cost(baseten_rate, input_tokens=14_500_000, output_tokens=50_000,
+                                   cache_tokens=7_500_000, cache_creation_tokens=0)
+        self.assertAlmostEqual(cost, 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.007, places=6)
+        self.assertIsNone(prices.compute_cost(baseten_rate, 0, 0, 0, 0))
+
+    def test_workbench_reprices_views_and_aligns_leaderboard_default_to_baseten(self):
+        from scripts.eval.harbor.bench import prices
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs_dir = root / "jobs"
+            cfg = root / "workbench.json"
+            atomic_json(cfg, {"model_prices": "off"})
+            atomic_json(root / prices.CACHE_NAME, {
+                "fetched_at": time.time(),
+                "models": {
+                    "deepseek/deepseek-v4.1-flash-1017": {
+                        "prompt": "0.0000003",
+                        "completion": "0.0000012",
+                        "input_cache_read": "0.000000006",
+                    },
+                },
+            })
+            job = jobs_dir / "fh-job"
+            _write(job / "config.json", {
+                "agents": [{"name": "metacodes", "model_name": "metask/DeepSeek-V4.1-Flash-1017"}],
+                "datasets": [{"name": "frontier-harness-eval/frontier-harness-eval@v1.1.0"}],
+                "n_attempts": 1, "n_concurrent_trials": 1,
+            })
+            _write(job / "result.json", {
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:10:00Z", "n_total_trials": 1,
+            })
+            _write(jobs_dir / ".bench-runs" / "fh-job.json", {
+                "name": "fh-job", "status": "finished", "suite": "frontier-harness-eval-1.1",
+                "model": "metask/DeepSeek-V4.1-Flash-1017",
+            })
+            trial = job / "fix-git__a"
+            _write(trial / "config.json", {})
+            _write(trial / "result.json", {
+                "task_name": "terminal-bench/fix-git",
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:05:00Z",
+                "agent_result": {
+                    "n_input_tokens": 14_500_000,
+                    "n_cache_tokens": 7_500_000,
+                    "n_output_tokens": 50_000,
+                    "cost_usd": 24.0,
+                },
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            })
+            _write(trial / "agent" / "metacodes-output.jsonl", [
+                {"type": "result", "stop_reason": "end_turn", "turns": 2, "tool_calls": 1,
+                 "input_tokens": 7_000_000, "output_tokens": 50_000,
+                 "cache_read_input_tokens": 7_500_000, "cache_creation_input_tokens": 0,
+                 "cost_usd": 24.0, "text": "ok"},
+            ])
+            tb_job = jobs_dir / "tb-job"
+            _write(tb_job / "config.json", {
+                "agents": [{"name": "metacodes", "model_name": "metask/DeepSeek-V4.1-Flash-1017"}],
+                "datasets": [{"name": "terminal-bench/terminal-bench-2-1"}],
+                "n_attempts": 1, "n_concurrent_trials": 1,
+            })
+            _write(tb_job / "result.json", {
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:10:00Z", "n_total_trials": 1,
+            })
+            tb_trial = tb_job / "fix-git__b"
+            _write(tb_trial / "config.json", {})
+            _write(tb_trial / "result.json", {
+                "task_name": "terminal-bench/fix-git",
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:05:00Z",
+                "agent_result": {
+                    "n_input_tokens": 14_500_000,
+                    "n_cache_tokens": 7_500_000,
+                    "n_output_tokens": 50_000,
+                    "cost_usd": 24.0,
+                },
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            })
+            manager = RunManager(jobs_dir, cfg)
+            wb = Workbench(data.Library([jobs_dir]), manager)
+            try:
+                wb.library.sync()
+                openrouter_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.006
+                baseten_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.007
+
+                default_job = wb.job("fh-job")
+                self.assertEqual(default_job["pricing"]["schedule"], "openrouter")
+                self.assertAlmostEqual(default_job["summary"]["cost_per_task"], openrouter_cost, places=6)
+                self.assertAlmostEqual(default_job["costs_by_schedule"]["openrouter"]["cost_per_task"], openrouter_cost, places=6)
+                self.assertAlmostEqual(default_job["costs_by_schedule"]["baseten"]["cost_per_task"], baseten_cost, places=6)
+                self.assertAlmostEqual(default_job["costs_by_schedule"]["recorded"]["cost_per_task"], 24.0, places=6)
+
+                baseten_job = wb.job("fh-job", price="baseten")
+                self.assertEqual(baseten_job["pricing"]["schedule"], "baseten")
+                self.assertAlmostEqual(baseten_job["summary"]["cost_per_task"], baseten_cost, places=6)
+
+                recorded_trial = wb.trial("fh-job", "fix-git__a", price="recorded")
+                self.assertAlmostEqual(recorded_trial["row"]["cost_usd"], 24.0, places=6)
+                self.assertAlmostEqual(recorded_trial["costs_by_schedule"]["baseten"]["cost_usd"], baseten_cost, places=6)
+
+                fh_board = wb.leaderboard("frontier-harness-eval-1.1")
+                self.assertEqual(fh_board["pricing"]["schedule"], "auto")
+                board_meta = fh_board["boards"][0]["pricing"]
+                self.assertEqual((board_meta["effective_schedule"], board_meta["aligned"]), ("baseten", True))
+                fh_entry = fh_board["boards"][0]["jobs"][0]
+                self.assertAlmostEqual(fh_entry["cost_per_task"], baseten_cost, places=6)
+                self.assertAlmostEqual(fh_entry["costs_by_schedule"]["openrouter"], openrouter_cost, places=6)
+                self.assertAlmostEqual(fh_entry["costs_by_schedule"]["recorded"], 24.0, places=6)
+
+                fh_override = wb.leaderboard("frontier-harness-eval-1.1", price="openrouter")
+                self.assertEqual(fh_override["boards"][0]["pricing"]["effective_schedule"], "openrouter")
+                self.assertFalse(fh_override["boards"][0]["pricing"]["aligned"])
+                self.assertAlmostEqual(fh_override["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
+
+                tb_board = wb.leaderboard("terminal-bench-2.1")
+                self.assertEqual(tb_board["boards"][0]["pricing"]["effective_schedule"], "openrouter")
+                self.assertTrue(tb_board["boards"][0]["pricing"]["aligned"])
+                self.assertAlmostEqual(tb_board["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
+            finally:
+                wb.close()
+
+    def test_remote_worker_summary_repricing_matches_row_repricing_for_cache_write_and_mixed_statuses(self):
+        from scripts.eval.harbor.bench import prices, results
+        from scripts.eval.harbor.bench.workbench import _reprice_view, board_job
+
+        def make_row(task, trial, status, *, input_tokens, output_tokens=0, cache_tokens=0,
+                     cache_creation_tokens=0, reward=None, cost_usd=99.0):
+            return {
+                "trial": trial,
+                "task": task,
+                "status": status,
+                "cause": "provider: err" if status == "invalid" else None,
+                "reward": reward,
+                "exception": None,
+                "stop_reason": "end_turn",
+                "empty_final": False,
+                "turns": 1,
+                "tool_calls": 1,
+                "input_tokens": float(input_tokens),
+                "initial_input_tokens": None,
+                "initial_composition": None,
+                "total_tokens": float(input_tokens + output_tokens),
+                "tokens_partial": False,
+                "cache_tokens": float(cache_tokens),
+                "cache_creation_tokens": float(cache_creation_tokens),
+                "output_tokens": float(output_tokens),
+                "cache_ratio": None,
+                "cost_usd": cost_usd,
+                "cost_source": "metacodes_catalog_estimate" if cost_usd is not None else "unavailable",
+                "requests": 1,
+                "profiled_requests": 0,
+                "ttft_samples_ms": [],
+                "tps_output_tokens": 0,
+                "tps_generation_ms": 0,
+                "ttft_ms": None,
+                "ttft_p50_ms": None,
+                "ttft_p95_ms": None,
+                "tps": None,
+                "started_at": "2026-11-26T00:00:00Z",
+                "finished_at": None if status == "running" else "2026-11-26T00:01:00Z",
+                "elapsed_s": 60.0,
+                "lifecycle": None,
+                "phases": {"environment": None, "setup": None, "agent": 10.0, "verifier": None},
+                "tests": None,
+            }
+
+        def build_pair(name, model, rows):
+            header = {
+                "name": name, "agent": "metacodes", "model": model, "dataset": "d",
+                "attempts": 2, "concurrency": 1, "planned": len(rows),
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:10:00Z",
+                "running": any(r["status"] == "running" for r in rows), "wall_s": 600.0,
+            }
+            local = {**header, "rows": [dict(r) for r in rows], "summary": data.summarize(rows)}
+            snapshot = {
+                "store_id": "0" * 32,
+                "source": "/remote/jobs/" + name,
+                "view": {**header, "summary": results.aggregate(rows)},
+                "tasks": results.task_summaries(rows),
+            }
+            results.check_snapshot(snapshot, name)
+            remote = {**snapshot["view"], "task_summaries": snapshot["tasks"]}
+            return local, remote, snapshot
+
+        sonnet_catalog = {
+            "anthropic/claude-sonnet-4.6": {
+                "prompt": "0.000003",
+                "completion": "0.000015",
+                "input_cache_read": "0.0000003",
+                "input_cache_write": "0.00000375",
+            },
+        }
+        cw_rows = [
+            make_row("task-cw", "task-cw__1", "pass", input_tokens=1_000_000, cache_creation_tokens=1_000_000, reward=1.0),
+        ]
+        local_cw, remote_cw, _ = build_pair("job-cw", "metask/claude-sonnet-4-6", cw_rows)
+        l_cw = _reprice_view(local_cw, None, prices.OPENROUTER, sonnet_catalog)
+        r_cw = _reprice_view(remote_cw, None, prices.OPENROUTER, sonnet_catalog)
+        self.assertAlmostEqual(l_cw["summary"]["cost_usd"], 3.75, places=6)
+        self.assertAlmostEqual(r_cw["summary"]["cost_usd"], 3.75, places=6)
+        self.assertAlmostEqual(r_cw["summary"]["cost_per_task"], 3.75, places=6)
+        self.assertAlmostEqual(board_job(r_cw, None)["cost_per_task"], 3.75, places=6)
+
+        mixed_rows = [
+            make_row("task-inv", "task-inv__1", "pass", input_tokens=1_000_000, reward=1.0),
+            make_row("task-inv", "task-inv__2", "invalid", input_tokens=9_000_000, reward=None),
+            make_row("task-len", "task-len__1", "pass", input_tokens=1_000_000, reward=1.0),
+            make_row("task-len", "task-len__2", "fail", input_tokens=9_000_000, reward=0.0),
+        ]
+        local_mix, remote_mix, snapshot_mix = build_pair("job-mix", "metask/DeepSeek-V4.1-Flash-1017", mixed_rows)
+        for schedule in (prices.BASETEN, prices.OPENROUTER):
+            or_catalog = {
+                "deepseek/deepseek-v4.1-flash-1017": {
+                    "prompt": "0.0000003",
+                    "completion": "0.0000012",
+                    "input_cache_read": "0.000000006",
+                },
+            }
+            l_view = _reprice_view(local_mix, None, schedule, or_catalog)
+            r_view = _reprice_view(remote_mix, None, schedule, or_catalog)
+            for key in ("cost_usd", "cost_trials", "cost_per_task", "cost_per_pass", "non_pass_cost_share",
+                        "task_cost_sum", "task_pass_sum", "task_cost_tasks"):
+                self.assertAlmostEqual(r_view["summary"][key], l_view["summary"][key], places=6, msg=(schedule, key))
+            self.assertEqual(r_view["summary"]["cost_by_status"], l_view["summary"]["cost_by_status"])
+            self.assertAlmostEqual(board_job(r_view, None)["cost_per_task"], board_job(l_view, None)["cost_per_task"], places=6)
+
+        inv_only_l, inv_only_r, _ = build_pair("job-inv", "metask/DeepSeek-V4.1-Flash-1017", mixed_rows[:2])
+        inv_r = _reprice_view(inv_only_r, None, prices.BASETEN, {})
+        self.assertAlmostEqual(inv_r["summary"]["cost_per_task"], 0.30, places=6)
+        self.assertAlmostEqual(inv_r["summary"]["cost_per_pass"], 0.30, places=6)
+        self.assertAlmostEqual(inv_r["summary"]["cost_usd"], 3.00, places=6)
+        self.assertAlmostEqual(inv_r["summary"]["non_pass_cost_share"], 0.0, places=6)
+        self.assertAlmostEqual(board_job(inv_r, None)["cost_per_task"], 1.50, places=6)
+
+        len_only_l, len_only_r, _ = build_pair("job-len", "metask/DeepSeek-V4.1-Flash-1017", mixed_rows[2:])
+        len_r = _reprice_view(len_only_r, None, prices.BASETEN, {})
+        self.assertAlmostEqual(len_r["summary"]["cost_per_task"], 1.50, places=6)
+        self.assertAlmostEqual(len_r["summary"]["cost_per_pass"], 3.00, places=6)
+        self.assertAlmostEqual(len_r["summary"]["non_pass_cost_share"], 0.90, places=6)
+
+        running_rows = [
+            make_row("task-run", "task-run__1", "pass", input_tokens=1_000_000, reward=1.0),
+            make_row("task-run", "task-run__2", "running", input_tokens=9_000_000, reward=None),
+        ]
+        local_run, remote_run, _ = build_pair("job-run", "metask/DeepSeek-V4.1-Flash-1017", running_rows)
+        for row in local_run["rows"]:
+            if row["status"] == "running":
+                row.update(status="invalid", cause="execution: cancelled")
+        local_run["summary"] = data.summarize(local_run["rows"])
+        remote_run["summary"] = results.stopped_summary(remote_run["summary"])
+        remote_run["task_summaries"] = {t: results.stopped_summary(g) for t, g in remote_run["task_summaries"].items()}
+        l_stopped = _reprice_view(local_run, None, prices.BASETEN, {})
+        r_stopped = _reprice_view(remote_run, None, prices.BASETEN, {})
+        self.assertAlmostEqual(r_stopped["summary"]["cost_per_task"], l_stopped["summary"]["cost_per_task"], places=6)
+        self.assertAlmostEqual(board_job(r_stopped, None)["cost_per_task"], board_job(l_stopped, None)["cost_per_task"], places=6)
+
+        legacy_snapshot = {
+            **snapshot_mix,
+            "view": {**snapshot_mix["view"], "summary": {k: v for k, v in snapshot_mix["view"]["summary"].items() if k != "tokens_by_status"}},
+            "tasks": {t: {k: v for k, v in g.items() if k != "tokens_by_status"} for t, g in snapshot_mix["tasks"].items()},
+        }
+        results.check_snapshot(legacy_snapshot, "job-mix")
+        legacy_remote = {**legacy_snapshot["view"], "task_summaries": legacy_snapshot["tasks"]}
+        legacy_baseten = _reprice_view(legacy_remote, None, prices.BASETEN, {})
+        self.assertIsNone(legacy_baseten["summary"]["cost_usd"])
+        self.assertIsNone(legacy_baseten["summary"]["cost_per_task"])
+        legacy_or = _reprice_view(legacy_remote, None, prices.OPENROUTER, {})
+        self.assertAlmostEqual(legacy_or["summary"]["cost_usd"], legacy_remote["summary"]["cost_usd"], places=6)
 
 if __name__ == '__main__':
     unittest.main()

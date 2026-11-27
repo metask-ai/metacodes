@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 
 from scripts.eval.harbor import suites
 from scripts.eval.harbor.suites import leaderboards
-from scripts.eval.harbor.bench import builds, data, executors, monitor, results
+from scripts.eval.harbor.bench import builds, data, executors, monitor, prices, results
 from scripts.eval.harbor.bench.profiles import (
     PROFILE_ACTIVE,
     ProfileManager,
@@ -44,6 +44,122 @@ ATTEMPT_FIELDS = ("trial", "status", "cause", "reward", "attempt_number", "first
 def _mean(values):
     values = [v for v in values if v is not None]
     return sum(values) / len(values) if values else None
+
+
+def _reprice_row(row, rate, schedule):
+    if schedule == prices.RECORDED:
+        return row
+    if rate is not None:
+        cost = prices.compute_cost(
+            rate,
+            row.get("input_tokens"),
+            row.get("output_tokens"),
+            row.get("cache_tokens"),
+            row.get("cache_creation_tokens"),
+        )
+        if cost is not None:
+            return {**row, "cost_usd": cost, "cost_source": schedule}
+    if schedule == prices.BASETEN:
+        return {**row, "cost_usd": None, "cost_source": "unavailable"}
+    return row
+
+
+def _clear_summary_costs(group):
+    updated = dict(group)
+    updated["cost_usd"] = None
+    updated["cost_trials"] = 0
+    if "finished_cost_mean" in updated:
+        updated["finished_cost_mean"] = None
+    updated["task_cost_sum"] = 0.0
+    updated["task_pass_sum"] = 0.0
+    updated["task_cost_tasks"] = 0
+    updated["cost_by_status"] = {st: 0.0 for st in data.VALID}
+    updated.update(data.outcome_fields(updated))
+    return updated
+
+
+def _reprice_task_summary(group, rate, schedule):
+    if schedule == prices.RECORDED:
+        return group
+    tbs = group.get("tokens_by_status")
+    if not isinstance(tbs, dict) or rate is None:
+        return _clear_summary_costs(group) if schedule == prices.BASETEN else group
+    status_cost = {}
+    status_trials = {}
+    for st in data.STATUSES:
+        bucket = tbs.get(st) or {}
+        priced_trials = int(bucket.get("trials") or 0)
+        cost = prices.compute_bucket_cost(rate, bucket) if priced_trials > 0 else 0.0
+        if schedule == prices.OPENROUTER:
+            fallback_trials = int(bucket.get("fallback_trials") or 0)
+            fallback_cost = float(bucket.get("fallback_cost") or 0.0)
+        else:
+            fallback_trials = 0
+            fallback_cost = 0.0
+        status_trials[st] = priced_trials + fallback_trials
+        status_cost[st] = (cost or 0.0) + fallback_cost
+    updated = dict(group)
+    all_trials = sum(status_trials.values())
+    updated["cost_usd"] = sum(status_cost.values()) if all_trials else None
+    updated["cost_trials"] = all_trials
+    if "finished_cost_mean" in updated:
+        finished_statuses = [st for st in data.STATUSES if st != "running"]
+        finished_trials = sum(status_trials[st] for st in finished_statuses)
+        updated["finished_cost_mean"] = (
+            sum(status_cost[st] for st in finished_statuses) / finished_trials if finished_trials else None
+        )
+    valid_trials = sum(status_trials[st] for st in data.VALID)
+    updated["cost_by_status"] = {st: status_cost[st] for st in data.VALID}
+    if valid_trials > 0:
+        updated["task_cost_sum"] = sum(status_cost[st] for st in data.VALID) / valid_trials
+        updated["task_pass_sum"] = status_trials["pass"] / valid_trials
+        updated["task_cost_tasks"] = 1
+    else:
+        updated["task_cost_sum"] = 0.0
+        updated["task_pass_sum"] = 0.0
+        updated["task_cost_tasks"] = 0
+    updated.update(data.outcome_fields(updated))
+    return updated
+
+
+def _reprice_view(view, run, schedule, openrouter_models):
+    model = (run or {}).get("model") or view.get("model")
+    recorded_price = (run or {}).get("model_price")
+    rate = prices.rate_for(model, schedule, openrouter_models, recorded_price)
+    updated = dict(view)
+    if "rows" in view:
+        rows = [_reprice_row(row, rate, schedule) for row in view["rows"]]
+        updated["rows"] = rows
+        updated["summary"] = data.summarize(rows)
+    elif "task_summaries" in view:
+        groups = {
+            task: _reprice_task_summary(group, rate, schedule)
+            for task, group in view["task_summaries"].items()
+        }
+        updated["task_summaries"] = groups
+        updated["summary"] = group_summary(groups)
+    elif schedule == prices.BASETEN:
+        updated["summary"] = _clear_summary_costs(view["summary"])
+    updated["pricing"] = {
+        "schedule": schedule,
+        "label": prices.SCHEDULE_LABELS[schedule],
+        "rate": rate,
+    }
+    return updated
+
+
+def _schedule_summary_entry(schedule, summary, rate=None):
+    entry = {
+        "schedule": schedule,
+        "label": prices.SCHEDULE_LABELS[schedule],
+        "cost_usd": summary.get("cost_usd"),
+        "cost_per_task": summary.get("cost_per_task"),
+        "cost_per_pass": summary.get("cost_per_pass"),
+        "task_cost_tasks": summary.get("task_cost_tasks"),
+    }
+    if rate is not None:
+        entry["rate"] = rate
+    return entry
 
 
 def task_group(task, rows, item, job):
@@ -308,6 +424,15 @@ class Workbench:
         records.update((r["name"], r) for r in self.runs())
         return records
 
+    def _openrouter_models(self):
+        if not self.manager:
+            return {}
+        cfg = settings(self.manager.config_path)
+        state_dir = self.manager.config_path.parent
+        if cfg.get("model_prices", prices.OPENROUTER) != prices.OPENROUTER:
+            return prices.cached_catalog(state_dir)
+        return prices.catalog(state_dir)
+
     def worker_read(self, run, operation, trial=None):
         snapshot = run.get("worker_summary") or {}
         name = run["name"]
@@ -334,7 +459,7 @@ class Workbench:
             return value
         return {**value, "detail_source": "worker"}
 
-    def job_view(self, name, with_rows=True, runs=None, *, aggregate=False) -> Optional[Dict[str, Any]]:
+    def job_view(self, name, with_rows=True, runs=None, *, aggregate=False, price=prices.RECORDED, openrouter_models=None) -> Optional[Dict[str, Any]]:
         if not isinstance(name, str) or not data.NAME.fullmatch(name):
             return None
         if isinstance(runs, dict):
@@ -383,6 +508,11 @@ class Workbench:
                 view["wall_s"] = (finished - started).total_seconds() if started else None
         view["profile"] = (run or {}).get("profile")
         view["metacodes"] = (run or {}).get("metacodes")
+        if price != prices.RECORDED:
+            models = self._openrouter_models() if openrouter_models is None else openrouter_models
+            view = _reprice_view(view, run, price, models)
+        else:
+            view["pricing"] = {"schedule": prices.RECORDED, "label": prices.SCHEDULE_LABELS[prices.RECORDED], "rate": None}
         if not with_rows:
             view.pop("rows", None)
         return view
@@ -418,18 +548,39 @@ class Workbench:
         value["last_run_at"] = max((i.get("started_at") or "" for i in value["items"]), default="") or None
         return value
 
-    def jobs(self, scope="all") -> Dict[str, Any]:
+    def _profile_costs_by_schedule(self, record, base_views, receipts, openrouter_models):
+        out = {}
+        for entry in prices.SCHEDULES:
+            sid = entry["id"]
+            repriced = {
+                name: _reprice_view(view, receipts.get(name), sid, openrouter_models)
+                for name, view in base_views.items()
+            }
+            latest, _ = latest_results(record, repriced)
+            summary = group_summary({key: group for key, (_, _, group) in latest.items()})
+            out[sid] = _schedule_summary_entry(sid, summary)
+        return out
+
+    def jobs(self, scope="all", price=None) -> Dict[str, Any]:
         """Every job, newest first; `scope` is a profile id or "all"."""
+        schedule = prices.parse_schedule(price)
         self.library.maybe_sync()
         runs = self.runs()
         receipts = {r["name"]: r for r in self.library.run_records()}
         receipts.update((r["name"], r) for r in runs)
+        openrouter_models = self._openrouter_models()
         names = set(self.library.job_names()).union(n for n, r in receipts.items() if r.get("worker_summary"))
-        jobs = [view for view in (self.job_view(name, True, receipts, aggregate=True) for name in sorted(names)) if view]
+        base_jobs = [view for view in (self.job_view(name, True, receipts, aggregate=True, price=prices.RECORDED) for name in sorted(names)) if view]
+        base_views = {view["name"]: view for view in base_jobs}
+        jobs = [_reprice_view(view, receipts.get(view["name"]), schedule, openrouter_models) for view in base_jobs]
         jobs.sort(key=lambda view: view["started_at"] or "", reverse=True)
         views = {view["name"]: view for view in jobs}
         records = self.profile_records()
-        profiles = [self.profile_summary(record, views) for record in records]
+        profiles = []
+        for record in records:
+            card = self.profile_summary(record, views)
+            card["costs_by_schedule"] = self._profile_costs_by_schedule(record, base_views, receipts, openrouter_models)
+            profiles.append(card)
         for view in jobs:
             view.pop("rows", None)
             view.pop("task_summaries", None)
@@ -442,6 +593,8 @@ class Workbench:
         storage = self.library.storage()
         return {"jobs": shown, "job_total": len(jobs), "scope": scope, "profiles": profiles, "runs": runs,
                 "summary": data.merge_summaries(j["summary"] for j in shown),
+                "pricing": {"schedule": schedule, "label": prices.SCHEDULE_LABELS[schedule],
+                            "schedules": list(prices.SCHEDULES)},
                 "storage": {**storage,
                             "records_dir": str(self.manager.records) if self.manager else None,
                             "format": storage["database"]["format"]}}
@@ -459,11 +612,12 @@ class Workbench:
                 views.append(view)
         return sorted(views, key=lambda view: view["started_at"] or "", reverse=True)
 
-    def leaderboard(self, suite_id=None) -> Optional[Dict[str, Any]]:
+    def leaderboard(self, suite_id=None, price=None) -> Optional[Dict[str, Any]]:
         """Published boards of one suite (default: the first that has any) and
         this workbench's finished jobs on each. A job scores the mean reward
         of its finished trials on the board's tasks, an invalid trial counting
         0; it is ranked when it covers at least RANKED_COVERAGE of them."""
+        requested = prices.parse_schedule(price, allow_auto=True)
         published = leaderboards.boards()
         listed = [s.id for s in suites.ALL if any(s.id in b["suites"] for b in published)]
         suite_id = suite_id or (listed[0] if listed else None)
@@ -473,19 +627,23 @@ class Workbench:
         task_count = len(suite.tasks) if suite.tasks else suite.max_tasks
         self.library.maybe_sync()
         runs = self.result_records()
+        openrouter_models = self._openrouter_models()
         names = set(self.library.job_names()).union(n for n, r in runs.items() if r.get("worker_summary"))
-        views = [view for view in (self.job_view(name, True, runs, aggregate=True) for name in sorted(names))
-                 if view and view.get("suite") == suite_id and not view["running"]]
+        base_views = [
+            view
+            for view in (self.job_view(name, True, runs, aggregate=True, price=prices.RECORDED) for name in sorted(names))
+            if view and view.get("suite") == suite_id and not view["running"]
+        ]
         records = self.profile_records()
         by_id, by_job = _profile_lookup(records)
-        view_names = {view["name"] for view in views}
+        view_names = {view["name"] for view in base_views}
         auth_runs = {}
         for record in records:
             for (auth_suite, model_key), run in authoritative_map(record).items():
                 if auth_suite == suite_id and run in view_names:
                     auth_runs[(record["id"], model_key)] = run
         filtered_views = []
-        for view in views:
+        for view in base_views:
             meta = by_job.get(view["name"]) or by_id.get(view.get("profile"))
             if meta:
                 model_key = (meta["profile_item_model"] or "") if "profile_item_model" in meta else (view.get("model") or "")
@@ -493,21 +651,53 @@ class Workbench:
                 if pinned is not None and view["name"] != pinned:
                     continue
             filtered_views.append(view)
-        views = filtered_views
+        base_views = filtered_views
+        by_schedule = {
+            entry["id"]: [
+                _reprice_view(view, runs.get(view["name"]), entry["id"], openrouter_models)
+                for view in base_views
+            ]
+            for entry in prices.SCHEDULES
+        }
         boards, ranked_anywhere, ranked_profiles = [], set(), set()
         for board in (b for b in published if suite_id in b["suites"]):
+            board_pricing = board.get("pricing") if isinstance(board.get("pricing"), dict) else {}
+            board_default = prices.parse_schedule(board_pricing.get("schedule"))
+            effective = board_default if requested == prices.AUTO else requested
             tasks = set(board["tasks"]) if board.get("tasks") else None
             needed = RANKED_COVERAGE * (len(tasks) if tasks else task_count)
-            jobs = [_attach_profile(job, by_id, by_job) for job in (board_job(view, tasks) for view in views) if job]
+            per_schedule_costs = {}
+            for entry in prices.SCHEDULES:
+                sid = entry["id"]
+                for view in by_schedule[sid]:
+                    entry_job = board_job(view, tasks)
+                    if entry_job:
+                        per_schedule_costs.setdefault(entry_job["name"], {})[sid] = entry_job["cost_per_task"]
+            jobs = [_attach_profile(job, by_id, by_job) for job in (board_job(view, tasks) for view in by_schedule[effective]) if job]
             for job in jobs:
                 job["ranked"] = job["tasks"] >= needed
+                job["costs_by_schedule"] = per_schedule_costs.get(job["name"], {})
+                job["price_schedule"] = effective
                 if job["ranked"]:
                     ranked_anywhere.add(job["name"])
                     if job.get("profile"):
                         ranked_profiles.add((job["profile"], job.get("model") or ""))
-            boards.append({**board, "jobs": _latest_ranked_per_profile(jobs)})
+            boards.append({
+                **board,
+                "pricing": {
+                    "schedule": requested,
+                    "default_schedule": board_default,
+                    "effective_schedule": effective,
+                    "label": prices.SCHEDULE_LABELS[effective],
+                    "default_label": prices.SCHEDULE_LABELS[board_default],
+                    "aligned": effective == board_default,
+                    "source": board_pricing.get("source"),
+                },
+                "jobs": _latest_ranked_per_profile(jobs),
+            })
+        unranked_schedule = (boards[0]["pricing"]["effective_schedule"] if boards else prices.OPENROUTER)
         unranked = []
-        for view in views:
+        for view in by_schedule[unranked_schedule]:
             job = board_job(view, None)
             if not job or job["name"] in ranked_anywhere:
                 continue
@@ -517,53 +707,115 @@ class Workbench:
             unranked.append(job)
         return {"suites": [suites.label(s) for s in listed], **suites.label(suite_id), "description": suite.description,
                 "task_count": task_count,
+                "pricing": {"schedule": requested, "label": prices.SCHEDULE_LABELS[requested],
+                            "schedules": list(prices.LEADERBOARD_SCHEDULES)},
                 "ranked_coverage": RANKED_COVERAGE, "boards": boards, "unranked": unranked}
 
-    def job(self, name) -> Optional[Dict[str, Any]]:
+    def job(self, name, price=None) -> Optional[Dict[str, Any]]:
+        schedule = prices.parse_schedule(price)
         self.library.maybe_sync()
-        view = self.job_view(name)
-        if view is None:
+        receipts = self.result_records()
+        base = self.job_view(name, runs=receipts, price=prices.RECORDED)
+        if base is None:
             return None
+        openrouter_models = self._openrouter_models()
+        run = receipts.get(name)
+        view = _reprice_view(base, run, schedule, openrouter_models)
+        view["pricing"] = {
+            **view["pricing"],
+            "schedules": list(prices.SCHEDULES),
+        }
+        view["costs_by_schedule"] = {
+            entry["id"]: _schedule_summary_entry(
+                entry["id"],
+                repriced["summary"],
+                repriced["pricing"].get("rate"),
+            )
+            for entry in prices.SCHEDULES
+            for repriced in [_reprice_view(base, run, entry["id"], openrouter_models)]
+        }
         by_id, by_job = _profile_lookup(self.profile_records())
         return _attach_profile(view, by_id, by_job)
 
-    def trial(self, job, trial) -> Optional[Dict[str, Any]]:
+    def trial(self, job, trial, price=None) -> Optional[Dict[str, Any]]:
+        schedule = prices.parse_schedule(price)
         self.library.maybe_sync()
         if not all(isinstance(n, str) and data.NAME.fullmatch(n) for n in (job, trial)):
             return None
-        run = self.result_records().get(job)
+        receipts = self.result_records()
+        run = receipts.get(job)
+        openrouter_models = self._openrouter_models()
         if run and run.get("result_owner"):
             detail = self.worker_read(run, "trial", trial)
             if detail and detail["row"]["status"] == "running" and run["status"] in {"failed", "cancelled", "interrupted"}:
                 detail["row"].update(status="invalid", cause="execution: " + run["status"])
-            return {**detail, "result_owner": run["result_owner"]} if detail else None
-        if not run and self.library.worker_only(job):
-            return None
-        detail = self.library.trial_detail(job, trial)
-        if detail is None:
-            return None
-        view = self.job_view(job)
-        for row in view["rows"] if view else []:
-            if row["trial"] == trial:
-                detail["row"] = row
-                break
+            if not detail:
+                return None
+            model = run.get("model")
+            detail = {**detail, "result_owner": run["result_owner"]}
+        else:
+            if not run and self.library.worker_only(job):
+                return None
+            detail = self.library.trial_detail(job, trial)
+            if detail is None:
+                return None
+            view = self.job_view(job, runs=receipts, price=prices.RECORDED)
+            model = (run or {}).get("model") or (view or {}).get("model")
+            for row in view["rows"] if view else []:
+                if row["trial"] == trial:
+                    detail["row"] = row
+                    break
+        recorded_price = (run or {}).get("model_price")
+        base_row = detail["row"]
+        rate = prices.rate_for(model, schedule, openrouter_models, recorded_price)
+        detail["row"] = _reprice_row(base_row, rate, schedule)
+        detail["pricing"] = {
+            "schedule": schedule,
+            "label": prices.SCHEDULE_LABELS[schedule],
+            "rate": rate,
+            "schedules": list(prices.SCHEDULES),
+        }
+        detail["costs_by_schedule"] = {}
+        for entry in prices.SCHEDULES:
+            sid = entry["id"]
+            s_rate = prices.rate_for(model, sid, openrouter_models, recorded_price)
+            s_row = _reprice_row(base_row, s_rate, sid)
+            detail["costs_by_schedule"][sid] = {
+                "schedule": sid,
+                "label": entry["label"],
+                "cost_usd": s_row.get("cost_usd"),
+                "rate": s_rate,
+            }
         return detail
 
-    def profile(self, profile) -> Optional[Dict[str, Any]]:
+    def profile(self, profile, price=None) -> Optional[Dict[str, Any]]:
         """A profile with every task's latest attempts and earlier runs."""
+        schedule = prices.parse_schedule(price)
         self.library.maybe_sync()
         record = next((r for r in self.profile_records() if r["id"] == profile), None)
         if record is None:
             return None
         runs = self.runs()
+        receipts = self.result_records()
         local_names = {r["name"] for r in runs}
-        full = {}
+        openrouter_models = self._openrouter_models()
+        base_full = {}
         for item in record["items"]:
-            view = self.job_view(item["run"], runs=runs) if item.get("run") else None
+            view = self.job_view(item["run"], runs=receipts, price=prices.RECORDED) if item.get("run") else None
             if view is not None:
-                full[view["name"]] = view
+                base_full[view["name"]] = view
+        full = {
+            name: _reprice_view(view, receipts.get(name), schedule, openrouter_models)
+            for name, view in base_full.items()
+        }
         value = self.profile_summary(record, full)
         active_auth = _active_authoritative(record, full)
+        value["pricing"] = {
+            "schedule": schedule,
+            "label": prices.SCHEDULE_LABELS[schedule],
+            "schedules": list(prices.SCHEDULES),
+        }
+        value["costs_by_schedule"] = self._profile_costs_by_schedule(record, base_full, receipts, openrouter_models)
         latest, history = latest_results(record, full)
         labels = submission_labels(value)
         tasks = [{**task_group(task, rows, item, job),

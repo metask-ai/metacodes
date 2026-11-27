@@ -43,6 +43,15 @@ These rules apply to the entire repository.
   after a raw read, and write to the terminal through `pfs.writeAll`; a call
   that cannot see EINTR says `// no EINTR: <reason>` on its line
   (`zig build test:terminal-io` enforces it).
+- Stop a child process tree through the one shared stop routine in
+  `platform.process`, never a new TERM/KILL sequence. It claims the job under
+  the registry lock, sends TERM to the whole process group (Job Object on
+  Windows), sets the KILL time from when TERM was actually sent, sends KILL to
+  the whole group when the grace period ends even if the leader has exited,
+  and reaps the leader last. A time limit is enforced by the registry's single
+  timer thread, which must exist before the child is spawned; it never depends
+  on the model polling for notifications, and expired jobs are stopped in
+  parallel, not one grace period after another.
 - The TUI's scrollback has no undo: in `apps/cli/src/repl/`, only the Renderer
   (`RenderRegion`) erases the screen or writes past the inline region. Erase
   with ED 0, reset the screen only through `RenderRegion.resetScreen`, climb
@@ -104,11 +113,15 @@ These rules apply to the entire repository.
   new `raise_reason` in a PR that does not itself grow the kernel past the
   base's budget, and the code that needs the room follows. CI checks the PR
   against its base (`zig build layer:check -Dlayer-base=<ref>`) and fails
-  when the baseline or the budget grows or `allowed_dependencies` widen. A
-  change to the layering itself goes in its own PR. `src/` holds only the
-  `facade` package, between `teamwork` and `agentcore`: `src/lib.zig`, the
-  `metacodes-core` module that re-exports the lower packages, and
-  `src/internal.zig`.
+  when the baseline or the budget grows or `allowed_dependencies` widen. An
+  exemption in `layer:check`'s base comparison names the categories it applies
+  to (upward, deep, wiring, wide roots) and never excuses a new upward entry.
+  Add it with a failing self-test for each way the same edge can appear (an
+  in-place reassignment in `layers.zon`, a file moved by git, a new package);
+  these must reach the same verdict. A change to the layering itself goes in
+  its own PR. `src/` holds only the `facade` package, between `teamwork` and
+  `agentcore`: `src/lib.zig`, the `metacodes-core` module that re-exports the
+  lower packages, and `src/internal.zig`.
 - `kernel` is the counterpart of pi's `pi-agent-core`: `packages/kernel/src/`
   holds only `conversation`, `message`, `session_id`, `result_budget` and the
   minimal loop (`loop`, `types`, `executor`), and its root is how other
@@ -187,6 +200,19 @@ all ([doc/API.md](doc/API.md#preview-features)). When you add a preview feature:
   help text in `apps/cli/src/main.zig`, and `CHANGELOG.md`.
 - The AgentCore ABI has no per-feature selection: `RuntimeConfigV1.preview = 1`
   enables every feature. Adding one there is an ABI revision.
+
+## Bench workbench
+
+- Bench code reads a task's `task.toml` and compose files only through the
+  shared task reader in `scripts/eval/harbor/bench/`. Pre-pull, egress, the
+  ghcr mirror and container mirrors must agree on which images and services a
+  task has, so a new form or field is added there with a test, never as
+  another regex or parser beside it.
+- Bench workbench state: a setting the user can change after queueing
+  (concurrency, auto-rerun) is stored once, on the record that owns it, and
+  resolved when a queued item launches. Do not copy it into queued items or
+  their launch requests; copy only what must stay fixed once queued (the
+  route, the features, the frozen bundle).
 
 ## PR review and repair workflow
 

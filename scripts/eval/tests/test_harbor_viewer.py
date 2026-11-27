@@ -217,6 +217,34 @@ class LibraryTest(unittest.TestCase):
         self.assertFalse(row["empty_final"])
         self.assertIsNotNone(rows["running"]["elapsed_s"])
 
+    def test_row_heals_legacy_workbuddy_input_tokens_missing_cache(self):
+        job = self.root / "workbuddy-legacy"
+        trial = _trial(job, "legacy-cache__aaa", reward=1.0)
+        result_path = trial / "result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["agent_result"] = {"n_input_tokens": 120, "n_cache_tokens": 80, "n_output_tokens": 30, "cost_usd": 0.01}
+        _write(result_path, result)
+        _write(
+            trial / "agent" / "metacodes-output.jsonl",
+            json.dumps({
+                "type": "result",
+                "stop_reason": "end_turn",
+                "turns": 2,
+                "tool_calls": 1,
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 10,
+                "cost_usd": 0.01,
+                "text": "done",
+            }) + "\n",
+        )
+        row = data.trial_row(trial)
+        self.assertEqual(row["input_tokens"], 210.0)
+        self.assertEqual(row["cache_tokens"], 80.0)
+        self.assertEqual(row["total_tokens"], 240.0)
+        self.assertAlmostEqual(row["cache_ratio"], 80.0 / 210.0)
+
     def test_trial_detail_clips_long_content_and_counts_tools(self):
         detail = data.trial_detail(self.library.trial_dir("glm-pilot", "kv-store__aaa"))
         self.assertEqual(detail["tools"], [("Bash", 1)])
@@ -713,7 +741,7 @@ ctx.render = async () => {};
 ctx.api = async (url, payload) => {
   if (payload !== undefined) { posts.push({ url, payload }); return {}; }
   if (url.startsWith('/api/profile?')) return { id: 'prof-a', name: 'Profile A', can_run: true };
-  return jobs[decodeURIComponent(url.split('name=')[1])];
+  return jobs[decodeURIComponent(url.split('name=')[1].split('&')[0])];
 };
 (async () => {
   const root = await vm.runInContext('renderCompare', ctx)(['run-1', 'run-2'], 'prof-a');
@@ -769,6 +797,65 @@ setTimeout(() => {
             "url": "/api/profile/authoritative",
             "payload": {"id": "prof-a", "suite": "terminal-bench-2.1", "model": "m", "run": "run-1"},
         }])
+
+    def test_leaderboard_and_profile_render_pricing_alignment_and_schedule_pills(self):
+        result = self._run_js("""
+const boardPayload = {
+  suite: 'frontier-harness-eval-1.1',
+  suite_name: 'FrontierHarness Eval v1.1',
+  description: 'desc',
+  task_count: 62,
+  ranked_coverage: 0.8,
+  suites: [{ suite: 'frontier-harness-eval-1.1', suite_name: 'FrontierHarness Eval v1.1' }],
+  pricing: { schedule: 'auto', label: '跟随榜单口径', schedules: [] },
+  boards: [{
+    suites: ['frontier-harness-eval-1.1'],
+    title: 'FrontierHarness Eval v1.1 排行榜',
+    model_filter: true,
+    default_model: 'All models',
+    source: { name: 'FH', url: 'https://frontierharness.org/', retrieved: '2026-11-22' },
+    pricing: { schedule: 'auto', default_schedule: 'baseten', effective_schedule: 'baseten', label: 'Baseten 挂牌价', aligned: true },
+    entries: [{ harness: 'ZCode', model: 'DeepSeek-V4.1-Flash-1017', score: 69.0, cost_per_task_usd: 0.153 }],
+    jobs: [{
+      name: 'fh-job', model: 'metask/DeepSeek-V4.1-Flash-1017', score: 0.65, tasks: 62, trials: 62,
+      ranked: true, cost_per_task: 2.2125,
+      costs_by_schedule: { openrouter: 2.205, baseten: 2.2125, recorded: 24.0 },
+    }],
+  }],
+  unranked: [],
+};
+const profilePayload = {
+  id: 'p1', name: 'DeepSeek Profile', status: 'finished', can_run: false,
+  metacodes: { label: '0.12.0' }, features: [], items: [], tasks: [], by_model: [],
+  models: ['metask/DeepSeek-V4.1-Flash-1017'], suites: ['frontier-harness-eval-1.1'],
+  pricing: { schedule: 'openrouter', label: 'OpenRouter 报价', schedules: [] },
+  costs_by_schedule: {
+    openrouter: { label: 'OpenRouter 报价', cost_per_task: 2.205 },
+    baseten: { label: 'Baseten 挂牌价', cost_per_task: 2.2125 },
+    recorded: { label: '运行记录原价', cost_per_task: 24.0 },
+  },
+  summary: {
+    counts: { pass: 1, partial: 0, fail: 0, timeout: 0, invalid: 0, running: 0 },
+    trials: 1, valid: 1, one_shot_pass_rate: 1, first_pass_rate: 1, first_passed: 1, first_valid: 1,
+    solved_rate: 1, tasks_solved: 1, tasks_attempted: 1, cost_per_task: 2.205, cost_per_pass: 2.205,
+    initial_input_tokens_mean: 1000, cache_hit_rate: 0.5,
+  },
+};
+const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+(async () => {
+  ctx.api = async (url) => url.startsWith('/api/leaderboard') ? boardPayload : profilePayload;
+  const boardRoot = await vm.runInContext('renderLeaderboard', ctx)('frontier-harness-eval-1.1');
+  const pricingBadges = walk(boardRoot).filter((n) => (n.className || '').includes('board-pricing')).map((n) => n.textContent);
+  const profileRoot = await vm.runInContext('renderProfile', ctx)('p1');
+  const pills = walk(profileRoot).filter((n) => (n.className || '').includes('price-pill')).map((n) => n.textContent);
+  console.log(JSON.stringify({ pricingBadges, pills }));
+})();
+""")
+        self.assertEqual(result["pricingBadges"], ["成本口径：Baseten 挂牌价（已对齐榜单）"])
+        self.assertEqual(len(result["pills"]), 3)
+        self.assertIn("OpenRouter 报价", result["pills"][0])
+        self.assertIn("Baseten 挂牌价", result["pills"][1])
+        self.assertIn("运行记录原价", result["pills"][2])
 
     def test_profile_expand_and_filters_redraw_locally_without_refetching(self):
         result = self._run_js("""
