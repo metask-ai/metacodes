@@ -146,6 +146,12 @@ def main():
                         page.wait_for_function("name => fetch('/api/job?name=' + name).then(r => r.ok)", arg=loose)
                         http.workbench.library.sync()
                         page.goto(f'http://127.0.0.1:{http.server_address[1]}/#/')
+                        page.locator('.pcard').first.wait_for()
+                        for card in page.locator('.pcard').all():
+                            assert card.evaluate(
+                                "el => [...el.querySelectorAll('.pcard-tags .tag')].every("
+                                "tag => tag.getBoundingClientRect().right <= el.getBoundingClientRect().right + 0.5)"), 'profile card tag overflow'
+                        assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'desktop overview overflow'
                         assert page.get_by_role('link', name=imported.name, exact=True).get_attribute('href') == '#/job/imported'
                         page.get_by_role('link', name=loose, exact=True).click()
                         page.get_by_text('执行日志', exact=True).wait_for()

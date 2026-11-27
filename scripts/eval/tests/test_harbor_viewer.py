@@ -463,7 +463,7 @@ class FakeNode {{
   }}
   set textContent(v) {{ this._text = String(v); }}
 }}
-const nodes = {{ '#title': new FakeNode('h1'), '#crumbs': new FakeNode('div') }};
+const nodes = {{ '#title': new FakeNode('h1'), '#crumbs': new FakeNode('div'), '#create-run': new FakeNode('button') }};
 const ctx = {{
   Node: FakeNode,
   URL: {{ createObjectURL: () => '', revokeObjectURL: () => {{}} }},
@@ -568,6 +568,47 @@ ctx.api = async (url) => jobs[decodeURIComponent(url.split('name=')[1])];
         self.assertIn("前沿", row_b[4])
         self.assertIn("$0.015", row_a[5])
         self.assertIn("$0.020", row_b[5])
+
+    def test_profile_overview_renders_each_feature_as_its_own_tag(self):
+        result = self._run_js("""
+const payload = {
+  can_run: true,
+  jobs: [],
+  runs: [],
+  profiles: [
+    {
+      id: 'prof-gates', name: 'profile-0.12.0-111110000', status: 'finished',
+      created_at: '2026-11-27T01:00:00Z', last_run_at: '2026-11-27T01:29:00Z',
+      metacodes: { label: '0.12.0' },
+      models: ['metask/DeepSeek-V4.1-Flash-1017'],
+      features: ['verification_final_gate', 'requirement_ledger', 'test_integrity', 'delivery_cadence', 'stall_gate'],
+      items: [],
+      summary: { first_pass_rate: 0.53, first_passed: 59, first_valid: 112, counts: { pass: 59 }, trials: 112, cost_per_task: 11.78, initial_input_tokens_mean: 16200 },
+    },
+    {
+      id: 'prof-plain', name: 'profile-0.12.0-plain', status: 'finished',
+      created_at: '2026-11-26T01:00:00Z', last_run_at: '2026-11-26T01:29:00Z',
+      metacodes: { label: '0.12.0' },
+      models: ['metask/DeepSeek-V4.1-Flash-1017'],
+      features: [],
+      items: [],
+      summary: { first_pass_rate: 0.5, first_passed: 1, first_valid: 2, counts: { pass: 1 }, trials: 2, cost_per_task: 1.0, initial_input_tokens_mean: 1000 },
+    },
+  ],
+};
+ctx.api = async () => payload;
+(async () => {
+  const root = await vm.runInContext('renderOverview', ctx)();
+  const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+  const tagGroups = walk(root).filter((n) => n.className === 'pcard-tags');
+  const tagsByCard = tagGroups.map((group) => group.children.map((child) => child.textContent));
+  console.log(JSON.stringify({ tagsByCard }));
+})();
+""")
+        self.assertEqual(result["tagsByCard"], [
+            ["0.12.0", "verification_final_gate", "requirement_ledger", "test_integrity", "delivery_cadence", "stall_gate"],
+            ["0.12.0", "默认功能"],
+        ])
 
 
 if __name__ == "__main__":
