@@ -4,7 +4,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const builtin = @import("builtin");
-const sandbox_backend = @import("metacodes-core").sandbox_exec;
+const sandbox_backend = @import("core_imports.zig").sandbox_exec;
 
 const sandbox_exec = "/usr/bin/sandbox-exec";
 const true_exec = "/usr/bin/true";
@@ -47,7 +47,7 @@ pub fn validate(allocator: std.mem.Allocator) AdmissionError!void {
         if (!sandbox_backend.hostSupported()) return error.CanaryFailed;
         // Exercise the same fully confined launch as Bash and external
         // workers, not merely the existence of a bwrap executable.
-        const settings: @import("metacodes-core").sandbox_config.SandboxSettings = .{
+        const settings: @import("core_imports.zig").sandbox_config.SandboxSettings = .{
             .enabled = true,
             .fail_if_unavailable = true,
             .allow_unsandboxed_commands = false,

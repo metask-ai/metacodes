@@ -1,7 +1,7 @@
 //! Session-filtered MCP view and immutable Run tool overlay.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const catalog = core.mcp_catalog;
 const canonical = core.mcp_canonical;
 const runtime = core.mcp_runtime;

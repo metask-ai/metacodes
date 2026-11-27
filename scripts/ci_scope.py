@@ -86,6 +86,13 @@ SCRIPT_TESTS = "scripts/tests/"
 TTY_TESTS = "tests/tty/"
 TESTS_PACKAGE = "tests"
 TEST_PACKAGES = ("testing", TESTS_PACKAGE)
+AGENTCORE_SDK_PREFIXES = ("sdk/python/", "sdk/node/", "sdk/rust/")
+AGENTCORE_SDK_FILES = (
+    "sdk/metask/agentcore.h",
+    "sdk/zig/protocol.zig",
+    "sdk/zig/root.zig",
+    "sdk/zig/build.zig",
+)
 TEST_STEP = re.compile(r'\bb\.step\(\s*"(test:[\w-]+)"')
 BUILD_SCRIPT_SUITE = re.compile(r'"(scripts\.tests\.test_\w+)"')
 MIGRATION_LABEL = "migration"
@@ -183,7 +190,11 @@ class Layout:
         owner = self.owner(path)
         if owner in TEST_PACKAGES:
             return self.owner(path, among=self.products)
-        return owner if owner in self.products else None
+        if owner in self.products:
+            return owner
+        if "agentcore" in self.products and (path.startswith(AGENTCORE_SDK_PREFIXES) or path in AGENTCORE_SDK_FILES):
+            return "agentcore"
+        return None
 
     @property
     def products(self) -> Tuple[str, ...]:
@@ -298,6 +309,9 @@ class Selection:
     tty: bool
     units: bool
     product: bool
+    sdk: bool = True
+    integration: bool = True
+    release: bool = True
     packages: Tuple[str, ...] = ()
     package_tests: Tuple[str, ...] = ()
     script_tests: Tuple[str, ...] = ()
@@ -307,17 +321,22 @@ class Selection:
     def complete(self) -> bool:
         """Every Zig and script suite of `zig build test` runs, so the run's
         test IDs are comparable with a full run's (scripts/test_ids.py)."""
-        return self.units and self.product and self.offline_eval and not self.package_tests
+        return (self.units and self.integration and self.product
+                and self.release and self.offline_eval and not self.package_tests)
 
 
 def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout] = None,
            release_sources: Sequence[str] = RELEASE_DOCS) -> Selection:
     if scope == "docs":
-        return Selection(suites=False, tty=False, units=False, product=False, offline_eval=False)
+        return Selection(suites=False, tty=False, sdk=False, units=False,
+                         integration=False, product=False, release=False, offline_eval=False)
     if scope == "eval":
-        return Selection(suites=True, tty=False, units=True, product=True)
+        return Selection(suites=True, tty=False, sdk=False, units=True,
+                         integration=True, product=True, release=True)
     if scope not in ("tests", "packages") or layout is None:
-        return Selection(suites=True, tty=True, units=True, product=True, packages=layout.products if layout else ())
+        return Selection(suites=True, tty=True, sdk=True, units=True,
+                         integration=True, product=True, release=True,
+                         packages=layout.products if layout else ())
     kinds = {path: path_kind(path, layout, release_sources) for _, path in changes}
     modules = {"scripts.tests." + PurePosixPath(path).stem
                for status, path in changes if status != "D" and kinds[path] == "script-test"}
@@ -328,11 +347,17 @@ def select(scope: str, changes: Sequence["Change"] = (), layout: Optional[Layout
     units = suites or bool(modules & layout.build_suites)
     if scope == "tests":
         tty = any(kind in ("tty-test", "suite-test") for kind in kinds.values())
-        chosen = Selection(suites=True, tty=tty, units=units, product=suites)
+        chosen = Selection(suites=True, tty=tty, sdk=suites, units=units,
+                           integration=units, product=suites, release=suites)
     else:
         affected = layout.affected(sorted({layout.package(path) for path, kind in kinds.items() if kind == "package"}))
         package_tests = () if units else tuple(f"test:{package}" for package in affected)
-        chosen = Selection(suites=True, tty=True, units=True, product=True, packages=affected, package_tests=package_tests)
+        cli_affected = suites or ("cli" in affected) or ("cli" not in layout.products)
+        sdk_affected = suites or ("agentcore" in affected) or ("agentcore" not in layout.products)
+        tty = cli_affected or any(kind == "tty-test" for kind in kinds.values())
+        chosen = Selection(suites=True, tty=tty, sdk=sdk_affected, units=True,
+                           integration=cli_affected, product=cli_affected, release=cli_affected,
+                           packages=affected, package_tests=package_tests)
     offline_eval = chosen.product and any(
         kind not in ("docs", "script-test", "tty-test") and not path.startswith(("apps/cli/src/repl/tui/", "apps/cli/tests/"))
         for path, kind in kinds.items()
@@ -482,11 +507,14 @@ def write_summary(destination: str, event: str, base: str, candidate: str,
              f"| Protocol document references and pins | {run(doc_references)} |",
              f"| Release documents, licences and notices | {run(release_docs)} |",
              f"| Build, unit, integration, product, release | {run(chosen.suites)} |",
-             f"| Unit and integration suites | {units if chosen.suites else 'Skip'} |",
+             f"| Unit suite | {units if chosen.suites else 'Skip'} |",
+             f"| Integration suite | {run(chosen.suites and chosen.integration)} |",
              f"| Product suite | {run(chosen.suites and chosen.product)} |",
+             f"| Release layout | {run(chosen.suites and chosen.release)} |",
              f"| Offline evaluation | {run(chosen.offline_eval)} |",
              f"| Changed script suites | {cell(' '.join(chosen.script_tests)) or 'None'} |",
-             f"| TTY and SDK | {run(chosen.tty)} |"]
+             f"| TTY | {run(chosen.tty)} |",
+             f"| SDK bindings | {run(chosen.sdk)} |"]
     lines.extend(["", "| Status | Changed path | Path scope |", "|---|---|---|"])
     for status, path in changes[:200]:
         path_scope, _ = classify([path], [path] if status not in ("A", "M") else [],
@@ -520,6 +548,7 @@ def local_commands(scope: str, selection: Selection, zig: str = "zig", windows: 
     steps = []
     if selection.units:
         steps.extend(list(selection.package_tests) or ["test:units"])
+    if selection.integration:
         steps.append("test:integration")
     if selection.product:
         steps.append("test:product" if selection.offline_eval else "test:product-runtime")
@@ -783,7 +812,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(args.github_output, "a", encoding="utf-8") as handle:
             handle.write(
                 f"scope={scope}\nsuites={flag(selection.suites)}\ntty={flag(selection.tty)}\n"
-                f"units={flag(selection.units)}\nproduct={flag(selection.product)}\n"
+                f"sdk={flag(selection.sdk)}\n"
+                f"units={flag(selection.units)}\nintegration={flag(selection.integration)}\n"
+                f"product={flag(selection.product)}\nrelease={flag(selection.release)}\n"
                 f"offline_eval={flag(selection.offline_eval)}\n"
                 f"packages={','.join(selection.packages)}\npackage_tests={' '.join(selection.package_tests)}\n"
                 f"script_tests={' '.join(selection.script_tests)}\ncomplete={flag(selection.complete)}\n"

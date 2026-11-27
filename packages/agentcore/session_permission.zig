@@ -5,7 +5,7 @@
 //! callback and checkpoint layers that follow.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 
 pub const ARGUMENT_DIGEST_BYTES: usize = 32;
 pub const REQUEST_ID_BYTES: usize = 32;

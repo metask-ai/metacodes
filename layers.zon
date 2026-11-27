@@ -39,7 +39,7 @@
         .{
             .name = "teamwork",
             .paths = .{"packages/teamwork/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding" },
             .root = "packages/teamwork/src/root.zig",
         },
         .{
@@ -50,12 +50,12 @@
         .{
             .name = "agentcore",
             .paths = .{"packages/agentcore/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session" },
         },
         .{
             .name = "cli",
             .paths = .{"apps/cli/"},
-            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade", "agentcore" },
+            .allowed_dependencies = .{ "base", "ai", "kernel", "guard", "coding", "session", "teamwork", "facade" },
         },
         .{
             .name = "testing",

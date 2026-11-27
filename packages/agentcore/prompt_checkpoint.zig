@@ -7,7 +7,7 @@
 //! A Session without a profile has no section at all (empty bytes).
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const prompt_sections = core.prompt_sections;
 
 const magic = "R18PRMT\x00";

@@ -10,7 +10,7 @@
 //! replacement produced.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const sync = @import("platform").sync;
 const checkpoint = @import("session_checkpoint.zig");
 const mcp_session = @import("mcp_session.zig");

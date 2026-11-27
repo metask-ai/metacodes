@@ -6,7 +6,7 @@
 //! external typed invocation. It does not add slash or Command semantics.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const skill_runtime = core.skills_runtime;
 const catalog = skill_runtime.catalog;
 const availability = skill_runtime.availability;

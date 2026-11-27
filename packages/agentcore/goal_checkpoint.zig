@@ -11,7 +11,7 @@
 //! the Session is idle. A Session without a goal has no section (empty bytes).
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const goal_mod = core.goal;
 
 const magic = "R23GOAL\x00";

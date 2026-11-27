@@ -22,7 +22,7 @@ const public_protocol = @import("metask_agentcore_protocol");
 const run_state = @import("run_state.zig");
 
 pub const RunStateProjector = run_state.Projector;
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
 const skill_runtime = core.skills_runtime;

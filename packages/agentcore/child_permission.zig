@@ -9,7 +9,7 @@
 //! shared Core/subagent implementation.
 
 const std = @import("std");
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 const event_projection = @import("event_projection.zig");
 
 const PermissionContext = core.permission.PermissionContext;

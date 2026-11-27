@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
-const core = @import("metacodes-core");
+const core = @import("core_imports.zig");
 
 const CoreEvent = core.protocol.ui_event.CoreEvent;
 const UiBackend = core.protocol.ui_backend.UiBackend;
