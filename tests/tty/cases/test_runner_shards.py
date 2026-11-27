@@ -4,6 +4,7 @@ CI 把 TTY 套件按 `--shard K/N` 拆到多台 runner(doc/CI_DESIGN.md §4)。�
 就是一个永远不跑却也不报错的用例,所以这里钉死:N 片恰好划分全表、互不重叠。
 `--jobs N` 在本机并行跑各片再合并结果(#588):同样钉死每条用例恰好跑一次、恰好计一次。
 """
+import ast
 import json
 import os
 import signal
@@ -150,6 +151,26 @@ def test_domains_manifest_covers_every_case_module(bin_path):
     on_disk = {fn[:-3] for fn in os.listdir(cases_dir) if fn.startswith("test_") and fn.endswith(".py")}
     listed = {mod for mods in domains.values() for mod in mods}
     assert listed == on_disk, (sorted(on_disk - listed), sorted(listed - on_disk))
+
+    by_mod = {}
+    for domain, mods in domains.items():
+        for mod in mods:
+            by_mod.setdefault(mod, set()).add(domain)
+    for mod in sorted(on_disk):
+        path = os.path.join(cases_dir, f"{mod}.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), path)
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.Import):
+                targets = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                targets = [node.module.split(".")[0]]
+            for target in targets:
+                if target in on_disk and target != mod:
+                    assert by_mod[mod].issubset(by_mod[target]), (
+                        f"{mod} ({sorted(by_mod[mod])}) imports {target} ({sorted(by_mod[target])})"
+                    )
 
 
 def test_domain_filtering_and_empty_shard_exit_zero(bin_path):

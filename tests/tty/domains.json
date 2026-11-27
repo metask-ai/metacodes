@@ -14,6 +14,7 @@
       "test_vterm_parity"
     ],
     "mcp": [
+      "test_key_login",
       "test_mcp_login",
       "test_mcp_permission",
       "test_mcp_startup"

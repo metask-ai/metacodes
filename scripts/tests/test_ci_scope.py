@@ -699,6 +699,7 @@ class LayoutTest(unittest.TestCase):
             ([("M", "packages/coding/src/mcp/client.zig"), ("M", "packages/coding/src/kg/client.zig")], "packages", True, ("kg", "mcp", "smoke")),
             ([("M", "packages/coding/src/mcp/client.zig"), ("M", "packages/coding/src/core/agent_loop.zig")], "packages", True, ()),
             ([("M", "tests/tty/cases/test_mcp_startup.py")], "tests", True, ("mcp",)),
+            ([("M", "tests/tty/cases/test_key_login.py")], "tests", True, ("mcp", "provider")),
             ([("M", "tests/tty/cases/test_runner_shards.py")], "tests", True, ("runner",)),
             ([("M", "tests/tty/cases/test_kitty_csi_u_keys.py")], "tests", True, ("provider", "tui")),
             ([("A", "tests/tty/cases/test_unmapped_new.py")], "tests", True, ()),
