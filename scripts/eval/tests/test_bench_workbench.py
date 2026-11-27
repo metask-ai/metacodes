@@ -12,6 +12,7 @@ import concurrent.futures
 import io
 import http.client
 import os
+import signal
 import socket
 import sys
 import tempfile
@@ -1141,6 +1142,53 @@ class WorkbenchTest(unittest.TestCase):
         final = wait_run(self.manager, run['name'])
         started = (self.manager.jobs_dir / run['name'] / 'argv.json').exists()
         self.assertEqual((shown, final['status'], final['exit_code'], started), ('cancelling', 'cancelled', None, False))
+
+    def test_live_worker_with_stale_mtime_stays_active_across_restart(self):
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '30'}):
+            run = self.client.request('api/runs', self.request())
+            record_path = self.manager.records / (run['name'] + '.json')
+            wait_status(self.manager, run['name'], 'running')
+            stale = time.time() - 120
+            os.utime(record_path, (stale, stale))
+            restarted = RunManager(self.manager.jobs_dir, self.manager.config_path)
+            shown = next(r for r in restarted.runs() if r['name'] == run['name'])
+            self.assertEqual(shown['status'], 'running')
+            with self.assertRaisesRegex(ValueError, '已有评测正在运行'):
+                restarted.launch(self.request())
+            restarted.cancel(run['name'])
+            self.assertEqual(wait_run(restarted, run['name'])['status'], 'cancelled')
+
+    def test_killed_worker_stops_orphan_local_child_before_marking_interrupted(self):
+        from scripts.eval.harbor.bench.runner import local_child_running
+        with patch.dict(os.environ, {'FAKE_BENCH_DELAY': '30'}):
+            run = self.client.request('api/runs', self.request())
+            record_path = self.manager.records / (run['name'] + '.json')
+            deadline = time.monotonic() + 15
+            record = {}
+            while time.monotonic() < deadline:
+                record = json.loads(record_path.read_text(encoding='utf-8'))
+                if record.get('worker_pid') and record.get('child_pid') and local_child_running(record['child_pid'], run['name']):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(local_child_running(record.get('child_pid'), run['name']), record)
+            os.kill(record['worker_pid'], signal.SIGKILL)
+            restarted = RunManager(self.manager.jobs_dir, self.manager.config_path)
+            restarted.CHILD_STOP_TIMEOUT = 1.0
+            deadline = time.monotonic() + 20
+            shown = []
+            final = None
+            while time.monotonic() < deadline:
+                current = next(r for r in restarted.runs() if r['name'] == run['name'])
+                shown.append(current['status'])
+                if current['status'] == 'interrupted':
+                    final = current
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(final, shown)
+            self.assertFalse(local_child_running(record['child_pid'], run['name']))
+            persisted = json.loads(record_path.read_text(encoding='utf-8'))
+            self.assertEqual(persisted['status'], 'interrupted')
+            self.assertTrue(persisted.get('finished_at'))
 
 
 @unittest.skipUnless(POSIX, 'fake executable and worker signal test are POSIX')

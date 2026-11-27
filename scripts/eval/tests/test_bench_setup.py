@@ -1329,6 +1329,79 @@ class SshRunTest(SetupFixture):
             self.assertEqual(final["status"], "cancelled", final)
             self.assertNotIn("interrupted", shown)
 
+    def test_killed_worker_cancels_orphan_remote_harbor_and_live_stale_mtime_stays_running(self):
+        manager, client, _ = self.prepare_remote()
+        os.environ["FAKE_BENCH_DELAY"] = "30"
+        run = client.request("api/runs", self.request())
+        name = run["name"]
+        record_path = manager.records / (name + ".json")
+        deadline = time.monotonic() + 30
+        record = {}
+        while time.monotonic() < deadline:
+            if (self.remote_home / ".metacodes-bench/jobs" / name / "argv.json").exists():
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                if record.get("worker_pid") and record.get("status") == "running":
+                    break
+            time.sleep(0.1)
+        self.assertTrue(record.get("worker_pid"), record)
+
+        stale = time.time() - 120
+        os.utime(record_path, (stale, stale))
+        restarted = RunManager(manager.jobs_dir, manager.config_path)
+        live_view = next(r for r in restarted.runs() if r["name"] == name)
+        self.assertEqual(live_view["status"], "running")
+        with self.assertRaisesRegex(ValueError, "仍在运行"):
+            executors.sync_run(manager.jobs_dir, name)
+
+        os.kill(record["worker_pid"], signal.SIGKILL)
+        final, shown = self.watch_until_done(restarted, name, timeout=30)
+        self.assertEqual(final["status"], "interrupted", (final, shown))
+        self.assertIn("cancelling", shown)
+        persisted = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "interrupted")
+        self.assertFalse(persisted.get("remote_stop_pending"))
+        exit_file = self.remote_home / ".metacodes-bench/runs" / name / "harbor.exit"
+        self.assertTrue(exit_file.is_file(), data.tail(manager.records / (name + ".log")))
+        self.assertNotEqual(json.loads(exit_file.read_text(encoding="utf-8")).get("code"), 0)
+
+    def test_unreachable_remote_reap_marks_pending_and_cancel_retries(self):
+        manager, _, _ = self.prepare_remote()
+        name = "bench-20261127-000001-dead01"
+        manager.records.mkdir(parents=True, exist_ok=True)
+        record_path = manager.records / (name + ".json")
+        spec_path = manager.records / (name + ".spec")
+        relay = executors.find(self.cfg(), "relay-4090")
+        atomic_json(spec_path, {"name": name, "executor": relay.spec()})
+        atomic_json(record_path, {"name": name, "status": "running", "created_at": "2026-11-27T00:00:00+00:00"})
+        stale = time.time() - 120
+        os.utime(record_path, (stale, stale))
+
+        outcomes = iter([(False, "ssh: connect refused"), (True, None)])
+        calls = []
+
+        def fake_cancel(executor, run_name, remote_spec_path=None, **_kwargs):
+            calls.append((executor.name, run_name, remote_spec_path))
+            return next(outcomes)
+
+        with patch.object(executors, "cancel_remote_run", side_effect=fake_cancel):
+            final, shown = self.watch_until_done(manager, name, timeout=10)
+            self.assertEqual(final["status"], "interrupted", shown)
+            self.assertTrue(final.get("remote_stop_pending"))
+            self.assertIn("未能连接执行机器", final.get("error") or "")
+
+            res = manager.cancel(name)
+            self.assertEqual(res["status"], "cancelling")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                current = next(r for r in manager.runs() if r["name"] == name)
+                if current["status"] == "interrupted" and not current.get("remote_stop_pending"):
+                    break
+                time.sleep(0.05)
+            persisted = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["status"], "interrupted")
+            self.assertFalse(persisted.get("remote_stop_pending"))
+            self.assertEqual(len(calls), 2)
+
     def test_unfinished_copy_back_is_reported_and_bench_sync_recovers(self):
         manager, client, _ = self.prepare_remote()
         os.environ.update(FAKE_SSH_PACK_FAIL="1", METACODES_BENCH_FINAL_SYNC_TIMEOUT="2")

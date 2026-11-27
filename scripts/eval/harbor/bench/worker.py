@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from scripts.eval.harbor import live_concurrency
-from scripts.eval.harbor.bench.runner import atomic_json, now, runtime_env
+from scripts.eval.harbor.bench.runner import acquire_worker_lock, atomic_json, now, release_worker_lock, runtime_env
 from scripts.eval.harbor.bench.account import Account
 from scripts.eval.harbor.profiling import (JUDGE_TOKEN_ENV, TimingRelay, auth_for, judge_argv, placeholder,
                                            route_problem, upstream_for)
@@ -201,6 +201,7 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         source.subscribe(remote.push_credential)  # first: no refresh is missed
     remote.start(secret_env, spec["remote_spec_path"], credential=source.current())
     record.update(status="running", executor=spec["executor"]["name"])
+    atomic_json(record_path, record)
     remote.start_sync()
     cancel_path = spec_path.with_suffix(".cancel")
     cancelled_at = None
@@ -297,121 +298,132 @@ def main(argv=None):
     spec_path = Path((argv or sys.argv[1:])[0])
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     record_path = spec_path.with_suffix(".json")
-    record = json.loads(record_path.read_text(encoding="utf-8"))
-    record.update(status="starting", started_at=now())
-    atomic_json(record_path, record)
-    process = None
-    relay = None
-    source = None
-    remote = None
-    # Ingests the job into the evaluation store while it runs and at the end.
-    sync = WorkerSync(spec)
-    sync.start()
+    lock_fd = acquire_worker_lock(spec_path.parent, spec["name"])
     try:
-        env = runtime_env()
-        # Account lookups can outlast RunManager's 30 second liveness window.
-        # Prepare beside the heartbeat, so a live worker is never shown as
-        # interrupted (which would admit a second launch). A cancel meanwhile
-        # waits for the lookup in flight, which may be rotating the stored
-        # OAuth token, and then ends the run before Harbor starts.
-        last_write = time.monotonic()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            preparing = pool.submit(prepare, spec, env)
-            while not preparing.done():
-                if spec_path.with_suffix(".cancel").exists() and record["status"] != "cancelling":
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record.update(status="starting", started_at=now(), worker_pid=os.getpid())
+        atomic_json(record_path, record)
+        process = None
+        relay = None
+        source = None
+        remote = None
+        # Ingests the job into the evaluation store while it runs and at the end.
+        sync = WorkerSync(spec)
+        sync.start()
+        try:
+            env = runtime_env()
+            # Account lookups can outlast RunManager's 30 second liveness window.
+            # Prepare beside the heartbeat, so a live worker is never shown as
+            # interrupted (which would admit a second launch). A cancel meanwhile
+            # waits for the lookup in flight, which may be rotating the stored
+            # OAuth token, and then ends the run before Harbor starts.
+            last_write = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                preparing = pool.submit(prepare, spec, env)
+                while not preparing.done():
+                    if spec_path.with_suffix(".cancel").exists() and record["status"] != "cancelling":
+                        record["status"] = "cancelling"
+                        last_write = 0.0
+                    if time.monotonic() - last_write > 2:
+                        atomic_json(record_path, record)
+                        last_write = time.monotonic()
+                    concurrent.futures.wait([preparing], timeout=0.25)
+            spec, relay, source = preparing.result()
+            if getattr(source, "refreshing", False):
+                source.keep()
+            stamp_credential(record, source)
+            if isinstance(relay, RemoteRun):
+                # Not a context manager: nothing to close before it starts.
+                remote, relay = relay, None
+                if remote.node:
+                    record["remote_node"] = remote.node
+                if spec.get("remote_spec_path"):
+                    record["remote_spec_path"] = spec["remote_spec_path"]
+                atomic_json(record_path, record)
+            if spec_path.with_suffix(".cancel").exists():
+                record.update(status="cancelled", finished_at=now())
+                return 1
+            if remote is not None:
+                supervise_remote(remote, spec, env, spec_path, record_path, record, source)
+                return 0 if record.get("status") == "finished" else 1
+            if spec.get("runner") != "workbuddy":
+                env[live_concurrency.FILE_ENV] = str(spec_path.with_suffix(".concurrency"))
+            argv, cwd, child_env = child_process(spec, env)
+            process = subprocess.Popen(argv, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
+                                       start_new_session=True)
+            record.update(status="running", child_pid=process.pid)
+            atomic_json(record_path, record)
+            cancelled = False
+            expired = False
+            last_write = 0.0
+            stop_at = None
+            while process.poll() is None:
+                stopping = None
+                if credential_failed(source) and not (cancelled or expired):
+                    # Fail fast instead of burning the remaining tasks on 401s.
+                    expired = True
+                    record["error"] = source.error
+                    stopping = "failed"
+                elif spec_path.with_suffix(".cancel").exists() and not (cancelled or expired):
+                    cancelled = True
                     record["status"] = "cancelling"
-                    last_write = 0.0
+                    stopping = "cancelling"
+                if stopping:
+                    stop_at = time.monotonic()
+                    if os.name == "nt":
+                        process.terminate()
+                    else:
+                        signal_group(process, signal.SIGINT)
+                if stop_at and time.monotonic() - stop_at > 20:
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        signal_group(process, signal.SIGKILL)
                 if time.monotonic() - last_write > 2:
+                    adjusted_concurrency(spec_path, record)
+                    stamp_credential(record, source)
                     atomic_json(record_path, record)
                     last_write = time.monotonic()
-                concurrent.futures.wait([preparing], timeout=0.25)
-        spec, relay, source = preparing.result()
-        if getattr(source, "refreshing", False):
-            source.keep()
-        stamp_credential(record, source)
-        if isinstance(relay, RemoteRun):
-            # Not a context manager: nothing to close before it starts.
-            remote, relay = relay, None
-        if spec_path.with_suffix(".cancel").exists():
-            record.update(status="cancelled", finished_at=now())
-            return 1
-        if remote is not None:
-            supervise_remote(remote, spec, env, spec_path, record_path, record, source)
-            return 0 if record.get("status") == "finished" else 1
-        if spec.get("runner") != "workbuddy":
-            env[live_concurrency.FILE_ENV] = str(spec_path.with_suffix(".concurrency"))
-        argv, cwd, child_env = child_process(spec, env)
-        process = subprocess.Popen(argv, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
-                                   start_new_session=True)
-        record["status"] = "running"
-        cancelled = False
-        expired = False
-        last_write = 0.0
-        stop_at = None
-        while process.poll() is None:
-            stopping = None
-            if credential_failed(source) and not (cancelled or expired):
-                # Fail fast instead of burning the remaining tasks on 401s.
-                expired = True
-                record["error"] = source.error
-                stopping = "failed"
-            elif spec_path.with_suffix(".cancel").exists() and not (cancelled or expired):
-                cancelled = True
-                record["status"] = "cancelling"
-                stopping = "cancelling"
-            if stopping:
-                stop_at = time.monotonic()
-                if os.name == "nt":
-                    process.terminate()
-                else:
-                    signal_group(process, signal.SIGINT)
-            if stop_at and time.monotonic() - stop_at > 20:
-                if os.name == "nt":
-                    process.kill()
-                else:
-                    signal_group(process, signal.SIGKILL)
-            if time.monotonic() - last_write > 2:
-                adjusted_concurrency(spec_path, record)
-                stamp_credential(record, source)
-                atomic_json(record_path, record)
-                last_write = time.monotonic()
-            time.sleep(0.25)
-        record.update(status="failed" if expired else "cancelled" if cancelled else
-                      ("finished" if process.returncode == 0 else "failed"),
-                      exit_code=process.returncode, finished_at=now())
-    except LaunchRefused as exc:
-        record.update(status="failed", error=str(exc), finished_at=now())
-    except Exception as exc:
-        record.update(status="failed", error=type(exc).__name__, finished_at=now())
-    finally:
-        if source is not None and hasattr(source, "stop"):
-            source.stop()
-        stamp_credential(record, source)
-        if relay:
-            relay.__exit__(None, None, None)
-        if remote is not None:
-            remote.close()  # the run's egress proxy, if any
-        if spec.get("runner") == "workbuddy":
-            from scripts.eval.harbor.suites import workbuddy
-            try:
-                workbuddy.finish(spec)
-            except OSError:
-                record["error"] = record.get("error") or "WorkBuddy 临时配置清理失败"
-            tag = spec["workbuddy"].get("harness_image")
-            if tag:
+                time.sleep(0.25)
+            record.pop("child_pid", None)
+            record.update(status="failed" if expired else "cancelled" if cancelled else
+                          ("finished" if process.returncode == 0 else "failed"),
+                          exit_code=process.returncode, finished_at=now())
+        except LaunchRefused as exc:
+            record.update(status="failed", error=str(exc), finished_at=now())
+        except Exception as exc:
+            record.update(status="failed", error=type(exc).__name__, finished_at=now())
+        finally:
+            if source is not None and hasattr(source, "stop"):
+                source.stop()
+            stamp_credential(record, source)
+            if relay:
+                relay.__exit__(None, None, None)
+            if remote is not None:
+                remote.close()  # the run's egress proxy, if any
+            if spec.get("runner") == "workbuddy":
+                from scripts.eval.harbor.suites import workbuddy
                 try:
-                    subprocess.run(["docker", "image", "rm", tag], stdin=subprocess.DEVNULL, capture_output=True,
-                                   timeout=60)
-                except (OSError, subprocess.SubprocessError):
-                    pass
-        # The final ingest, run row included, precedes the terminal receipt
-        # (and follows the WorkBuddy job's finished_at stamp), so a finished
-        # run's results are already in the store and nothing writes them once
-        # the run has ended; touching the receipt keeps the worker visibly
-        # alive meanwhile.
-        sync.finish(lambda: os.utime(record_path), record)
-        atomic_json(record_path, record)
-    return 0 if record.get("status") == "finished" else 1
+                    workbuddy.finish(spec)
+                except OSError:
+                    record["error"] = record.get("error") or "WorkBuddy 临时配置清理失败"
+                tag = spec["workbuddy"].get("harness_image")
+                if tag:
+                    try:
+                        subprocess.run(["docker", "image", "rm", tag], stdin=subprocess.DEVNULL, capture_output=True,
+                                       timeout=60)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            # The final ingest, run row included, precedes the terminal receipt
+            # (and follows the WorkBuddy job's finished_at stamp), so a finished
+            # run's results are already in the store and nothing writes them once
+            # the run has ended; touching the receipt keeps the worker visibly
+            # alive meanwhile.
+            sync.finish(lambda: os.utime(record_path), record)
+            atomic_json(record_path, record)
+        return 0 if record.get("status") == "finished" else 1
+    finally:
+        release_worker_lock(lock_fd)
 
 
 if __name__ == "__main__":
