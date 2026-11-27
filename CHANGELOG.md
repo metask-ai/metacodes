@@ -46,6 +46,11 @@ status, compatibility boundaries, and entry points are defined by
   notice. Event text is XML-escaped and labelled as command output, not
   instructions. Off by default; with it off Monitor is unchanged
   ([API.md](doc/API.md#preview-features)).
+- **`/status` shows what the session runs on.** The model, its provider,
+  route (channel and wire) and endpoint, where its credential comes from,
+  the reasoning level, and about how much of the context window the
+  conversation fills; `not set` when the session has no model.
+
 - **Bench has a 监控 page for the execution machine.** It shows the machine's
   CPU, load, memory, disks and network rate, whether Docker Hub, ghcr.io,
   GitHub, PyPI, Hugging Face, astral.sh and every configured mirror answer

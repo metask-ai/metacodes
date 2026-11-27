@@ -480,6 +480,16 @@ test "/logout: a preset alone in .env is used with its provider's key from the s
         try testing.expectEqualStrings("Prov B", done.session.switched.name);
         try testing.expectEqualStrings("fast", done.session.switched.preset orelse return error.NoPreset);
         try testing.expectEqual(cc.app_route_state.CredentialOrigin.environment, done.session.switched.origin);
+        var status: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer status.deinit();
+        try app.writeStatus(&status.writer);
+        try expectContains(status.written(), "  Model:       b-model\n");
+        try expectContains(status.written(), "  Provider:    Prov B\n");
+        try expectContains(status.written(), " · openai_chat\n");
+        try expectContains(status.written(), try std.fmt.allocPrint(a, "  Endpoint:    {s}", .{try originOf(a, preset_relay)}));
+        try expectContains(status.written(), "  Credential:  from shell\n");
+        try expectContains(status.written(), "  Reasoning:   high\n");
+        try expectContains(status.written(), "  Context:     about ");
         try sendOneTurn(app);
         const captured = preset_relay.lastRequest() orelse return error.NoRequestCaptured;
         try testing.expectEqualStrings("Bearer " ++ PRESET_KEY, headerValue(captured, "authorization") orelse "");
@@ -506,6 +516,10 @@ test "/logout: a preset alone in .env is used with its provider's key from the s
     try testing.expect(missing.provider.eqlText("prov-b"));
     try testing.expectEqualStrings(PRESET_ENV, missing.variable orelse return error.NoVariable);
     try testing.expect(app.unbound().? == .signed_out);
+    var status: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer status.deinit();
+    try app.writeStatus(&status.writer);
+    try testing.expectEqualStrings("Status\n  Model:       not set — /login, or configure .env\n", status.written());
     try testing.expectEqual(@as(usize, 0), relay.requestCount());
     try testing.expectEqual(@as(usize, 1), preset_relay.requestCount());
     try testing.expectEqual(@as(usize, 0), gateway.requestCount());

@@ -1492,6 +1492,44 @@ pub const App = struct {
         };
     }
 
+    pub fn writeStatus(app: *App, w: *std.Io.Writer) !void {
+        try w.writeAll("Status\n");
+        if (app.unbound() != null) {
+            try w.print("  Model:       {s}\n", .{route_state_mod.not_set_line});
+            return;
+        }
+        try w.print("  Model:       {s}\n", .{app.activeModel()});
+        const host: ?*provider_host_mod.Host = app.providerHost() catch null;
+        const offer = if (host) |found| if (found.kernel.currentOfferId()) |id| found.kernel.catalogSnapshot().find(id) else null else null;
+        if (offer) |current| {
+            const profile = host.?.registry.findById(current.provider_id);
+            try w.print("  Provider:    {s}\n", .{if (profile) |built| built.display_name else current.provider_id.slice()});
+            try w.print("  Route:       {s} · {s}\n", .{ current.channel_id.slice(), current.protocol });
+            try w.print("  Endpoint:    {s}\n", .{current.endpoint_ref});
+        }
+        const origin: ?[]const u8 = switch (app.route_state) {
+            .bound => |bound| bound.label(),
+            .unbound => null,
+        };
+        try w.print("  Credential:  {s}\n", .{origin orelse "unknown"});
+        if (app.config.reasoning_effort) |effort| if (effort.active()) try w.print("  Reasoning:   {s}\n", .{effort.name()});
+        const window = app.api_client.resolveMaxInputTokens();
+        const used: usize = if (app.conversation.usageAnchor()) |anchor| anchor.context_tokens else app.conversation.totalTokens();
+        var used_buf: [16]u8 = undefined;
+        var window_buf: [16]u8 = undefined;
+        try w.print("  Context:     about {s} of {s} tokens ({d}%)\n", .{
+            shortTokens(&used_buf, used),
+            shortTokens(&window_buf, window),
+            if (window == 0) 0 else @min(100, used * 100 / window),
+        });
+    }
+
+    fn shortTokens(buf: []u8, tokens: usize) []const u8 {
+        if (tokens >= 1_000_000) return std.fmt.bufPrint(buf, "{d:.1}M", .{@as(f64, @floatFromInt(tokens)) / 1_000_000.0}) catch "?";
+        if (tokens >= 1_000) return std.fmt.bufPrint(buf, "{d:.1}K", .{@as(f64, @floatFromInt(tokens)) / 1_000.0}) catch "?";
+        return std.fmt.bufPrint(buf, "{d}", .{tokens}) catch "?";
+    }
+
     pub fn writeFirstStartNotice(app: *App, w: *std.Io.Writer) !void {
         const state_env = @import("app/state_env.zig");
         var arena_state = std.heap.ArenaAllocator.init(app.allocator);

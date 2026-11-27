@@ -568,6 +568,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             try handleKg(app, allocator, rest);
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/status")) {
+            printStatus(app);
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/cost")) {
             const u = app.usage;
             cmd_output.print(
@@ -1817,6 +1821,16 @@ fn refusedUnbound(app: *app_mod.App) bool {
     if (app.unbound() == null) return false;
     printUnboundReminder(app);
     return true;
+}
+
+fn printStatus(app: *app_mod.App) void {
+    var out: std.Io.Writer.Allocating = .init(app.allocator);
+    defer out.deinit();
+    app.writeStatus(&out.writer) catch {
+        cmd_output.print("{s}(out of memory rendering the status){s}\n", .{ app.theme.danger, app.theme.reset });
+        return;
+    };
+    cmd_output.print("{s}", .{out.written()});
 }
 
 fn printFirstStartNotice(app: *app_mod.App) void {

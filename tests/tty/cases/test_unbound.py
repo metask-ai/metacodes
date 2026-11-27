@@ -122,6 +122,16 @@ def test_a_first_start_names_the_sign_in_the_env_file_and_the_guide_before_anyth
         _assert_nothing_sent(case)
 
 
+def test_status_says_no_model_is_set(bin_path):
+    with _Case() as case:
+        case.bin = bin_path
+        raw = case.run([READY, "type:/status", "key:enter", wait_for("Model:", 10), "strictsleep:0.3"], term_size=(40, 180))
+        a = TTYAssert(raw, rows=40, cols=180)
+        screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+        assert "Status" in screen and "Model:       not set" in screen, screen
+        _assert_nothing_sent(case)
+
+
 def test_unbound_start_reminds_and_sends_nothing(bin_path):
     with _Case() as case:
         case.bin = bin_path
