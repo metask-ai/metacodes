@@ -1350,7 +1350,7 @@ class MetacodesAgent(BaseInstalledAgent):
         cache_read = int(result.get("cache_read_input_tokens") or 0)
         cache_creation = int(result.get("cache_creation_input_tokens") or 0)
         final_metrics = FinalMetrics(
-            total_prompt_tokens=int(result["input_tokens"]),
+            total_prompt_tokens=int(result["input_tokens"]) + cache_read + cache_creation,
             total_completion_tokens=int(result["output_tokens"]),
             total_cached_tokens=cache_read,
             total_cost_usd=float(result["cost_usd"]),
@@ -1360,6 +1360,7 @@ class MetacodesAgent(BaseInstalledAgent):
                 "metacodes_tool_calls": int(result["tool_calls"]),
                 "metacodes_stop_reason": result["stop_reason"],
                 "cache_creation_input_tokens": cache_creation,
+                "prompt_tokens_include_cache": True,
                 "requested_context_window": self._context_window,
                 "requested_context_compact_pct": self._context_compact_pct,
                 "model_params_via_host_proxy": self._model_params,

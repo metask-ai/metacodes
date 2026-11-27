@@ -1396,16 +1396,34 @@ matches the model to the one OpenRouter model whose id without its `vendor/`
 prefix is the run's request model id (case-insensitive, so
 `metask/DeepSeek-V4.1-Flash-1017` is `deepseek/deepseek-v4.1-flash-1017`;
 a request id with its own namespace, such as `acme/model` behind
-`gateway/`, matches only the OpenRouter id `acme/model`),
-records it on the run as `model_price` (USD per million tokens and the
-`openrouter_id`), and the adapter writes it to the trial's `config.json` as
-`model_prices`, which every metacodes cost meter charges first (`doc/API.md`,
-"Model prices"). The catalog (`https://openrouter.ai/api/v1/models`) is
-cached beside `workbench.json` as `openrouter-prices.json` for a day; when
-OpenRouter cannot be reached the cached copy is used. A model with no single
-match, or without a cached catalog, keeps metacodes' own estimate and
-records no `model_price`. `"model_prices": "off"` in `workbench.json` skips
-the lookup.
+`gateway/`, matches only the OpenRouter id `acme/model`). When there is no
+exact match, it retries after normalizing hyphen/dot version separators
+(`metask/claude-opus-4-6` → `anthropic/claude-opus-4.6`) and then after
+dropping a trailing release date (`-YYYYMMDD`, `@YYYYMMDD`, or `-YYYY-MM-DD`)
+from the request id (`metask/claude-haiku-4-5-20251001` →
+`anthropic/claude-haiku-4.5`). It records the price on the run as
+`model_price` (USD per million tokens and the `openrouter_id`), and the
+adapter writes it to the trial's `config.json` as `model_prices`, which every
+metacodes cost meter charges first (`doc/API.md`, "Model prices"). The catalog
+(`https://openrouter.ai/api/v1/models`) is cached beside `workbench.json` as
+`openrouter-prices.json` for a day; when OpenRouter cannot be reached the
+cached copy is used. A model with no single match, or without a cached
+catalog, keeps metacodes' own estimate and records no `model_price`.
+`"model_prices": "off"` in `workbench.json` skips the lookup.
+
+The workbench API and UI also support viewing costs across multiple price
+schedules (`?price=openrouter|baseten|recorded`, and `auto` on
+`/api/leaderboard`):
+- **Default (`openrouter`)** across Profiles, Profile detail, Job, Trial, and
+  Compare recomputes trial costs from recorded token counts using the cached
+  OpenRouter catalog (falling back to the recorded `cost_usd` when a model is
+  absent or offline), and shows a side-by-side breakdown against Baseten list
+  prices and the original recorded cost.
+- **Leaderboards (`auto`, default)** align each published board with the
+  platform's public list prices: `frontier-harness-eval-1.1` defaults to
+  **Baseten list prices** (`baseten`), while boards without a dedicated
+  provider price book default to **OpenRouter** (`openrouter`). Users can still
+  switch schedules on any view.
 - **Validity**: `teamwork status --json` lands in the trial's agent logs,
   and the run directory without its worktrees (`teamwork-run/`: ledger,
   seat records and logs) beside it. A run that wrote no status, or in which

@@ -129,6 +129,8 @@ jobs:
       product: ${{ steps.decide.outputs.product }}
       release: ${{ steps.decide.outputs.release }}
       offline_eval: ${{ steps.decide.outputs.offline_eval }}
+      bench_tests: ${{ steps.decide.outputs.bench_tests }}
+      bench_smoke: ${{ steps.decide.outputs.bench_smoke }}
       packages: ${{ steps.decide.outputs.packages }}
       package_tests: ${{ steps.decide.outputs.package_tests }}
       script_tests: ${{ steps.decide.outputs.script_tests }}
@@ -252,6 +254,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -301,7 +305,7 @@ jobs:
       # hash, so a restored directory is always safe; test execution is not
       # affected because test Run steps are has_side_effects in build.zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false') || (matrix.product && env.BENCH_SMOKE == 'true'))
         with:
           version: 0.16.0
           use-cache: false
@@ -311,7 +315,7 @@ jobs:
       # prefix of what main saves (its run ID follows), so the newest wins.
       # Each leg builds a different share of the graph and keeps its own line.
       - name: Restore the Zig cache main saved
-        if: env.WARM_CACHE != 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.WARM_CACHE != 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false') || (matrix.product && env.BENCH_SMOKE == 'true'))
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
@@ -582,6 +586,14 @@ jobs:
       - name: Offline test suite (product runtime)
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL == 'false'
         run: zig build test:product-runtime -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Bench unit suites
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES == 'false' && env.BENCH_TESTS == 'true'
+        run: python3 scripts/eval/tests/run_shard.py --bench-only --jobs 4 -v
+      - name: Bench CLI smoke
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES == 'false' && env.BENCH_SMOKE == 'true'
+        run: |
+          zig fmt --check scripts/bench_assets.zig
+          zig build test:bench-smoke -j"$ZIG_BUILD_JOBS" --summary all
       - name: ReleaseSafe core gate
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         run: zig build test:lib -Doptimize=ReleaseSafe
@@ -594,9 +606,19 @@ jobs:
       - name: Documentation link check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_links.py
+      # Persistent self-hosted runners keep $RUNNER_TEMP across jobs, so a
+      # leftover directory from an earlier run trips scripts/install.sh's
+      # PrefixOccupied check or mixes stale release artifacts.
+      - name: Create a private temporary directory for release verification
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_work=$(mktemp -d "$RUNNER_TEMP/release-work.XXXXXX")
+          echo "RELEASE_WORK_DIR=$release_work" >> "$GITHUB_ENV"
       - name: Default install prefix
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
-        run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
+        run: zig build --prefix "$RELEASE_WORK_DIR/install-prefix" && python3 scripts/verify_install_prefix.py "$RELEASE_WORK_DIR/install-prefix" --doctor
       # The footprint red lines of doc/PERF_MEMORY_PRINCIPLES.md §2 (the
       # ReleaseSmall binary size, warm `--help` start, idle peak RSS), measured
       # by scripts/perf_baseline.sh into the job summary (#303). Report-only
@@ -636,7 +658,7 @@ jobs:
       # as nothing ran a real one through doctor, 2026-09-21).
       - name: Built project kernel provenance is accepted by doctor
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
-        run: python3 scripts/verify_kernel_provenance.py "$RUNNER_TEMP/install-prefix/bin/metacodes" --project "$RUNNER_TEMP/metacodes-project-kernel"
+        run: python3 scripts/verify_kernel_provenance.py "$RELEASE_WORK_DIR/install-prefix/bin/metacodes" --project "$RUNNER_TEMP/metacodes-project-kernel"
       # Manifest v2 ships both Lean kernels and pins them, so the release
       # layout is two invocations (release/LAYOUT.md): stage the kernels, then
       # build the executable with their digests. KERNEL_PINS carries them to
@@ -646,40 +668,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          zig build kernels:stage -Dlean-kernels=on --prefix "$RUNNER_TEMP/release-prefix"
-          pins=$(python3 scripts/kernel_pins.py "$RUNNER_TEMP/release-prefix")
+          zig build kernels:stage -Dlean-kernels=on --prefix "$RELEASE_WORK_DIR/release-prefix"
+          pins=$(python3 scripts/kernel_pins.py "$RELEASE_WORK_DIR/release-prefix")
           echo "KERNEL_PINS=$pins" >> "$GITHUB_ENV"
       - name: Release layout prefix
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
-        run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
+        run: zig build release:verify -Drelease-layout=true --prefix "$RELEASE_WORK_DIR/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS && python3 scripts/verify_install_prefix.py "$RELEASE_WORK_DIR/release-prefix" --release --doctor
       # The installer, through the same script users run, on the verified
       # unit: every file re-verified at the new prefix, an install record and
       # state root of its own, and the installed executable's doctor --strict.
       - name: Install the release unit with scripts/install.sh
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
-        run: sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP/release-prefix" && "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
+        run: sh scripts/install.sh --no-link --prefix "$RELEASE_WORK_DIR/installed" "$RELEASE_WORK_DIR/release-prefix" && "$RELEASE_WORK_DIR/installed/bin/metacodes" doctor --strict
       - name: Release bundle verifier self-test
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         run: python3 scripts/verify_release_bundle.py --self-test
       - name: Release archive is reproducible
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         run: |
-          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
-          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
-          ls "$RUNNER_TEMP"/dist-1
+          zig build release:archive -Drelease-layout=true --prefix "$RELEASE_WORK_DIR/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RELEASE_WORK_DIR/dist-1"
+          zig build release:archive -Drelease-layout=true --prefix "$RELEASE_WORK_DIR/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RELEASE_WORK_DIR/dist-2"
+          ls "$RELEASE_WORK_DIR"/dist-1
           same=true
-          for archive in "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz; do cmp "$archive" "$RUNNER_TEMP/dist-2/$(basename "$archive")" || same=false; done
+          for archive in "$RELEASE_WORK_DIR"/dist-1/metacodes-*.tar.gz; do cmp "$archive" "$RELEASE_WORK_DIR/dist-2/$(basename "$archive")" || same=false; done
           if [ "$same" != true ]; then
             # Evidence for the next mismatch: which members differ.
-            mkdir -p "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2"
-            for archive in "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz; do tar -xzf "$archive" -C "$RUNNER_TEMP/unpacked-1"; done
-            for archive in "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz; do tar -xzf "$archive" -C "$RUNNER_TEMP/unpacked-2"; done
-            diff -rq "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2" || true
-            cat "$RUNNER_TEMP"/unpacked-*/*/libexec/metacodes/*.build-receipt.json || true
+            mkdir -p "$RELEASE_WORK_DIR/unpacked-1" "$RELEASE_WORK_DIR/unpacked-2"
+            for archive in "$RELEASE_WORK_DIR"/dist-1/metacodes-*.tar.gz; do tar -xzf "$archive" -C "$RELEASE_WORK_DIR/unpacked-1"; done
+            for archive in "$RELEASE_WORK_DIR"/dist-2/metacodes-*.tar.gz; do tar -xzf "$archive" -C "$RELEASE_WORK_DIR/unpacked-2"; done
+            diff -rq "$RELEASE_WORK_DIR/unpacked-1" "$RELEASE_WORK_DIR/unpacked-2" || true
+            cat "$RELEASE_WORK_DIR"/unpacked-*/*/libexec/metacodes/*.build-receipt.json || true
             exit 1
           fi
-          zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
-          cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
+          zig build release:sums -Drelease-layout=true --prefix "$RELEASE_WORK_DIR/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RELEASE_WORK_DIR/dist-1"
+          cat "$RELEASE_WORK_DIR"/dist-1/metacodes-*-SHA256SUMS
       # Keep the native ARM64 baseline in PR CI. Intel macOS is built and
       # tested on its own runner by release.yml, rather than cross-built here.
       - name: macOS release executables need no more than their targets
@@ -688,8 +710,8 @@ jobs:
         run: |
           set -euo pipefail
           for target in aarch64-macos.13.0; do
-            zig build install -Drelease-layout=true -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$RUNNER_TEMP/baseline-$target"
-            python3 scripts/check_binary_baseline.py --target "$target" "$RUNNER_TEMP/baseline-$target/bin/metacodes"
+            zig build install -Drelease-layout=true -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "$RELEASE_WORK_DIR/baseline-$target"
+            python3 scripts/check_binary_baseline.py --target "$target" "$RELEASE_WORK_DIR/baseline-$target/bin/metacodes"
           done
       - name: Third-party notices check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.RELEASE_DOCS != 'false'
@@ -741,10 +763,10 @@ jobs:
         if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Install linters
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || env.BENCH_TESTS == 'true')
         run: python3 -m pip install --break-system-packages -r requirements-lint.txt
       - name: Lint
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || env.BENCH_TESTS == 'true')
         run: python3 scripts/lint.py
       - name: Lint unit tests
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
@@ -811,12 +833,16 @@ jobs:
           path: ${{ env.METACODES_TEST_IDS_DIR }}
           if-no-files-found: error
           retention-days: 3
+      - name: Clean up release verification directory
+        if: always() && matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false' && env.RELEASE_WORK_DIR != ''
+        shell: bash
+        run: rm -rf "$RELEASE_WORK_DIR"
       # main's warm run saves what this leg built from an empty cache, so the
       # entry holds only what the current tree needs and does not grow night
       # after night. A failed leg saves nothing and the previous night's entry
       # stays. Cache keys are immutable, hence the run ID in each.
       - name: Save the Zig cache for pull requests
-        if: env.WARM_CACHE == 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.WARM_CACHE == 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false') || (matrix.product && env.BENCH_SMOKE == 'true'))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
@@ -859,6 +885,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -901,6 +929,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -1173,6 +1203,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # As in `gates-linux`.
       ZIG_BUILD_JOBS: "8"
@@ -1186,7 +1218,7 @@ jobs:
           REASON: ${{ needs.scope.outputs.reason }}
         run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (matrix.product && env.BENCH_TESTS == 'true'))
         with:
           # Same as `gates-linux`: the repository-snapshot and grounding
           # fingerprint tests resolve historical commits with `git rev-parse`,
@@ -1220,7 +1252,7 @@ jobs:
       # Git-Bash $HOME would be a POSIX-style path that native zig.exe cannot
       # use.
       - name: Normalize line endings of the checkout
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (matrix.product && env.BENCH_TESTS == 'true'))
         shell: cmd
         run: |
           git config --show-origin --get-all core.autocrlf & echo (core.autocrlf origins above, if any)
@@ -1236,7 +1268,7 @@ jobs:
       # PyYAML for the Python suites that `zig build test` runs; see
       # `gates-linux`.
       - name: Install Python development dependencies
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (matrix.product && env.BENCH_TESTS == 'true'))
         shell: cmd
         run: python -m pip install -r requirements-dev.txt
       # As in `gates-linux`: the platform root, standalone, spawn tests on. On
@@ -1317,25 +1349,32 @@ jobs:
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
         run: bash scripts/ci/install-elan.sh
+      - name: Create a private temporary directory for release verification
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP ("release-work-" + [System.Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_WORK_DIR=$dir"
       - name: Stage Lean kernels for the release layout
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         shell: cmd
         run: |
-          zig build kernels:stage -Dlean-kernels=on --prefix "%RUNNER_TEMP%\release-prefix" || exit /b 1
-          for /f "delims=" %%P in ('python scripts\kernel_pins.py "%RUNNER_TEMP%\release-prefix"') do echo KERNEL_PINS=%%P>> "%GITHUB_ENV%"
+          zig build kernels:stage -Dlean-kernels=on --prefix "%RELEASE_WORK_DIR%\release-prefix" || exit /b 1
+          for /f "delims=" %%P in ('python scripts\kernel_pins.py "%RELEASE_WORK_DIR%\release-prefix"') do echo KERNEL_PINS=%%P>> "%GITHUB_ENV%"
           findstr /B KERNEL_PINS= "%GITHUB_ENV%" || exit /b 1
       - name: Default install prefix
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         shell: cmd
-        run: zig build --prefix "%RUNNER_TEMP%\install-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\install-prefix" --doctor
+        run: zig build --prefix "%RELEASE_WORK_DIR%\install-prefix" && python scripts\verify_install_prefix.py "%RELEASE_WORK_DIR%\install-prefix" --doctor
       - name: Release layout prefix
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         shell: cmd
-        run: zig build release:verify -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release-prefix" --release --doctor
+        run: zig build release:verify -Drelease-layout=true --prefix "%RELEASE_WORK_DIR%\release-prefix" %KERNEL_PINS% && python scripts\verify_install_prefix.py "%RELEASE_WORK_DIR%\release-prefix" --release --doctor
       - name: Install the release unit with scripts/install.ps1
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         shell: cmd
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%RUNNER_TEMP%\release-prefix" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%RELEASE_WORK_DIR%\release-prefix" -Prefix "%RELEASE_WORK_DIR%\installed" -NoPath && "%RELEASE_WORK_DIR%\installed\bin\metacodes.exe" doctor --strict
       - name: Release bundle verifier self-test
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         shell: cmd
@@ -1343,7 +1382,7 @@ jobs:
       - name: Release archive is reproducible
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         shell: cmd
-        run: zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1" && zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-2" && python scripts\release_sums.py --self-test && for %%F in ("%RUNNER_TEMP%\dist-1\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-2\%%~nxF" > nul && zig build release:sums -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1"
+        run: zig build release:archive -Drelease-layout=true --prefix "%RELEASE_WORK_DIR%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RELEASE_WORK_DIR%\dist-1" && zig build release:archive -Drelease-layout=true --prefix "%RELEASE_WORK_DIR%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RELEASE_WORK_DIR%\dist-2" && python scripts\release_sums.py --self-test && for %%F in ("%RELEASE_WORK_DIR%\dist-1\metacodes-*.zip") do fc /b "%%F" "%RELEASE_WORK_DIR%\dist-2\%%~nxF" > nul && zig build release:sums -Drelease-layout=true --prefix "%RELEASE_WORK_DIR%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RELEASE_WORK_DIR%\dist-1"
       - name: Verify install prefix unit tests
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false'
         shell: cmd
@@ -1394,6 +1433,10 @@ jobs:
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL == 'false'
         shell: cmd
         run: zig build test:product-runtime -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Bench unit suites
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES == 'false' && env.BENCH_TESTS == 'true'
+        shell: cmd
+        run: python scripts/eval/tests/run_shard.py --bench-only --jobs 4 -v
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite
@@ -1402,6 +1445,13 @@ jobs:
         run: |
           git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)
           exit /b 0
+      - name: Clean up release verification directory
+        if: always() && matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false' && env.RELEASE_WORK_DIR != ''
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath $env:RELEASE_WORK_DIR) {
+            Remove-Item -LiteralPath $env:RELEASE_WORK_DIR -Recurse -Force
+          }
       # As in `gates-linux`: main's warm run saves, pull requests never do. The
       # suite builds the Lean kernels here, so the Lean products are saved
       # after it.
@@ -1447,6 +1497,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # .github/runner-pools.json, sized to the runner.
       ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.windows_zig_build_jobs }}

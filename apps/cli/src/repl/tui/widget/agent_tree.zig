@@ -25,7 +25,7 @@ const tool_card = @import("tool_card.zig");
 const util_time = @import("metacodes-internal").util.time;
 const progress = @import("metacodes-internal").teamwork.progress;
 const teamwork_types = @import("metacodes-internal").teamwork.types;
-const input = @import("../../input.zig");
+const TerminalEnv = @import("../term.zig").TerminalEnv;
 
 const JobSnapshot = registry.AgentJobRegistry.JobSnapshot;
 const JobStatus = registry.JobStatus;
@@ -107,7 +107,7 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, jobs: []const JobSnapshot, no
 }
 
 fn backgroundHint() []const u8 {
-    return if (input.insideTmux()) "(ctrl+b ctrl+b to run in background)" else "(ctrl+b to run in background)";
+    return if (TerminalEnv.fromProcess().insideTmux()) "(ctrl+b ctrl+b to run in background)" else "(ctrl+b to run in background)";
 }
 
 pub fn renderTeamwork(alloc: std.mem.Allocator, th: Theme, snapshot: progress.Snapshot, max_cols: ?usize) ![]u8 {

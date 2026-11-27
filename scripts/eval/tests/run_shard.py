@@ -29,13 +29,16 @@ and exits non-zero. Python 3.9, stdlib only.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import faulthandler
+import subprocess
 import sys
 import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
+BENCH_MODULE_PREFIXES = ("test_bench_", "test_harbor_")
 # The slowest shard takes about 5 minutes on a Linux CI runner and up to about
 # 10.5 minutes on macOS. 20 minutes leaves room for the slowest runner and still
 # fails well before the job's own 45-minute timeout.
@@ -82,6 +85,26 @@ def _first_test(suite):
     return None
 
 
+def module_name(suite) -> str:
+    test = _first_test(suite)
+    if test is None:
+        return ""
+    mod = type(test).__module__
+    if mod == "unittest.loader":
+        return getattr(test, "_testMethodName", "")
+    return mod
+
+
+def is_bench_module(name: str) -> bool:
+    return name.startswith(BENCH_MODULE_PREFIXES)
+
+
+def filter_modules(modules: list, *, bench_only: bool = False) -> list:
+    if not bench_only:
+        return modules
+    return [module for module in modules if is_bench_module(module_name(module))]
+
+
 def module_group(suite) -> str:
     """A discovered module's EVAL_SHARD_GROUP, or a key of its own."""
     test = _first_test(suite)
@@ -92,29 +115,110 @@ def module_group(suite) -> str:
     return "group:" + declared if isinstance(declared, str) and declared else "test:" + test.id()
 
 
+def run_parallel_groups(groups: list, jobs: int, verbose: bool) -> int:
+    ordered = sorted(
+        groups,
+        key=lambda group: sum(module.countTestCases() for module in group),
+        reverse=True,
+    )
+    total_tests = sum(module.countTestCases() for group in ordered for module in group)
+    total_modules = sum(len(group) for group in ordered)
+    workers = max(1, min(jobs, len(ordered)))
+    print(
+        f"evaluation suite parallel run ({workers} workers): {total_tests} tests"
+        f" from {total_modules} modules",
+        file=sys.stderr,
+    )
+
+    def run_group(group: list) -> tuple[list[str], int, str]:
+        names = [module_name(module) for module in group]
+        targets = [f"scripts.eval.tests.{name}" for name in names]
+        cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), *targets]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=SHARD_TIMEOUT_S,
+                check=False,
+            )
+            return names, proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+            err = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+            return names, 1, f"{out}{err}\nTimeout after {SHARD_TIMEOUT_S}s running {', '.join(names)}\n"
+
+    failed = False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(run_group, group) for group in ordered]
+        for future in concurrent.futures.as_completed(futures):
+            names, code, output = future.result()
+            if code != 0:
+                failed = True
+            header = f"=== {', '.join(names)} ({'PASS' if code == 0 else f'FAIL rc={code}'}) ==="
+            print(header, file=sys.stderr)
+            if output:
+                print(output, file=sys.stderr, end="" if output.endswith("\n") else "\n")
+    return 1 if failed else 0
+
+
 def main(argv: list[str]) -> int:
-    shard = parse_shard(argv[0]) if argv else None
-    if shard is None:
-        print("usage: run_shard.py K/N [-v]  (1 <= K <= N)", file=sys.stderr)
+    bench_only = False
+    verbose = False
+    jobs: int | None = None
+    shard_arg: str | None = None
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--bench-only":
+            bench_only = True
+        elif arg == "-v":
+            verbose = True
+        elif arg == "--jobs":
+            if index + 1 >= len(argv) or not argv[index + 1].isdigit() or int(argv[index + 1]) < 1:
+                print("usage: run_shard.py [--bench-only] (K/N | --jobs M) [-v]", file=sys.stderr)
+                return 2
+            jobs = int(argv[index + 1])
+            index += 1
+        elif shard_arg is None:
+            shard_arg = arg
+        else:
+            print("usage: run_shard.py [--bench-only] (K/N | --jobs M) [-v]", file=sys.stderr)
+            return 2
+        index += 1
+    if (shard_arg is None) == (jobs is None):
+        print("usage: run_shard.py [--bench-only] (K/N | --jobs M) [-v]", file=sys.stderr)
         return 2
-    index, count = shard
     # `python3 -m unittest` has the working directory, the repository root,
     # on sys.path; the suite imports `scripts.eval`.
     sys.path.insert(0, str(ROOT))
     from scripts import test_ids
 
-    modules = list(unittest.defaultTestLoader.discover(str(HERE)))
-    groups = select_shard(group_modules(modules, module_group), index, count)
-    selected = unittest.TestSuite([module for group in groups for module in group])
+    modules = filter_modules(list(unittest.defaultTestLoader.discover(str(HERE))), bench_only=bench_only)
+    groups = group_modules(modules, module_group)
+    if not groups:
+        print("this selection matches no test modules", file=sys.stderr)
+        return 1
+    if jobs is not None:
+        return run_parallel_groups(groups, jobs, verbose)
+
+    shard = parse_shard(shard_arg)
+    if shard is None:
+        print("usage: run_shard.py [--bench-only] (K/N | --jobs M) [-v]", file=sys.stderr)
+        return 2
+    shard_index, count = shard
+    selected_groups = select_shard(groups, shard_index, count)
+    selected = unittest.TestSuite([module for group in selected_groups for module in group])
     print(
-        f"evaluation suite shard {index}/{count}: {selected.countTestCases()} tests"
-        f" from {sum(len(group) for group in groups)} of {len(modules)} modules",
+        f"evaluation suite shard {shard_index}/{count}: {selected.countTestCases()} tests"
+        f" from {sum(len(group) for group in selected_groups)} of {len(modules)} modules",
         file=sys.stderr,
     )
     if selected.countTestCases() == 0:
         print("this shard selects no tests", file=sys.stderr)
         return 1
-    verbosity = 2 if "-v" in argv[1:] else 1
+    verbosity = 2 if verbose else 1
     arm_watchdog(SHARD_TIMEOUT_S)
     result_class = test_ids.recording_result_class("eval", "scripts/eval/tests")
     result = unittest.TextTestRunner(verbosity=verbosity, resultclass=result_class).run(selected)

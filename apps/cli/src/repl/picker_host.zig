@@ -206,8 +206,12 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key, guard: Guard) R
             close(app, ui, guard);
             guard.lock();
             defer guard.unlock();
-            var level_buf: [48]u8 = undefined;
-            app.model_picker.setNotice("kept {s}{s}", .{ app.activeModel(), levelNote(app.config.reasoning_effort, &level_buf) });
+            if (app.unbound() != null) {
+                app.model_picker.setNotice("no model set", .{});
+            } else {
+                var level_buf: [48]u8 = undefined;
+                app.model_picker.setNotice("kept {s}{s}", .{ app.activeModel(), levelNote(app.config.reasoning_effort, &level_buf) });
+            }
             return .cancelled;
         },
         .commit => |commit| return apply(app, ui, commit, guard),

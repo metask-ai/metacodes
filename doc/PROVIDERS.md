@@ -453,7 +453,7 @@ does.
 A start takes the first of these that applies: a provider named by
 `--provider` or `METACODES_PROVIDER`; a preset named by `--preset` or
 `METACODES_PRESET`; the preset the working directory remembers; the default
-you stored in `/model` (press Tab there for "every future session"); a Metask
+you stored in `/model` (press Tab there for "from now on"); a Metask
 sign-in; what `<state root>/.env` chooses; otherwise none, and the terminal
 UI opens without a model. A provider you defined is chosen the same ways
 (`metacodes --provider my-relay`, a preset that names one of its models, or

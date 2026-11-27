@@ -89,10 +89,9 @@ SETUP_STEPS = {
         "Stand down if the hosted legs took over", "Keep the caches on the pool host",
     },
     "windows-gates": {
-        "Release fast path", "Change scope", CHECKOUT,
+        "Release fast path", "Change scope",
         "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
         "Restore the Zig cache main saved", "Save the Zig cache for pull requests",
-        "Normalize line endings of the checkout", "Install Python development dependencies",
         "Stand down if the hosted legs took over",
         "Restore Lean toolchain and build products", "Install pinned elan",
     },
@@ -169,6 +168,67 @@ class ClassifyTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(ci_scope.classify([path])[0], "full")
 
+    def test_the_bench_platform_is_the_bench_scope(self) -> None:
+        for paths in (
+            ["scripts/eval/harbor/viewer/static/viewer.js"],
+            ["scripts/eval/harbor/viewer/static/viewer.css", "scripts/eval/tests/test_harbor_viewer.py"],
+            ["scripts/eval/harbor/bench/profiles.py", "scripts/eval/tests/test_bench_profiles.py"],
+            ["scripts/bench_assets.zig", "scripts/eval/harbor/cli.py", "doc/BENCH_WORKBENCH.md"],
+            ["scripts/eval/bench_cli_smoke.py"],
+            ["scripts/eval/bench_ui_smoke.py"],
+        ):
+            with self.subTest(paths=paths):
+                self.assertEqual(ci_scope.classify(paths)[0], "bench")
+        for path in ("scripts/eval/model.py", "scripts/eval/workbuddy/trace.py", "scripts/eval/tests/test_cli.py"):
+            with self.subTest(non_bench_eval=path):
+                self.assertEqual(ci_scope.classify([path])[0], "eval")
+        self.assertEqual(
+            ci_scope.classify(["scripts/eval/harbor/cli.py", "scripts/eval/chained_runner.py"])[0],
+            "eval",
+        )
+
+    def test_bench_smoke_selection_splits_static_and_runtime_changes(self) -> None:
+        for changes in (
+            [("M", "scripts/eval/harbor/viewer/static/viewer.js"), ("M", "scripts/eval/tests/test_harbor_viewer.py")],
+            [("M", "scripts/eval/harbor/viewer/static/viewer.css"), ("M", "scripts/eval/bench_ui_smoke.py")],
+            [("M", "scripts/eval/harbor/viewer/README.md"), ("D", "scripts/eval/tests/test_bench_old.py")],
+            [("M", "scripts/eval/tests/test_bench_profiles.py"), ("M", "doc/BENCH_WORKBENCH.md")],
+        ):
+            with self.subTest(no_smoke=changes):
+                chosen = ci_scope.select("bench", changes)
+                self.assertFalse(chosen.suites)
+                self.assertTrue(chosen.bench_tests)
+                self.assertFalse(chosen.bench_smoke)
+                self.assertFalse(chosen.tty or chosen.sdk or chosen.units or chosen.product or chosen.release)
+                self.assertEqual(
+                    ci_scope.local_commands("bench", chosen, "zig"),
+                    [[sys.executable, "scripts/eval/tests/run_shard.py", "--bench-only", "--jobs", "4", "-v"]],
+                )
+        for changes in (
+            [("M", "scripts/eval/harbor/cli.py")],
+            [("M", "scripts/eval/harbor/bench/profiles.py"), ("M", "scripts/eval/tests/test_bench_profiles.py")],
+            [("M", "scripts/eval/harbor/suites/leaderboards.json")],
+            [("M", "scripts/bench_assets.zig")],
+            [("M", "scripts/eval/bench_cli_smoke.py")],
+            [("D", "scripts/eval/harbor/viewer/static/viewer.js")],
+        ):
+            with self.subTest(with_smoke=changes):
+                chosen = ci_scope.select("bench", changes)
+                self.assertFalse(chosen.suites)
+                self.assertTrue(chosen.bench_tests)
+                self.assertTrue(chosen.bench_smoke)
+                self.assertEqual(
+                    ci_scope.local_commands("bench", chosen, "zig"),
+                    [
+                        [sys.executable, "scripts/eval/tests/run_shard.py", "--bench-only", "--jobs", "4", "-v"],
+                        ["zig", "build", "test:bench-smoke"],
+                    ],
+                )
+                self.assertEqual(
+                    ci_scope.local_commands("bench", chosen, "zig", windows=True),
+                    [[sys.executable, "scripts/eval/tests/run_shard.py", "--bench-only", "--jobs", "4", "-v"]],
+                )
+
     def test_the_evaluation_harness_is_the_eval_scope(self) -> None:
         for paths in (["scripts/eval/chained_runner.py"], ["evals/experiments/learning-turn-v1.md"],
                       ["evals/validators/d1_check_gate_v3_cron.py", "doc/README.md"]):
@@ -193,6 +253,8 @@ class ClassifyTest(unittest.TestCase):
             return chosen.suites, chosen.tty, chosen.units, chosen.product, chosen.complete
 
         self.assertEqual(flags("docs"), (False, False, False, False, False))
+        self.assertEqual(flags("bench"), (False, False, False, False, False))
+        self.assertEqual((ci_scope.select("bench").bench_tests, ci_scope.select("bench").bench_smoke), (True, True))
         self.assertEqual(flags("eval"), (True, False, True, True, True))
         self.assertEqual(flags("full"), (True, True, True, True, True))
         # Without the layout a narrow scope cannot be planned: everything runs.
@@ -351,6 +413,30 @@ class MainTest(unittest.TestCase):
         got = self.run_main("pull_request", "HEAD^1")
         self.assertEqual(got["scope"], "full")
         self.assertIn("changed type", got["reason"])
+
+    def test_a_bench_change_emits_bench_outputs_and_splits_smoke(self) -> None:
+        (self.repo / "scripts/eval/harbor/viewer/static").mkdir(parents=True)
+        (self.repo / "scripts/eval/tests").mkdir(parents=True)
+        (self.repo / "scripts/eval/harbor/viewer/static/viewer.js").write_text("console.log(1);\n", encoding="utf-8")
+        (self.repo / "scripts/eval/tests/test_harbor_viewer.py").write_text("pass\n", encoding="utf-8")
+        self.commit("bench viewer")
+        static_out = self.run_main("pull_request", "HEAD^1")
+        self.assertEqual(
+            (static_out["scope"], static_out["suites"], static_out["bench_tests"], static_out["bench_smoke"],
+             static_out["doc_references"], static_out["release_docs"], static_out["tty"], static_out["sdk"]),
+            ("bench", "false", "true", "false", "false", "false", "false", "false"),
+        )
+        summary = (self.repo / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Bench unit suites | Run |", summary)
+        self.assertIn("| Bench CLI smoke | Skip |", summary)
+
+        (self.repo / "scripts/bench_assets.zig").write_text("pub const files = .{};\n", encoding="utf-8")
+        self.commit("bench assets")
+        assets_out = self.run_main("pull_request", "HEAD^1")
+        self.assertEqual(
+            (assets_out["scope"], assets_out["suites"], assets_out["bench_tests"], assets_out["bench_smoke"]),
+            ("bench", "false", "true", "true"),
+        )
 
     def test_an_added_documentation_file_keeps_the_docs_scope(self) -> None:
         (self.repo / "doc" / "B.md").write_text("b\n", encoding="utf-8")
@@ -693,6 +779,8 @@ class LayoutTest(unittest.TestCase):
             ([("M", "apps/cli/src/repl/model_picker.zig")], "packages", True, ("provider", "smoke")),
             ([("M", "apps/cli/src/web/server.zig")], "packages", False, ()),
             ([("M", "apps/cli/src/daemon/serve.zig")], "packages", False, ()),
+            ([("M", "apps/cli/src/app/bench_cli.zig")], "packages", False, ()),
+            ([("M", "apps/cli/src/app/bench_cli.zig"), ("M", "scripts/eval/harbor/cli.py")], "packages", False, ()),
             ([("M", "apps/cli/src/repl/tui/theme.zig")], "packages", True, ()),
             ([("M", "packages/coding/src/core/agent_loop.zig")], "packages", True, ()),
             ([("M", "packages/ai/src/root.zig")], "packages", True, ()),
@@ -983,11 +1071,70 @@ class WorkflowTest(unittest.TestCase):
         running = set()
         for step in self.jobs["gates-linux"]["steps"]:
             condition = step.get("if", "")
-            if "env.SUITES != 'false'" not in condition:
+            if "env.SUITES != 'false'" not in condition and "env.SUITES == 'false'" not in condition:
                 running.add(step_label(step))
             else:
                 self.assertIn("env.FAST_PATH != 'true'", condition, step_label(step))
         self.assertEqual(running, DOC_STEPS)
+
+    def test_bench_switches_run_only_bench_checks_and_skip_unrelated_builds(self) -> None:
+        def selected(step, bench_tests, bench_smoke, *, suites="false", os_name="Linux",
+                     units=False, product=False, release=False, checks=False):
+            values = {
+                "env.FAST_PATH": "false",
+                "env.SUITES": suites,
+                "env.BENCH_TESTS": bench_tests,
+                "env.BENCH_SMOKE": bench_smoke,
+                "env.DOC_REFERENCES": "false",
+                "env.RELEASE_DOCS": "false",
+                "env.WARM_CACHE": "false",
+                "env.POOL_JOB": "false",
+                "runner.os": os_name,
+                "matrix.units": units,
+                "matrix.product": product,
+                "matrix.release": release,
+                "matrix.checks": checks,
+            }
+            condition = step.get("if", "True")
+            condition = re.sub(r"\b(?:env|matrix|runner)\.\w+|\bsteps\.[\w.-]+",
+                               lambda match: repr(values.get(match.group(), False)), condition)
+            condition = condition.replace("&&", "and").replace("||", "or")
+            return eval(condition, {"__builtins__": {}, "failure": lambda: False, "always": lambda: True}, {})
+
+        posix_steps = self.jobs["gates-linux"]["steps"]
+        zig = next(step for step in posix_steps if step.get("uses", "").startswith("mlugg/setup-zig@"))
+        # Tier B (viewer static / bench tests): no Zig, no Lean, no smoke; runs bench unit suites + Lint.
+        product_tier_b = {step_label(s) for s in posix_steps if selected(s, "true", "false", product=True)}
+        self.assertIn("Bench unit suites", product_tier_b)
+        self.assertNotIn("Bench CLI smoke", product_tier_b)
+        self.assertNotIn(step_label(zig), product_tier_b)
+        self.assertNotIn("Build pinned Lean kernel", product_tier_b)
+        self.assertNotIn("Provision the pinned WorkBuddy-Bench checkout", product_tier_b)
+        checks_tier_b = {step_label(s) for s in posix_steps if selected(s, "true", "false", checks=True)}
+        self.assertIn("Lint", checks_tier_b)
+        self.assertNotIn("ReleaseSafe core gate", checks_tier_b)
+        self.assertNotIn("Contract snapshots", checks_tier_b)
+        self.assertNotIn(step_label(zig), checks_tier_b)
+        # Tier A (bench runtime / bench_assets.zig / bench_cli_smoke.py): adds Zig + Bench CLI smoke on product leg only.
+        product_tier_a = {step_label(s) for s in posix_steps if selected(s, "true", "true", product=True)}
+        self.assertIn("Bench unit suites", product_tier_a)
+        self.assertIn("Bench CLI smoke", product_tier_a)
+        self.assertIn(step_label(zig), product_tier_a)
+        self.assertNotIn("Build pinned Lean kernel", product_tier_a)
+        self.assertNotIn(step_label(zig), {step_label(s) for s in posix_steps if selected(s, "true", "true", units=True)})
+        # Windows: runs Bench unit suites on product leg without Zig or Lean; other legs skip checkout.
+        win_steps = self.jobs["windows-gates"]["steps"]
+        win_product = {step_label(s) for s in win_steps if selected(s, "true", "true", os_name="Windows", product=True)}
+        self.assertIn("Bench unit suites", win_product)
+        self.assertNotIn(step_label(zig), win_product)
+        self.assertNotIn("Install pinned elan", win_product)
+        win_units = {step_label(s) for s in win_steps if selected(s, "true", "true", os_name="Windows", units=True)}
+        self.assertNotIn(CHECKOUT, win_units)
+        # Fail-open (empty scope outputs) runs full suites and never double-runs bench-only steps.
+        fail_open = {step_label(s) for s in posix_steps if selected(s, "", "", suites="", product=True)}
+        self.assertIn("Offline test suite (product)", fail_open)
+        self.assertNotIn("Bench unit suites", fail_open)
+        self.assertNotIn("Bench CLI smoke", fail_open)
 
     def test_document_switches_do_not_enable_product_builds(self) -> None:
         def selected(step, references, release_docs, os_name="Linux", checks=True):
@@ -998,7 +1145,7 @@ class WorkflowTest(unittest.TestCase):
             condition = re.sub(r"\b(?:env|matrix|runner)\.\w+|\bsteps\.[\w.-]+",
                                lambda match: repr(values.get(match.group(), False)), condition)
             condition = condition.replace("&&", "and").replace("||", "or")
-            return eval(condition, {"__builtins__": {}}, {})
+            return eval(condition, {"__builtins__": {}, "failure": lambda: False, "always": lambda: True}, {})
 
         steps = self.jobs["gates-linux"]["steps"]
         zig = next(step for step in steps if step.get("uses", "").startswith("mlugg/setup-zig@"))
@@ -1032,10 +1179,15 @@ class WorkflowTest(unittest.TestCase):
                 if label in ECHO_STEPS:
                     continue
                 with self.subTest(job=job, step=label):
+                    condition = step.get("if", "")
                     # `!= 'false'`, never `== 'true'`: an empty output (the
-                    # scope job failed) runs the step.
-                    self.assertIn("env.%s != 'false'" % var, step.get("if", ""))
-                    self.assertIn("env.FAST_PATH != 'true'", step.get("if", ""))
+                    # scope job failed) runs the full step; narrowed bench-only
+                    # steps run only when SUITES == 'false' and BENCH_TESTS == 'true'.
+                    if label == "Bench unit suites":
+                        self.assertIn("env.SUITES == 'false' && env.BENCH_TESTS == 'true'", condition)
+                    else:
+                        self.assertIn("env.%s != 'false'" % var, condition)
+                    self.assertIn("env.FAST_PATH != 'true'", condition)
 
     def test_each_required_check_is_a_result_job_over_its_legs(self) -> None:
         by_name = {}
@@ -1200,13 +1352,19 @@ class WorkflowTest(unittest.TestCase):
                     self.assertEqual(step.get("if"), "env.SDK != 'false'")
 
     def test_the_selection_outputs_reach_the_suite_steps(self) -> None:
-        for name in ("sdk", "units", "integration", "product", "release", "packages", "package_tests", "script_tests", "complete"):
+        for name in ("sdk", "units", "integration", "product", "release", "bench_tests", "bench_smoke",
+                     "packages", "package_tests", "script_tests", "complete"):
             self.assertEqual(self.jobs["scope"]["outputs"][name], "${{ steps.decide.outputs.%s }}" % name)
-        for job, names in (("gates-linux", ("units", "integration", "product", "release", "package_tests", "script_tests", "complete")),
-                           ("gates-macos", ("units", "integration", "product", "release", "package_tests", "script_tests", "complete")),
-                           ("gates-macos-vm", ("units", "integration", "product", "release", "package_tests", "script_tests", "complete")),
-                           ("windows-gates", ("units", "integration", "product", "release", "package_tests")),
-                           ("windows-gates-vm", ("units", "integration", "product", "release", "package_tests"))):
+        for job, names in (("gates-linux", ("units", "integration", "product", "release", "bench_tests", "bench_smoke",
+                                            "package_tests", "script_tests", "complete")),
+                           ("gates-macos", ("units", "integration", "product", "release", "bench_tests", "bench_smoke",
+                                            "package_tests", "script_tests", "complete")),
+                           ("gates-macos-vm", ("units", "integration", "product", "release", "bench_tests", "bench_smoke",
+                                               "package_tests", "script_tests", "complete")),
+                           ("windows-gates", ("units", "integration", "product", "release", "bench_tests", "bench_smoke",
+                                              "package_tests")),
+                           ("windows-gates-vm", ("units", "integration", "product", "release", "bench_tests", "bench_smoke",
+                                                 "package_tests"))):
             for name in names:
                 with self.subTest(job=job, output=name):
                     self.assertEqual(self.jobs[job]["env"][name.upper()], "${{ needs.scope.outputs.%s }}" % name)

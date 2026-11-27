@@ -9,6 +9,7 @@
 //! 测试策略：LineEditor 全部用 fake keystream 驱动。termios 只做 "不崩" 测试（真 tty 行为难在 CI 里验证）。
 
 const std = @import("std");
+const TerminalEnv = @import("tui/term.zig").TerminalEnv;
 const ppaths = @import("metacodes-internal").platform.paths;
 const pfs = @import("metacodes-internal").platform.fs;
 const platform_term = @import("metacodes-internal").platform.terminal;
@@ -1096,11 +1097,11 @@ pub fn classifyKittyKeyboard(term_program: ?[]const u8, term: ?[]const u8, multi
 }
 
 pub fn insideGnuScreen() bool {
-    return nonEmptyEnv("STY");
+    return TerminalEnv.fromProcess().insideGnuScreen();
 }
 
 pub fn insideTmux() bool {
-    return nonEmptyEnv("TMUX");
+    return TerminalEnv.fromProcess().insideTmux();
 }
 
 fn kittyTerm(term: []const u8) bool {
@@ -1125,21 +1126,16 @@ pub fn keyboardEnhancementOptedOut() bool {
 /// 读真实 env 调 classifyKittyKeyboard。
 pub fn keyboardPolicy() KeyboardPolicy {
     if (keyboardEnhancementOptedOut()) return .disable;
-    const term = envValue("TERM");
-    const multiplexer: Multiplexer = if (nonEmptyEnv("TMUX"))
-        .tmux
-    else if (nonEmptyEnv("STY") or envValue("ZELLIJ") != null or
-        (term != null and (std.mem.startsWith(u8, term.?, "screen") or std.mem.startsWith(u8, term.?, "tmux"))))
-        .other
-    else
-        .none;
-    return classifyKittyKeyboard(terminalProgram(), term, multiplexer);
+    return keyboardPolicyFor(TerminalEnv.fromProcess());
 }
 
-fn terminalProgram() ?[]const u8 {
-    if (envValue("TERM_PROGRAM")) |program| if (program.len > 0) return program;
-    if (envValue("LC_TERMINAL")) |terminal| if (std.mem.eql(u8, terminal, "iTerm2")) return "iTerm.app";
-    return null;
+pub fn keyboardPolicyFor(env: TerminalEnv) KeyboardPolicy {
+    const multiplexer: Multiplexer = switch (env.innerMultiplexer()) {
+        .tmux => .tmux,
+        .none => .none,
+        else => .other,
+    };
+    return classifyKittyKeyboard(env.resolvedTermProgram(), env.term, multiplexer);
 }
 
 /// 启动探测的答案:终端答了 Kitty flags 查询。启动时、首次进 raw mode 之前写一次
@@ -1208,7 +1204,7 @@ fn emitLateKeyboardEnable(fd: c_int) void {
 ///   一行时出现,那时用户已经敲过字,所以这条判据不会晚。
 /// - 终端自己把 Shift+Enter 绑成了 ESC CR(/terminal-setup,#386;recordNewlineBinding)→ 也是 shift。
 pub fn newlineHint() []const u8 {
-    const protocol_newline = shouldEnableKittyKeyboard() and !nonEmptyEnv("TMUX");
+    const protocol_newline = shouldEnableKittyKeyboard() and !insideTmux();
     const shift_newline = protocol_newline or platform_term.keyRecordsTypeText() or g_newline_binding.load(.acquire);
     return if (shift_newline) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }

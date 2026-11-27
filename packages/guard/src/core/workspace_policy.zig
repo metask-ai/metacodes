@@ -108,7 +108,8 @@ pub const WorkspacePolicy = struct {
 pub fn isShellTool(name: []const u8) bool {
     return std.mem.eql(u8, name, "Bash") or
         std.mem.eql(u8, name, "BashOutput") or
-        std.mem.eql(u8, name, "KillShell");
+        std.mem.eql(u8, name, "KillShell") or
+        std.mem.eql(u8, name, "Monitor");
 }
 
 /// Validates and resolves every directory before returning; on any error
@@ -184,6 +185,22 @@ test "WorkspacePolicy requires an existing absolute root and fails shell closed"
     try std.testing.expect(policy.allowsTool("Read"));
     try std.testing.expect(!policy.allowsTool("Bash"));
     try std.testing.expect(policy.sandbox() == null);
+}
+
+test "WorkspacePolicy applies every shell policy to all shell tools" {
+    const shell_tools = [_][]const u8{ "Bash", "BashOutput", "KillShell", "Monitor" };
+    const non_shell_tools = [_][]const u8{ "Read", "Edit", "", "monitor", "MonitorStatus" };
+    for (shell_tools) |name| try std.testing.expect(isShellTool(name));
+    for (non_shell_tools) |name| try std.testing.expect(!isShellTool(name));
+
+    const cwd = try @import("metacodes-base").util.fs.getCwd(std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    for ([_]ShellPolicy{ .disabled, .sandboxed, .unrestricted }) |shell| {
+        var policy = try WorkspacePolicy.init(std.testing.allocator, .{ .root = cwd, .shell = shell });
+        defer policy.deinit();
+        for (shell_tools) |name| try std.testing.expectEqual(shell != .disabled, policy.allowsTool(name));
+        for (non_shell_tools) |name| try std.testing.expect(policy.allowsTool(name));
+    }
 }
 
 test "WorkspacePolicy keeps the real paths of distinct additional directories and refuses invalid ones" {

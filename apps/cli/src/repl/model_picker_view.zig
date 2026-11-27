@@ -51,10 +51,9 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
         rows += drawRow(picker, w, th, layout, row, index == picker.cursor);
     }
     if (end < visible.len or top > 0) {
-        // Only a list longer than its window gets this line, and it is where
-        // the keys that reach the rest are named: a long list that does not
-        // say how to page reads as the whole list. It counts the rows the
-        // cursor can stop on; headings are not choices.
+        // Only a list longer than its window gets this line: a long list
+        // that does not say where the cursor is reads as the whole list. It
+        // counts the rows the cursor can stop on; headings are not choices.
         var position: usize = 0;
         var total: usize = 0;
         for (visible, 0..) |row, index| {
@@ -63,7 +62,7 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
             if (index <= picker.cursor) position = total;
         }
         line(w);
-        w.print("  {s}[{d}/{d}] · PgUp/PgDn page · Home/End{s}{s}", .{
+        w.print("  {s}[{d}/{d}]{s}{s}", .{
             th.dim,
             position,
             total,
@@ -378,9 +377,29 @@ fn drawRow(picker: *const Picker, w: *std.Io.Writer, th: Theme, layout: Layout, 
             if (route.preferred) w.writeAll("   preferred") catch {};
             w.print("{s}", .{th.reset}) catch {};
         },
+        .more => |more| {
+            paint(w, th, selected, false);
+            w.print("All models{s}{s} · {d} more · enter to {s}{s}", .{
+                th.reset,
+                th.dim,
+                more.hidden,
+                if (more.open) "hide" else "show",
+                th.reset,
+            }) catch {};
+        },
+        .vendor => |vendor| {
+            const name = vendorName(picker.offers.items[vendor.offer_index]);
+            w.print("    {s}{s}{s}", .{ th.dim, clip(name, layout.cols -| 5), th.reset }) catch {};
+        },
     }
     newline(w);
     return 1;
+}
+
+fn vendorName(offer: picker_mod.OfferSummary) []const u8 {
+    if (std.mem.indexOf(u8, offer.display_name, ": ")) |at| return offer.display_name[0..at];
+    const vendor = picker_mod.vendorOf(picker_mod.canonicalKey(offer));
+    return if (vendor.len > 0) vendor else "Other";
 }
 
 /// The controls of the focused route, a line each: the vocabulary after
@@ -1183,6 +1202,48 @@ test "a filter keeps the headings, so a match says which route it goes through a
     }
 }
 
+test "a long OpenRouter list opens on its latest models, folds the rest, and names their vendors once shown" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [44][32]u8 = undefined;
+    var offers: [46]control_plane.OfferSummary = undefined;
+    offers[0] = offerOf("openrouter", "auto", "~anthropic/claude-sonnet-latest", "openai_chat");
+    offers[0].display_name = "Anthropic: Claude Sonnet Latest";
+    offers[1] = offerOf("openrouter", "auto", "~z-ai/glm-latest", "openai_chat");
+    offers[1].display_name = "Z.ai: GLM Latest";
+    for (offers[2..], 0..) |*slot, index| {
+        const odd = index % 2 == 1;
+        const id = std.fmt.bufPrint(&names[index], "{s}/model-{d:0>2}", .{ if (odd) "anthropic" else "qwen", index }) catch unreachable;
+        slot.* = offerOf("openrouter", "auto", id, "openai_chat");
+        slot.display_name = try std.fmt.allocPrint(arena, "{s}: Model {d:0>2}", .{ if (odd) "Anthropic" else "Qwen", index });
+    }
+    try seed(&picker, &offers, null);
+    const notes = [_]picker_mod.ProviderNote{picker_mod.ProviderNote.init(ids.Slug.lit("openrouter"), "OpenRouter", .environment)};
+    var ready: [46]bool = undefined;
+    @memset(&ready, true);
+    try picker.setReadiness(&ready, &notes);
+    picker.page_rows = 80;
+
+    const folded = try visibleRows(arena, drawAt(&picker, try arena.alloc(u8, 64 * 1024), 100));
+    try testing.expectEqualStrings("  OpenRouter · key from shell · billed to your OpenRouter account", folded[1]);
+    try testing.expect(std.mem.startsWith(u8, folded[2], "  >  Anthropic: Claude Sonnet Latest"));
+    try testing.expect(std.mem.startsWith(u8, folded[3], "     Z.ai: GLM Latest"));
+    try testing.expectEqualStrings("     All models · 44 more · enter to show", folded[4]);
+    for (folded) |row| try testing.expect(std.mem.indexOf(u8, row, "Model 0") == null);
+
+    _ = picker.onKey(.end);
+    _ = picker.onKey(.enter);
+    const open = try visibleRows(arena, drawAt(&picker, try arena.alloc(u8, 64 * 1024), 100));
+    try testing.expectEqualStrings("  >  All models · 44 more · enter to hide", open[4]);
+    try testing.expectEqualStrings("    Anthropic", open[5]);
+    try testing.expect(std.mem.startsWith(u8, open[6], "     Anthropic: Model 01"));
+    try testing.expectEqualStrings("    Qwen", open[5 + 1 + 22]);
+    for (open) |row| try testing.expect(textWidth(row) < 100);
+}
+
 test "a window scrolled into a group opens with that group's heading, never over the cursor (#600)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1352,7 +1413,7 @@ test "a long list scrolls with a position indicator that counts models, not head
     picker.page_rows = 6;
     _ = picker.onKey(.end);
     const text = try screen(arena, &picker, 120);
-    try testing.expect(std.mem.indexOf(u8, text, "[30/30] · PgUp/PgDn page · Home/End · type to filter") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[30/30] · type to filter") != null);
     try testing.expect(std.mem.indexOf(u8, text, "m29") != null);
     try testing.expect(std.mem.indexOf(u8, text, "m00") == null);
 }

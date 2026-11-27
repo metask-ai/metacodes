@@ -4,6 +4,7 @@ const process = @import("metacodes-internal").platform.process;
 const platform_thread = @import("metacodes-internal").platform.thread;
 const CopyNotice = @import("ui_state.zig").CopyNotice;
 const input = @import("../input.zig");
+const TerminalEnv = @import("term.zig").TerminalEnv;
 const mirror = @import("screen_mirror.zig");
 const remote = @import("remote.zig");
 const tui_config = @import("config.zig");
@@ -16,10 +17,11 @@ pub const Outcome = union(enum) { not_mine, consumed, copied: CopyNotice };
 pub const no_mouse_env = "METACODES_NO_MOUSE";
 
 pub fn enable(gpa: std.mem.Allocator, state_root: []const u8, fd: c_int) void {
-    if (builtin.os.tag == .windows or input.insideGnuScreen() or turnedOff(gpa, state_root)) return;
+    const env = TerminalEnv.fromProcess();
+    if (builtin.os.tag == .windows or env.insideGnuScreen() or turnedOff(gpa, state_root)) return;
     input.recordMouseSelection(true);
     mirror.enable(fd);
-    if (input.insideTmux()) askTmuxInBackground();
+    if (env.insideTmux()) askTmuxInBackground();
 }
 
 pub fn turnedOff(gpa: std.mem.Allocator, state_root: []const u8) bool {

@@ -482,12 +482,24 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
     output_tokens = number(agent_result.get("n_output_tokens"))
     partial = not agent and ((trial_dir / "agent" / "metacodes-output.jsonl").exists() or bool(measured["requests"]))
     if partial:
-        input_tokens, cache_tokens, output_tokens = (measured["usage"].get(k) for k in ("input_tokens", "cache_tokens", "output_tokens"))
+        input_tokens, cache_tokens, output_tokens, cache_creation_tokens = (
+            measured["usage"].get(k) for k in ("input_tokens", "cache_tokens", "output_tokens", "cache_creation_tokens")
+        )
     else:
         fallback = usage_values(agent)
+        raw_input = number(agent.get("input_tokens"))
+        if (
+            input_tokens is not None
+            and raw_input is not None
+            and fallback.get("input_tokens") is not None
+            and input_tokens == raw_input
+            and fallback["input_tokens"] > input_tokens
+        ):
+            input_tokens = fallback["input_tokens"]
         input_tokens = input_tokens if input_tokens is not None else fallback.get("input_tokens", measured["usage"].get("input_tokens"))
         cache_tokens = cache_tokens if cache_tokens is not None else fallback.get("cache_tokens", measured["usage"].get("cache_tokens"))
         output_tokens = output_tokens if output_tokens is not None else fallback.get("output_tokens", measured["usage"].get("output_tokens"))
+        cache_creation_tokens = fallback.get("cache_creation_tokens", measured["usage"].get("cache_creation_tokens"))
     total_tokens = input_tokens + output_tokens if input_tokens is not None and output_tokens is not None else None
     cost = number(agent_result.get("cost_usd"))
     if cost is None:
@@ -513,6 +525,7 @@ def trial_row(trial_dir: Path) -> Dict[str, Any]:
         "total_tokens": total_tokens,
         "tokens_partial": partial,
         "cache_tokens": cache_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
         "output_tokens": output_tokens,
         "cache_ratio": (cache_tokens / input_tokens) if input_tokens and cache_tokens is not None else None,
         "cost_usd": cost,
