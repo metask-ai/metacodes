@@ -313,6 +313,10 @@ status, compatibility boundaries, and entry points are defined by
   other mistyped name. Web and daemon hosts that send `/vim` through
   `POST /command` are not affected.
 
+- **`/login` marks an unofficial sign-in in its list.** ChatGPT's sign-in
+  said it is unofficial only once it started; its entry in the `/login`
+  list now reads `ChatGPT (Codex) · browser sign-in · unofficial`.
+
 - **API failure notices are in English.** The line under `API request
   failed` mixed Chinese into an English screen, e.g. `HTTP 429(重试 4 次后放弃):
   …`. It now reads `HTTP 429 (gave up after 4 attempts): …`, and the named

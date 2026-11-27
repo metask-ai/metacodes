@@ -992,7 +992,12 @@ pub const LoginDialog = struct {
                 try p.text("Select a provider:");
                 try p.blank();
                 for (self.choices[0..self.listedLen()], 0..) |*choice, i| {
-                    try p.option(i + 1, i == self.sel, label(choice), method(choice));
+                    var how_buf: [64]u8 = undefined;
+                    const how = if (choice.profile.oauth_support == .unofficial)
+                        std.fmt.bufPrint(&how_buf, "{s} · unofficial", .{method(choice)}) catch method(choice)
+                    else
+                        method(choice);
+                    try p.option(i + 1, i == self.sel, label(choice), how);
                 }
                 // The pane cannot scroll the rest into view: they are named,
                 // never silently left out.
@@ -2200,6 +2205,28 @@ test "login: the list wraps, numbers are shown, Esc interrupts" {
     try testing.expectEqual(@as(usize, 0), dialog.sel);
     try testing.expectEqual(Step.done, dialog.key(.esc));
     try testing.expect(dialog.outcome == .interrupted);
+}
+
+test "login: an unofficial sign-in says so in the list" {
+    const kinds = [_]provider_profile.CredentialKind{.openai_oauth};
+    const profile = provider_profile.ProviderProfile{
+        .id = @import("metacodes-internal").provider.ids.Slug.lit("dialog-test"),
+        .implementation_id = @import("metacodes-internal").provider.ids.Slug.lit("dialog-test"),
+        .display_name = "Dialog Test",
+        .channels = &.{},
+        .accepted_credential_kinds = &kinds,
+        .oauth_token_url = "http://127.0.0.1:1/token",
+        .oauth_authorize_url = "http://127.0.0.1:1/authorize",
+        .oauth_client_id = "dialog-client",
+        .oauth_support = .unofficial,
+    };
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined };
+    defer dialog.deinit();
+    const flow = try provider_login.prepareFlow(&profile, .{ .state_root = "", .open_browser = false, .port = 0 }, null);
+    dialog.add(.{ .profile = &profile, .method = .{ .flow = flow } });
+    const plain = try renderPlain(&dialog, 80);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "> 1. Dialog Test · browser sign-in · unofficial") != null);
 }
 
 /// `count` key providers `p1`…`p<count>` (the GLM Coding Plan's setup).
