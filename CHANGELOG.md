@@ -388,6 +388,12 @@ status, compatibility boundaries, and entry points are defined by
   it runs at it, reruns included. A profile saved earlier keeps its latest
   dataset's value. `bench run` on the CLI still takes `--concurrency`.
 
+- **List hints name only keys a laptop has.** The position line under a
+  long `/model` list or slash menu reads `[12/315] · type to filter` instead
+  of also naming PgUp/PgDn and Home/End, which most laptop keyboards reach
+  only through Fn. The keys still work, and the `?` shortcuts now list them
+  (`pgup / pgdn, home / end in lists`).
+
 - **Bench profiles replace batches.** A profile (评测配置) is one frozen
   metacodes version with a fixed set of advanced features, and every run
   belongs to one; the same version with the same features is always the same

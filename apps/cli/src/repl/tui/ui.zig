@@ -502,6 +502,7 @@ pub const SHORTCUTS = [_][]const u8{
     "ctrl + g to edit in $EDITOR",
     "ctrl + x ctrl + o for transcript",
     "ctrl + b to run a reply in background",
+    "pgup / pgdn, home / end in lists",
 };
 
 const SHORTCUT_GAP: usize = 2;
@@ -765,6 +766,13 @@ test "issue #16: `?` help lists both the picker and its replacement binding" {
     // A moved binding that is not documented is a binding users lose.
     try testing.expect(found_picker);
     try testing.expect(found_transcript);
+}
+
+test "`?` help names the paging keys the list hints leave out" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    _ = try renderHelpLines(&w, @import("theme.zig").monochrome, 120);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "pgup / pgdn, home / end in lists") != null);
 }
 
 test "shortcut grid: three columns when they fit, fewer on a narrow terminal" {

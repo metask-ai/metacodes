@@ -51,10 +51,9 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
         rows += drawRow(picker, w, th, layout, row, index == picker.cursor);
     }
     if (end < visible.len or top > 0) {
-        // Only a list longer than its window gets this line, and it is where
-        // the keys that reach the rest are named: a long list that does not
-        // say how to page reads as the whole list. It counts the rows the
-        // cursor can stop on; headings are not choices.
+        // Only a list longer than its window gets this line: a long list
+        // that does not say where the cursor is reads as the whole list. It
+        // counts the rows the cursor can stop on; headings are not choices.
         var position: usize = 0;
         var total: usize = 0;
         for (visible, 0..) |row, index| {
@@ -63,7 +62,7 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
             if (index <= picker.cursor) position = total;
         }
         line(w);
-        w.print("  {s}[{d}/{d}] · PgUp/PgDn page · Home/End{s}{s}", .{
+        w.print("  {s}[{d}/{d}]{s}{s}", .{
             th.dim,
             position,
             total,
@@ -1352,7 +1351,7 @@ test "a long list scrolls with a position indicator that counts models, not head
     picker.page_rows = 6;
     _ = picker.onKey(.end);
     const text = try screen(arena, &picker, 120);
-    try testing.expect(std.mem.indexOf(u8, text, "[30/30] · PgUp/PgDn page · Home/End · type to filter") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[30/30] · type to filter") != null);
     try testing.expect(std.mem.indexOf(u8, text, "m29") != null);
     try testing.expect(std.mem.indexOf(u8, text, "m00") == null);
 }

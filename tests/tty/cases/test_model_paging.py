@@ -72,7 +72,8 @@ VENDOR_KEYS = (
 def test_picker_end_reaches_the_last_of_many_models(bin_path):
     text = _run(bin_path, OPEN_MODEL_STAGE + ["key:end", wait_for(f"[{COUNT}/{COUNT}]")])
     assert f"> Model {COUNT}" in text.replace(">  ", "> "), "End 没有到最后一个模型:\n" + text
-    assert f"[{COUNT}/{COUNT}] · PgUp/PgDn page · Home/End · type to filter" in text, "长列表没有说明翻页键:\n" + text
+    assert f"[{COUNT}/{COUNT}] · type to filter" in text, "长列表没有标出位置:\n" + text
+    assert "PgUp" not in text and "Home/End" not in text, "提示行不该再写笔记本上没有的键:\n" + text
     assert "Not configured" not in text, "没有 key 的厂商不该列出:\n" + text
 
 
