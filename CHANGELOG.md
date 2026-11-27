@@ -609,6 +609,29 @@ status, compatibility boundaries, and entry points are defined by
   `TZ=UTC`, locally and on SSH nodes. Jobs started before this change keep
   their shifted start time.
 
+- **`NO_COLOR` also turns off the colors in an answer's markdown and in diff
+  code.** With `NO_COLOR` set, or a terminal without colors, an answer's
+  headings, links and code blocks kept their cyan, blue, gray and syntax
+  colors, and the code in an edit's diff kept its syntax colors: the
+  renderer fell back to fixed 16-color codes whenever the theme gave it none.
+  It now takes them from the theme, so the colorless theme renders them
+  without color; bold, italic, dim and underline stay.
+
+- **Inside GNU screen the TUI no longer draws 24-bit colors that screen
+  drops.** screen 4 hands the outer terminal's `COLORTERM=truecolor` to the
+  programs it runs but discards 24-bit color codes, so highlighted code lost
+  its colors. Inside screen (`STY` is set, or `TERM` starts with `screen`
+  outside tmux) `COLORTERM` is ignored: a `TERM` with `256color` gets 256
+  colors, any other 16. `FORCE_COLOR` still decides first, for a screen 5
+  with `truecolor on`.
+
+- **Over SSH a file link in an answer names the machine the file is on.**
+  File links were written as `file:///path`, so a terminal on the local
+  machine opened its own file at that path. When `SSH_CONNECTION`,
+  `SSH_CLIENT` or `SSH_TTY` is set the link is now `file://<host>/path` with
+  the remote machine's name, as the OSC 8 convention asks, so the terminal
+  can tell the file is not local. Local sessions are unchanged.
+
 - **A provider overload is retried like a 503.** HTTP 529 was an unnamed
   status that ended the turn after one attempt; it is now
   `ServiceUnavailable` and goes through the connect retry (attempt limit,

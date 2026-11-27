@@ -19,12 +19,13 @@
 
 const std = @import("std");
 
-// ANSI 常量(集中走 tui/ansi.zig;markdown 渲染不感知主题,关色用 NO_COLOR=1)
+// ANSI 常量(集中走 tui/ansi.zig);颜色取自调用方传入的主题调色板(Theme.syntax)
 const ansi = @import("tui/ansi.zig");
 // CJK-aware 显示宽度(表格列宽/cell 折行用);term 不引 render,无循环依赖。
 const term = @import("tui/term.zig");
 const theme_mod = @import("tui/theme.zig");
 const pfs = @import("metacodes-internal").platform.fs;
+const remote = @import("tui/remote.zig");
 const SyntaxTheme = theme_mod.SyntaxTheme;
 const RESET = ansi.sgr.reset;
 const BOLD = ansi.sgr.bold;
@@ -37,6 +38,13 @@ const YELLOW = ansi.sgr.fg_yellow;
 const MAGENTA = ansi.sgr.fg_magenta;
 const BLUE = ansi.sgr.fg_blue;
 const UNDERLINE = ansi.sgr.underline;
+
+pub const Style = struct {
+    syn: SyntaxTheme,
+    file_host: []const u8 = "",
+};
+
+const batch_style: Style = .{ .syn = ansi.syntax_palette.b16 };
 
 pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;
@@ -59,7 +67,7 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
                 try out.append(allocator, '\n');
                 in_code_block = false;
             } else {
-                try highlightCodeLine(line, code_lang, &hl_state, GRAY, &out, allocator, ansi.syntax_palette.b16);
+                try highlightCodeLine(line, code_lang, &hl_state, batch_style.syn.code, &out, allocator, batch_style.syn);
                 try out.appendSlice(allocator, RESET);
                 try out.append(allocator, '\n');
             }
@@ -70,7 +78,7 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
             try out.append(allocator, '\n');
             in_code_block = true;
         } else if (isHeading(line)) |h| {
-            try renderHeading(line, h, &out, allocator);
+            try renderHeading(line, h, batch_style, &out, allocator);
             try out.append(allocator, '\n');
         } else if (peekLine(md, next) != null and isTableStart(line, peekLine(md, next).?)) {
             // 表格前瞻:line 是表头、下一行是分隔行 → 收集整块渲染。
@@ -89,7 +97,7 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
                 last_end = le;
                 scan = if (le < md.len) le + 1 else md.len;
             }
-            const t = try renderTable(tbl_rows.items, TABLE_BATCH_WIDTH, allocator);
+            const t = try renderTable(tbl_rows.items, TABLE_BATCH_WIDTH, batch_style, allocator);
             defer allocator.free(t);
             try out.appendSlice(allocator, t);
             if (last_end < md.len) try out.append(allocator, '\n');
@@ -97,10 +105,10 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
             continue;
         } else if (isListItem(line)) |prefix_len| {
             try out.appendSlice(allocator, "  • ");
-            try renderInline(line[prefix_len..], &out, allocator);
+            try renderInline(line[prefix_len..], batch_style, &out, allocator);
             try out.append(allocator, '\n');
         } else {
-            try renderInline(line, &out, allocator);
+            try renderInline(line, batch_style, &out, allocator);
             if (line_end < md.len) try out.append(allocator, '\n');
         }
         cursor = next;
@@ -122,6 +130,7 @@ pub const StreamState = struct {
     code_lang_buf: [max_lang_len]u8 = undefined,
     code_lang_len: u8 = 0,
     hl_state: HlState = .{},
+    file_host: remote.LinkHost = .{},
 
     /// 超长 info string 不截断(截断可能误判成别的语言),按 generic 处理。
     pub const max_lang_len = 32;
@@ -144,12 +153,13 @@ pub const StreamState = struct {
 /// 对齐 renderToOwned 的逐行逻辑,供 live 流式路径逐行调用——inline(bold/code/heading/list)
 /// 行内即决,代码块靠 st.in_code_block 跨行。caller 自行追加 \n。
 pub fn renderLineStreaming(line: []const u8, st: *StreamState, out: *std.ArrayList(u8), allocator: std.mem.Allocator, syn: SyntaxTheme) !void {
+    const style: Style = .{ .syn = syn, .file_host = st.file_host.slice() };
     if (st.in_code_block) {
         if (std.mem.startsWith(u8, line, "```")) {
             try out.appendSlice(allocator, RESET);
             st.in_code_block = false;
         } else {
-            try highlightCodeLine(line, st.codeLang(), &st.hl_state, GRAY, out, allocator, syn);
+            try highlightCodeLine(line, st.codeLang(), &st.hl_state, syn.code, out, allocator, syn);
             try out.appendSlice(allocator, RESET);
         }
     } else if (std.mem.startsWith(u8, line, "```")) {
@@ -158,12 +168,12 @@ pub fn renderLineStreaming(line: []const u8, st: *StreamState, out: *std.ArrayLi
         st.in_code_block = true;
         // 围栏行本身不输出内容(对齐 cc 去围栏)。
     } else if (isHeading(line)) |h| {
-        try renderHeading(line, h, out, allocator);
+        try renderHeading(line, h, style, out, allocator);
     } else if (isListItem(line)) |prefix_len| {
         try out.appendSlice(allocator, "  • ");
-        try renderInline(line[prefix_len..], out, allocator);
+        try renderInline(line[prefix_len..], style, out, allocator);
     } else {
-        try renderInline(line, out, allocator);
+        try renderInline(line, style, out, allocator);
     }
 }
 
@@ -190,23 +200,23 @@ fn peekLine(md: []const u8, from: usize) ?[]const u8 {
     return md[from..end];
 }
 
-fn renderHeading(line: []const u8, hash_count: usize, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+fn renderHeading(line: []const u8, hash_count: usize, style: Style, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     try out.appendSlice(allocator, BOLD);
-    try out.appendSlice(allocator, CYAN);
-    try renderInline(line[hash_count + 1 ..], out, allocator);
+    try out.appendSlice(allocator, style.syn.heading);
+    try renderInline(line[hash_count + 1 ..], style, out, allocator);
     try out.appendSlice(allocator, RESET);
 }
 
 /// 行内：`**bold**` / `*italic*` / `` `code` ``。成对扫描。
-fn renderInline(text: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+fn renderInline(text: []const u8, style: Style, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] == '[') {
             if (parseMarkdownLink(text, i)) |link| {
                 if (markdownLinkTarget(link.target)) |target| {
-                    if (try appendHyperlinkOpen(target, out, allocator)) {
+                    if (try appendHyperlinkOpen(target, style.file_host, out, allocator)) {
                         try out.appendSlice(allocator, UNDERLINE);
-                        try out.appendSlice(allocator, BLUE);
+                        try out.appendSlice(allocator, style.syn.link);
                         try out.appendSlice(allocator, link.label);
                         try out.appendSlice(allocator, RESET);
                         try out.appendSlice(allocator, ansi.hyperlink.close);
@@ -221,7 +231,7 @@ fn renderInline(text: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Al
         if (text[i] == '`') {
             if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |close| {
                 const code = text[i + 1 .. close];
-                const linked = if (codeSpanLinkTarget(code)) |target| try appendHyperlinkOpen(target, out, allocator) else false;
+                const linked = if (codeSpanLinkTarget(code)) |target| try appendHyperlinkOpen(target, style.file_host, out, allocator) else false;
                 try out.appendSlice(allocator, DIM);
                 try out.appendSlice(allocator, code);
                 try out.appendSlice(allocator, RESET);
@@ -406,7 +416,7 @@ fn stripLocation(target: []const u8) []const u8 {
     return path;
 }
 
-fn appendHyperlinkOpen(target: LinkTarget, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !bool {
+fn appendHyperlinkOpen(target: LinkTarget, file_host: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !bool {
     switch (target) {
         .web => |url| {
             try out.appendSlice(allocator, ansi.hyperlink.open_prefix);
@@ -417,6 +427,7 @@ fn appendHyperlinkOpen(target: LinkTarget, out: *std.ArrayList(u8), allocator: s
             const base: []const u8 = if (isAbsolutePath(path)) "" else pfs.getCwd(&cwd_buf) orelse return false;
             try out.appendSlice(allocator, ansi.hyperlink.open_prefix);
             try out.appendSlice(allocator, "file://");
+            try appendUrlHost(file_host, out, allocator);
             if (base.len > 0) {
                 try appendFileUrlPath(base, out, allocator);
                 const last = base[base.len - 1];
@@ -429,6 +440,17 @@ fn appendHyperlinkOpen(target: LinkTarget, out: *std.ArrayList(u8), allocator: s
     }
     try out.appendSlice(allocator, ansi.hyperlink.open_suffix);
     return true;
+}
+
+fn appendUrlHost(host: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    for (host) |c| {
+        if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-._~", c) != null) {
+            try out.append(allocator, c);
+        } else {
+            var hex: [3]u8 = undefined;
+            try out.appendSlice(allocator, std.fmt.bufPrint(&hex, "%{X:0>2}", .{c}) catch unreachable);
+        }
+    }
 }
 
 fn appendFileUrlPath(path: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -522,8 +544,7 @@ fn isIdentChar(c: u8) bool {
 pub fn highlightCodeLine(line: []const u8, lang: []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator, syn: SyntaxTheme) !void {
     const kind = classifyLang(lang);
     const kws = keywordsFor(kind);
-    // syn 各组空时回退历史 basic-16 常量(保证 16 色/无主题路径零回归)。
-    const c_str = if (syn.string.len > 0) syn.string else GREEN;
+    const c_str = syn.string;
     const c_cmt = if (syn.comment.len > 0) syn.comment else DIM;
 
     // 跨行延续态:整行(或到闭合处)按对应色,然后继续常规扫描。
@@ -569,11 +590,11 @@ pub fn highlightCodeLine(line: []const u8, lang: []const u8, state: *HlState, ba
 }
 
 /// 扫描一行(无跨行延续态),按 token 上色;每 token 收尾 RESET 后重铺 base(bg-aware)。
-/// 可能在行尾**进入**跨行态(设 state)。syn 提供语义色,空组回退历史 basic-16。
+/// 可能在行尾**进入**跨行态(设 state)。syn 提供语义色,空组不上色(注释退回 dim)。
 fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator, syn: SyntaxTheme) !void {
-    const c_str = if (syn.string.len > 0) syn.string else GREEN;
-    const c_num = if (syn.number.len > 0) syn.number else YELLOW;
-    const c_kw = if (syn.keyword.len > 0) syn.keyword else MAGENTA;
+    const c_str = syn.string;
+    const c_num = syn.number;
+    const c_kw = syn.keyword;
     const c_cmt = if (syn.comment.len > 0) syn.comment else DIM;
     const line_comment_hash = (kind == .python or kind == .shell or kind == .generic);
     var i: usize = 0;
@@ -908,10 +929,10 @@ fn carryStylesAcrossLines(lines: [][]u8, allocator: std.mem.Allocator) !void {
 }
 
 /// 把单元格 markdown 渲成 ANSI(借用 renderInline),返回 owned。
-fn renderCellInline(cell: []const u8, allocator: std.mem.Allocator) ![]u8 {
+fn renderCellInline(cell: []const u8, style: Style, allocator: std.mem.Allocator) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try renderInline(cell, &out, allocator);
+    try renderInline(cell, style, &out, allocator);
     return try out.toOwnedSlice(allocator);
 }
 
@@ -935,7 +956,7 @@ fn appendSpaces(out: *std.ArrayList(u8), n: usize, allocator: std.mem.Allocator)
 /// 渲染 GFM 表格 → Unicode 框线多行字符串。
 /// rows[0]=表头,rows[1]=分隔,rows[2..]=正文。输出含 `\n` 与表头加粗 ANSI,无尾随 `\n`,
 /// 无外层前缀;每物理行可见宽 ≤ avail_width。rows.len<2 或 rows[1] 非分隔 → 退化逐行 renderInline。
-pub fn renderTable(rows: []const []const u8, avail_width: usize, allocator: std.mem.Allocator) ![]u8 {
+pub fn renderTable(rows: []const []const u8, avail_width: usize, style: Style, allocator: std.mem.Allocator) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -943,7 +964,7 @@ pub fn renderTable(rows: []const []const u8, avail_width: usize, allocator: std.
         // 退化:不是合法表格,各行过 renderInline 以 \n 连。
         for (rows, 0..) |row, idx| {
             if (idx > 0) try out.append(allocator, '\n');
-            try renderInline(row, &out, allocator);
+            try renderInline(row, style, &out, allocator);
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -995,7 +1016,7 @@ pub fn renderTable(rows: []const []const u8, avail_width: usize, allocator: std.
     for (nat) |*w| w.* = 0;
     for (content_rows.items) |row| {
         for (row, 0..) |cell, c| {
-            const rendered_cell = try renderCellInline(cell, allocator);
+            const rendered_cell = try renderCellInline(cell, style, allocator);
             defer allocator.free(rendered_cell);
             const cw = visibleWidth(rendered_cell);
             if (cw > nat[c]) nat[c] = cw;
@@ -1073,7 +1094,7 @@ pub fn renderTable(rows: []const []const u8, avail_width: usize, allocator: std.
         }
         var hrows: usize = 1;
         for (row, 0..) |cell, c| {
-            const ansi_cell = try renderCellInline(cell, allocator);
+            const ansi_cell = try renderCellInline(cell, style, allocator);
             defer allocator.free(ansi_cell);
             sublines[c] = try wrapCell(ansi_cell, col[c], allocator);
             if (sublines[c].items.len > hrows) hrows = sublines[c].items.len;
@@ -1506,7 +1527,7 @@ test "a link label wrapped inside a table cell stays inside its cell" {
         "|---|---|",
         "| [a long link label here](/tmp/notes.txt) | plain text |",
     };
-    const out = try renderTable(&rows, 30, testing.allocator);
+    const out = try renderTable(&rows, 30, batch_style, testing.allocator);
     defer testing.allocator.free(out);
     var opens: usize = 0;
     var it = std.mem.splitScalar(u8, out, '\n');
@@ -1523,7 +1544,7 @@ test "a link label ending in a space closes before the next cell of a one-line r
         "|---|---|",
         "| [笔记 ](/tmp/n.md) | 普通文本 |",
     };
-    const out = try renderTable(&rows, 80, testing.allocator);
+    const out = try renderTable(&rows, 80, batch_style, testing.allocator);
     defer testing.allocator.free(out);
     var it = std.mem.splitScalar(u8, out, '\n');
     while (it.next()) |line| try testing.expect(!styledAtBorder(line));
@@ -1548,7 +1569,7 @@ test "table column width counts a link by its label, not its path" {
         "|---|---|",
         "| [x](/a/very/long/path/to/some/file.txt) | bbbbbbbbbbbb |",
     };
-    const out = try renderTable(&rows, 30, testing.allocator);
+    const out = try renderTable(&rows, 30, batch_style, testing.allocator);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "bbbbbbbbbbbb") != null);
 }
@@ -1627,7 +1648,7 @@ test "renderTable CJK: borders present, header bold, rows equal display width" {
         "| LLM 够用 | gpt-4o 推断结构 |",
         "| 增加复杂度 | grammar 编译 |",
     };
-    const r = try renderTable(&rows, 80, testing.allocator);
+    const r = try renderTable(&rows, 80, batch_style, testing.allocator);
     defer testing.allocator.free(r);
 
     // 框线齐全。
@@ -1659,7 +1680,7 @@ test "renderTable overflow: no line exceeds avail, long cell wraps" {
         "| short | this is a very long cell that must wrap across multiple physical lines |",
     };
     const avail: usize = 24;
-    const r = try renderTable(&rows, avail, testing.allocator);
+    const r = try renderTable(&rows, avail, batch_style, testing.allocator);
     defer testing.allocator.free(r);
 
     const plain = try stripAnsi(r, testing.allocator);
@@ -1691,7 +1712,7 @@ test "renderTable right alignment has leading spaces" {
         "| ---: |",
         "| 7 |",
     };
-    const r = try renderTable(&rows, 80, testing.allocator);
+    const r = try renderTable(&rows, 80, batch_style, testing.allocator);
     defer testing.allocator.free(r);
     const plain = try stripAnsi(r, testing.allocator);
     defer testing.allocator.free(plain);
@@ -1701,7 +1722,7 @@ test "renderTable right alignment has leading spaces" {
         "| ---: |",
         "| 7 |",
     };
-    const r2 = try renderTable(&rows2, 80, testing.allocator);
+    const r2 = try renderTable(&rows2, 80, batch_style, testing.allocator);
     defer testing.allocator.free(r2);
     const plain2 = try stripAnsi(r2, testing.allocator);
     defer testing.allocator.free(plain2);
@@ -1715,7 +1736,7 @@ test "renderTable degenerate: avail < N*MIN_COL still valid grid" {
         "|---|---|---|",
         "| 1 | 2 | 3 |",
     };
-    const r = try renderTable(&rows, 8, testing.allocator); // 远小于 3*3+chrome
+    const r = try renderTable(&rows, 8, batch_style, testing.allocator); // 远小于 3*3+chrome
     defer testing.allocator.free(r);
     // 至少能产出框(不 panic),含竖线。
     try testing.expect(std.mem.indexOf(u8, r, "│") != null);
@@ -1761,4 +1782,98 @@ test "renderToOwned: lone pipe line is NOT a table" {
     defer testing.allocator.free(r);
     try testing.expect(std.mem.indexOf(u8, r, "┌") == null); // 无框
     try testing.expect(std.mem.indexOf(u8, r, "a | b is just prose") != null);
+}
+
+fn expectNoColor(out: []const u8) !void {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, out, from, "\x1b[")) |at| {
+        var end = at + 2;
+        while (end < out.len and (std.ascii.isDigit(out[end]) or out[end] == ';' or out[end] == '?')) : (end += 1) {}
+        if (end >= out.len) break;
+        if (out[end] == 'm') {
+            var params = std.mem.splitScalar(u8, out[at + 2 .. end], ';');
+            while (params.next()) |param| {
+                const n = std.fmt.parseInt(u16, param, 10) catch continue;
+                const colored = (n >= 30 and n <= 38) or (n >= 40 and n <= 48) or (n >= 90 and n <= 97) or (n >= 100 and n <= 107);
+                if (colored) try testing.expectEqualStrings("", out[at .. end + 1]);
+            }
+        }
+        from = end + 1;
+    }
+}
+
+fn renderStreamed(lines: []const []const u8, st: *StreamState, syn: SyntaxTheme) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    for (lines) |line| {
+        try renderLineStreaming(line, st, &out, testing.allocator, syn);
+        try out.append(testing.allocator, '\n');
+    }
+    return out.toOwnedSlice(testing.allocator);
+}
+
+const sample_answer = [_][]const u8{
+    "## Plan",
+    "Read [the docs](https://example.com/docs), then `src/main.zig:3` and [notes](/tmp/notes.txt).",
+    "- **bold** and *italic*",
+    "```zig",
+    "pub fn main() void { const s = \"x\"; _ = 42; } // done",
+    "```",
+    "```python",
+    "def f(): return 'y' # tail",
+    "```",
+};
+
+test "markdown with the colorless theme: headings, links, inline code and code blocks carry no color" {
+    const syn = theme_mod.select(.auto, .none).syntax;
+    var st: StreamState = .{};
+    const out = try renderStreamed(&sample_answer, &st, syn);
+    defer testing.allocator.free(out);
+    try expectNoColor(out);
+    try testing.expect(std.mem.indexOf(u8, out, UNDERLINE ++ "the docs") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ansi.hyperlink.open_prefix ++ "https://example.com/docs") != null);
+    try testing.expect(std.mem.indexOf(u8, out, BOLD ++ "Plan") != null);
+
+    const rows = [_][]const u8{ "| file | note |", "|---|---|", "| [a](/tmp/a.txt) | **b** |" };
+    const table = try renderTable(&rows, 80, .{ .syn = syn }, testing.allocator);
+    defer testing.allocator.free(table);
+    try expectNoColor(table);
+    try testing.expect(std.mem.indexOf(u8, table, ansi.hyperlink.open_prefix ++ "file:///tmp/a.txt") != null);
+}
+
+test "markdown with a 16, 256 or 24-bit theme keeps its 16-color heading, link and code base" {
+    for ([_]term.ColorCapability{ .basic_16, .extended_256, .truecolor }) |cap| {
+        var st: StreamState = .{};
+        const out = try renderStreamed(&sample_answer, &st, theme_mod.select(.dark, cap).syntax);
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, BOLD ++ CYAN ++ "Plan") != null);
+        try testing.expect(std.mem.indexOf(u8, out, UNDERLINE ++ BLUE ++ "the docs") != null);
+        try testing.expect(std.mem.indexOf(u8, out, GRAY) != null);
+    }
+}
+
+test "a file link names the host the render state carries; a web link and a state without a host are unchanged" {
+    var remote_st: StreamState = .{ .file_host = remote.LinkHost.of("devbox.example") };
+    const out = try renderStreamed(&.{"[notes](/tmp/notes.txt) `src/x.zig:3` [d](https://example.com/d)"}, &remote_st, ansi.syntax_palette.b16);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, ansi.hyperlink.open_prefix ++ "file://devbox.example/tmp/notes.txt" ++ ansi.hyperlink.open_suffix) != null);
+    try testing.expect(std.mem.indexOf(u8, out, ansi.hyperlink.open_prefix ++ "file://devbox.example/") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "/src/x.zig" ++ ansi.hyperlink.open_suffix) != null);
+    try testing.expect(std.mem.indexOf(u8, out, ansi.hyperlink.open_prefix ++ "https://example.com/d" ++ ansi.hyperlink.open_suffix) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "file:///") == null);
+
+    var odd_st: StreamState = .{ .file_host = remote.LinkHost.of("my host/x") };
+    const odd = try renderStreamed(&.{"[n](/tmp/n.txt)"}, &odd_st, ansi.syntax_palette.b16);
+    defer testing.allocator.free(odd);
+    try testing.expect(std.mem.indexOf(u8, odd, "file://my%20host%2Fx/tmp/n.txt") != null);
+
+    var local_st: StreamState = .{};
+    const local = try renderStreamed(&.{"[n](/tmp/n.txt)"}, &local_st, ansi.syntax_palette.b16);
+    defer testing.allocator.free(local);
+    try testing.expect(std.mem.indexOf(u8, local, ansi.hyperlink.open_prefix ++ "file:///tmp/n.txt") != null);
+
+    const rows = [_][]const u8{ "| file |", "|---|", "| [a](/tmp/a.txt) |" };
+    const table = try renderTable(&rows, 80, .{ .syn = ansi.syntax_palette.b16, .file_host = "devbox" }, testing.allocator);
+    defer testing.allocator.free(table);
+    try testing.expect(std.mem.indexOf(u8, table, ansi.hyperlink.open_prefix ++ "file://devbox/tmp/a.txt") != null);
 }

@@ -19,6 +19,7 @@ const app_mod = @import("../../app.zig");
 const types = @import("metacodes-internal").types;
 const ansi = @import("ansi.zig");
 const term = @import("term.zig");
+const remote = @import("remote.zig");
 const reflow = @import("reflow.zig");
 const theme_mod = @import("theme.zig");
 const verbs = @import("verbs.zig");
@@ -2155,7 +2156,7 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         self.md_buf.clearRetainingCapacity();
-        self.md_state = .{};
+        self.md_state = .{ .file_host = remote.linkHost() };
         self.md_at_segment_start = true;
         self.resetTableLocked();
     }
@@ -2263,7 +2264,7 @@ pub const RenderRegion = struct {
             self.resetTableLocked();
             return;
         }
-        const tbl = md_render.renderTable(self.tbl_rows.items, avail, self.allocator) catch {
+        const tbl = md_render.renderTable(self.tbl_rows.items, avail, .{ .syn = self.theme.syntax, .file_host = self.md_state.file_host.slice() }, self.allocator) catch {
             for (self.tbl_rows.items) |r| self.emitAssistantLine(r, true);
             self.resetTableLocked();
             return;

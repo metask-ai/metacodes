@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const process = @import("metacodes-internal").platform.process;
 const input = @import("../input.zig");
 const mirror = @import("screen_mirror.zig");
+const remote = @import("remote.zig");
 const RenderRegion = @import("render_region.zig").RenderRegion;
 
 pub const cursor_query = "\x1b[6n";
@@ -102,7 +103,7 @@ pub fn osc52(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
 }
 
 fn copyNative(gpa: std.mem.Allocator, text: []const u8) void {
-    if (builtin.os.tag != .macos or remoteSession()) return;
+    if (builtin.os.tag != .macos or remote.session()) return;
     const captured = process.capture(&.{ "/usr/bin/pbcopy", null }, gpa, .{
         .stdin_data = text,
         .timeout_ms = 2000,
@@ -111,15 +112,6 @@ fn copyNative(gpa: std.mem.Allocator, text: []const u8) void {
     }) catch return;
     gpa.free(captured.stdout);
     gpa.free(captured.stderr);
-}
-
-fn remoteSession() bool {
-    for ([_][*:0]const u8{ "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY" }) |name| {
-        if (std.c.getenv(name)) |value| {
-            if (std.mem.span(value).len > 0) return true;
-        }
-    }
-    return false;
 }
 
 const testing = std.testing;

@@ -107,7 +107,7 @@ pub const diff_bg = struct {
 /// 语法高亮语义色调色板(对齐 VS Code Dark+/Light+;参考 metacode syntect 设计)。
 /// theme.select 按 ColorCapability 选一套填进 Theme.syntax。**fg-only,无 bold/italic/
 /// underline**——终端对斜体/下划线渲染参差(metacode 经验);只用前景色保证一致。
-/// 每套含 10 个语义组,空串 = 不上色(走 base 底色)。
+/// 每套含 10 个语义组,外加 markdown 的标题、链接和代码块底色;空串 = 不上色(走 base 底色)。
 pub const syntax_palette = struct {
     /// basic_16(dark/light 共用;16 色分不出明暗)。**字节须 == 历史硬编码值**,
     /// 保证 16 色终端零回归(keyword=magenta/string=green/number=yellow/function=cyan/type=blue)。
@@ -122,6 +122,9 @@ pub const syntax_palette = struct {
         .variable = "",
         .operator = "",
         .punctuation = "",
+        .heading = sgr.fg_cyan,
+        .link = sgr.fg_blue,
+        .code = sgr.fg_bright_black,
     };
     /// 256 色 dark(VS Code Dark+ 近似索引)。
     pub const idx_dark = Syntax{
@@ -135,6 +138,9 @@ pub const syntax_palette = struct {
         .variable = "\x1b[38;5;153m",
         .operator = "",
         .punctuation = "",
+        .heading = sgr.fg_cyan,
+        .link = sgr.fg_blue,
+        .code = sgr.fg_bright_black,
     };
     /// 256 色 light(深墨)。
     pub const idx_light = Syntax{
@@ -148,6 +154,9 @@ pub const syntax_palette = struct {
         .variable = "\x1b[38;5;25m",
         .operator = "",
         .punctuation = "",
+        .heading = sgr.fg_cyan,
+        .link = sgr.fg_blue,
+        .code = sgr.fg_bright_black,
     };
     /// truecolor dark(VS Code Dark+ 原色)。
     pub const tc_dark = Syntax{
@@ -161,6 +170,9 @@ pub const syntax_palette = struct {
         .variable = "\x1b[38;2;156;220;254m", // #9CDCFE
         .operator = "",
         .punctuation = "",
+        .heading = sgr.fg_cyan,
+        .link = sgr.fg_blue,
+        .code = sgr.fg_bright_black,
     };
     /// truecolor light(VS Code Light+ 原色)。
     pub const tc_light = Syntax{
@@ -174,6 +186,9 @@ pub const syntax_palette = struct {
         .variable = "\x1b[38;2;0;16;128m", // #001080
         .operator = "",
         .punctuation = "",
+        .heading = sgr.fg_cyan,
+        .link = sgr.fg_blue,
+        .code = sgr.fg_bright_black,
     };
 
     /// 调色板单元(与 theme.SyntaxTheme 同形;此处定义避免循环 import)。
@@ -188,6 +203,9 @@ pub const syntax_palette = struct {
         variable: []const u8 = "",
         operator: []const u8 = "",
         punctuation: []const u8 = "",
+        heading: []const u8 = "",
+        link: []const u8 = "",
+        code: []const u8 = "",
     };
 };
 

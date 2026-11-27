@@ -84,9 +84,20 @@ pub fn detectFromEnv(fd: c_int) ColorCapability {
         }
     }
     const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
-    const colorterm = if (std.c.getenv("COLORTERM")) |t| std.mem.span(t) else null;
+    const inherited = if (std.c.getenv("COLORTERM")) |t| std.mem.span(t) else null;
+    const colorterm = effectiveColorterm(inherited, envSet("STY"), envSet("TMUX"), term);
 
     return detectColor(no_color, force_color, term, colorterm, tty);
+}
+
+pub fn effectiveColorterm(colorterm: ?[]const u8, sty: bool, tmux: bool, term: ?[]const u8) ?[]const u8 {
+    return if (insideScreen(sty, tmux, term)) null else colorterm;
+}
+
+pub fn insideScreen(sty: bool, tmux: bool, term: ?[]const u8) bool {
+    if (sty) return true;
+    const t = term orelse return false;
+    return !tmux and std.mem.startsWith(u8, t, "screen");
 }
 
 // ============================================================================
@@ -238,6 +249,28 @@ test "detectColor: FORCE_COLOR 压过 NO_COLOR(no-color.org 优先级)" {
     try testing.expectEqual(ColorCapability.truecolor, detectColor(true, 3, "xterm-256color", null, true));
     // FORCE_COLOR=0 + NO_COLOR=1 → none(两者都要关,一致)。
     try testing.expectEqual(ColorCapability.none, detectColor(true, 0, "xterm-256color", null, true));
+}
+
+test "insideScreen: STY, or a screen TERM outside tmux" {
+    try testing.expect(insideScreen(true, false, "screen.xterm-256color"));
+    try testing.expect(insideScreen(true, false, null));
+    try testing.expect(insideScreen(true, true, "tmux-256color"));
+    try testing.expect(insideScreen(false, false, "screen"));
+    try testing.expect(insideScreen(false, false, "screen-256color"));
+    try testing.expect(!insideScreen(false, true, "screen-256color"));
+    try testing.expect(!insideScreen(false, false, "xterm-256color"));
+    try testing.expect(!insideScreen(false, false, null));
+}
+
+test "detectColor: inside GNU screen the inherited COLORTERM is dropped and the TERM screen set decides; FORCE_COLOR still wins" {
+    const screen_256 = "screen.xterm-256color";
+    try testing.expectEqual(ColorCapability.extended_256, detectColor(false, null, screen_256, effectiveColorterm("truecolor", true, false, screen_256), true));
+    try testing.expectEqual(ColorCapability.basic_16, detectColor(false, null, "screen", effectiveColorterm("truecolor", true, false, "screen"), true));
+    try testing.expectEqual(ColorCapability.basic_16, detectColor(false, null, "screen", effectiveColorterm("24bit", false, false, "screen"), true));
+    try testing.expectEqual(ColorCapability.truecolor, detectColor(false, 3, "screen", effectiveColorterm("truecolor", true, false, "screen"), true));
+    try testing.expectEqual(ColorCapability.none, detectColor(true, null, screen_256, effectiveColorterm("truecolor", true, false, screen_256), true));
+    try testing.expectEqual(ColorCapability.truecolor, detectColor(false, null, "screen-256color", effectiveColorterm("truecolor", false, true, "screen-256color"), true));
+    try testing.expectEqual(ColorCapability.truecolor, detectColor(false, null, "xterm-256color", effectiveColorterm("truecolor", false, false, "xterm-256color"), true));
 }
 
 test "detectColor: COLORTERM=truecolor" {
