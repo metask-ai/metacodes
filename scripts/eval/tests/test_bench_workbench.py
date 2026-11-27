@@ -1190,6 +1190,42 @@ class WorkbenchTest(unittest.TestCase):
             self.assertEqual(persisted['status'], 'interrupted')
             self.assertTrue(persisted.get('finished_at'))
 
+    def test_unconfirmed_local_reap_stays_cancelling_until_cancel_confirms(self):
+        from scripts.eval.harbor.bench import runner as runner_mod
+        name = 'bench-20261127-000002-local1'
+        self.manager.records.mkdir(parents=True, exist_ok=True)
+        record_path = self.manager.records / (name + '.json')
+        atomic_json(record_path, {'name': name, 'status': 'running', 'child_pid': 999999,
+                                  'created_at': '2026-11-27T00:00:00+00:00'})
+        stale = time.time() - 120
+        os.utime(record_path, (stale, stale))
+        outcomes = iter([(False, 'EPERM'), (True, None)])
+        with patch.object(runner_mod, 'local_child_running', return_value=True), \
+                patch.object(runner_mod, 'stop_local_child', side_effect=lambda *_a, **_kw: next(outcomes)):
+            deadline = time.monotonic() + 10
+            current = {}
+            while time.monotonic() < deadline:
+                current = next(r for r in self.manager.runs() if r['name'] == name)
+                if current.get('stop_pending') and not self.manager._is_reaping(name):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(current['status'], 'cancelling')
+            self.assertTrue(current.get('stop_pending'))
+            self.assertIsNone(current.get('finished_at'))
+            with self.assertRaisesRegex(ValueError, '已有评测正在运行'):
+                self.manager.launch(self.request())
+            res = self.manager.cancel(name)
+            self.assertEqual(res['status'], 'cancelling')
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                current = next(r for r in self.manager.runs() if r['name'] == name)
+                if current['status'] == 'interrupted':
+                    break
+                time.sleep(0.05)
+            self.assertEqual(current['status'], 'interrupted')
+            self.assertFalse(current.get('stop_pending'))
+            self.assertTrue(current.get('finished_at'))
+
 
 @unittest.skipUnless(POSIX, 'fake executable and worker signal test are POSIX')
 class TokenRefreshRunTest(unittest.TestCase):

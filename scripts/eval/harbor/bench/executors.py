@@ -1914,7 +1914,8 @@ def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float], store_co
         raise ValueError("运行不存在：" + name) from None
     if (spec.get("executor") or {}).get("kind") != "ssh":
         raise ValueError(name + " 不是在 SSH 执行机器上运行的，结果已在本机")
-    if record.get("status") in ACTIVE and worker_alive(records, name, record_path, RunManager.STALE_AFTER):
+    if record.get("status") in ACTIVE and (
+            record.get("stop_pending") or worker_alive(records, name, record_path, RunManager.STALE_AFTER)):
         raise ValueError(name + " 仍在运行；它结束时会自己同步结果")
     remote = RemoteRun(spec, log=log)
     local = jobs_dir / name

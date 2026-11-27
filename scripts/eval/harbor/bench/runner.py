@@ -143,12 +143,14 @@ def worker_lock_held(records, name):
             pass
 
 
-def worker_alive(records, name, record_path=None, stale_after=30, process=None):
+def worker_alive(records, name, record_path=None, stale_after=30, process=None, record=None):
     if process is not None and process.poll() is None:
         return True
     held = worker_lock_held(records, name)
     if held is not None:
         return held
+    if isinstance(record, dict) and record.get("stop_pending"):
+        return False
     path = Path(record_path) if record_path is not None else Path(records) / (name + ".json")
     try:
         return time.time() - path.stat().st_mtime <= stale_after
@@ -566,10 +568,10 @@ class RunManager:
             path = write_config(Path(directory) / "provider.json", route["config"])
             return route_problem({"auth_mode": "provider", "model": route["model"], "provider_config": path})
 
-    def _worker_alive(self, name, path):
+    def _worker_alive(self, name, path, record=None):
         with self.reap_lock:
             process = self.processes.get(name)
-        return worker_alive(self.records, name, path, self.STALE_AFTER, process=process)
+        return worker_alive(self.records, name, path, self.STALE_AFTER, process=process, record=record)
 
     def _is_reaping(self, name):
         with self.reap_lock:
@@ -583,20 +585,28 @@ class RunManager:
         except OSError:
             pass
 
-    def _finalize_interrupted(self, name, path, error, *, remote_stop_pending=False):
+    def _finalize_interrupted(self, name, path, error):
         current = data.read_json(path)
-        if not isinstance(current, dict):
+        if not isinstance(current, dict) or current.get("status") not in ACTIVE:
             return
-        if current.get("status") not in ACTIVE and not current.get("remote_stop_pending"):
-            return
-        if current.get("status") in ACTIVE and self._worker_alive(name, path):
+        if self._worker_alive(name, path, current):
             return
         updated = {**current, "status": "interrupted", "finished_at": current.get("finished_at") or now(), "error": error}
         updated.pop("child_pid", None)
-        if remote_stop_pending:
-            updated["remote_stop_pending"] = True
-        else:
-            updated.pop("remote_stop_pending", None)
+        updated.pop("stop_pending", None)
+        try:
+            atomic_json(path, updated)
+        except OSError:
+            pass
+
+    def _mark_stop_pending(self, name, path, error):
+        current = data.read_json(path)
+        if not isinstance(current, dict) or current.get("status") not in ACTIVE:
+            return
+        if self._worker_alive(name, path, current):
+            return
+        updated = {**current, "status": "cancelling", "stop_pending": True, "error": error}
+        updated.pop("finished_at", None)
         try:
             atomic_json(path, updated)
         except OSError:
@@ -636,10 +646,9 @@ class RunManager:
                 if confirmed:
                     self._finalize_interrupted(name, path, "执行进程已停止更新，已终止残留远程评测进程，请检查运行日志")
                 else:
-                    self._finalize_interrupted(
+                    self._mark_stop_pending(
                         name, path,
                         f"执行进程已停止更新，未能连接执行机器确认停止远程评测（{reason}）；恢复连接后可再次点击停止",
-                        remote_stop_pending=True,
                     )
                 return
             child_pid = initial.get("child_pid")
@@ -647,7 +656,10 @@ class RunManager:
             if confirmed:
                 self._finalize_interrupted(name, path, "执行进程已停止更新，已终止残留评测进程，请检查运行日志")
             else:
-                self._finalize_interrupted(name, path, f"执行进程已停止更新，残留进程未能确认终止（{reason}），请检查运行日志")
+                self._mark_stop_pending(
+                    name, path,
+                    f"执行进程已停止更新，残留本地进程未能确认终止（{reason}）；可再次点击停止重试",
+                )
         finally:
             with self.reap_lock:
                 if self.reaping.get(name) is threading.current_thread():
@@ -656,6 +668,8 @@ class RunManager:
     def _reap_or_interrupt(self, name, path, value):
         if self._is_reaping(name):
             return {**value, "status": "cancelling", "error": value.get("error") or "执行进程已停止更新，正在终止残留评测进程"}
+        if value.get("stop_pending"):
+            return {**value, "status": "cancelling"}
         try:
             (self.records / (name + ".cancel")).touch()
         except OSError:
@@ -671,6 +685,7 @@ class RunManager:
         error = value.get("error") or "执行进程已停止更新，请检查运行日志"
         interrupted = {**value, "status": "interrupted", "finished_at": value.get("finished_at") or now(), "error": error}
         interrupted.pop("child_pid", None)
+        interrupted.pop("stop_pending", None)
         try:
             atomic_json(path, interrupted)
         except OSError:
@@ -686,7 +701,7 @@ class RunManager:
             name = value["name"]
             if self._is_reaping(name):
                 value = {**value, "status": "cancelling", "error": value.get("error") or "执行进程已停止更新，正在终止残留评测进程"}
-            elif value.get("status") in ACTIVE and not self._worker_alive(name, path):
+            elif value.get("status") in ACTIVE and not self._worker_alive(name, path, value):
                 value = self._reap_or_interrupt(name, path, value)
             result.append(value)
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
@@ -951,6 +966,8 @@ class RunManager:
         record = next((r for r in self.runs() if r["name"] == name), None)
         if record is None or record["status"] not in ACTIVE:
             raise ValueError("运行不存在或已结束")
+        if record["status"] == "cancelling" or record.get("stop_pending"):
+            raise ValueError("运行正在停止，不能调整并发")
         if record.get("runner") == suites.WORKBUDDY:
             raise ValueError("WorkBuddy 评测运行中不能调整并发")
         live_concurrency.write(self.records / (name + ".concurrency"), concurrency)
@@ -964,10 +981,9 @@ class RunManager:
             raise ValueError("运行不存在")
         if record["status"] in ACTIVE:
             (self.records / (name + ".cancel")).touch()
-        elif record.get("remote_stop_pending"):
-            (self.records / (name + ".cancel")).touch()
-            self._start_reap(name, self.records / (name + ".json"), record)
-            return {"name": name, "status": "cancelling", "cancel_requested": True}
+            if record.get("stop_pending"):
+                self._start_reap(name, self.records / (name + ".json"), record)
+                return {"name": name, "status": "cancelling", "cancel_requested": True}
         return {"name": name, "status": record["status"], "cancel_requested": True}
 
 

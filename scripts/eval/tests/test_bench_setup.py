@@ -1364,15 +1364,40 @@ class SshRunTest(SetupFixture):
         self.assertTrue(exit_file.is_file(), data.tail(manager.records / (name + ".log")))
         self.assertNotEqual(json.loads(exit_file.read_text(encoding="utf-8")).get("code"), 0)
 
-    def test_unreachable_remote_reap_marks_pending_and_cancel_retries(self):
+    def test_unreachable_remote_reap_stays_active_and_cancel_retries_across_entry_points(self):
+        from scripts.eval.harbor.bench.workbench import Workbench
+
         manager, _, _ = self.prepare_remote()
+        workbench = Workbench(data.Library([manager.jobs_dir]), manager)
+        profiles = workbench.profiles
+        self.addCleanup(workbench.close)
         name = "bench-20261127-000001-dead01"
+        profile_id = "profile-dead01"
+        submission_id = "sub-dead01"
         manager.records.mkdir(parents=True, exist_ok=True)
         record_path = manager.records / (name + ".json")
         spec_path = manager.records / (name + ".spec")
         relay = executors.find(self.cfg(), "relay-4090")
         atomic_json(spec_path, {"name": name, "executor": relay.spec()})
-        atomic_json(record_path, {"name": name, "status": "running", "created_at": "2026-11-27T00:00:00+00:00"})
+        atomic_json(record_path, {"name": name, "status": "running", "profile": profile_id,
+                                  "created_at": "2026-11-27T00:00:00+00:00"})
+        profiles.save({
+            "id": profile_id, "name": "远端失联回归", "status": "running",
+            "created_at": "2026-11-27T00:00:00+00:00", "started_at": "2026-11-27T00:00:00+00:00",
+            "finished_at": None, "metacodes": {"label": "0.12.0", "digest": "dead", "bundle": self.cfg().get("bundle") or ""},
+            "features": [], "cancel_requested": False, "url": "/#/profile/" + profile_id,
+            "concurrency": 4, "next_item_index": 2,
+            "items": [
+                {"index": 0, "suite": "terminal-bench-2.1", "tasks": ["fix-git"], "model": "tokenjoy/test-model",
+                 "attempts": 1, "executor": "relay-4090", "status": "running", "run": name,
+                 "error": None, "queued_at": "2026-11-27T00:00:00+00:00",
+                 "started_at": "2026-11-27T00:00:00+00:00", "finished_at": None, "submission": submission_id},
+                {"index": 1, "suite": "terminal-bench-2.1", "tasks": ["fix-git"], "model": "tokenjoy/test-model",
+                 "attempts": 1, "executor": "relay-4090", "status": "pending", "run": None,
+                 "error": None, "queued_at": "2026-11-27T00:00:00+00:00",
+                 "started_at": None, "finished_at": None, "submission": submission_id},
+            ],
+        })
         stale = time.time() - 120
         os.utime(record_path, (stale, stale))
 
@@ -1384,23 +1409,53 @@ class SshRunTest(SetupFixture):
             return next(outcomes)
 
         with patch.object(executors, "cancel_remote_run", side_effect=fake_cancel):
-            final, shown = self.watch_until_done(manager, name, timeout=10)
-            self.assertEqual(final["status"], "interrupted", shown)
-            self.assertTrue(final.get("remote_stop_pending"))
-            self.assertIn("未能连接执行机器", final.get("error") or "")
-
-            res = manager.cancel(name)
-            self.assertEqual(res["status"], "cancelling")
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 current = next(r for r in manager.runs() if r["name"] == name)
-                if current["status"] == "interrupted" and not current.get("remote_stop_pending"):
+                if current.get("stop_pending") and not manager._is_reaping(name):
                     break
                 time.sleep(0.05)
-            persisted = json.loads(record_path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["status"], "interrupted")
-            self.assertFalse(persisted.get("remote_stop_pending"))
+            self.assertEqual(current["status"], "cancelling", current)
+            self.assertTrue(current.get("stop_pending"))
+            self.assertIsNone(current.get("finished_at"))
+            self.assertIn("未能连接执行机器", current.get("error") or "")
+
+            restarted = RunManager(manager.jobs_dir, manager.config_path)
+            persisted = next(r for r in restarted.runs() if r["name"] == name)
+            self.assertEqual(persisted["status"], "cancelling")
+            self.assertTrue(persisted.get("stop_pending"))
+            self.assertEqual(len(calls), 1)
+
+            profiles.advance()
+            profile = profiles.get(profile_id)
+            self.assertEqual(profile["status"], "running", profile)
+            self.assertEqual(profile["items"][0]["status"], "running")
+            self.assertEqual(profile["items"][1]["status"], "pending")
+            self.assertIn("未能连接执行机器", profile["items"][0].get("error") or "")
+
+            with self.assertRaisesRegex(ValueError, "已有评测正在运行"):
+                manager.launch(self.request())
+            with self.assertRaisesRegex(ValueError, "仍在运行"):
+                executors.sync_run(manager.jobs_dir, name)
+            with self.assertRaisesRegex(ValueError, "正在停止"):
+                manager.set_concurrency(name, 2)
+            with self.assertRaisesRegex(ValueError, "还在运行"):
+                workbench.delete_job(name)
+            with self.assertRaisesRegex(ValueError, "还在运行"):
+                workbench.delete_profile(profile_id)
+
+            profiles.submission_action(profile_id, submission_id, "cancel")
+            final, _ = self.watch_until_done(manager, name, timeout=10)
+            self.assertEqual(final["status"], "interrupted", final)
+            self.assertFalse(final.get("stop_pending"))
+            self.assertTrue(final.get("finished_at"))
             self.assertEqual(len(calls), 2)
+
+            profiles.advance()
+            profile = profiles.get(profile_id)
+            self.assertEqual(profile["status"], "finished")
+            self.assertEqual(profile["items"][0]["status"], "interrupted")
+            self.assertEqual(profile["items"][1]["status"], "skipped")
 
     def test_unfinished_copy_back_is_reported_and_bench_sync_recovers(self):
         manager, client, _ = self.prepare_remote()
