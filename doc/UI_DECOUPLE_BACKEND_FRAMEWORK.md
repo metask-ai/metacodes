@@ -162,7 +162,7 @@ pub const UiBackend = struct {
 > 下列旧路径仅作历史参照;现行路径见 §8。
 
 - `packages/guard/src/core/protocol/ui_event.zig` —— CoreEvent / UiEvent / Phase(原 repl/ui_event.zig)
-- `packages/coding/src/core/protocol/ui_backend.zig` —— UiBackend vtable(原 repl/ui_backend.zig)
+- `packages/guard/src/core/protocol/ui_backend.zig` —— UiBackend vtable(原 repl/ui_backend.zig)
 - `packages/guard/src/core/protocol/ui_request.zig` —— UiRequest/UiResponse/UiRequestFn(原 repl/ui_request.zig)
 - `apps/cli/src/repl/tui/tui_backend.zig` —— TuiBackend(渲染 + 键盘 + tick)
 - `packages/coding/src/core/writer_backend.zig` —— WriterBackend(print-only sink)

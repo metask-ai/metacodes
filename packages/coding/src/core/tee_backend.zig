@@ -7,7 +7,7 @@
 //! poll 只走 primary(诊断后端无输入端;它 poll 恒 null,合并无意义且会丢 primary 的输入)。
 //! 纯转发,无 UI 依赖 → 放 core/。
 
-const ui_backend = @import("protocol/ui_backend.zig");
+const ui_backend = @import("metacodes-guard").core.protocol.ui_backend;
 
 const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;

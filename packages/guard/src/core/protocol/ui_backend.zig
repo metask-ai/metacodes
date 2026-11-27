@@ -11,7 +11,7 @@
 //! tick(定期激活)**不进 vtable**:UI 后端自己起 tick 线程/timer(TuiBackend=
 //! spinner tick 线程,GUI=requestAnimationFrame,语音=无 tick)。core 不管。
 
-const ui_event = @import("metacodes-guard").core.protocol.ui_event;
+const ui_event = @import("ui_event.zig");
 
 pub const CoreEvent = ui_event.CoreEvent;
 pub const UiEvent = ui_event.UiEvent;

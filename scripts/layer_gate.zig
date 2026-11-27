@@ -757,9 +757,23 @@ fn reachesNoFurther(
     }
     for (files) |file| {
         if (layers.owner(file.path) != added) continue;
-        const owner_before = base_layers.owner(file.path) orelse return false;
+        if (layers.isRoot(added, file.path) and try base.source(arena, io, file.path) == null) {
+            if (!try isPureInternalRoot(arena, layers, added, file)) return false;
+            continue;
+        }
+        const was = pathInBase(base, file.path);
+        const owner_before = base_layers.owner(was) orelse return false;
         if (!base_layers.mayDepend(before, owner_before)) return false;
-        if (try base.source(arena, io, file.path) == null) return false;
+        if (try base.source(arena, io, was) == null) return false;
+    }
+    return true;
+}
+
+fn isPureInternalRoot(arena: std.mem.Allocator, layers: Layers, package: usize, file: SourceFile) !bool {
+    for (try importsOf(arena, file.source)) |import| {
+        if (std.mem.eql(u8, import.literal, "std")) continue;
+        const target = try resolve(arena, file.path, import.literal) orelse return false;
+        if (layers.owner(target) != package) return false;
     }
     return true;
 }
@@ -1627,4 +1641,100 @@ test "a new wide module root passes against the base only beside a wide root of 
     try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&tree, entry_layers, wide_baseline, wiring, beside));
     const alone = TestBase{ .layers = test_layers, .baseline = test_baseline };
     try std.testing.expectEqual(@as(usize, 2), try checkTreeAgainst(&tree, entry_layers, wide_baseline, wiring, alone));
+}
+
+test "a package split may move files from a reachable base package and add a pure internal root" {
+    const base_tree = clean_tree;
+    const moved_split_layers =
+        \\.{
+        \\    .packages = .{
+        \\        .{ .name = "base", .paths = .{ "src/util/", "src/types.zig", "src/util_root.zig" }, .allowed_dependencies = .{} },
+        \\        .{ .name = "leaf", .paths = .{"packages/leaf/"}, .allowed_dependencies = .{"base"}, .root = "packages/leaf/root.zig" },
+        \\        .{ .name = "kernel", .paths = .{"src/core/agent_loop.zig"}, .allowed_dependencies = .{"base"} },
+        \\        .{ .name = "coding", .paths = .{ "src/core/", "src/tools/" }, .allowed_dependencies = .{ "base", "leaf", "kernel" } },
+        \\        .{ .name = "cli", .paths = .{ "src/repl/", "src/main.zig" }, .allowed_dependencies = .{ "base", "leaf", "kernel", "coding" } },
+        \\        .{ .name = "tests", .paths = .{"tests/"}, .allowed_dependencies = .{ "base", "leaf", "kernel", "coding", "cli" } },
+        \\    },
+        \\    .kernel_budget = .{ .package = "kernel", .max_lines = 3, .max_dependencies = .{ "base", "coding" } },
+        \\}
+        \\
+    ;
+    const moved_split_baseline =
+        \\.{
+        \\    .upward = .{
+        \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+        \\    },
+        \\    .deep = .{
+        \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+        \\        .{ "src/core/compact.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/tools/bash.zig" },
+        \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+        \\    },
+        \\    .cycles = .{
+        \\        .{ "kernel", "coding" },
+        \\    },
+        \\    .wiring = .{},
+        \\    .wide_roots = .{},
+        \\}
+        \\
+    ;
+    const leaf_moved_tree = [_][2][]const u8{
+        clean_tree[0],
+        clean_tree[1],
+        clean_tree[2],
+        clean_tree[3],
+        clean_tree[5],
+        clean_tree[6],
+        .{ "packages/leaf/compact.zig", "" },
+        .{ "packages/leaf/root.zig", "const std = @import(\"std\");\npub const compact = @import(\"compact.zig\");\n" },
+    };
+    const split_base = TestBase{
+        .layers = test_layers,
+        .baseline = test_baseline,
+        .files = &base_tree,
+        .moves = &.{.{ "src/core/compact.zig", "packages/leaf/compact.zig" }},
+    };
+    const no_compact_baseline =
+        \\.{
+        \\    .upward = .{
+        \\        .{ "src/core/agent_loop.zig", "src/tools/bash.zig" },
+        \\    },
+        \\    .deep = .{
+        \\        .{ "src/core/agent_loop.zig", "src/util/fs.zig" },
+        \\        .{ "src/main.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/main.zig", "src/tools/bash.zig" },
+        \\        .{ "src/tools/bash.zig", "src/core/agent_loop.zig" },
+        \\        .{ "src/tools/bash.zig", "src/util/fs.zig" },
+        \\    },
+        \\    .cycles = .{
+        \\        .{ "kernel", "coding" },
+        \\    },
+        \\    .wiring = .{},
+        \\    .wide_roots = .{},
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try checkTreeAgainst(&leaf_moved_tree, moved_split_layers, no_compact_baseline, test_wiring, split_base));
+
+    const impure_root = [_][2][]const u8{
+        clean_tree[0],
+        clean_tree[1],
+        clean_tree[2],
+        clean_tree[3],
+        clean_tree[5],
+        clean_tree[6],
+        .{ "packages/leaf/compact.zig", "" },
+        .{ "packages/leaf/root.zig", "pub const fs = @import(\"../../src/util/fs.zig\");\n" },
+    };
+    try std.testing.expect(try checkTreeAgainst(&impure_root, moved_split_layers, moved_split_baseline, test_wiring, split_base) > 0);
+
+    const moved_from_cli = TestBase{
+        .layers = test_layers,
+        .baseline = test_baseline,
+        .files = &base_tree,
+        .moves = &.{.{ "src/repl/view.zig", "packages/leaf/compact.zig" }},
+    };
+    try std.testing.expect(try checkTreeAgainst(&leaf_moved_tree, moved_split_layers, no_compact_baseline, test_wiring, moved_from_cli) > 0);
 }

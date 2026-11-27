@@ -35,7 +35,7 @@
 const std = @import("std");
 const sync = @import("platform").sync;
 const span_mod = @import("span.zig");
-const ui_backend = @import("../core/protocol/ui_backend.zig");
+const ui_backend = @import("metacodes-guard").core.protocol.ui_backend;
 const json_util = @import("metacodes-base").util.json;
 const log = @import("metacodes-base").util.log;
 

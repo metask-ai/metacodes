@@ -13,6 +13,7 @@ pub const core = struct {
     pub const prompt_sections = @import("core/prompt_sections.zig");
     pub const protocol = struct {
         pub const permission_choice = @import("core/protocol/permission_choice.zig");
+        pub const ui_backend = @import("core/protocol/ui_backend.zig");
         pub const ui_event = @import("core/protocol/ui_event.zig");
         pub const ui_request = @import("core/protocol/ui_request.zig");
     };
