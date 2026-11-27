@@ -13,7 +13,15 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from scripts.eval.tests.run_shard import group_modules, module_group, parse_shard, select_shard
+from scripts.eval.tests.run_shard import (
+    filter_modules,
+    group_modules,
+    is_bench_module,
+    module_group,
+    module_name,
+    parse_shard,
+    select_shard,
+)
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -72,6 +80,25 @@ class RunShardTest(unittest.TestCase):
         for bad in ("0/3", "4/3", "1/0", "1", "a/b", "1/2/3", "", "-1/2"):
             with self.subTest(bad=bad):
                 self.assertIsNone(parse_shard(bad))
+
+    def test_bench_only_filters_exactly_the_bench_and_harbor_modules(self) -> None:
+        modules = list(unittest.defaultTestLoader.discover(str(HERE)))
+        filtered = filter_modules(modules, bench_only=True)
+        names = [module_name(module) for module in filtered]
+        self.assertTrue(names)
+        self.assertTrue(all(is_bench_module(name) for name in names), names)
+        self.assertIn("test_bench_workbench", names)
+        self.assertIn("test_harbor_viewer", names)
+        self.assertNotIn("test_run_shard", names)
+        self.assertNotIn("test_workbuddy_adapter", names)
+        on_disk = sorted(p.stem for p in HERE.glob("test_*.py") if is_bench_module(p.stem))
+        self.assertEqual(sorted(names), on_disk)
+
+    def test_failed_bench_module_import_is_preserved_by_bench_filter(self) -> None:
+        loader = unittest.TestLoader()
+        broken = loader.loadTestsFromName("test_bench_nonexistent_module_for_shard_filter")
+        self.assertEqual(module_name(broken), "test_bench_nonexistent_module_for_shard_filter")
+        self.assertEqual(filter_modules([broken], bench_only=True), [broken])
 
     def test_the_watchdog_ends_a_hung_shard_and_names_where_it_hung(self) -> None:
         hung = textwrap.dedent(

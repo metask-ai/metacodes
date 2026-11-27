@@ -129,6 +129,8 @@ jobs:
       product: ${{ steps.decide.outputs.product }}
       release: ${{ steps.decide.outputs.release }}
       offline_eval: ${{ steps.decide.outputs.offline_eval }}
+      bench_tests: ${{ steps.decide.outputs.bench_tests }}
+      bench_smoke: ${{ steps.decide.outputs.bench_smoke }}
       packages: ${{ steps.decide.outputs.packages }}
       package_tests: ${{ steps.decide.outputs.package_tests }}
       script_tests: ${{ steps.decide.outputs.script_tests }}
@@ -252,6 +254,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -301,7 +305,7 @@ jobs:
       # hash, so a restored directory is always safe; test execution is not
       # affected because test Run steps are has_side_effects in build.zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false') || (matrix.product && env.BENCH_SMOKE == 'true'))
         with:
           version: 0.16.0
           use-cache: false
@@ -311,7 +315,7 @@ jobs:
       # prefix of what main saves (its run ID follows), so the newest wins.
       # Each leg builds a different share of the graph and keeps its own line.
       - name: Restore the Zig cache main saved
-        if: env.WARM_CACHE != 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.WARM_CACHE != 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false') || (matrix.product && env.BENCH_SMOKE == 'true'))
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
@@ -582,6 +586,14 @@ jobs:
       - name: Offline test suite (product runtime)
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL == 'false'
         run: zig build test:product-runtime -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Bench unit suites
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES == 'false' && env.BENCH_TESTS == 'true'
+        run: python3 scripts/eval/tests/run_shard.py --bench-only --jobs 4 -v
+      - name: Bench CLI smoke
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES == 'false' && env.BENCH_SMOKE == 'true'
+        run: |
+          zig fmt --check scripts/bench_assets.zig
+          zig build test:bench-smoke -j"$ZIG_BUILD_JOBS" --summary all
       - name: ReleaseSafe core gate
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PACKAGE_TESTS == ''
         run: zig build test:lib -Doptimize=ReleaseSafe
@@ -741,10 +753,10 @@ jobs:
         if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Install linters
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || env.BENCH_TESTS == 'true')
         run: python3 -m pip install --break-system-packages -r requirements-lint.txt
       - name: Lint
-        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || env.BENCH_TESTS == 'true')
         run: python3 scripts/lint.py
       - name: Lint unit tests
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
@@ -816,7 +828,7 @@ jobs:
       # after night. A failed leg saves nothing and the previous night's entry
       # stays. Cache keys are immutable, hence the run ID in each.
       - name: Save the Zig cache for pull requests
-        if: env.WARM_CACHE == 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false'))
+        if: env.WARM_CACHE == 'true' && env.POOL_JOB != 'true' && env.FAST_PATH != 'true' && (env.SUITES != 'false' || (runner.os == 'Linux' && matrix.checks && env.RELEASE_DOCS != 'false') || (matrix.product && env.BENCH_SMOKE == 'true'))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
@@ -859,6 +871,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -901,6 +915,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       SCRIPT_TESTS: ${{ needs.scope.outputs.script_tests }}
       COMPLETE: ${{ needs.scope.outputs.complete }}
@@ -1173,6 +1189,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # As in `gates-linux`.
       ZIG_BUILD_JOBS: "8"
@@ -1186,7 +1204,7 @@ jobs:
           REASON: ${{ needs.scope.outputs.reason }}
         run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (matrix.product && env.BENCH_TESTS == 'true'))
         with:
           # Same as `gates-linux`: the repository-snapshot and grounding
           # fingerprint tests resolve historical commits with `git rev-parse`,
@@ -1220,7 +1238,7 @@ jobs:
       # Git-Bash $HOME would be a POSIX-style path that native zig.exe cannot
       # use.
       - name: Normalize line endings of the checkout
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (matrix.product && env.BENCH_TESTS == 'true'))
         shell: cmd
         run: |
           git config --show-origin --get-all core.autocrlf & echo (core.autocrlf origins above, if any)
@@ -1236,7 +1254,7 @@ jobs:
       # PyYAML for the Python suites that `zig build test` runs; see
       # `gates-linux`.
       - name: Install Python development dependencies
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: env.FAST_PATH != 'true' && (env.SUITES != 'false' || (matrix.product && env.BENCH_TESTS == 'true'))
         shell: cmd
         run: python -m pip install -r requirements-dev.txt
       # As in `gates-linux`: the platform root, standalone, spawn tests on. On
@@ -1394,6 +1412,10 @@ jobs:
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.PRODUCT != 'false' && env.OFFLINE_EVAL == 'false'
         shell: cmd
         run: zig build test:product-runtime -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Bench unit suites
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES == 'false' && env.BENCH_TESTS == 'true'
+        shell: cmd
+        run: python scripts/eval/tests/run_shard.py --bench-only --jobs 4 -v
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite
@@ -1447,6 +1469,8 @@ jobs:
       PRODUCT: ${{ needs.scope.outputs.product }}
       RELEASE: ${{ needs.scope.outputs.release }}
       OFFLINE_EVAL: ${{ needs.scope.outputs.offline_eval }}
+      BENCH_TESTS: ${{ needs.scope.outputs.bench_tests }}
+      BENCH_SMOKE: ${{ needs.scope.outputs.bench_smoke }}
       PACKAGE_TESTS: ${{ needs.scope.outputs.package_tests }}
       # .github/runner-pools.json, sized to the runner.
       ZIG_BUILD_JOBS: ${{ needs.runner-plan.outputs.windows_zig_build_jobs }}
