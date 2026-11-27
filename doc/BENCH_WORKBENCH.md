@@ -1410,6 +1410,20 @@ metacodes cost meter charges first (`doc/API.md`, "Model prices"). The catalog
 cached copy is used. A model with no single match, or without a cached
 catalog, keeps metacodes' own estimate and records no `model_price`.
 `"model_prices": "off"` in `workbench.json` skips the lookup.
+
+The workbench API and UI also support viewing costs across multiple price
+schedules (`?price=openrouter|baseten|recorded`, and `auto` on
+`/api/leaderboard`):
+- **Default (`openrouter`)** across Profiles, Profile detail, Job, Trial, and
+  Compare recomputes trial costs from recorded token counts using the cached
+  OpenRouter catalog (falling back to the recorded `cost_usd` when a model is
+  absent or offline), and shows a side-by-side breakdown against Baseten list
+  prices and the original recorded cost.
+- **Leaderboards (`auto`, default)** align each published board with the
+  platform's public list prices: `frontier-harness-eval-1.1` defaults to
+  **Baseten list prices** (`baseten`), while boards without a dedicated
+  provider price book default to **OpenRouter** (`openrouter`). Users can still
+  switch schedules on any view.
 - **Validity**: `teamwork status --json` lands in the trial's agent logs,
   and the run directory without its worktrees (`teamwork-run/`: ledger,
   seat records and logs) beside it. A run that wrote no status, or in which

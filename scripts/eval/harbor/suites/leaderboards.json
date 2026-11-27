@@ -7,6 +7,11 @@
    "title": "FrontierHarness Eval v1.1 排行榜",
    "model_filter": true,
    "default_model": "All models",
+   "pricing": {
+    "schedule": "baseten",
+    "label": "Baseten 挂牌价",
+    "source": "Baseten Model APIs list price"
+   },
    "source": {
     "name": "FrontierHarness Eval v1.1 leaderboard (frontierharness.org) / frontier-harness-eval/eval release/v1.1",
     "url": "https://frontierharness.org/leaderboard/v1.1/",

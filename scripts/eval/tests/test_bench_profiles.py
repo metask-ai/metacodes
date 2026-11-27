@@ -1418,5 +1418,136 @@ class ModelPriceTest(unittest.TestCase):
                          ['model_price={"input":0.15,"output":0.6}'])
         self.assertFalse([a for a in command({**spec, "model_price": None}) if a.startswith("model_price=")])
 
+    def test_baseten_catalog_and_compute_cost_cover_frontier_harness_models(self):
+        from scripts.eval.harbor.bench import prices
+        for model, expected_id in (
+            ("metask/DeepSeek-V4.1-Flash-1017", "deepseek-ai/deepseek-v4.1-flash-1017"),
+            ("metask/GLM-5.3", "zai-org/glm-5.3"),
+            ("metask/glm-5-3-flash", "zai-org/glm-5.3-flash"),
+            ("metask/Kimi-K3", "moonshotai/kimi-k3"),
+            ("metask/muse-spark-open", "meta-models/muse-spark-open"),
+        ):
+            found = prices.baseten_price_for(model)
+            self.assertIsNotNone(found, model)
+            self.assertEqual(found["baseten_id"], expected_id)
+        self.assertIsNone(prices.baseten_price_for("metask/claude-opus-4-6"))
+        baseten_rate = prices.rate_for("metask/DeepSeek-V4.1-Flash-1017", prices.BASETEN)
+        cost = prices.compute_cost(baseten_rate, input_tokens=14_500_000, output_tokens=50_000,
+                                   cache_tokens=7_500_000, cache_creation_tokens=0)
+        self.assertAlmostEqual(cost, 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.007, places=6)
+        self.assertIsNone(prices.compute_cost(baseten_rate, 0, 0, 0, 0))
+
+    def test_workbench_reprices_views_and_aligns_leaderboard_default_to_baseten(self):
+        from scripts.eval.harbor.bench import prices
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs_dir = root / "jobs"
+            cfg = root / "workbench.json"
+            atomic_json(cfg, {"model_prices": "off"})
+            atomic_json(root / prices.CACHE_NAME, {
+                "fetched_at": time.time(),
+                "models": {
+                    "deepseek/deepseek-v4.1-flash-1017": {
+                        "prompt": "0.0000003",
+                        "completion": "0.0000012",
+                        "input_cache_read": "0.000000006",
+                    },
+                },
+            })
+            job = jobs_dir / "fh-job"
+            _write(job / "config.json", {
+                "agents": [{"name": "metacodes", "model_name": "metask/DeepSeek-V4.1-Flash-1017"}],
+                "datasets": [{"name": "frontier-harness-eval/frontier-harness-eval@v1.1.0"}],
+                "n_attempts": 1, "n_concurrent_trials": 1,
+            })
+            _write(job / "result.json", {
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:10:00Z", "n_total_trials": 1,
+            })
+            _write(jobs_dir / ".bench-runs" / "fh-job.json", {
+                "name": "fh-job", "status": "finished", "suite": "frontier-harness-eval-1.1",
+                "model": "metask/DeepSeek-V4.1-Flash-1017",
+            })
+            trial = job / "fix-git__a"
+            _write(trial / "config.json", {})
+            _write(trial / "result.json", {
+                "task_name": "terminal-bench/fix-git",
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:05:00Z",
+                "agent_result": {
+                    "n_input_tokens": 14_500_000,
+                    "n_cache_tokens": 7_500_000,
+                    "n_output_tokens": 50_000,
+                    "cost_usd": 24.0,
+                },
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            })
+            _write(trial / "agent" / "metacodes-output.jsonl", [
+                {"type": "result", "stop_reason": "end_turn", "turns": 2, "tool_calls": 1,
+                 "input_tokens": 7_000_000, "output_tokens": 50_000,
+                 "cache_read_input_tokens": 7_500_000, "cache_creation_input_tokens": 0,
+                 "cost_usd": 24.0, "text": "ok"},
+            ])
+            tb_job = jobs_dir / "tb-job"
+            _write(tb_job / "config.json", {
+                "agents": [{"name": "metacodes", "model_name": "metask/DeepSeek-V4.1-Flash-1017"}],
+                "datasets": [{"name": "terminal-bench/terminal-bench-2-1"}],
+                "n_attempts": 1, "n_concurrent_trials": 1,
+            })
+            _write(tb_job / "result.json", {
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:10:00Z", "n_total_trials": 1,
+            })
+            tb_trial = tb_job / "fix-git__b"
+            _write(tb_trial / "config.json", {})
+            _write(tb_trial / "result.json", {
+                "task_name": "terminal-bench/fix-git",
+                "started_at": "2026-11-26T00:00:00Z", "finished_at": "2026-11-26T00:05:00Z",
+                "agent_result": {
+                    "n_input_tokens": 14_500_000,
+                    "n_cache_tokens": 7_500_000,
+                    "n_output_tokens": 50_000,
+                    "cost_usd": 24.0,
+                },
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            })
+            manager = RunManager(jobs_dir, cfg)
+            wb = Workbench(data.Library([jobs_dir]), manager)
+            self.addCleanup(wb.close)
+            wb.library.sync()
+            openrouter_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.006
+            baseten_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.007
+
+            default_job = wb.job("fh-job")
+            self.assertEqual(default_job["pricing"]["schedule"], "openrouter")
+            self.assertAlmostEqual(default_job["summary"]["cost_per_task"], openrouter_cost, places=6)
+            self.assertAlmostEqual(default_job["costs_by_schedule"]["openrouter"]["cost_per_task"], openrouter_cost, places=6)
+            self.assertAlmostEqual(default_job["costs_by_schedule"]["baseten"]["cost_per_task"], baseten_cost, places=6)
+            self.assertAlmostEqual(default_job["costs_by_schedule"]["recorded"]["cost_per_task"], 24.0, places=6)
+
+            baseten_job = wb.job("fh-job", price="baseten")
+            self.assertEqual(baseten_job["pricing"]["schedule"], "baseten")
+            self.assertAlmostEqual(baseten_job["summary"]["cost_per_task"], baseten_cost, places=6)
+
+            recorded_trial = wb.trial("fh-job", "fix-git__a", price="recorded")
+            self.assertAlmostEqual(recorded_trial["row"]["cost_usd"], 24.0, places=6)
+            self.assertAlmostEqual(recorded_trial["costs_by_schedule"]["baseten"]["cost_usd"], baseten_cost, places=6)
+
+            fh_board = wb.leaderboard("frontier-harness-eval-1.1")
+            self.assertEqual(fh_board["pricing"]["schedule"], "auto")
+            board_meta = fh_board["boards"][0]["pricing"]
+            self.assertEqual((board_meta["effective_schedule"], board_meta["aligned"]), ("baseten", True))
+            fh_entry = fh_board["boards"][0]["jobs"][0]
+            self.assertAlmostEqual(fh_entry["cost_per_task"], baseten_cost, places=6)
+            self.assertAlmostEqual(fh_entry["costs_by_schedule"]["openrouter"], openrouter_cost, places=6)
+            self.assertAlmostEqual(fh_entry["costs_by_schedule"]["recorded"], 24.0, places=6)
+
+            fh_override = wb.leaderboard("frontier-harness-eval-1.1", price="openrouter")
+            self.assertEqual(fh_override["boards"][0]["pricing"]["effective_schedule"], "openrouter")
+            self.assertFalse(fh_override["boards"][0]["pricing"]["aligned"])
+            self.assertAlmostEqual(fh_override["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
+
+            tb_board = wb.leaderboard("terminal-bench-2.1")
+            self.assertEqual(tb_board["boards"][0]["pricing"]["effective_schedule"], "openrouter")
+            self.assertTrue(tb_board["boards"][0]["pricing"]["aligned"])
+            self.assertAlmostEqual(tb_board["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
+
 if __name__ == '__main__':
     unittest.main()
