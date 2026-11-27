@@ -1510,44 +1510,46 @@ class ModelPriceTest(unittest.TestCase):
             })
             manager = RunManager(jobs_dir, cfg)
             wb = Workbench(data.Library([jobs_dir]), manager)
-            self.addCleanup(wb.close)
-            wb.library.sync()
-            openrouter_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.006
-            baseten_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.007
+            try:
+                wb.library.sync()
+                openrouter_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.006
+                baseten_cost = 7.0 * 0.30 + 0.05 * 1.20 + 7.5 * 0.007
 
-            default_job = wb.job("fh-job")
-            self.assertEqual(default_job["pricing"]["schedule"], "openrouter")
-            self.assertAlmostEqual(default_job["summary"]["cost_per_task"], openrouter_cost, places=6)
-            self.assertAlmostEqual(default_job["costs_by_schedule"]["openrouter"]["cost_per_task"], openrouter_cost, places=6)
-            self.assertAlmostEqual(default_job["costs_by_schedule"]["baseten"]["cost_per_task"], baseten_cost, places=6)
-            self.assertAlmostEqual(default_job["costs_by_schedule"]["recorded"]["cost_per_task"], 24.0, places=6)
+                default_job = wb.job("fh-job")
+                self.assertEqual(default_job["pricing"]["schedule"], "openrouter")
+                self.assertAlmostEqual(default_job["summary"]["cost_per_task"], openrouter_cost, places=6)
+                self.assertAlmostEqual(default_job["costs_by_schedule"]["openrouter"]["cost_per_task"], openrouter_cost, places=6)
+                self.assertAlmostEqual(default_job["costs_by_schedule"]["baseten"]["cost_per_task"], baseten_cost, places=6)
+                self.assertAlmostEqual(default_job["costs_by_schedule"]["recorded"]["cost_per_task"], 24.0, places=6)
 
-            baseten_job = wb.job("fh-job", price="baseten")
-            self.assertEqual(baseten_job["pricing"]["schedule"], "baseten")
-            self.assertAlmostEqual(baseten_job["summary"]["cost_per_task"], baseten_cost, places=6)
+                baseten_job = wb.job("fh-job", price="baseten")
+                self.assertEqual(baseten_job["pricing"]["schedule"], "baseten")
+                self.assertAlmostEqual(baseten_job["summary"]["cost_per_task"], baseten_cost, places=6)
 
-            recorded_trial = wb.trial("fh-job", "fix-git__a", price="recorded")
-            self.assertAlmostEqual(recorded_trial["row"]["cost_usd"], 24.0, places=6)
-            self.assertAlmostEqual(recorded_trial["costs_by_schedule"]["baseten"]["cost_usd"], baseten_cost, places=6)
+                recorded_trial = wb.trial("fh-job", "fix-git__a", price="recorded")
+                self.assertAlmostEqual(recorded_trial["row"]["cost_usd"], 24.0, places=6)
+                self.assertAlmostEqual(recorded_trial["costs_by_schedule"]["baseten"]["cost_usd"], baseten_cost, places=6)
 
-            fh_board = wb.leaderboard("frontier-harness-eval-1.1")
-            self.assertEqual(fh_board["pricing"]["schedule"], "auto")
-            board_meta = fh_board["boards"][0]["pricing"]
-            self.assertEqual((board_meta["effective_schedule"], board_meta["aligned"]), ("baseten", True))
-            fh_entry = fh_board["boards"][0]["jobs"][0]
-            self.assertAlmostEqual(fh_entry["cost_per_task"], baseten_cost, places=6)
-            self.assertAlmostEqual(fh_entry["costs_by_schedule"]["openrouter"], openrouter_cost, places=6)
-            self.assertAlmostEqual(fh_entry["costs_by_schedule"]["recorded"], 24.0, places=6)
+                fh_board = wb.leaderboard("frontier-harness-eval-1.1")
+                self.assertEqual(fh_board["pricing"]["schedule"], "auto")
+                board_meta = fh_board["boards"][0]["pricing"]
+                self.assertEqual((board_meta["effective_schedule"], board_meta["aligned"]), ("baseten", True))
+                fh_entry = fh_board["boards"][0]["jobs"][0]
+                self.assertAlmostEqual(fh_entry["cost_per_task"], baseten_cost, places=6)
+                self.assertAlmostEqual(fh_entry["costs_by_schedule"]["openrouter"], openrouter_cost, places=6)
+                self.assertAlmostEqual(fh_entry["costs_by_schedule"]["recorded"], 24.0, places=6)
 
-            fh_override = wb.leaderboard("frontier-harness-eval-1.1", price="openrouter")
-            self.assertEqual(fh_override["boards"][0]["pricing"]["effective_schedule"], "openrouter")
-            self.assertFalse(fh_override["boards"][0]["pricing"]["aligned"])
-            self.assertAlmostEqual(fh_override["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
+                fh_override = wb.leaderboard("frontier-harness-eval-1.1", price="openrouter")
+                self.assertEqual(fh_override["boards"][0]["pricing"]["effective_schedule"], "openrouter")
+                self.assertFalse(fh_override["boards"][0]["pricing"]["aligned"])
+                self.assertAlmostEqual(fh_override["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
 
-            tb_board = wb.leaderboard("terminal-bench-2.1")
-            self.assertEqual(tb_board["boards"][0]["pricing"]["effective_schedule"], "openrouter")
-            self.assertTrue(tb_board["boards"][0]["pricing"]["aligned"])
-            self.assertAlmostEqual(tb_board["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
+                tb_board = wb.leaderboard("terminal-bench-2.1")
+                self.assertEqual(tb_board["boards"][0]["pricing"]["effective_schedule"], "openrouter")
+                self.assertTrue(tb_board["boards"][0]["pricing"]["aligned"])
+                self.assertAlmostEqual(tb_board["boards"][0]["jobs"][0]["cost_per_task"], openrouter_cost, places=6)
+            finally:
+                wb.close()
 
     def test_remote_worker_summary_repricing_matches_row_repricing_for_cache_write_and_mixed_statuses(self):
         from scripts.eval.harbor.bench import prices, results
