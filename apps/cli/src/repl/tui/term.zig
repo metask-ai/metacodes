@@ -309,10 +309,11 @@ test "displayWidth: wide emoji outside the U+1F300 block take two columns" {
     for ([_][]const u8{ "✅", "❌", "⭐", "⚡", "⌛", "⏳", "☕", "✨" }) |emoji| try testing.expectEqual(@as(usize, 2), displayWidth(emoji));
 }
 
-test "displayWidth: combining marks, joiners and zero width spaces take no column" {
+test "displayWidth: combining marks take no column, joiners and zero width spaces one as Terminal.app draws them" {
     try testing.expectEqual(@as(usize, 1), displayWidth("e\u{301}"));
-    try testing.expectEqual(@as(usize, 0), displayWidth("\u{200B}"));
-    try testing.expectEqual(@as(usize, 4), displayWidth("\u{1F468}\u{200D}\u{1F4BB}"));
+    try testing.expectEqual(@as(usize, 1), displayWidth("\u{200B}"));
+    try testing.expectEqual(@as(usize, 5), displayWidth("\u{1F468}\u{200D}\u{1F4BB}"));
+    try testing.expectEqual(@as(usize, 8), displayWidth("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"));
 }
 
 test "displayWidth: emoji presentation, flags and decomposed Hangul count at least what a terminal draws" {

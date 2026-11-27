@@ -15,9 +15,6 @@ SOFT_HYPHEN = 0x00AD
 EMOJI_PRESENTATION_SELECTOR = 0xFE0F
 HANGUL_TRAILING_JAMO = range(0x1160, 0x1200)
 REGIONAL_INDICATORS = range(0x1F1E6, 0x1F200)
-PREPENDED_CONCATENATION_MARKS = frozenset(
-    list(range(0x0600, 0x0606)) + [0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2, 0x110BD, 0x110CD]
-)
 
 
 def terminal_width(cp):
@@ -32,7 +29,7 @@ def terminal_width(cp):
 
 
 def tui_width(cp):
-    if cp == EMOJI_PRESENTATION_SELECTOR or cp in HANGUL_TRAILING_JAMO or cp in PREPENDED_CONCATENATION_MARKS:
+    if cp == EMOJI_PRESENTATION_SELECTOR or cp in HANGUL_TRAILING_JAMO or unicodedata.category(chr(cp)) == "Cf":
         return 1
     if cp in REGIONAL_INDICATORS:
         return 2

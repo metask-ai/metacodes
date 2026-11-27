@@ -160,9 +160,7 @@ test "the TUI never counts a character narrower than the reference terminal draw
         const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
         const tui = cc.tui_term.displayWidth(buf[0..n]);
         const drawn = vterm.charWidth(cp);
-        const kept_wider = cp == 0xFE0F or (cp >= 0x1160 and cp <= 0x11FF) or (cp >= 0x1F1E6 and cp <= 0x1F1FF) or
-            (cp >= 0x0600 and cp <= 0x0605) or cp == 0x06DD or cp == 0x070F or cp == 0x0890 or cp == 0x0891 or
-            cp == 0x08E2 or cp == 0x110BD or cp == 0x110CD;
+        const kept_wider = (drawn == 0 and tui == 1) or (cp >= 0x1F1E6 and cp <= 0x1F1FF and drawn == 1 and tui == 2);
         if (tui < drawn or (tui != drawn and !kept_wider)) {
             std.debug.print("U+{X:0>4}: term.zig width {d}, reference terminal {d}\n", .{ cp, tui, drawn });
             return error.TestExpectedEqual;
