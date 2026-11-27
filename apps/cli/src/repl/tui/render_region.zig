@@ -24,6 +24,7 @@ const reflow = @import("reflow.zig");
 const theme_mod = @import("theme.zig");
 const verbs = @import("verbs.zig");
 const StatusBar = @import("widget/status_bar.zig").StatusBar;
+const thinking_view = @import("widget/thinking.zig");
 const util_time = @import("metacodes-internal").util.time;
 const complete = @import("../complete.zig");
 /// `/` 菜单最多同时显示的行数(超出时按选中项滚动)。
@@ -2002,6 +2003,7 @@ pub const RenderRegion = struct {
         if (!self.inGeneration()) return;
         self.observeResize();
         self.hold_paint = true;
+        self.endGenThinkingLocked(util_time.nowMs());
         self.flushGenAssistantLocked(); // 助手文本残行(markdown)先 flush
         self.flushLineBuf(); // 再把行缓冲残行(无尾随 \n 的末行)输出,别丢
         self.hold_paint = false;
@@ -2167,6 +2169,48 @@ pub const RenderRegion = struct {
         self.tbl_rows.clearRetainingCapacity();
         self.in_table = false;
         self.tbl_unconfirmed = false;
+    }
+
+    pub fn writeGenThinking(self: *RenderRegion, text: []const u8, now_ms: i64) void {
+        self.lock();
+        defer self.unlock();
+        if (text.len == 0) return;
+        const g = self.ui.generatingPhase() orelse return;
+        if (g.thinking == null) g.thinking = .{ .start_ms = now_ms };
+        g.thinking.?.append(text);
+        self.region_dirty = true;
+        self.requestPaintLocked();
+    }
+
+    pub fn endGenThinking(self: *RenderRegion, now_ms: i64) void {
+        self.lock();
+        defer self.unlock();
+        self.endGenThinkingLocked(now_ms);
+    }
+
+    fn endGenThinkingLocked(self: *RenderRegion, now_ms: i64) void {
+        const g = self.ui.generatingPhase() orelse return;
+        const live = if (g.thinking) |*l| l else return;
+        const elapsed = now_ms - live.start_ms;
+        g.thinking = null;
+        self.region_dirty = true;
+        self.writeThinkingSummaryLocked(elapsed);
+    }
+
+    pub fn writeThinkingSummary(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        self.writeThinkingSummaryLocked(null);
+    }
+
+    fn writeThinkingSummaryLocked(self: *RenderRegion, elapsed_ms: ?i64) void {
+        var buf: [160]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const pending = self.pending_scroll.items;
+        const half_line = if (pending.len > 0) pending[pending.len - 1] != '\n' else self.text_pending_newline;
+        if (half_line) w.writeByte('\n') catch return;
+        thinking_view.writeSummary(&w, self.theme, elapsed_ms) catch return;
+        self.emitToScroll(w.buffered());
     }
 
     /// 写助手文本(text_chunk):逐行过 markdown(render.renderLineStreaming)+ 段首 ⏺ / 续行
@@ -2472,6 +2516,8 @@ pub const RenderRegion = struct {
 
         var R: u16 = 0;
 
+        if (g.thinking) |*live| R += self.drawThinkingRows(w, live.text());
+
         // -- spinner 行 --(读 g.spinner/tools 单一真相源,不再读旧双写字段)
         w.writeAll(ansi.clear.line) catch {};
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - g.spinner.start_ms, 0));
@@ -2575,6 +2621,20 @@ pub const RenderRegion = struct {
         self.anchor = reflow.Anchor.measure(self.scratch.written()[rows_start..], edit_row, cursor_col, self.cols);
         self.region_drawn = true;
         if (!self.frame_active) self.flushScratch(); // 帧内:由外层 frame 统一 flush(原子帧)
+    }
+
+    fn drawThinkingRows(self: *RenderRegion, w: *std.Io.Writer, text: []const u8) u16 {
+        if (self.cols < 12) return 0;
+        var rows_buf: [thinking_view.live_rows]thinking_view.Row = undefined;
+        const rows = thinking_view.lastRows(text, self.cols - 4, &rows_buf);
+        for (rows, 0..) |row, k| {
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("{s}{s} ", .{ self.theme.dim, if (k == 0) self.theme.icon_thinking else " " }) catch {};
+            thinking_view.writeRow(w, text, row) catch {};
+            w.writeAll(self.theme.reset) catch {};
+            w.writeAll("\r\n") catch {};
+        }
+        return @intCast(rows.len);
     }
 
     /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。

@@ -229,7 +229,7 @@ pub fn replay(allocator: std.mem.Allocator, target: Target, conversation: *Conve
         .stream => |blocks| {
             ui.emitEvent(session, .stream_begin);
             for (blocks) |b| switch (b) {
-                .thinking => |t| ui.emitEvent(session, .{ .thinking_chunk = t }),
+                .thinking => target.region.writeThinkingSummary(),
                 .text => |t| ui.emitEvent(session, .{ .text_chunk = t }),
                 else => {},
             };

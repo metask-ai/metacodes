@@ -259,12 +259,40 @@ pub const InputPhase = struct {
     menu_dismissal: MenuDismissal = .{},
 };
 
+pub const ThinkingLive = struct {
+    pub const capacity = 2048;
+
+    start_ms: i64,
+    bytes: [capacity]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn text(self: *const ThinkingLive) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn append(self: *ThinkingLive, more: []const u8) void {
+        const take = more[more.len -| capacity..];
+        const keep = @min(self.len, capacity - take.len);
+        std.mem.copyForwards(u8, self.bytes[0..keep], self.bytes[self.len - keep .. self.len]);
+        @memcpy(self.bytes[keep..][0..take.len], take);
+        var len = keep + take.len;
+        var cut: usize = 0;
+        while (cut < len and self.bytes[cut] & 0xC0 == 0x80) cut += 1;
+        if (cut > 0) {
+            std.mem.copyForwards(u8, self.bytes[0 .. len - cut], self.bytes[cut..len]);
+            len -= cut;
+        }
+        self.len = @intCast(len);
+    }
+};
+
 /// 一次回复(或回复前的等待)拥有的状态。
 pub const GeneratingPhase = struct {
     interaction: Interaction = .{},
     /// 由 `PhaseEntry.generating` 带入 verb/start_ms。
     spinner: SpinnerState = .{},
     tools: ToolsState = .{},
+    thinking: ?ThinkingLive = null,
 };
 
 /// 阶段及其拥有的全部状态。payload 在 `enter` 时整体替换:旧阶段打开的东西没有任何
