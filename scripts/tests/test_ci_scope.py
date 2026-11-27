@@ -1019,6 +1019,16 @@ def step_label(step: dict) -> str:
     return step.get("name") or step.get("uses", "")
 
 
+def gate_step_selected(step: dict, leg: dict, os_name: str, **env: str) -> bool:
+    values = {"runner.os": os_name}
+    values.update({f"matrix.{key}": value for key, value in leg.items()})
+    values.update({f"env.{key}": value for key, value in env.items()})
+    condition = re.sub(r"\b(?:env|matrix|runner)\.\w+|\bsteps\.[\w.-]+",
+                       lambda match: repr(values.get(match.group(), False)), step.get("if", "True"))
+    return bool(eval(condition.replace("&&", " and ").replace("||", " or "),
+                     {"__builtins__": {}, "failure": lambda: False, "always": lambda: True}, {}))
+
+
 class WorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
         self.workflow = load_workflow()
@@ -1069,13 +1079,64 @@ class WorkflowTest(unittest.TestCase):
 
     def test_only_the_documentation_checks_run_on_a_docs_change(self) -> None:
         running = set()
-        for step in self.jobs["gates-linux"]["steps"]:
-            condition = step.get("if", "")
-            if "env.SUITES != 'false'" not in condition and "env.SUITES == 'false'" not in condition:
-                running.add(step_label(step))
-            else:
-                self.assertIn("env.FAST_PATH != 'true'", condition, step_label(step))
-        self.assertEqual(running, DOC_STEPS)
+        job = self.jobs["gates-linux"]
+        for leg in job["strategy"]["matrix"]["include"]:
+            for step in job["steps"]:
+                if gate_step_selected(step, leg, "Linux", FAST_PATH="false", SUITES="false",
+                                      POOL_JOB="false", WARM_CACHE="false", RELEASE_DOCS="true",
+                                      DOC_REFERENCES="true", BENCH_TESTS="false", BENCH_SMOKE="false"):
+                    running.add(step_label(step))
+                if step_label(step) not in DOC_STEPS:
+                    self.assertIn("env.FAST_PATH != 'true'", step.get("if", ""), step_label(step))
+        zig = next(s for s in job["steps"] if s.get("uses", "").startswith("mlugg/setup-zig@"))
+        self.assertEqual(running, (DOC_STEPS - {"Stand down if the hosted legs took over"}) |
+                         {step_label(zig), "Restore the Zig cache main saved"})
+
+    def test_posix_rehearsal_selection_preserves_checks_and_skips_inactive_release_legs(self) -> None:
+        for job, os_name, _ in GATE_JOBS:
+            if os_name == "Windows":
+                continue
+            spec = self.jobs[job]
+            steps = [s for s in spec["steps"] if step_label(s) == "Version state gate and release rehearsal"]
+            self.assertEqual(len(steps), 1)
+            for leg in spec["strategy"]["matrix"]["include"]:
+                for fast, suites, release in (("false", "true", "true"), ("true", "true", "true"),
+                                              ("false", "false", "true"), ("false", "true", "false")):
+                    with self.subTest(job=job, leg=leg["leg"], fast=fast, suites=suites, release=release):
+                        expected = leg.get("checks", False) or (leg.get("release", False) and
+                                    fast != "true" and suites != "false" and release != "false")
+                        self.assertEqual(gate_step_selected(steps[0], leg, os_name, FAST_PATH=fast,
+                                                           SUITES=suites, RELEASE=release), expected)
+
+    def test_every_release_leg_rehearses_before_verifying_and_archiving(self) -> None:
+        for job, os_name, _ in GATE_JOBS:
+            spec = self.jobs[job]
+            for leg in spec["strategy"]["matrix"]["include"]:
+                with self.subTest(job=job, leg=leg["leg"]):
+                    selected = [s for s in spec["steps"] if gate_step_selected(
+                        s, leg, os_name, FAST_PATH="false", SUITES="true", RELEASE="true")]
+                    labels = [step_label(s) for s in selected]
+                    for name in ("Release layout prefix", "Release archive is reproducible"):
+                        self.assertEqual(name in labels, leg.get("release", False))
+                        if name in labels:
+                            self.assertIn("Version state gate and release rehearsal", labels)
+                            rehearsal = labels.index("Version state gate and release rehearsal")
+                            self.assertLess(rehearsal, labels.index(name))
+                            run = selected[rehearsal]["run"]
+                            if os_name != "Windows":
+                                run = run[run.index('if [ "$FAST_PATH" = "true" ]; then'):]
+                            else:
+                                run = run.splitlines()[-1]
+                            stub = 'python() { printf "%s\\n" "$*"; }; python3() { python "$@"; };\n'
+                            proc = subprocess.run([*BASH, stub + run], env=dict(os.environ, FAST_PATH="false"),
+                                                  capture_output=True, text=True)
+                            self.assertEqual(proc.returncode, 0, proc.stderr)
+                            self.assertEqual(proc.stdout.strip(), "scripts/check_version_state.py --rehearse")
+                            if os_name != "Windows":
+                                proc = subprocess.run([*BASH, stub + run], env=dict(os.environ, FAST_PATH="true"),
+                                                      capture_output=True, text=True)
+                                self.assertEqual(proc.returncode, 0, proc.stderr)
+                                self.assertEqual(proc.stdout.strip(), "scripts/check_version_state.py")
 
     def test_bench_switches_run_only_bench_checks_and_skip_unrelated_builds(self) -> None:
         def selected(step, bench_tests, bench_smoke, *, suites="false", os_name="Linux",
