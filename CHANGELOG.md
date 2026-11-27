@@ -317,6 +317,13 @@ status, compatibility boundaries, and entry points are defined by
   said it is unofficial only once it started; its entry in the `/login`
   list now reads `ChatGPT (Codex) · browser sign-in · unofficial`.
 
+- **`/login` scrolls its provider list.** Past the 12 providers it shows at
+  once, the list said `N more not shown: /login <provider> (…)`, and ↑/↓
+  stopped at the twelfth. ↑/↓ now scroll the rest into view, with `↑ N
+  more` and `↓ N more` for what lies past either end, and Esc from a
+  provider's page returns to it in the list. Only providers past the 64 a
+  dialog holds are still counted under the list.
+
 - **API failure notices are in English.** The line under `API request
   failed` mixed Chinese into an English screen, e.g. `HTTP 429(重试 4 次后放弃):
   …`. It now reads `HTTP 429 (gave up after 4 attempts): …`, and the named
