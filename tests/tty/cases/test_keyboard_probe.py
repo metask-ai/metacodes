@@ -39,6 +39,7 @@ def _unknown_terminal(**extra):
     env = {
         "TERM": "xterm-256color",
         "TERM_PROGRAM": None,
+        "LC_TERMINAL": None,
         "TMUX": None,
         "STY": None,
         "ZELLIJ": None,
@@ -144,6 +145,13 @@ def test_deny_listed_terminal_is_not_asked(bin_path):
     ], _unknown_terminal(TERM_PROGRAM="Apple_Terminal"))
     assert KITTY_QUERY not in raw, "deny-list 上的终端不应被问 Kitty flags"
     assert KITTY_ENABLE not in raw, "deny-list 上的终端即便答了也不应收到 Kitty enable"
+
+
+def test_iterm2_over_ssh_is_known_by_lc_terminal_and_not_asked(bin_path):
+    _posix_only()
+    raw = _run(bin_path, ["sleep:0.8"], _unknown_terminal(LC_TERMINAL="iTerm2", SSH_TTY="/dev/ttys001"))
+    assert KITTY_QUERY not in raw, "iTerm2 named by LC_TERMINAL should not be asked"
+    assert KITTY_ENABLE in raw, "iTerm2 named by LC_TERMINAL should get the Kitty enable"
 
 
 def test_tmux_is_not_asked_and_keeps_kitty(bin_path):

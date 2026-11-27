@@ -1002,7 +1002,13 @@ pub fn keyboardPolicy() KeyboardPolicy {
         .other
     else
         .none;
-    return classifyKittyKeyboard(envValue("TERM_PROGRAM"), term, multiplexer);
+    return classifyKittyKeyboard(terminalProgram(), term, multiplexer);
+}
+
+fn terminalProgram() ?[]const u8 {
+    if (envValue("TERM_PROGRAM")) |program| if (program.len > 0) return program;
+    if (envValue("LC_TERMINAL")) |terminal| if (std.mem.eql(u8, terminal, "iTerm2")) return "iTerm.app";
+    return null;
 }
 
 /// 启动探测的答案:终端答了 Kitty flags 查询。进程内只在启动时、首次进 raw mode 之前写一次
@@ -2748,6 +2754,27 @@ test "newlineHint: inside tmux the keyboard protocol stays on, but the hint is \
     try testing.expect(shouldEnableKittyKeyboard());
     if (platform_term.keyRecordsTypeText()) return;
     try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
+}
+
+test "keyboardPolicy: over SSH from iTerm2, LC_TERMINAL names the terminal that TERM_PROGRAM no longer does" {
+    const envs = [_]SavedEnv{
+        try SavedEnv.set("TERM_PROGRAM", null),
+        try SavedEnv.set("LC_TERMINAL", "iTerm2"),
+        try SavedEnv.set("TERM", "xterm-256color"),
+        try SavedEnv.set("TMUX", null),
+        try SavedEnv.set("STY", null),
+        try SavedEnv.set("ZELLIJ", null),
+        try SavedEnv.set(no_keyboard_enhancement_env, null),
+    };
+    defer for (envs) |saved| saved.restore();
+    try testing.expectEqual(KeyboardPolicy.enable, keyboardPolicy());
+    ppaths.setEnv("TERM_PROGRAM", "");
+    try testing.expectEqual(KeyboardPolicy.enable, keyboardPolicy());
+    ppaths.setEnv("LC_TERMINAL", "SomeTerminal");
+    try testing.expectEqual(KeyboardPolicy.probe, keyboardPolicy());
+    ppaths.setEnv("LC_TERMINAL", "iTerm2");
+    ppaths.setEnv("TERM_PROGRAM", "Apple_Terminal");
+    try testing.expectEqual(KeyboardPolicy.disable, keyboardPolicy());
 }
 
 test "keyboardPolicy: METACODES_NO_KEYBOARD_ENHANCEMENT keeps the protocol off for every terminal, and keyboardSummary says why" {
