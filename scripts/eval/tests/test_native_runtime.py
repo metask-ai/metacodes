@@ -208,9 +208,7 @@ class NativeRuntimeTest(unittest.TestCase):
             ]
             kinds = [next(iter(envelope["event"])) for envelope in envelopes]
             self.assertEqual(kinds.count("model_request_finished"), 1)
-            # Anthropic-style streaming reports input usage at message_start
-            # and output usage at message_delta; both belong to request one.
-            self.assertEqual(kinds.count("usage"), 2)
+            self.assertEqual(kinds.count("usage"), 1)
             self.assertEqual(kinds.count("run_started"), 2)
             self.assertEqual(kinds.count("run_finished"), 2)
             stop_reasons = [

@@ -813,8 +813,8 @@ const BedrockStream = struct {
                     client_mod.reportStreamIncomplete("bedrock", self.id);
                     return error.StreamIncomplete;
                 }
-                // Blocks the server never closed with contentBlockStop.
                 while (self.reasoning.items.len > 0) try self.finishReasoning(0);
+                if (self.usage_reports.finish()) |u| try self.push(.{ .usage = u });
                 continue; // drain anything queued, then null
             };
             defer self.allocator.free(frame);
@@ -896,12 +896,12 @@ const BedrockStream = struct {
             self.last_stop = mapStopReason(stringField(payload, "stopReason") orelse "");
         } else if (std.mem.eql(u8, event_type, "metadata")) {
             const usage = objectField(payload, "usage") orelse return;
-            try self.queue.append(self.allocator, .{ .usage = self.usage_reports.increment(.{
+            self.usage_reports.record(.{
                 .input_tokens = intField(usage, "inputTokens"),
                 .output_tokens = intField(usage, "outputTokens"),
                 .cache_read_input_tokens = intField(usage, "cacheReadInputTokens"),
                 .cache_creation_input_tokens = intField(usage, "cacheWriteInputTokens"),
-            }) });
+            });
         }
     }
 

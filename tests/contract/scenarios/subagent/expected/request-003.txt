@@ -41,7 +41,7 @@ Today's date is <DATE>. Time zone: UTC (UTC+00:00).\n
 {
 "type":"tool_result",
 "tool_use_id":"toolu_01",
-"content":"{\"subagent_type\":\"Explore\",\"final_text\":\"notes.txt holds the notes.\",\"stop_reason\":\"end_turn\",\"turns\":1,\"tool_calls\":0,\"tokens\":2}"}]}],
+"content":"{\"subagent_type\":\"Explore\",\"final_text\":\"notes.txt holds the notes.\",\"stop_reason\":\"end_turn\",\"turns\":1,\"tool_calls\":0,\"tokens\":13}"}]}],
 "system":"You are MetaCode, a local CLI agent for software engineering.\n
 \n
 You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.\n

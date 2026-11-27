@@ -3,9 +3,8 @@
 {"run_state":{"run_id":2,"transition_seq":2,"phase":"generating","turn":1,"tool_calls":0,"in_flight_tools":[]}}
 {"progress":{"turn":1,"tool_name":"","tool_input":"","tool_calls":0}}
 {"output_segment_begin":{"index":0,"turn":1,"group":0}}
-{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"text_chunk":"They said alpha."}
-{"usage":{"input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+{"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
 {"stream_done":{}}
 {"output_segment_end":{"index":0,"turn":1,"group":0,"disposition":"final","bytes":16}}
 {"run_state":{"run_id":2,"transition_seq":3,"phase":"finalizing","turn":1,"tool_calls":0,"in_flight_tools":[]}}

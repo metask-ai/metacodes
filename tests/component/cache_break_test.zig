@@ -5,39 +5,47 @@ const cc = @import("cc");
 
 const Detector = cc.cache_break.CacheBreakDetector;
 
-/// Feeds one provider report the way a stream does: through the response's
-/// cursor into the response's usage view.
-fn observeReport(cursor: *cc.api_stream.UsageReportCursor, usage: *cc.cache_break.ResponseUsage, report: cc.api_stream.UsageReport) void {
-    const d = cursor.increment(report);
-    usage.observe(d.input_tokens, d.output_tokens, d.cache_read_input_tokens, d.cache_creation_input_tokens);
+fn finishUsage(cursor: *cc.api_stream.UsageReportCursor, usage: *cc.cache_break.ResponseUsage) void {
+    if (cursor.finish()) |d| {
+        usage.observe(d.input_tokens, d.output_tokens, d.cache_read_input_tokens, d.cache_creation_input_tokens);
+    }
 }
 
 test "L2 usage fragments aggregate once per response" {
     var cursor = cc.api_stream.UsageReportCursor{};
     var usage = cc.cache_break.ResponseUsage{};
-    observeReport(&cursor, &usage, .{}); // GLM-compatible message_start placeholder
-    observeReport(&cursor, &usage, .{ .input_tokens = 1200, .output_tokens = 80, .cache_read_input_tokens = 9000 }); // complete message_delta snapshot
+    cursor.merge(.{ .input_tokens = 0, .output_tokens = 0 });
+    cursor.merge(.{ .input_tokens = 1200, .output_tokens = 80, .cache_read_input_tokens = 9000 });
+    cursor.merge(.{ .output_tokens = 120 });
+    finishUsage(&cursor, &usage);
     try std.testing.expect(usage.has_metering);
     try std.testing.expectEqual(@as(u64, 1200), usage.input_tokens);
-    try std.testing.expectEqual(@as(u64, 80), usage.output_tokens);
-    try std.testing.expectEqual(@as(u64, 9000), usage.cache_read_tokens);
-    try std.testing.expectEqual(@as(u64, 10200), usage.promptTokens());
-
-    // Official Anthropic may split input/cache and output across fragments.
-    observeReport(&cursor, &usage, .{ .output_tokens = 120 });
     try std.testing.expectEqual(@as(u64, 120), usage.output_tokens);
     try std.testing.expectEqual(@as(u64, 9000), usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 10200), usage.promptTokens());
 }
 
 test "L2 usage view of a response is the provider's total, not the sum of its reports" {
     var cursor = cc.api_stream.UsageReportCursor{};
     var usage = cc.cache_break.ResponseUsage{};
-    // message_start, then cumulative message_deltas (the documented web-search shape).
-    observeReport(&cursor, &usage, .{ .input_tokens = 2679, .output_tokens = 3 });
-    observeReport(&cursor, &usage, .{ .output_tokens = 200 });
-    observeReport(&cursor, &usage, .{ .input_tokens = 10682, .output_tokens = 510 });
+    cursor.merge(.{ .input_tokens = 2679, .output_tokens = 3 });
+    cursor.merge(.{ .output_tokens = 200 });
+    cursor.merge(.{ .input_tokens = 10682, .output_tokens = 510 });
+    finishUsage(&cursor, &usage);
     try std.testing.expectEqual(@as(u64, 10682), usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 510), usage.output_tokens);
+}
+
+test "L2 usage view replaces provisional message_start estimate when cache_read splits out" {
+    var cursor = cc.api_stream.UsageReportCursor{};
+    var usage = cc.cache_break.ResponseUsage{};
+    cursor.merge(.{ .input_tokens = 8607, .output_tokens = 0, .cache_read_input_tokens = 0 });
+    cursor.merge(.{ .input_tokens = 1434, .output_tokens = 65, .cache_read_input_tokens = 16000 });
+    finishUsage(&cursor, &usage);
+    try std.testing.expectEqual(@as(u64, 1434), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 65), usage.output_tokens);
+    try std.testing.expectEqual(@as(u64, 16000), usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 17434), usage.promptTokens());
 }
 
 test "L2 击穿: 首次无基线 → null" {

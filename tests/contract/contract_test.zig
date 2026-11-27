@@ -374,7 +374,7 @@ const scenarios = [_]Scenario{
     .{ .name = "provider_529_retry", .args = &.{ "-p", "say hi" }, .provider = .{ .status_lines = &.{ "HTTP/1.1 529 Overloaded", "HTTP/1.1 200 OK" } } },
     .{ .name = "provider_overloaded_event", .args = &.{ "-p", "say hi" } },
     .{ .name = "sse_cut", .args = &.{ "-p", "say hi" }, .provider = .{ .cut_response = 0 } },
-    .{ .name = "user_interrupt", .args = &.{ "-p", "say hi" }, .provider = .{ .event_interval_ms = 1000 }, .interrupt = .{ .after_output = "\"type\":\"usage\"" } },
+    .{ .name = "user_interrupt", .args = &.{ "-p", "say hi" }, .provider = .{ .event_interval_ms = 1000 }, .interrupt = .{ .after_output = "\"type\":\"output_segment_begin\"" } },
     .{ .name = "tool_abort", .args = &.{ "--allowedTools", "Bash", "-p", "run the slow check" }, .interrupt = .{ .after_file = "started" } },
     .{ .name = "interrupt_awaiting_head", .args = &.{ "-p", "say hi" }, .provider = .silent_head, .interrupt = .after_request },
     .{ .name = "interrupt_stalled_stream", .args = &.{ "-p", "say hi" }, .provider = .{ .silent_after = "\"text\":\"Hello\"}}\n\n" }, .interrupt = .{ .after_output = "\"type\":\"text\"" } },
