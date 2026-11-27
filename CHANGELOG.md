@@ -408,6 +408,13 @@ status, compatibility boundaries, and entry points are defined by
   now lists only the routes of the key's site; a key from the environment or
   `.env`, whose site is not known, still lists both.
 
+- **`/model` lists one route per site.** A model a provider serves on its
+  China and Global sites over two wires each (Kimi Code's `cn-responses`,
+  `cn-chat`, `global-responses`, `global-chat`) listed four routes under it.
+  It lists one per site: the route in use there, else the site's first.
+  With the cursor on a site's route, that site's other wires are listed
+  under it, and a second account on a site is still a route of its own.
+
 - **A long OpenRouter list opens on the models you would pick.** `/model`
   listed all of OpenRouter's 300-odd models in one list. A provider listing
   more than 40 models that marks its own latest ones (OpenRouter's

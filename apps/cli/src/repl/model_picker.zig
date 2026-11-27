@@ -25,8 +25,11 @@
 //!   one in use first), each saying where its credential comes from and who
 //!   bills it, filtered or not.
 //! - A model served on several routes shows them under it while the cursor is
-//!   on it. Enter on the model takes its preferred route (the one in use, else
-//!   the first in catalog order); Enter on a route takes that route.
+//!   on it, one per site where the routes name their region (the route in use
+//!   there, else its first); with the cursor on a site's route, all of that
+//!   site's routes are listed. Enter on the model takes its preferred route
+//!   (the one in use, else the first in catalog order); Enter on a route takes
+//!   that route.
 //! - The controls the focused route declares (in practice the reasoning
 //!   effort) are a line under the list, changed with ←/→ from any row. The
 //!   value is remembered as the one wanted, and each model shows and commits
@@ -380,6 +383,7 @@ pub const Picker = struct {
     expanded_provider: ?Slug = null,
     expanded_key_buffer: [MAX_GROUP_KEY]u8 = undefined,
     expanded_key_len: usize = 0,
+    open_site: ?OfferId = null,
     open_more: ?Slug = null,
     /// Set when the picker is (re)opened: the cursor goes to the model in use
     /// as soon as there is a snapshot to find it in.
@@ -712,20 +716,53 @@ pub const Picker = struct {
         const at = findModel(buffer.list.items[start..], self.expandedKey()) orelse return;
         const group = buffer.list.items[start + at].model;
         if (group.offer_count < 2) return;
-        var insert_at = start + at + 1;
-        var listed: usize = 0;
-        for (self.offers.items, 0..) |offer, index| {
+        var shown: std.ArrayList(usize) = .empty;
+        defer shown.deinit(buffer.gpa);
+        for (self.offers.items, 0..) |*offer, index| {
             if (!offer.provider_id.eql(provider) or !self.isReady(index)) continue;
-            if (!std.mem.eql(u8, canonicalKey(offer), group.label)) continue;
-            listed += 1;
+            if (!std.mem.eql(u8, canonicalKey(offer.*), group.label)) continue;
+            const site = for (shown.items, 0..) |seen, at_site| {
+                if (sameSite(&self.offers.items[seen], offer)) break at_site;
+            } else null;
+            if (site) |at_site| {
+                if (self.isCurrent(offer.*)) shown.items[at_site] = index;
+                continue;
+            }
+            try shown.append(buffer.gpa, index);
+        }
+        var listed: std.ArrayList(usize) = .empty;
+        defer listed.deinit(buffer.gpa);
+        const open = self.openSiteOffer();
+        for (shown.items) |representative| {
+            const site_open = if (open) |opened| sameSite(opened, &self.offers.items[representative]) else false;
+            if (!site_open) {
+                try listed.append(buffer.gpa, representative);
+                continue;
+            }
+            for (self.offers.items, 0..) |*offer, index| {
+                if (!offer.provider_id.eql(provider) or !self.isReady(index)) continue;
+                if (!std.mem.eql(u8, canonicalKey(offer.*), group.label)) continue;
+                if (sameSite(offer, &self.offers.items[representative])) try listed.append(buffer.gpa, index);
+            }
+        }
+        var insert_at = start + at + 1;
+        for (listed.items, 1..) |index, count| {
             try buffer.list.insert(buffer.gpa, insert_at, .{ .route = .{
                 .offer_index = index,
-                .is_current = self.isCurrent(offer),
+                .is_current = self.isCurrent(self.offers.items[index]),
                 .preferred = index == group.offer_index,
-                .last = listed == group.offer_count,
+                .last = count == listed.items.len,
             } });
             insert_at += 1;
         }
+    }
+
+    fn openSiteOffer(self: *const Picker) ?*const OfferSummary {
+        const id = self.open_site orelse return null;
+        for (self.offers.items) |*offer| {
+            if (offer.offer_id.eql(id)) return offer;
+        }
+        return null;
     }
 
     fn foldLongList(self: *const Picker, buffer: *RowBuffer, start: usize) error{OutOfMemory}!void {
@@ -851,6 +888,7 @@ pub const Picker = struct {
     fn collapse(self: *Picker) void {
         self.expanded_provider = null;
         self.expanded_key_len = 0;
+        self.open_site = null;
     }
 
     /// Put the cursor on the row `id` names: a model lists its routes, a
@@ -863,8 +901,9 @@ pub const Picker = struct {
                 const key = id.key();
                 @memcpy(self.expanded_key_buffer[0..key.len], key);
                 self.expanded_key_len = key.len;
+                self.open_site = null;
             },
-            .route => {},
+            .route => self.open_site = id.offer,
             else => self.collapse(),
         }
         var buffer = RowBuffer.init(self.allocator);
@@ -1222,6 +1261,15 @@ pub const Picker = struct {
 /// legitimately share.
 pub fn canonicalKey(offer: OfferSummary) []const u8 {
     return offer.canonical_model_id orelse offer.request_model_id;
+}
+
+fn sameSite(a: *const OfferSummary, b: *const OfferSummary) bool {
+    const left = a.region orelse return false;
+    const right = b.region orelse return false;
+    if (!std.mem.eql(u8, left, right)) return false;
+    const left_account = a.credential_ref orelse return b.credential_ref == null;
+    const right_account = b.credential_ref orelse return false;
+    return left_account.eql(right_account);
 }
 
 pub fn isLatestAlias(offer: OfferSummary) bool {
@@ -1679,6 +1727,52 @@ test "a long list that marks none of its models stays one list" {
     try loadFixture(&picker, &offers, null);
     picker.restart();
     try testing.expectEqual(@as(usize, 47), picker.rowCount());
+}
+
+test "a site's routes are listed once until the cursor is on one of them, the one in use standing for it; another account on the site is its own route" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var offers = [_]OfferSummary{
+        fixtureOffer("kimi-code", "cn-responses", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_responses"),
+        fixtureOffer("kimi-code", "cn-chat", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_chat"),
+        fixtureOffer("kimi-code", "global-responses", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_responses"),
+        fixtureOffer("kimi-code", "global-chat", "Kimi K3.1 Pro", "kimi/k3.1-pro", "k3.1-pro", "openai_chat"),
+    };
+    for (offers[0..2]) |*offer| offer.region = "cn";
+    for (offers[2..4]) |*offer| offer.region = "global";
+    var buffer = Picker.RowBuffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    var list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 4), list.len);
+    try testing.expectEqual(@as(usize, 4), list[1].model.offer_count);
+    try testing.expect(picker.offers.items[list[2].route.offer_index].channel_id.eqlText("cn-responses"));
+    try testing.expect(picker.offers.items[list[3].route.offer_index].channel_id.eqlText("global-responses"));
+    try testing.expect(list[3].route.last);
+
+    try testing.expect(picker.onKey(.down) == .redraw);
+    list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 5), list.len);
+    try testing.expect(picker.offers.items[list[picker.cursor].route.offer_index].channel_id.eqlText("cn-responses"));
+    try testing.expect(picker.offers.items[list[3].route.offer_index].channel_id.eqlText("cn-chat"));
+    try testing.expect(picker.offers.items[list[4].route.offer_index].channel_id.eqlText("global-responses"));
+    try testing.expect(picker.onKey(.down) == .redraw);
+    try testing.expect(picker.focusedOffer().?.channel_id.eqlText("cn-chat"));
+
+    try loadFixture(&picker, &offers, offers[3].offer_id);
+    picker.restart();
+    list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 4), list.len);
+    try testing.expect(picker.offers.items[list[3].route.offer_index].channel_id.eqlText("global-chat"));
+    try testing.expect(list[3].route.is_current and list[3].route.preferred);
+
+    offers[1].credential_ref = Slug.lit("second");
+    try loadFixture(&picker, &offers, null);
+    picker.restart();
+    list = try picker.rows(&buffer);
+    try testing.expectEqual(@as(usize, 5), list.len);
 }
 
 test "scope is session unless the user explicitly cycles it" {
