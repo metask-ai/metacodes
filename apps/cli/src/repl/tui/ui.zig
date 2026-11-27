@@ -143,9 +143,9 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64, pasted: bool) Effec
 
     // ── issue #16: model picker 开着时,键盘属于它 ──────────────────────────
     // 对键模态(普通字符是它的过滤器),对会话不模态:草稿不动、生成不停。
-    // 输入期的 Ctrl+C 不管 picker 停在哪一步都直接关掉它(#607),再按才回到提示符的双击退出;
-    // Ctrl+D 和生成期的 Ctrl+C 不拦——用户永远有一条不依赖本状态机的退出路径。
-    if (ix.picker_open and key == .ctrl_c and state.phase == .input) {
+    // Ctrl+C 不管 picker 停在哪一步都直接关掉它(#607):输入期再按才回到提示符的双击退出,
+    // 生成期再按才打断回复。Ctrl+D 不拦——用户永远有一条不依赖本状态机的退出路径。
+    if (ix.picker_open and key == .ctrl_c) {
         return .{ .action = .picker_key, .picker_key = .cancel };
     }
     if (ix.picker_open and key != .ctrl_c and key != .ctrl_d) {
@@ -502,6 +502,7 @@ pub const SHORTCUTS = [_][]const u8{
     "ctrl + g to edit in $EDITOR",
     "ctrl + x ctrl + o for transcript",
     "ctrl + b to run a reply in background",
+    "pgup / pgdn, home / end in lists",
 };
 
 const SHORTCUT_GAP: usize = 2;
@@ -745,13 +746,21 @@ test "Ctrl+R in an open picker is the picker's: it fetches again a list that did
 test "issue #16: an open picker never traps the session" {
     var state = UiState.in(.{ .input = .{} });
     state.interaction().?.picker_open = true;
-    // Ctrl+D, and Ctrl+C during a reply, keep their normal meaning, so there
-    // is always a way out that does not depend on the picker's own state machine.
     try testing.expect(press(&state, .ctrl_d).action != .picker_key);
     var replying = UiState.in(.{ .generating = .{} });
     replying.interaction().?.picker_open = true;
-    try testing.expect(press(&replying, .ctrl_c).action != .picker_key);
     try testing.expect(press(&replying, .ctrl_d).action != .picker_key);
+}
+
+test "Ctrl+C during a reply closes an open picker first; the next Ctrl+C interrupts the reply" {
+    var replying = UiState.in(.{ .generating = .{} });
+    const ix = replying.interaction().?;
+    ix.picker_open = true;
+    const closed = press(&replying, .ctrl_c);
+    try testing.expectEqual(event.LoopAction.picker_key, closed.action);
+    try testing.expect(closed.picker_key == .cancel);
+    ix.picker_open = false;
+    try testing.expect(press(&replying, .ctrl_c).action != .picker_key);
 }
 
 test "Ctrl+C at the prompt closes an open picker and keeps the draft; the next Ctrl+C arms the exit (#607)" {
@@ -807,6 +816,13 @@ test "issue #16: `?` help lists both the picker and its replacement binding" {
     // A moved binding that is not documented is a binding users lose.
     try testing.expect(found_picker);
     try testing.expect(found_transcript);
+}
+
+test "`?` help names the paging keys the list hints leave out" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    _ = try renderHelpLines(&w, @import("theme.zig").monochrome, 120);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "pgup / pgdn, home / end in lists") != null);
 }
 
 test "shortcut grid: three columns when they fit, fewer on a narrow terminal" {

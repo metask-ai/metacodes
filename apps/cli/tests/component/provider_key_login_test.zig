@@ -358,6 +358,52 @@ test "L2 key login (#488): /model takes no key and does not list a provider with
     try std.testing.expectEqual(@as(usize, 0), check.requestCount());
 }
 
+test "L2 key login: /model lists only the region a stored key was made for; a key of unknown region keeps both" {
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+    var check = try harness.MockServer.start(MODELS_OK, 0);
+    defer check.stop();
+    try case.checkAt(check);
+
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const argv = [_][*:0]const u8{"metacodes"};
+    const app = try App.init(std.testing.allocator, io_runtime.io(), try case.config(&argv), "metask-key");
+    defer app.deinit();
+
+    const Want = struct { page: ?[]const u8, cn: bool, global: bool };
+    for ([_]Want{
+        .{ .page = "global-personal", .cn = false, .global = true },
+        .{ .page = "cn-team", .cn = true, .global = false },
+        .{ .page = null, .cn = true, .global = true },
+    }) |want| {
+        try key_store.save(std.testing.allocator, case.root, Slug.lit("zai-coding-plan"), .zai_coding_plan_api_key, GOOD_KEY, want.page, 1);
+        var listing = try app.listModelOffers();
+        defer listing.deinit(std.testing.allocator);
+        var cn = false;
+        var global = false;
+        for (listing.page.items, listing.ready.items) |offer, ready| {
+            if (!ready or !offer.provider_id.eqlText("zai-coding-plan")) continue;
+            const region = offer.region orelse continue;
+            if (std.mem.eql(u8, region, "cn")) cn = true;
+            if (std.mem.eql(u8, region, "global")) global = true;
+        }
+        try std.testing.expectEqual(want.cn, cn);
+        try std.testing.expectEqual(want.global, global);
+    }
+
+    try key_store.save(std.testing.allocator, case.root, Slug.lit("zai-coding-plan"), .zai_coding_plan_api_key, GOOD_KEY, "global-team", 1);
+    var ui: cc.tui_ui_state.UiState = .{};
+    picker_host.open(app, &ui, .unguarded);
+    for ("glm-5.3") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
+    try std.testing.expectEqualStrings(GOOD_KEY, app.api_key);
+    try std.testing.expect(std.mem.indexOf(u8, app.api_client.base_url, "z.ai") != null);
+    try std.testing.expectEqual(@as(usize, 0), check.requestCount());
+}
+
 // ── phase 2: every built-in vendor takes a pasted key ───────────────────────
 
 /// A vendor `/login <id>` now guides to a key page, and where its requests

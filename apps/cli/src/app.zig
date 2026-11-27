@@ -124,6 +124,7 @@ const provider_startup_mod = @import("metacodes-internal").provider.startup;
 const kg_provider_audit = @import("metacodes-internal").kg.provider_audit;
 const provider_alias_mod = @import("metacodes-internal").provider.alias;
 const provider_oauth_mod = @import("metacodes-internal").provider.oauth;
+const provider_profile_mod = @import("metacodes-internal").provider.profile;
 const oauth_exchange_mod = @import("metacodes-internal").api.oauth_exchange;
 const oauth_revoke_mod = @import("metacodes-internal").api.oauth_revoke;
 const metask_oauth_mod = @import("metacodes-internal").api.metask_oauth;
@@ -3448,6 +3449,7 @@ pub const App = struct {
             else
                 null;
             const sources = app.credentialSources(provider_id, &pool, &stored, oauth, now);
+            const key_region = storedKeyRegion(profile, &stored);
             var any_ready = false;
             var origin: model_picker_mod.ProviderNote.Origin = .unknown;
             for (offers[first..], first..) |candidate, index| {
@@ -3460,6 +3462,9 @@ pub const App = struct {
                 // cured by setting its key, so the route stays listed and a
                 // commit reports why, as before.
                 if (provider_binding_mod.bindOffer(&host.registry, offer, sources, &reference_buffer, false)) |binding| {
+                    if (key_region) |region| if (stored.entry()) |entry| if (binding.secret.ptr == entry.secret.ptr) {
+                        if (candidate.region) |route_region| if (!std.mem.eql(u8, route_region, region)) continue;
+                    };
                     // The first route that binds says where the provider's
                     // credential comes from, for its heading in the picker.
                     if (!any_ready) origin = noteOrigin(host, binding, oauth, stored.entry());
@@ -3475,6 +3480,13 @@ pub const App = struct {
                 try listing.notes.append(app.allocator, model_picker_mod.ProviderNote.init(provider_id, name, origin));
             }
         }
+    }
+
+    fn storedKeyRegion(profile: ?*const provider_profile_mod.ProviderProfile, stored: *const StoredKey) ?[]const u8 {
+        const built = profile orelse return null;
+        const file = if (stored.file) |*found| found else return null;
+        const page = built.keyPage(file.page orelse return null) orelse return null;
+        return page.region;
     }
 
     /// Where `provider` gets its credential, for the setup the picker shows

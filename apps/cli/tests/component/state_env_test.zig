@@ -1261,8 +1261,12 @@ test "state .env: keys of two providers and no name leave the TUI without a mode
     try expectAbsent(reminder.written(), "sk-relay-two");
     try expectAbsent(reminder.written(), "sk-deepseek-two");
 
-    // /model lists both as ready; Tab makes the pick every future session's.
     var ui: cc.tui_ui_state.UiState = .{};
+    cc.repl_picker_host.open(app, &ui, .unguarded);
+    try testing.expectEqual(cc.repl_picker_host.Result.cancelled, cc.repl_picker_host.onKey(app, &ui, .cancel, .unguarded));
+    try testing.expectEqualStrings("no model set", app.model_picker.notice());
+
+    // /model lists both as ready; Tab makes the pick every future session's.
     cc.repl_picker_host.open(app, &ui, .unguarded);
     _ = try cursorOnProvider(app, &ui, "deepseek");
     cc.repl_picker_host.close(app, &ui, .unguarded);
@@ -1343,6 +1347,6 @@ test "state .env: login status, for keys of two providers and no name, says to c
     const a = case.arena();
     try case.write("state/.env", "DEEPSEEK_API_KEY=sk-status-deepseek\nOPENAI_API_KEY=sk-status-openai\n");
     const status = try case.run(&.{}, &.{ "login", "status" });
-    try expectContains(status.stderr, try std.fmt.allocPrint(a, "This start uses no provider: {s} holds keys of several (deepseek, openai) and names none. Choose one with /model; Tab there applies it to every future session. Or add METACODES_PROVIDER=<one of them> to it.", .{try std.fs.path.join(a, &.{ case.state, ".env" })}));
+    try expectContains(status.stderr, try std.fmt.allocPrint(a, "This start uses no provider: {s} holds keys of several (deepseek, openai) and names none. Choose one with /model; press Tab there for \"from now on\" to keep it. Or add METACODES_PROVIDER=<one of them> to it.", .{try std.fs.path.join(a, &.{ case.state, ".env" })}));
     try expectAbsent(status.stderr, "sk-status-");
 }
