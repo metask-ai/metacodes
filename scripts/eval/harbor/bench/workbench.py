@@ -56,57 +56,62 @@ def _reprice_row(row, rate, schedule):
     return row
 
 
-def _reprice_summary(group, rate, schedule):
+def _clear_summary_costs(group):
+    updated = dict(group)
+    updated["cost_usd"] = None
+    updated["cost_trials"] = 0
+    if "finished_cost_mean" in updated:
+        updated["finished_cost_mean"] = None
+    updated["task_cost_sum"] = 0.0
+    updated["task_pass_sum"] = 0.0
+    updated["task_cost_tasks"] = 0
+    updated["cost_by_status"] = {st: 0.0 for st in data.VALID}
+    updated.update(data.outcome_fields(updated))
+    return updated
+
+
+def _reprice_task_summary(group, rate, schedule):
     if schedule == prices.RECORDED:
         return group
-    counts = group.get("counts") or {}
-    finished = (group.get("trials") or 0) - counts.get("running", 0)
-    valid = group.get("valid") or 0
-    cost = (
-        prices.compute_cost(
-            rate,
-            group.get("input_tokens"),
-            group.get("output_tokens"),
-            group.get("cache_tokens"),
-        )
-        if rate is not None
-        else None
-    )
-    if cost is not None:
-        updated = dict(group)
-        updated["cost_usd"] = cost
-        updated["cost_trials"] = finished or group.get("token_trials") or 0
-        if "finished_cost_mean" in updated:
-            updated["finished_cost_mean"] = cost / finished if finished else None
-        if valid > 0:
-            mean_cost = cost / finished if finished else cost / valid
-            updated["task_cost_sum"] = mean_cost
-            updated["task_pass_sum"] = (counts.get("pass") or 0) / valid
-            updated["task_cost_tasks"] = 1
-            updated["cost_by_status"] = {
-                st: cost * (counts.get(st, 0) / finished) if finished else 0.0
-                for st in data.VALID
-            }
+    tbs = group.get("tokens_by_status")
+    if not isinstance(tbs, dict) or rate is None:
+        return _clear_summary_costs(group) if schedule == prices.BASETEN else group
+    status_cost = {}
+    status_trials = {}
+    for st in data.STATUSES:
+        bucket = tbs.get(st) or {}
+        priced_trials = int(bucket.get("trials") or 0)
+        cost = prices.compute_bucket_cost(rate, bucket) if priced_trials > 0 else 0.0
+        if schedule == prices.OPENROUTER:
+            fallback_trials = int(bucket.get("fallback_trials") or 0)
+            fallback_cost = float(bucket.get("fallback_cost") or 0.0)
         else:
-            updated["task_cost_sum"] = 0.0
-            updated["task_pass_sum"] = 0.0
-            updated["task_cost_tasks"] = 0
-            updated["cost_by_status"] = {st: 0.0 for st in data.VALID}
-        updated.update(data.outcome_fields(updated))
-        return updated
-    if schedule == prices.BASETEN:
-        updated = dict(group)
-        updated["cost_usd"] = None
-        updated["cost_trials"] = 0
-        if "finished_cost_mean" in updated:
-            updated["finished_cost_mean"] = None
+            fallback_trials = 0
+            fallback_cost = 0.0
+        status_trials[st] = priced_trials + fallback_trials
+        status_cost[st] = (cost or 0.0) + fallback_cost
+    updated = dict(group)
+    all_trials = sum(status_trials.values())
+    updated["cost_usd"] = sum(status_cost.values()) if all_trials else None
+    updated["cost_trials"] = all_trials
+    if "finished_cost_mean" in updated:
+        finished_statuses = [st for st in data.STATUSES if st != "running"]
+        finished_trials = sum(status_trials[st] for st in finished_statuses)
+        updated["finished_cost_mean"] = (
+            sum(status_cost[st] for st in finished_statuses) / finished_trials if finished_trials else None
+        )
+    valid_trials = sum(status_trials[st] for st in data.VALID)
+    updated["cost_by_status"] = {st: status_cost[st] for st in data.VALID}
+    if valid_trials > 0:
+        updated["task_cost_sum"] = sum(status_cost[st] for st in data.VALID) / valid_trials
+        updated["task_pass_sum"] = status_trials["pass"] / valid_trials
+        updated["task_cost_tasks"] = 1
+    else:
         updated["task_cost_sum"] = 0.0
         updated["task_pass_sum"] = 0.0
         updated["task_cost_tasks"] = 0
-        updated["cost_by_status"] = {st: 0.0 for st in data.VALID}
-        updated.update(data.outcome_fields(updated))
-        return updated
-    return group
+    updated.update(data.outcome_fields(updated))
+    return updated
 
 
 def _reprice_view(view, run, schedule, openrouter_models):
@@ -120,13 +125,13 @@ def _reprice_view(view, run, schedule, openrouter_models):
         updated["summary"] = data.summarize(rows)
     elif "task_summaries" in view:
         groups = {
-            task: _reprice_summary(group, rate, schedule)
+            task: _reprice_task_summary(group, rate, schedule)
             for task, group in view["task_summaries"].items()
         }
         updated["task_summaries"] = groups
         updated["summary"] = group_summary(groups)
-    else:
-        updated["summary"] = _reprice_summary(view["summary"], rate, schedule)
+    elif schedule == prices.BASETEN:
+        updated["summary"] = _clear_summary_costs(view["summary"])
     updated["pricing"] = {
         "schedule": schedule,
         "label": prices.SCHEDULE_LABELS[schedule],

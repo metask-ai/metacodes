@@ -224,6 +224,42 @@ def rate_for(
     return None
 
 
+def token_bucket(
+    input_tokens: Optional[float],
+    output_tokens: Optional[float],
+    cache_tokens: Optional[float] = None,
+    cache_creation_tokens: Optional[float] = None,
+) -> Optional[Dict[str, float]]:
+    if input_tokens is None or output_tokens is None:
+        return None
+    if input_tokens < 0 or output_tokens < 0 or (input_tokens == 0 and output_tokens == 0):
+        return None
+    cache_read = max(0.0, float(cache_tokens or 0.0))
+    cache_write = max(0.0, float(cache_creation_tokens or 0.0))
+    uncached = max(0.0, float(input_tokens) - cache_read - cache_write)
+    return {
+        "uncached": uncached,
+        "output": float(output_tokens),
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+    }
+
+
+def compute_bucket_cost(rate: Optional[Dict[str, Any]], bucket: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(rate, dict) or not isinstance(bucket, dict):
+        return None
+    input_rate = float(rate["input"])
+    output_rate = float(rate["output"])
+    cached_rate = float(rate["cached_input"]) if rate.get("cached_input") is not None else input_rate
+    write_rate = float(rate["cache_write"]) if rate.get("cache_write") is not None else input_rate
+    return (
+        float(bucket.get("uncached") or 0.0) * input_rate
+        + float(bucket.get("output") or 0.0) * output_rate
+        + float(bucket.get("cache_read") or 0.0) * cached_rate
+        + float(bucket.get("cache_write") or 0.0) * write_rate
+    ) / 1_000_000.0
+
+
 def compute_cost(
     rate: Optional[Dict[str, Any]],
     input_tokens: Optional[float],
@@ -231,20 +267,5 @@ def compute_cost(
     cache_tokens: Optional[float] = None,
     cache_creation_tokens: Optional[float] = None,
 ) -> Optional[float]:
-    if not isinstance(rate, dict) or input_tokens is None or output_tokens is None:
-        return None
-    if input_tokens < 0 or output_tokens < 0 or (input_tokens == 0 and output_tokens == 0):
-        return None
-    cache_read = max(0.0, float(cache_tokens or 0.0))
-    cache_write = max(0.0, float(cache_creation_tokens or 0.0))
-    uncached = max(0.0, float(input_tokens) - cache_read - cache_write)
-    input_rate = float(rate["input"])
-    output_rate = float(rate["output"])
-    cached_rate = float(rate["cached_input"]) if rate.get("cached_input") is not None else input_rate
-    write_rate = float(rate["cache_write"]) if rate.get("cache_write") is not None else input_rate
-    return (
-        uncached * input_rate
-        + float(output_tokens) * output_rate
-        + cache_read * cached_rate
-        + cache_write * write_rate
-    ) / 1_000_000.0
+    bucket = token_bucket(input_tokens, output_tokens, cache_tokens, cache_creation_tokens)
+    return compute_bucket_cost(rate, bucket)
