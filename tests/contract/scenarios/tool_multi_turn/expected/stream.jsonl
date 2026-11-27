@@ -1,25 +1,22 @@
 {"type":"turn_begin","turn":1}
 {"type":"output_segment_begin","index":0,"turn":1,"group":0}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"text","text":"Reading the note first."}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"output_segment_end","index":0,"turn":1,"group":0,"disposition":"commentary","bytes":23}
 {"type":"tool_start","id":"toolu_01","name":"Read","input":"{\"file_path\":\"notes.txt\"}","input_bytes":25}
 {"type":"tool_result","id":"toolu_01","name":"Read","is_error":false,"elapsed_ms":<N>,"content_bytes":<N>,"content":"     1\talpha\n"}
 {"type":"turn_end","turn":1,"tool_calls":1}
 {"type":"turn_begin","turn":2}
 {"type":"output_segment_begin","index":1,"turn":2,"group":1}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"output_segment_end","index":1,"turn":2,"group":1,"disposition":"commentary","bytes":0}
 {"type":"tool_start","id":"toolu_02","name":"Write","input":"{\"file_path\":\"copy.txt\",\"content\":\"alpha\\n\"}","input_bytes":44}
 {"type":"tool_result","id":"toolu_02","name":"Write","is_error":false,"elapsed_ms":<N>,"content_bytes":<N>,"content":"{\"success\":true,\"path\":\"copy.txt\",\"structuredPatch\":[{\"oldStart\":0,\"oldLines\":0,\"newStart\":1,\"newLines\":1,\"lines\":[\"+alpha\"]}],\"gitDiff\":\"--- a/copy.txt\\n+++ b/copy.txt\\n@@ -0,0 +1,1 @@\\n+alpha\\n\"}"}
 {"type":"turn_end","turn":2,"tool_calls":2}
 {"type":"turn_begin","turn":3}
 {"type":"output_segment_begin","index":2,"turn":3,"group":2}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"text","text":"Copied notes.txt to copy.txt."}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"turn_end","turn":3,"tool_calls":2}
 {"type":"output_segment_end","index":2,"turn":3,"group":2,"disposition":"final","bytes":29}
 {"type":"run_end","turns":3,"tool_calls":2,"stop_reason":"end_turn"}

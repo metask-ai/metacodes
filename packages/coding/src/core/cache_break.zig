@@ -11,14 +11,6 @@ const std = @import("std");
 /// cache_read 跌幅超过此(且占上次 >5%)才判击穿,避免噪声。对齐 cc MIN_CACHE_MISS_TOKENS。
 const MIN_DROP_TOKENS: u64 = 2000;
 
-/// One response's usage, summed from its `usage` events. Providers report
-/// running totals (Anthropic's message_start then cumulative message_delta,
-/// repeated OpenAI usage objects, repeated Gemini usageMetadata), and each
-/// provider stream turns them into increments (`api/stream.zig`
-/// `UsageReportCursor`), so the sum is the per-counter maximum of the reports
-/// however the provider split them. Cache diagnostics and the conversation
-/// token anchor must consume this view exactly once per successful request,
-/// never each SSE fragment.
 pub const ResponseUsage = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,

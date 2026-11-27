@@ -1,8 +1,7 @@
 {"type":"turn_begin","turn":1}
 {"type":"output_segment_begin","index":0,"turn":1,"group":0}
-{"type":"usage","input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"text","text":"Release branches are cut on Fridays."}
-{"type":"usage","input_tokens":0,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+{"type":"usage","input_tokens":10,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}
 {"type":"turn_end","turn":1,"tool_calls":0}
 {"type":"output_segment_end","index":0,"turn":1,"group":0,"disposition":"final","bytes":36}
 {"type":"run_end","turns":1,"tool_calls":0,"stop_reason":"end_turn"}

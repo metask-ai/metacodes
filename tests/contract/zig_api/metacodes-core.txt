@@ -7830,9 +7830,18 @@ metacodes-core.api_stream.UsageReport.input_tokens: u64 = 0
 metacodes-core.api_stream.UsageReport.output_tokens: u64 = 0
 metacodes-core.api_stream.UsageReport.cache_read_input_tokens: u64 = 0
 metacodes-core.api_stream.UsageReport.cache_creation_input_tokens: u64 = 0
+metacodes-core.api_stream.UsagePatch: struct
+metacodes-core.api_stream.UsagePatch.input_tokens: ?u64 = null
+metacodes-core.api_stream.UsagePatch.output_tokens: ?u64 = null
+metacodes-core.api_stream.UsagePatch.cache_read_input_tokens: ?u64 = null
+metacodes-core.api_stream.UsagePatch.cache_creation_input_tokens: ?u64 = null
 metacodes-core.api_stream.UsageReportCursor: struct
 metacodes-core.api_stream.UsageReportCursor.seen: UsageReport = .{}
-metacodes-core.api_stream.UsageReportCursor.increment: fn increment(self: *UsageReportCursor, report: UsageReport) UsageDelta
+metacodes-core.api_stream.UsageReportCursor.reported: bool = false
+metacodes-core.api_stream.UsageReportCursor.emitted: bool = false
+metacodes-core.api_stream.UsageReportCursor.record: fn record(self: *UsageReportCursor, report: UsageReport) void
+metacodes-core.api_stream.UsageReportCursor.merge: fn merge(self: *UsageReportCursor, patch: UsagePatch) void
+metacodes-core.api_stream.UsageReportCursor.finish: fn finish(self: *UsageReportCursor) ?UsageDelta
 metacodes-core.api_stream.StopReason: enum
 metacodes-core.api_stream.StopReason.unknown
 metacodes-core.api_stream.StopReason.end_turn
@@ -7889,6 +7898,7 @@ metacodes-core.api_stream.EventIterator.credential: ?model_error.SecretPrint = n
 metacodes-core.api_stream.EventIterator.last_stop_reason: StopReason = .unknown
 metacodes-core.api_stream.EventIterator.stop_reported: bool = false
 metacodes-core.api_stream.EventIterator.usage_reports: UsageReportCursor = .{}
+metacodes-core.api_stream.EventIterator.pending_done: bool = false
 metacodes-core.api_stream.EventIterator.pending_tool: ?PendingTool = null
 metacodes-core.api_stream.EventIterator.tool_call_started: bool = false
 metacodes-core.api_stream.EventIterator.line_overflow: std.ArrayList(u8) = .empty

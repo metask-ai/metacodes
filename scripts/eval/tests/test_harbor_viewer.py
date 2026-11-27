@@ -485,14 +485,17 @@ class FakeNode {{
   append(...items) {{
     for (const item of items) {{
       if (item === null || item === undefined || item === false) continue;
-      if (typeof item === 'string') this.children.push({{ textContent: item, children: [] }});
-      else this.children.push(item);
+      if (item instanceof FakeNode || (item && typeof item === 'object' && !Array.isArray(item) && 'textContent' in item)) {{
+        this.children.push(item);
+      }} else {{
+        this.children.push({{ textContent: String(item), children: [] }});
+      }}
     }}
   }}
   replaceChildren(...items) {{ this.children = []; this.append(...items); }}
-  setAttribute(k, v) {{ this.attrs[k] = v; if (k === 'value') this._value = v; if (k === 'selected') this.selected = true; }}
+  setAttribute(k, v) {{ this.attrs[k] = v; if (k === 'value') this._value = v; if (k === 'selected') this.selected = true; if (k === 'checked') this.checked = true; }}
   addEventListener(type, fn) {{ (this._listeners[type] = this._listeners[type] || []).push(fn); }}
-  dispatch(type) {{ for (const fn of this._listeners[type] || []) fn({{ target: this, currentTarget: this }}); }}
+  dispatch(type) {{ for (const fn of this._listeners[type] || []) fn({{ target: this, currentTarget: this, stopPropagation() {{}} }}); }}
   get value() {{
     if (this.tagName === 'select') {{
       const picked = this.children.find((c) => c.selected) || this.children[0];
@@ -766,6 +769,227 @@ setTimeout(() => {
             "url": "/api/profile/authoritative",
             "payload": {"id": "prof-a", "suite": "terminal-bench-2.1", "model": "m", "run": "run-1"},
         }])
+
+    def test_profile_expand_and_filters_redraw_locally_without_refetching(self):
+        result = self._run_js("""
+const summary = {
+  counts: { pass: 1, partial: 0, fail: 1, timeout: 0, invalid: 0, running: 0 },
+  trials: 2, valid: 2, one_shot_pass_rate: 0.5,
+  first_passed: 1, first_valid: 2, first_pass_rate: 0.5,
+  tasks_solved: 1, tasks_attempted: 2, solved_rate: 0.5,
+  cost_per_task: 0.5, cost_per_pass: 1.0, total_tokens: 2000,
+  initial_input_tokens_mean: 500, cache_hit_rate: 0.5,
+  tps: 20, ttft_ms: 100, ttft_p95_ms: 200, non_pass_cost_share: 0.5,
+};
+const profile = {
+  id: 'prof-live', name: 'profile-0.12.0', status: 'running', can_run: true,
+  concurrency: 32, auto_rerun_invalid: false,
+  created_at: '2026-11-27T01:00:00Z', last_run_at: '2026-11-27T02:00:00Z',
+  metacodes: { label: '0.12.0' }, features: ['stall_gate'],
+  models: ['model-a', 'model-b'],
+  summary,
+  by_model: [
+    { model: 'model-a', tasks: 1, summary },
+    { model: 'model-b', tasks: 1, summary },
+  ],
+  items: [
+    { submission: 's1', suite: 'suite-a', suite_name: 'Suite A', model: 'model-a', status: 'finished',
+      tasks: ['t1'], run: 'run-1', job: { name: 'run-1', planned: 1, running: false, wall_s: 10, summary } },
+    { submission: 's2', suite: 'suite-b', suite_name: 'Suite B', model: 'model-b', status: 'running',
+      tasks: ['t2'], run: 'run-2', job: { name: 'run-2', planned: 1, running: true, wall_s: 5, summary } },
+  ],
+  tasks: [
+    { suite: 'suite-a', suite_name: 'Suite A', model: 'model-a', task: 't1', job: 'run-1',
+      first_status: 'pass', passed: 1, valid: 1, mean_total_tokens: 1000, mean_turns: 2, mean_elapsed_s: 5,
+      attempts: [{ attempt_number: 1, trial: 't1__1', status: 'pass', total_tokens: 1000, elapsed_s: 5 }] },
+    { suite: 'suite-b', suite_name: 'Suite B', model: 'model-b', task: 't2', job: 'run-2',
+      first_status: 'fail', passed: 0, valid: 1, mean_total_tokens: 1000, mean_turns: 3, mean_elapsed_s: 6,
+      attempts: [{ attempt_number: 1, trial: 't2__1', status: 'fail', total_tokens: 1000, elapsed_s: 6 }] },
+  ],
+};
+let fetches = 0;
+ctx.api = async () => {
+  fetches += 1;
+  if (fetches > 1) throw new TypeError('Failed to fetch');
+  return profile;
+};
+const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+(async () => {
+  const root = await vm.runInContext('renderProfile', ctx)('prof-live');
+  vm.runInContext('state.busy = true', ctx);
+  const expandBtn = () => walk(root).find((n) => n.tagName === 'button' && n.attrs['aria-expanded'] !== undefined);
+  const hasExpanded = () => walk(root).some((n) => n.className === 'profile-expanded');
+  const before = { expanded: hasExpanded(), aria: expandBtn().attrs['aria-expanded'], label: expandBtn().textContent };
+
+  expandBtn().dispatch('click');
+  const opened = {
+    expanded: hasExpanded(),
+    aria: expandBtn().attrs['aria-expanded'],
+    label: expandBtn().textContent,
+    hasQueue: walk(root).some((n) => n.textContent.includes('作业队列')),
+    hasSettings: walk(root).some((n) => n.textContent.includes('Profile 设置与冻结信息')),
+  };
+
+  const failPill = walk(root).find((n) => n.tagName === 'button' && (n.className || '').includes('stat-pill') && n.textContent.includes('失败'));
+  failPill.dispatch('click');
+  const failRows = walk(walk(root).find((n) => n.className === 'task-table')).filter((n) => n.tagName === 'tr').slice(1).map((tr) => tr.textContent);
+
+  const modelChip = walk(root).find((n) => n.tagName === 'button' && n.className === 'chip' && n.textContent === 'model-a');
+  modelChip.dispatch('click');
+  const afterModelChip = vm.runInContext('state.profileModel', ctx);
+
+  expandBtn().dispatch('click');
+  const closed = { expanded: hasExpanded(), aria: expandBtn().attrs['aria-expanded'], label: expandBtn().textContent };
+
+  console.log(JSON.stringify({ fetches, before, opened, failRows, afterModelChip, closed }));
+})();
+""")
+        self.assertEqual(result["fetches"], 1)
+        self.assertFalse(result["before"]["expanded"])
+        self.assertEqual(result["before"]["aria"], "false")
+        self.assertIn("展开作业 (2)", result["before"]["label"])
+        self.assertTrue(result["opened"]["expanded"])
+        self.assertEqual(result["opened"]["aria"], "true")
+        self.assertIn("收起作业", result["opened"]["label"])
+        self.assertTrue(result["opened"]["hasQueue"])
+        self.assertTrue(result["opened"]["hasSettings"])
+        self.assertEqual(len(result["failRows"]), 1)
+        self.assertIn("t2", result["failRows"][0])
+        self.assertEqual(result["afterModelChip"], "model-a")
+        self.assertFalse(result["closed"]["expanded"])
+        self.assertEqual(result["closed"]["aria"], "false")
+
+    def test_overview_job_compare_and_leaderboard_controls_redraw_locally(self):
+        result = self._run_js("""
+const walk = (n, acc = []) => { acc.push(n); for (const c of n.children || []) walk(c, acc); return acc; };
+const summary = {
+  counts: { pass: 1, partial: 0, fail: 1, timeout: 0, invalid: 0, running: 0 },
+  trials: 2, valid: 2, one_shot_pass_rate: 0.5,
+  first_passed: 1, first_valid: 2, first_pass_rate: 0.5,
+  tasks_solved: 1, tasks_attempted: 2, solved_rate: 0.5,
+  cost_per_task: 0.02, cost_per_pass: 0.04, total_tokens: 2000, token_trials: 2,
+  initial_input_tokens_mean: 500, cache_hit_rate: 0.5, mean_reward: 0.5,
+  invalid_causes: {}, empty_final: 0, input_tokens: 1500, output_tokens: 500, cache_tokens: 750,
+};
+let overviewCalls = 0;
+ctx.api = async () => {
+  overviewCalls += 1;
+  if (overviewCalls > 1) throw new TypeError('Failed to fetch');
+  return {
+    can_run: true, jobs: [], runs: [],
+    profiles: [
+      { id: 'p1', name: 'P1', status: 'finished', models: ['m1'], features: [], metacodes: { label: '0.12' },
+        items: [{ submission: 's1', suite: 'fh', suite_name: 'FH', model: 'm1', tasks: ['t1'], job: { name: 'j1', planned: 1 } }],
+        summary },
+      { id: 'p2', name: 'P2', status: 'running', models: ['m2'], features: [], metacodes: { label: '0.13' },
+        items: [{ submission: 's1', suite: 'fh', suite_name: 'FH', model: 'm2', tasks: ['t1'], job: { name: 'j2', planned: 1 } }],
+        summary },
+    ],
+  };
+};
+(async () => {
+  const ov = await vm.runInContext('renderOverview', ctx)();
+  for (const box of walk(ov).filter((n) => n.tagName === 'input' && n.attrs.type === 'checkbox')) {
+    box.checked = true;
+    box.dispatch('change');
+  }
+  const hasDock = walk(ov).some((n) => n.className === 'compare-dock');
+  walk(ov).find((n) => n.tagName === 'button' && n.textContent === '清空').dispatch('click');
+  const clearedDock = !walk(ov).some((n) => n.className === 'compare-dock');
+
+  let jobCalls = 0;
+  ctx.api = async () => {
+    jobCalls += 1;
+    if (jobCalls > 1) throw new TypeError('Failed to fetch');
+    return {
+      name: 'j1', running: false, planned: 2, wall_s: 10, summary,
+      rows: [
+        { task: 't1', trial: 't1__a', first_attempt: true, attempt_number: 1, status: 'pass', reward: 1, phases: { agent: 4 }, elapsed_s: 4 },
+        { task: 't2', trial: 't2__a', first_attempt: true, attempt_number: 1, status: 'fail', reward: 0, phases: { agent: 6 }, elapsed_s: 6 },
+      ],
+    };
+  };
+  const jobRoot = await vm.runInContext('renderJob', ctx)('j1');
+  walk(jobRoot).find((n) => n.tagName === 'button' && n.textContent.includes('失败')).dispatch('click');
+  const jobFiltered = walk(jobRoot).filter((n) => n.tagName === 'tbody')[0].children.map((tr) => tr.textContent);
+
+  let cmpCalls = 0;
+  const cmpJobs = {
+    j1: { name: 'j1', model: 'm1', running: false, summary, rows: [
+      { task: 't1', trial: 't1__a', first_attempt: true, status: 'fail', cost_usd: 0.02, total_tokens: 1000, elapsed_s: 4 },
+    ] },
+    j2: { name: 'j2', model: 'm1', running: false, summary, rows: [
+      { task: 't1', trial: 't1__b', first_attempt: true, status: 'pass', cost_usd: 0.02, total_tokens: 1000, elapsed_s: 4 },
+    ] },
+  };
+  ctx.api = async (url) => {
+    cmpCalls += 1;
+    if (cmpCalls > 2) throw new TypeError('Failed to fetch');
+    return cmpJobs[decodeURIComponent(url.split('name=')[1])];
+  };
+  const cmpRoot = await vm.runInContext('renderCompare', ctx)(['j1', 'j2'], null);
+  walk(cmpRoot).find((n) => n.tagName === 'button' && n.textContent === '设为基准').dispatch('click');
+  const cmpBaseline = vm.runInContext('state.compareBaseline', ctx);
+
+  let boardCalls = 0;
+  ctx.api = async () => {
+    boardCalls += 1;
+    if (boardCalls > 1) throw new TypeError('Failed to fetch');
+    return {
+      suite: 'tb', suite_name: 'TB', task_count: 10, ranked_coverage: 0.8,
+      suites: [{ suite: 'tb', suite_name: 'TB' }], unranked: [],
+      boards: [{
+        suites: ['tb'], title: 'Board', source: { name: 'src', url: 'https://example.invalid', retrieved: '2026-11-27' },
+        entries: [{ harness: 'Other', model: 'm1', score: 50 }],
+        jobs: [
+          { name: 'j1', profile_name: 'P1', model: 'm1', score: 0.6, ranked: true, tasks: 10, cost_per_task: 1 },
+          { name: 'j2', profile_name: 'P2', model: 'm1', score: 0.7, ranked: true, tasks: 10, cost_per_task: 1 },
+        ],
+      }],
+    };
+  };
+  const lbRoot = await vm.runInContext('renderLeaderboard', ctx)('tb');
+  const boardTables = () => walk(lbRoot).filter((n) => n.tagName === 'table' && n.className === 'board');
+  const boardInitialTables = boardTables().length;
+  const boardInitialHasOther = boardTables().some((t) => t.textContent.includes('Other'));
+  const stripBox = walk(lbRoot).find((n) => n.tagName === 'input' && n.attrs.type === 'checkbox');
+  stripBox.checked = false;
+  stripBox.dispatch('change');
+  const boardAfterStripTables = boardTables().length;
+  const boardAfterStripHasOther = boardTables().some((t) => t.textContent.includes('Other'));
+  const boardSelectedAfterStrip = vm.runInContext("state.boardSelected['tb'].size", ctx);
+  const tableBox = walk(boardTables()[0]).find((n) => n.tagName === 'input' && n.attrs.type === 'checkbox');
+  tableBox.checked = !tableBox.checked;
+  tableBox.dispatch('change');
+  const boardAfterTableTables = boardTables().length;
+  const boardSelectedAfterTable = vm.runInContext("state.boardSelected['tb'].size", ctx);
+
+  console.log(JSON.stringify({
+    overviewCalls, hasDock, clearedDock,
+    jobCalls, jobFiltered,
+    cmpCalls, cmpBaseline,
+    boardCalls, boardInitialTables, boardInitialHasOther,
+    boardAfterStripTables, boardAfterStripHasOther, boardSelectedAfterStrip,
+    boardAfterTableTables, boardSelectedAfterTable,
+  }));
+})();
+""")
+        self.assertEqual(result["overviewCalls"], 1)
+        self.assertTrue(result["hasDock"])
+        self.assertTrue(result["clearedDock"])
+        self.assertEqual(result["jobCalls"], 1)
+        self.assertEqual(len(result["jobFiltered"]), 1)
+        self.assertIn("t2", result["jobFiltered"][0])
+        self.assertEqual(result["cmpCalls"], 2)
+        self.assertEqual(result["cmpBaseline"], "j2")
+        self.assertEqual(result["boardCalls"], 1)
+        self.assertEqual(result["boardInitialTables"], 1)
+        self.assertTrue(result["boardInitialHasOther"])
+        self.assertEqual(result["boardAfterStripTables"], 1)
+        self.assertTrue(result["boardAfterStripHasOther"])
+        self.assertEqual(result["boardSelectedAfterStrip"], 1)
+        self.assertEqual(result["boardAfterTableTables"], 1)
+        self.assertEqual(result["boardSelectedAfterTable"], 2)
 
 
 if __name__ == "__main__":
