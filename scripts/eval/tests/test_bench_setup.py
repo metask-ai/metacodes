@@ -32,7 +32,7 @@ import urllib.request
 from functools import partial
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
@@ -186,7 +186,7 @@ elif name == "ssh":
                 "FAKE_EGRESS_FETCH", "FAKE_JUDGE_REQUEST", "FAKE_NO_BUILDX", "FAKE_BUILD_DELAY",
                 "FAKE_RM_DELAY", "FAKE_BUILD_BREAKS", "FAKE_DOCKER_INSPECT", "FAKE_DOCKER_PS",
                 "FAKE_DOCKER_BRIDGE", "FAKE_SYSCTL", "FAKE_BENCH_RELEASE_FILE",
-                "FAKE_LATE_TRAFFIC", "FAKE_EGRESS_PROBE_ID"):
+                "FAKE_LATE_TRAFFIC", "FAKE_EGRESS_PROBE_ID", "METACODES_BENCH_HEARTBEAT_INTERVAL"):
         if key in env:
             remote[key] = env[key]
     if " results final " in command or " results summary " in command or " pack " in command:
@@ -355,6 +355,52 @@ def release_fixture(root, version="9.9.9", corrupt=False):
     http = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=http.serve_forever, daemon=True).start()
     return http, digest
+
+
+class HeartbeatTest(unittest.TestCase):
+    def test_interval_defaults_and_environment_overrides(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(remote.heartbeat_interval(), 2.0)
+            for value, expected in (("", 2.0), ("0.3", 0.3), ("4", 4.0), ("0", 2.0),
+                                    ("-1", 2.0), ("invalid", 2.0), ("nan", 2.0), ("inf", 2.0)):
+                with self.subTest(value=value):
+                    os.environ["METACODES_BENCH_HEARTBEAT_INTERVAL"] = value
+                    self.assertEqual(remote.heartbeat_interval(), expected)
+
+    def test_preparation_uses_the_configured_interval(self):
+        done = Mock()
+        done.wait.side_effect = [False, True]
+        with patch.dict(os.environ, METACODES_BENCH_HEARTBEAT_INTERVAL="0.3"), \
+                patch.object(remote.threading, "Event", return_value=done), \
+                patch.object(remote.threading, "Thread") as thread, patch.object(remote, "emit") as emit:
+            thread.side_effect = lambda **kwargs: types.SimpleNamespace(start=kwargs["target"])
+            self.assertEqual(remote.beating("prepare", threading.Event(), lambda: 7), 7)
+        self.assertEqual(done.wait.call_args_list, [call(0.3), call(0.3)])
+        done.set.assert_called_once_with()
+        emit.assert_called_once_with("heartbeat", phase="prepare")
+
+    def test_follow_uses_the_interval_and_adapts_its_polling(self):
+        for interval, polling, expected in ((0.5, 0.125, [10.0, 10.5, 11.0]),
+                                            (2.0, 0.25, [10.0, 12.0])):
+            with self.subTest(interval=interval):
+                clock = [10.0]
+                beats = []
+                harbor = Mock()
+                harbor.result.side_effect = [None] * 10 + [{"code": 0}]
+                finishing = Mock()
+                def sleep(seconds):
+                    clock[0] += seconds
+                with patch.dict(os.environ, METACODES_BENCH_HEARTBEAT_INTERVAL=str(interval)), \
+                        patch.object(remote.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(remote.time, "sleep", side_effect=sleep) as pause, \
+                        patch.object(remote, "emit", side_effect=lambda *_: beats.append(clock[0])), \
+                        patch.object(remote, "terminal") as terminal:
+                    self.assertEqual(remote.follow(harbor, threading.Event(), threading.Event(), None,
+                                                   types.SimpleNamespace(quiet=False), None, finishing), 0)
+                self.assertEqual(beats, expected)
+                self.assertEqual(pause.call_args_list, [call(polling)] * 10)
+                finishing.assert_called_once_with()
+                terminal.assert_called_once_with(None, "exit", code=0, cancelled=False)
 
 
 class NodeProtocolTest(unittest.TestCase):
@@ -1425,7 +1471,8 @@ class SshRunTest(SetupFixture):
         drops = self.root / "drops"
         drops.write_text("1")
         os.environ.update(FAKE_SSH_DROPS=str(drops), FAKE_SSH_DROP_AFTER="120", FAKE_SSH_DROP_SILENT="1",
-                          FAKE_BENCH_DELAY="6", METACODES_BENCH_HEARTBEAT_TIMEOUT="2")
+                          FAKE_BENCH_DELAY="6", METACODES_BENCH_HEARTBEAT_INTERVAL="0.3",
+                          METACODES_BENCH_HEARTBEAT_TIMEOUT="3")
         run = client.request("api/runs", self.request())
         final, _ = self.watch_until_done(manager, run["name"])
         log = data.tail(manager.records / (run["name"] + ".log"))
