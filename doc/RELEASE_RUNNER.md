@@ -24,7 +24,7 @@ job.
 
 | Property | Value |
 |---|---|
-| Runners | `ubuntu-latest` (x86_64 Linux), `ubuntu-24.04-arm` (aarch64 Linux), `macos-latest` (aarch64 macOS), `macos-15-intel` (x86_64 macOS), `windows-latest`; one job per release unit, each native to its target, `publish` on `ubuntu-latest` |
+| Runners | `ubuntu-latest` (x86_64 Linux), `ubuntu-24.04-arm` (aarch64 Linux), `macos-latest` (aarch64 macOS), `macos-15-intel` (x86_64 macOS), `windows-latest`. Each unit builds on its native target. Intel macOS uses a second native runner for the full test suite. `publish` runs on `ubuntu-latest`. |
 | CLI target | An explicit Zig target per unit, never the runner's own: `x86_64-linux-gnu.2.31`, `aarch64-linux-gnu.2.31`, `aarch64-macos.13.0`, `x86_64-macos.13.0`, `x86_64-windows-gnu` (`cli_target` in the matrix, passed to `release:verify` and `release:archive`). It means the baseline CPU and the oldest glibc or macOS the unit supports; `scripts/check_binary_baseline.py` fails a unit whose executable needs more |
 | Trigger | `workflow_dispatch`, inputs `tag` (bare `X.Y.Z` for the stable channel, a branch or full 40-hex commit SHA for `0.x.y-dev` pre-releases; `actions/checkout` rejects short SHAs) and `dry_run` (default `true`: build, verify, archive and upload artifacts, no draft); a bare `X.Y.Z` tag push; and a nightly `schedule` (17:00 UTC) that rehearses the pre channel on `main` and never reaches `publish` |
 | Toolchain | Zig 0.16.0 from `mlugg/setup-zig` (no cache); the images' Python and Rust stable (`cargo`); for the test suite's Glob and Grep tests the image's `rg`, or where the image has none (the arm64 Linux runner) the vendored, attested binary the unit ships (`stage_ripgrep_binary.py`); `bindgen` 0.72.1 installed by `cargo install bindgen-cli --locked` in the job for the AgentCore gate's bindings-regen check; PyYAML from `requirements-dev.txt`; elan 4.2.4 from its pinned release asset (`scripts/ci/install-elan.sh`, Git Bash on Windows) and the Lean toolchain `control-plane/lean/lean-toolchain` names, to build both kernels the unit ships (`zig build kernels:stage`, then `scripts/kernel_pins.py`) |
@@ -41,9 +41,14 @@ job.
 
 ## Reproducibility
 
-- Every run starts from `actions/checkout` with `fetch-depth: 0` and
-  `fetch-tags: true` (the stable channel needs `git describe --tags
-  --exact-match HEAD`). Prefixes and archives live under `$RUNNER_TEMP`.
+- Each build, test, and draft job checks out the resolved source commit with
+  `fetch-depth: 0` and `fetch-tags: true` (the stable channel needs
+  `git describe --tags --exact-match HEAD`). A manual dispatch can run the
+  workflow from one branch and build a different source ref. In that case,
+  when the source is given by name, the run saves its resolved commit for
+  subsequent attempts. If that record could not be saved or has expired,
+  start a new dispatch with an explicit source commit or stable tag.
+  Prefixes and archives live under `$RUNNER_TEMP`.
 - The reproducibility step archives twice into two directories and compares
   them byte for byte; a difference fails the release before anything is
   uploaded.
@@ -66,12 +71,16 @@ immutable pre-release with checksums (design §10).
 
 ## What a release proves
 
-Each platform job runs the repository's own gates in release configuration:
+Each platform runs the repository's own gates in release configuration:
 `verify_tinykg_binary.py`, `verify_ripgrep_binary.py`, `zig build test
 -Doptimize=ReleaseSafe`, `zig build release:verify` (the seven-point acceptance
 of #47 §5.4 on the staged prefix, from outside it), `zig build agentcore:gate`
-for the native target, then `release:archive` and `agentcore:archive`. Between
-`release:verify` and the archives, `scripts/check_binary_baseline.py`
+for the native target, then `release:archive` and `agentcore:archive`.
+On Intel macOS, the full suite and its clean-tree check run in parallel with
+the job that builds, verifies, and uploads the release archives. Both jobs
+check out the same source commit and must succeed before a draft can be created.
+
+Between `release:verify` and the archives, `scripts/check_binary_baseline.py`
 disassembles the unit's executable and fails it on any instruction beyond the
 baseline CPU (no AVX, AVX2 or AVX-512 on x86_64; no SVE or Armv8.6 matrix
 instructions on aarch64), on a GLIBC symbol version newer than the target's

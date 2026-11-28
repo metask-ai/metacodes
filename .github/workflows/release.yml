@@ -47,8 +47,88 @@ env:
   RELEASE_REF: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  release-source:
+    name: Resolve release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Identify a source already pinned by the event
+        id: request
+        env:
+          REQUESTED_REF: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref=$REQUESTED_REF
+          if [[ "$ref" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            ref="refs/tags/$ref"
+          fi
+          if [[ -z "$ref" || "$ref" == "$GITHUB_REF" ]]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          elif [[ "$ref" =~ ^[[:xdigit:]]{40}$ ]]; then
+            printf 'sha=%s\n' "$ref" | tr 'A-F' 'a-f' >> "$GITHUB_OUTPUT"
+          elif [[ "refs/heads/$ref" == "$GITHUB_REF" && "$ref" != refs/* ]]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          else
+            git check-ref-format "refs/heads/$ref"
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out the requested release ref
+        if: steps.request.outputs.sha != '' || github.run_attempt == '1'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.request.outputs.sha || steps.request.outputs.ref }}
+          sparse-checkout: .github/workflows/release.yml
+          sparse-checkout-cone-mode: false
+      - name: Restore the original source (dispatch a new run if the pin is missing)
+        if: steps.request.outputs.sha == '' && github.run_attempt != '1'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-source
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+      - name: Record the release commit
+        id: source
+        env:
+          PINNED_SHA: ${{ steps.request.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$RUNNER_TEMP/release-source/commit"
+          if [[ -n "$PINNED_SHA" ]]; then
+            sha=$(git rev-parse 'HEAD^{commit}')
+            test "$sha" = "$(git rev-parse --verify "$PINNED_SHA^{commit}")"
+          elif [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]; then
+            sha=$(git rev-parse 'HEAD^{commit}')
+            mkdir -p "$(dirname "$pin")"
+            printf '%s\n' "$sha" > "$pin"
+          else
+            read -r sha < "$pin"
+          fi
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected a full release commit SHA"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          printf 'Release source: `%s`\n' "$sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save the source for subsequent attempts
+        if: steps.request.outputs.sha == '' && github.run_attempt == '1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-source/commit
+          if-no-files-found: error
+          retention-days: 30
+
   build-posix:
     name: Release (${{ matrix.os }} ${{ matrix.arch }})
+    needs: release-source
     timeout-minutes: 150
     strategy:
       # Every platform reports its own verdict: a rehearsal needs all of them,
@@ -100,15 +180,24 @@ jobs:
       # (doc/RELEASE_RUNNER.md, "Debug symbols"). Every step that builds or
       # archives the unit passes the same flags.
       RELEASE_SYMBOLS: ${{ matrix.os == 'Linux' && '-Drelease-symbols=true' || '' }}
+      ZIG_TARGET: ${{ matrix.zig_target }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - &checkout-release
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ needs.release-source.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
+      - &check-release-source
+        name: Verify the release checkout
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.release-source.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
       # A release build must not inherit a cache another branch wrote: no
       # setup-zig cache here, every release compiles cold.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - &setup-release-zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
           use-cache: false
@@ -123,19 +212,20 @@ jobs:
           done
           cargo --version
           bindgen --version
-      - name: Install Python development dependencies
+      - &install-release-python
+        name: Install Python development dependencies
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
-      - name: Vendored runtime assets are attested
+      - &verify-release-assets
+        name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
       # The suite's Glob and Grep tests resolve rg from PATH, as in ci.yml. The
       # arm64 Linux image ships none, and its first dry run failed those tests
       # with RipgrepNotFound (#307). There the vendored, attested binary the
       # unit itself ships goes on PATH rather than a package manager's, so the
       # job reaches no new network source.
-      - name: ripgrep for the test suite
+      - &setup-release-ripgrep
+        name: ripgrep for the test suite
         shell: bash
-        env:
-          ZIG_TARGET: ${{ matrix.zig_target }}
         run: |
           set -euo pipefail
           if ! command -v rg >/dev/null 2>&1; then
@@ -146,7 +236,8 @@ jobs:
           fi
           command -v rg
           rg --version
-      - name: openssl on PATH matches the OpenSSL Python links
+      - &setup-release-openssl
+        name: openssl on PATH matches the OpenSSL Python links
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -170,7 +261,8 @@ jobs:
       # The unit ships both Lean kernels (manifest v2, release/LAYOUT.md),
       # built here natively and cold like everything else in a release: the
       # pinned elan, no Lean cache.
-      - name: Install pinned elan
+      - &install-release-elan
+        name: Install pinned elan
         run: bash scripts/ci/install-elan.sh
       - name: Build the Lean kernels and their pins
         shell: bash
@@ -183,8 +275,10 @@ jobs:
       # is what the Windows dry runs tripped (a few I/O-bound unit tests sit
       # near a minute on that box).
       - name: Full suite in release configuration
+        if: matrix.runner != 'macos-15-intel'
         run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
-      - name: The working tree is still clean before staging
+      - &check-release-tree
+        name: The working tree is still clean before staging
         shell: bash
         run: |
           set -euo pipefail
@@ -277,16 +371,34 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  test-macos-intel:
+    name: Release tests (macOS X64)
+    needs: release-source
+    timeout-minutes: 150
+    runs-on: macos-15-intel
+    env:
+      ZIG_TARGET: x86_64-macos
+    steps:
+      - *checkout-release
+      - *check-release-source
+      - *setup-release-zig
+      - *install-release-python
+      - *verify-release-assets
+      - *setup-release-ripgrep
+      - *setup-release-openssl
+      - *install-release-elan
+      - name: Full suite in release configuration
+        run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on --summary all
+      - *check-release-tree
+
   build-windows:
     name: Release (Windows)
+    needs: release-source
     timeout-minutes: 150
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-          fetch-depth: 0
-          fetch-tags: true
+      - *checkout-release
+      - *check-release-source
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
@@ -382,6 +494,7 @@ jobs:
 
   windows-arm-cross:
     name: Release (Windows ARM64 cross / ${{ matrix.target }})
+    needs: release-source
     timeout-minutes: 60
     runs-on: windows-latest
     strategy:
@@ -389,11 +502,8 @@ jobs:
       matrix:
         target: [aarch64-windows-gnu, aarch64-windows-msvc]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-          fetch-depth: 0
-          fetch-tags: true
+      - *checkout-release
+      - *check-release-source
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
@@ -407,7 +517,7 @@ jobs:
 
   publish:
     name: Draft release
-    needs: [build-posix, build-windows, windows-arm-cross]
+    needs: [release-source, build-posix, test-macos-intel, build-windows, windows-arm-cross]
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
     timeout-minutes: 20
     runs-on: ubuntu-latest
@@ -416,13 +526,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-          fetch-depth: 0
-          fetch-tags: true
+      - *checkout-release
+      - *check-release-source
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: archives-*
           path: ${{ runner.temp }}/dist
           merge-multiple: true
       - name: The ref must be a bare X.Y.Z tag at HEAD
@@ -436,6 +544,17 @@ jobs:
           fi
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
           python3 scripts/check_version_state.py
+      - name: Require the CLI archive for every release platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          for unit in x86_64-linux-gnu.tar.gz aarch64-linux-gnu.tar.gz x86_64-macos.tar.gz aarch64-macos.tar.gz x86_64-windows-gnu.zip; do
+            archive="metacodes-$RELEASE_REF-$unit"
+            if [[ ! -f "$RUNNER_TEMP/dist/$archive" ]]; then
+              echo "::error::Missing release archive: $archive"
+              exit 1
+            fi
+          done
       # Refuses a development version, a package around another library, a
       # version or ABI that disagrees anywhere, and any asset whose name a
       # published release already holds with other bytes.

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -1166,6 +1167,184 @@ class WorkflowTest(unittest.TestCase):
     def test_the_rehearsal_runs_in_ci(self) -> None:
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("agentcore_release.py rehearse", ci)
+
+
+class IntelReleaseWorkflowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import yaml
+
+        workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8"))
+        cls.jobs = workflow["jobs"]
+
+    def test_intel_tests_run_alongside_packaging_and_gate_the_draft(self) -> None:
+        intel = self.jobs["test-macos-intel"]
+        posix = self.jobs["build-posix"]
+        publish = self.jobs["publish"]
+        self.assertEqual(intel["runs-on"], "macos-15-intel")
+        self.assertNotIn("if", intel)
+        self.assertEqual(intel["needs"], posix["needs"])
+        self.assertNotIn("continue-on-error", intel)
+        self.assertNotIn("continue-on-error", posix)
+        self.assertEqual(set(publish["needs"]), {
+            "release-source", "test-macos-intel", "build-posix", "build-windows", "windows-arm-cross",
+        })
+        self.assertNotRegex(publish["if"], r"\b(always|failure|cancelled)\s*\(")
+
+        for job in ("build-posix", "test-macos-intel", "build-windows"):
+            with self.subTest(job=job):
+                steps = self.jobs[job]["steps"]
+                suite, = [s for s in steps if s.get("run", "").startswith("zig build test ")]
+                clean, = [s for s in steps if "git status --porcelain" in s.get("run", "")]
+                self.assertIn("-Doptimize=ReleaseSafe", suite["run"])
+                self.assertIn("--test-timeout 5m", suite["run"])
+                self.assertIn("-Dlean-kernels=on", suite["run"])
+                self.assertNotIn("continue-on-error", suite)
+                self.assertNotIn("if", clean)
+                if job == "build-posix":
+                    self.assertEqual(suite["if"], "matrix.runner != 'macos-15-intel'")
+                    self.assertEqual(sum(row["runner"] == "macos-15-intel"
+                                         for row in posix["strategy"]["matrix"]["include"]), 1)
+                else:
+                    self.assertNotIn("if", suite)
+                if job == "test-macos-intel":
+                    self.assertLess(steps.index(suite), steps.index(clean))
+                    self.assertIn("--summary all", suite["run"])
+
+    def test_only_the_packaging_leg_produces_intel_release_archives(self) -> None:
+        tests = self.jobs["test-macos-intel"]["steps"]
+        posix = self.jobs["build-posix"]["steps"]
+        for step in tests:
+            self.assertNotIn("release:archive", step.get("run", ""))
+            self.assertFalse(step.get("uses", "").startswith("actions/upload-artifact@"))
+        upload, = [s for s in posix if s.get("uses", "").startswith("actions/upload-artifact@")]
+        self.assertEqual(upload["with"]["name"], "archives-${{ matrix.os }}-${{ matrix.arch }}")
+        self.assertNotIn("if", upload)
+        for command in ("zig build release:verify", "zig build agentcore:gate", "doctor --strict"):
+            with self.subTest(command=command):
+                self.assertTrue(any(command in s.get("run", "") and "if" not in s
+                                    for s in posix[:posix.index(upload)]))
+
+    def test_builds_tests_and_the_draft_check_out_the_same_source_commit(self) -> None:
+        pin = "${{ needs.release-source.outputs.sha }}"
+        self.assertIn("sha", self.jobs["release-source"]["outputs"])
+        for name in ("build-posix", "test-macos-intel", "build-windows", "windows-arm-cross", "publish"):
+            with self.subTest(job=name):
+                job = self.jobs[name]
+                needs = job["needs"]
+                self.assertIn("release-source", [needs] if isinstance(needs, str) else needs)
+                checkout, = [s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+                self.assertEqual(checkout["with"]["ref"], pin)
+                verify = job["steps"][job["steps"].index(checkout) + 1]
+                self.assertEqual(verify["env"]["RELEASE_SHA"], pin)
+                self.assertIn('test "$(git rev-parse HEAD)" = "$RELEASE_SHA"', verify["run"])
+        download, = [s for s in self.jobs["publish"]["steps"]
+                     if s.get("uses", "").startswith("actions/download-artifact@")]
+        self.assertEqual(download["with"]["pattern"], "archives-*")
+        self.assertNotIn("run-id", download["with"])
+
+    @unittest.skipIf(os.name == "nt", "the draft release runs in bash on Linux")
+    def test_a_whole_platform_cannot_disappear_from_the_draft(self) -> None:
+        steps = self.jobs["publish"]["steps"]
+        check = next(s for s in steps if s.get("name") == "Require the CLI archive for every release platform")
+        verify = next(s for s in steps if "agentcore_release.py verify-dist" in s.get("run", ""))
+        self.assertLess(steps.index(check), steps.index(verify))
+        self.assertNotIn("if", check)
+        targets = ("x86_64-linux-gnu.tar.gz", "aarch64-linux-gnu.tar.gz", "x86_64-macos.tar.gz",
+                   "aarch64-macos.tar.gz", "x86_64-windows-gnu.zip")
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp) / "dist"
+            dist.mkdir()
+            env = dict(os.environ, RUNNER_TEMP=tmp, RELEASE_REF="0.14.0")
+            archives = [dist / f"metacodes-0.14.0-{target}" for target in targets]
+            for archive in archives:
+                archive.write_bytes(b"archive")
+            subprocess.run(["bash", "-c", check["run"]], env=env, check=True)
+            for archive in archives:
+                with self.subTest(missing=archive.name):
+                    archive.unlink()
+                    failed = subprocess.run(["bash", "-c", check["run"]], env=env, capture_output=True)
+                    self.assertNotEqual(failed.returncode, 0)
+                    archive.write_bytes(b"archive")
+
+    @unittest.skipIf(os.name == "nt", "release-source runs in bash on Linux")
+    def test_an_event_or_full_sha_is_immutable_and_other_refs_need_resolution(self) -> None:
+        request = next(s for s in self.jobs["release-source"]["steps"] if s.get("id") == "request")
+        self.assertEqual(request["env"]["REQUESTED_REF"], "${{ inputs.tag }}")
+        sha = "ab" * 20
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            for event_ref, requested, expected in (
+                ("refs/tags/0.14.0", "", f"sha={sha}"),
+                ("refs/heads/main", "", f"sha={sha}"),
+                ("refs/heads/main", "main", f"sha={sha}"),
+                ("refs/heads/main", "refs/heads/main", f"sha={sha}"),
+                ("refs/tags/0.14.0", "0.14.0", f"sha={sha}"),
+                ("refs/heads/0.14.0", "0.14.0", "ref=refs/tags/0.14.0"),
+                ("refs/heads/main", "0.14.0", "ref=refs/tags/0.14.0"),
+                ("refs/heads/main", "another-branch", "ref=another-branch"),
+                ("refs/heads/main", "CD" * 20, "sha=" + "cd" * 20),
+            ):
+                with self.subTest(event_ref=event_ref, requested=requested):
+                    output.write_text("", encoding="utf-8")
+                    env = dict(os.environ, GITHUB_SHA=sha, GITHUB_REF=event_ref,
+                               GITHUB_REF_NAME=event_ref.split("/", 2)[-1], REQUESTED_REF=requested,
+                               GITHUB_OUTPUT=str(output))
+                    subprocess.run(["bash", "-c", request["run"]], env=env, check=True)
+                    self.assertEqual(output.read_text().splitlines(), [expected])
+
+    @unittest.skipIf(os.name == "nt", "release-source runs in bash on Linux")
+    def test_retry_uses_the_original_commit_and_refuses_a_missing_pin(self) -> None:
+        steps = self.jobs["release-source"]["steps"]
+        source = next(s for s in steps if s.get("id") == "source")
+        checkout, = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
+        save, = [s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@")]
+        restore, = [s for s in steps if s.get("uses", "").startswith("actions/download-artifact@")]
+        self.assertEqual(checkout["with"]["ref"], "${{ steps.request.outputs.sha || steps.request.outputs.ref }}")
+        self.assertEqual(checkout["if"], "steps.request.outputs.sha != '' || github.run_attempt == '1'")
+        self.assertEqual(save["if"], "steps.request.outputs.sha == '' && github.run_attempt == '1'")
+        self.assertEqual(restore["if"], "steps.request.outputs.sha == '' && github.run_attempt != '1'")
+        self.assertEqual(save["with"]["name"], restore["with"]["name"])
+        self.assertEqual(restore["with"]["run-id"], "${{ github.run_id }}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git(root, "init", "-q")
+            git(root, "config", "user.email", "test@metacodes.local")
+            git(root, "config", "user.name", "metacodes-test")
+            git(root, "commit", "--allow-empty", "-qm", "first")
+            first = git(root, "rev-parse", "HEAD")
+            git(root, "tag", "-am", "annotated", "0.14.0")
+            tag_object = git(root, "rev-parse", "refs/tags/0.14.0")
+            output = root / "output"
+            env = dict(os.environ, RUNNER_TEMP=tmp, GITHUB_OUTPUT=str(output), PINNED_SHA="",
+                       GITHUB_STEP_SUMMARY=str(root / "summary"), GITHUB_RUN_ATTEMPT="1")
+            subprocess.run(["bash", "-c", source["run"]], cwd=root, env=dict(env, PINNED_SHA=tag_object), check=True)
+            self.assertEqual(output.read_text().splitlines(), [f"sha={first}"])
+            output.write_text("", encoding="utf-8")
+            subprocess.run(["bash", "-c", source["run"]], cwd=root, env=env, check=True)
+            self.assertEqual(output.read_text().splitlines(), [f"sha={first}"])
+            git(root, "commit", "--allow-empty", "-qm", "branch advanced")
+            env["GITHUB_RUN_ATTEMPT"] = "2"
+            output.write_text("", encoding="utf-8")
+            wrong_checkout = subprocess.run(["bash", "-c", source["run"]], cwd=root,
+                                            env=dict(env, PINNED_SHA=tag_object), capture_output=True)
+            self.assertNotEqual(wrong_checkout.returncode, 0)
+            self.assertEqual(output.read_text(), "")
+            subprocess.run(["bash", "-c", source["run"]], cwd=root, env=env, check=True)
+            self.assertEqual(output.read_text().splitlines(), [f"sha={first}"])
+            pin = Path(save["with"]["path"].replace("${{ runner.temp }}", tmp))
+            self.assertEqual(str(pin.parent), restore["with"]["path"].replace("${{ runner.temp }}", tmp))
+            for bad_pin in ("main\n", None):
+                with self.subTest(bad_pin=bad_pin):
+                    if bad_pin is None:
+                        pin.unlink()
+                    else:
+                        pin.write_text(bad_pin, encoding="utf-8")
+                    output.write_text("", encoding="utf-8")
+                    failed = subprocess.run(["bash", "-c", source["run"]], cwd=root, env=env, capture_output=True)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertEqual(output.read_text(), "")
 
 
 if __name__ == "__main__":
