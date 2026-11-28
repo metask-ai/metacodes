@@ -14,6 +14,8 @@ empty `### Migration`.
 
 ## Unreleased
 
+## 0.17.0 — 2026-11-28
+
 ### Changed
 
 - No change a Host can see. The inputs moved for configured model prices:

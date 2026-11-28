@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.14.0 — 2026-11-28
+
 ### Added
 
 - **`METACODES_NO_KEYBOARD_ENHANCEMENT` keeps the TUI's keyboard protocol
