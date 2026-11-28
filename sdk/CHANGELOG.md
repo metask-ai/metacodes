@@ -14,6 +14,14 @@ empty `### Migration`.
 
 ## Unreleased
 
+### Fixed
+
+- No change a Host can see. `JobRegistry.stopWithGrace` now completes its
+  synchronous `TERM` → grace wait → `forceKillAndReap` sequence without
+  publishing `kill_at_ms` to the background deadline sweeper, eliminating a
+  race that could intermittently drop `.time_limit` exit events. ABI
+  revision 29 is unchanged.
+
 ## 0.17.0 — 2026-11-28
 
 ### Changed

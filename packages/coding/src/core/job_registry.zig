@@ -977,21 +977,6 @@ pub const JobRegistry = struct {
         }
     }
 
-    fn killScheduled(self: *JobRegistry, steps: []ExpiryStep) void {
-        var count: usize = 0;
-        self.lock();
-        for (steps) |step| {
-            const entry = self.getPtrLocked(step.id[0..]) orelse continue;
-            const slot = killAtSlot(entry) orelse continue;
-            if (slot.* == null) continue;
-            slot.* = null;
-            steps[count] = step;
-            count += 1;
-        }
-        self.unlock();
-        self.forceKillAndReap(steps[0..count]);
-    }
-
     fn forceKillAndReap(self: *JobRegistry, steps: []const ExpiryStep) void {
         if (steps.len == 0) return;
         for (steps) |step| process.forceKill(step.proc);
@@ -1001,11 +986,14 @@ pub const JobRegistry = struct {
         for (steps) |step| self.commitStoppedLocked(step.id[0..]);
     }
 
-    fn stopWithGrace(self: *JobRegistry, steps: []ExpiryStep) void {
+    fn stopWithGrace(self: *JobRegistry, steps: []const ExpiryStep) void {
         if (steps.len == 0) return;
-        self.sendTerm(steps, util_time);
+        for (steps) |step| {
+            holdBeforeTermInTests();
+            process.terminate(step.proc);
+        }
         util_time.sleepMs(process.KILL_GRACE_MS);
-        self.killScheduled(steps);
+        self.forceKillAndReap(steps);
     }
 
     fn stopExpired(self: *JobRegistry, owner: SessionId, now_ms: util_time.Millis) void {
@@ -1812,6 +1800,61 @@ test "a claimed expiry cannot be killed or reaped by anyone else before its TERM
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqual(JobEventKind{ .time_limit = 60_000 }, events[0].kind);
     try std.testing.expect(!r.get(j.idSlice()).?.stop_in_progress);
+}
+
+test "synchronous expiry stop owns its grace period without racing the sweeper" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var r = try JobRegistry.init(a);
+    defer r.deinit();
+    const owner = @import("metacodes-kernel").session_id.gen();
+    const command = "trap 'echo term' TERM; echo ready; while :; do sleep 0.05; done";
+    const j = try r.spawnBackgroundWatched(command, null, owner, 60_000);
+    try waitForOutput(&r, j.idSlice(), "ready\n".len);
+
+    const Outcome = struct {
+        events_len: usize = 0,
+        status: ?JobStatus = null,
+        kind: ?JobEventKind = null,
+        failed: bool = false,
+    };
+    const Runner = struct {
+        fn run(registry: *JobRegistry, session: SessionId, now_ms: util_time.Millis, out: *Outcome) void {
+            const events = registry.takeUnannouncedExitsAt(session, std.testing.allocator, now_ms) catch {
+                out.failed = true;
+                return;
+            };
+            defer freeJobExitEvents(std.testing.allocator, events);
+            out.events_len = events.len;
+            if (events.len > 0) {
+                out.status = events[0].status;
+                out.kind = events[0].kind;
+            }
+        }
+    };
+
+    var outcome: Outcome = .{};
+    const expired_at = j.started_ms + 60_000;
+    const caller = try std.Thread.spawn(.{}, Runner.run, .{ &r, owner, expired_at, &outcome });
+    var joined = false;
+    defer if (!joined) caller.join();
+
+    try waitForOutput(&r, j.idSlice(), "ready\nterm\n".len);
+    // Once TERM has been sent, stopWithGrace must not publish kill_at_ms to
+    // the background sweeper; otherwise killDue can clear the slot and return
+    // stopWithGrace before commitStoppedLocked finishes.
+    try std.testing.expectEqual(@as(?util_time.Millis, null), r.get(j.idSlice()).?.watchdog.?.kill_at_ms);
+    r.killDue(util_time.nowMs() + 10 * @as(util_time.Millis, @intCast(process.KILL_GRACE_MS)));
+
+    caller.join();
+    joined = true;
+    try std.testing.expect(!outcome.failed);
+    try std.testing.expectEqual(@as(usize, 1), outcome.events_len);
+    try std.testing.expectEqual(@as(?JobStatus, .killed), outcome.status);
+    try std.testing.expectEqual(@as(?JobEventKind, .{ .time_limit = 60_000 }), outcome.kind);
+    const after = r.get(j.idSlice()).?;
+    try std.testing.expectEqual(JobStatus.killed, after.status);
+    try std.testing.expect(!after.stop_in_progress);
 }
 
 fn monitorIndex(r: *JobRegistry, id: []const u8) usize {
