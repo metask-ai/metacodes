@@ -763,6 +763,45 @@ def _check_main_units(assets: Sequence[Path], main_version: str, entry: contract
 
 # ---------------------------------------------------------------- rehearsal
 
+REHEARSAL_PLACEHOLDER = "- Rehearsal placeholder (not a formal release)."
+
+
+def _seed_rehearsal_changelog(root: Path, needs_migration: bool) -> None:
+    """Fill missing `## Unreleased` entries in the scratch rehearsal worktree so
+    `rehearse` can exercise `apply_cut`, packaging and `verify-dist` even right
+    after a reopen when `sdk/CHANGELOG.md` is empty. Malformed changelogs are
+    left untouched for `apply_cut` to refuse."""
+    text = common.read(root, contract.SDK_CHANGELOG)
+    lines = text.splitlines()
+    heads = [i for i, line in enumerate(lines) if line == common.UNRELEASED]
+    if len(heads) != 1:
+        return
+    start = heads[0]
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    block = list(lines[start + 1 : end])
+    changed = False
+    if needs_migration and not has_migration("\n".join(block)):
+        if MIGRATION_HEADING in block:
+            idx = block.index(MIGRATION_HEADING)
+            block[idx + 1 : idx + 1] = ["", REHEARSAL_PLACEHOLDER]
+        else:
+            while block and not block[-1].strip():
+                block.pop()
+            block.extend(["", MIGRATION_HEADING, "", REHEARSAL_PLACEHOLDER])
+        changed = True
+    if not any(line.startswith("- ") for line in block):
+        while block and not block[-1].strip():
+            block.pop()
+        block.extend(["", "### Changed", "", REHEARSAL_PLACEHOLDER])
+        changed = True
+    if not changed:
+        return
+    while block and not block[-1].strip():
+        block.pop()
+    tail = ["", *lines[end:]] if end < len(lines) else []
+    new_lines = lines[: start + 1] + block + tail
+    common.write(root, contract.SDK_CHANGELOG, "\n".join(new_lines).rstrip("\n") + "\n")
+
 
 def rehearse(root: Path, target: str, work: Path, zig: str = "zig", optimize: str = "ReleaseSafe") -> str:
     """Prove the formal path on the real build without releasing anything: in a
@@ -782,6 +821,7 @@ def rehearse(root: Path, target: str, work: Path, zig: str = "zig", optimize: st
         plan = plan_cut(tree)
         if plan.kind != "built":
             return f"nothing to rehearse: this tree would reuse AgentCore {plan.version}"
+        _seed_rehearsal_changelog(tree, changed_abi(contract.load_ledger(tree), plan.abi_revision))
         apply_cut(tree, plan.version, main_version, "2000-01-01")
         common.run(["git", "-c", "user.name=rehearsal", "-c", "user.email=rehearsal@metacodes.invalid", "commit", "-q", "-am", "rehearsal: formal AgentCore"], tree)
         common.run(["git", "tag", main_version], tree)

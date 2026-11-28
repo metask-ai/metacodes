@@ -1138,6 +1138,72 @@ class SumsTest(unittest.TestCase):
             self.assertEqual(sorted(release.parse_sums(target.read_text(encoding="ascii"))), ["metacodes-0.13.0-py3-none-x.whl", "metacodes-node-0.13.0-t.tgz"])
 
 
+class RehearseTest(Tree):
+    def run_rehearse(self) -> str:
+        work = Path(self._tmp.name) / "work"
+        work.mkdir(exist_ok=True)
+        real_run = subprocess.run
+
+        def fake_run(argv, *args, **kwargs):
+            if argv and argv[0] == "zig":
+                return subprocess.CompletedProcess(argv, 0)
+            return real_run(argv, *args, **kwargs)
+
+        with (
+            mock.patch.object(release.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(release, "package_languages", return_value=[]),
+            mock.patch.object(release, "verify_dist", return_value=[]),
+            mock.patch.object(release, "assets_in", return_value=[Path("a"), Path("b")]),
+        ):
+            return release.rehearse(self.root, TARGET, work)
+
+    def test_empty_unreleased_changelog_rehearses_without_relaxing_apply_cut(self) -> None:
+        self.release_built()
+        rc.apply_version(self.root, "0.10.1-dev")
+        (self.root / "src" / "lib.zig").write_text("pub const x = 2;\n", encoding="utf-8")
+        self.commit("fix: internal change without host changelog")
+        before = common.read(self.root, contract.SDK_CHANGELOG)
+
+        outcome = self.run_rehearse()
+        self.assertIn("rehearsed a formal AgentCore 0.13.1", outcome)
+        self.assertEqual(common.read(self.root, contract.SDK_CHANGELOG), before)
+        self.assertEqual(git(self.root, "tag", "-l", "0.10.1"), "")
+        with self.assertRaisesRegex(common.CutError, "a release needs release notes"):
+            release.apply_cut(self.root, "0.13.1", "0.10.1", "2026-11-02")
+
+    def test_abi_bump_rehearses_when_migration_entry_is_missing(self) -> None:
+        self.release_built()
+        rc.apply_version(self.root, "0.11.0-dev")
+        set_revision(self.root, 27)
+        self.commit("feat: bump abi")
+
+        outcome = self.run_rehearse()
+        self.assertIn("rehearsed a formal AgentCore 0.14.0", outcome)
+
+        # Also covers an already-present but empty `### Migration` heading.
+        common.write(self.root, contract.SDK_CHANGELOG, CHANGES + "\n### Migration\n")
+        self.commit("docs: empty migration heading")
+        outcome = self.run_rehearse()
+        self.assertIn("rehearsed a formal AgentCore 0.14.0", outcome)
+
+        with self.assertRaisesRegex(common.CutError, "### Migration"):
+            release.apply_cut(self.root, "0.14.0", "0.11.0", "2026-11-02")
+
+    def test_malformed_changelog_is_still_refused_by_rehearse(self) -> None:
+        self.release_built()
+        rc.apply_version(self.root, "0.10.1-dev")
+        (self.root / "src" / "lib.zig").write_text("pub const x = 2;\n", encoding="utf-8")
+        common.write(self.root, contract.SDK_CHANGELOG, "# AgentCore changelog\n\n## Unreleased\n\n### Bogus\n")
+        self.commit("fix: bogus subsection")
+        with self.assertRaisesRegex(common.CutError, "### Bogus"):
+            self.run_rehearse()
+
+        common.write(self.root, contract.SDK_CHANGELOG, "# AgentCore changelog\n")
+        self.commit("fix: missing unreleased")
+        with self.assertRaisesRegex(common.CutError, "expected exactly one '## Unreleased'"):
+            self.run_rehearse()
+
+
 class WorkflowTest(unittest.TestCase):
     """The door is only a door if the release path goes through it."""
 
