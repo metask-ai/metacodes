@@ -248,6 +248,8 @@ def supervise_remote(remote, spec, env, spec_path, record_path, record, source=N
         time.sleep(0.25)
     remote.hang_up()
     remote.close()  # the session (and its ssh -R) is over: stop the egress proxy
+    if remote.reconnects:
+        record["reconnects"] = remote.reconnects
     stamp_credential(record, source)
     stop = threading.Event()
     timeout = None if remote.exit_code() is not None else min(remote.final_timeout, 120)
