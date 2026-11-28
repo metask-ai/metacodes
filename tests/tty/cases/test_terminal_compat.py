@@ -269,12 +269,20 @@ def _left_on(raw):
     return [name for name, (on, off) in MODE_PAIRS.items() if raw.rfind(on) > raw.rfind(off)]
 
 
+def _mouse_on(env):
+    home = case_tmpdir("cc-tty-mouse-home-")
+    os.makedirs(os.path.join(home, ".metacodes"), exist_ok=True)
+    with open(os.path.join(home, ".metacodes", "config.json"), "w") as f:
+        f.write('{"mouse": true}')
+    return {**env, "HOME": home, "METACODES_HOME": None, "METACODES_NO_MOUSE": None}
+
+
 def test_gnu_screen_gets_no_kitty_or_mouse_and_x10_mouse_reports_type_nothing(bin_path):
     _skip_if_conpty()
     raw = run(bin_path, [READY, "type:ab", "raw:\\x1b[M *,\\x1b[M@4,\\x1b[M#4,", "type:c", "sleep:0.5"],
-              env={"STY": "4242.pts-1.host", "TERM": "screen-256color", "TERM_PROGRAM": "ghostty",
-                   "TMUX": None, "ZELLIJ": None})
-    for sequence in (b"\x1b[>1u", b"\x1b[>4;2m", b"\x1b[?1002h", b"\x1b[?1006h"):
+              env=_mouse_on({"STY": "4242.pts-1.host", "TERM": "screen-256color", "TERM_PROGRAM": "ghostty",
+                             "TMUX": None, "ZELLIJ": None}))
+    for sequence in (b"\x1b[>1u", b"\x1b[>4;2m", b"\x1b[?1002", b"\x1b[?1006"):
         assert sequence not in raw, f"inside GNU screen {sequence!r} should not be sent"
     TTYAssert(raw).assert_input_echo("abc")
 
@@ -282,8 +290,9 @@ def test_gnu_screen_gets_no_kitty_or_mouse_and_x10_mouse_reports_type_nothing(bi
 def test_a_fatal_signal_turns_the_terminal_modes_off_before_the_process_dies(bin_path):
     _skip_if_conpty()
     for name in ("QUIT", "ABRT", "ALRM", "SEGV"):
-        raw = run(bin_path, [READY, f"signal:{name}", "sleep:0.8"], env=WARP)
-        assert b"\x1b[>1u" in raw and b"\x1b[?2004h" in raw, f"SIG{name}: the modes were never turned on"
+        raw = run(bin_path, [READY, f"signal:{name}", "sleep:0.8"], env=_mouse_on(WARP))
+        assert b"\x1b[>1u" in raw and b"\x1b[?2004h" in raw and b"\x1b[?1002h" in raw, \
+            f"SIG{name}: the modes were never turned on"
         left = _left_on(raw)
         assert not left, f"SIG{name} left {left} on for the shell"
 

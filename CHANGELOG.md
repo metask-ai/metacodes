@@ -35,13 +35,6 @@ status, compatibility boundaries, and entry points are defined by
   like every job notification it carries no output bytes. With the feature
   off, the Bash tool and its jobs behave as before.
 
-- **Mouse reporting can be turned off.** Set `METACODES_NO_MOUSE` (to any
-  value) or put `"mouse": false` in `<state root>/config.json` and the TUI
-  leaves mouse reporting off: the wheel scrolls the terminal's scrollback,
-  the terminal's own selection works without a key held, and dragging no
-  longer copies through metacodes
-  ([Terminal setup](doc/TERMINAL_SETUP.md#selecting-text-with-the-mouse)).
-
 - **Ctrl+Z stops metacodes, and `fg` brings it back.** metacodes first hands
   the terminal back (bracketed paste, the keyboard protocol and mouse
   reporting off, line editing on) and stops itself, as programs started from
@@ -118,19 +111,23 @@ status, compatibility boundaries, and entry points are defined by
   ones the model failed. Turning on 自动重跑无效的题 on a profile queues a
   finished dataset's invalid tasks again, at most two rounds per dataset.
 
-- **Dragging over text in the TUI copies it.** On macOS and Linux the
-  interactive TUI reports the mouse; releasing a left-button drag copies the
-  text under it through OSC 52 (and `pbcopy` in a local macOS session), like
-  Claude Code's fullscreen mode. The prompt says where it went: `Copied to
-  clipboard` when `pbcopy` took it, `Sent to the terminal's clipboard` when
-  OSC 52 was the only way, and inside a tmux that keeps programs' OSC 52 to
-  itself `tmux did not pass it on: set-clipboard on`. The wheel no longer
-  scrolls the terminal's scrollback while the TUI
-  runs, at the prompt and during a reply, and the terminal's own selection
-  needs the key that skips mouse reporting: Shift in most terminals, Option
-  in iTerm2, and in VS Code and Cursor on macOS Option once
-  `terminal.integrated.macOptionClickForcesSelection` is on. Apple documents
-  no such key for Terminal; turn mouse reporting off there with ⌘R
+- **Dragging over text in the TUI can copy it.** Put `"mouse": true` in
+  `<state root>/config.json` and, on macOS and Linux, the interactive TUI
+  reports the mouse; releasing a left-button drag copies the text under it
+  through OSC 52 (and `pbcopy` in a local macOS session), like Claude Code's
+  fullscreen mode. The prompt says where it went: `Copied to clipboard` when
+  `pbcopy` took it, `Sent to the terminal's clipboard` when OSC 52 was the
+  only way, and inside a tmux that keeps programs' OSC 52 to itself `tmux did
+  not pass it on: set-clipboard on`. While it is on, the wheel does not
+  scroll the terminal's scrollback, at the prompt or during a reply, and the
+  terminal's own selection needs the key that skips mouse reporting: Shift
+  in most terminals, Option in iTerm2, and in VS Code and Cursor on macOS
+  Option once `terminal.integrated.macOptionClickForcesSelection` is on.
+  Apple documents no such key for Terminal; turn mouse reporting off there
+  with ⌘R. Without the setting the TUI leaves the mouse to the terminal, so
+  the wheel scrolls the scrollback and the terminal's own selection works as
+  before. `METACODES_NO_MOUSE` (any value) keeps mouse reporting off even
+  with the setting, and Windows and GNU screen never turn it on
   ([Terminal setup](doc/TERMINAL_SETUP.md#selecting-text-with-the-mouse)).
 - **File references in replies open with Cmd/Ctrl+click.** The TUI renders a
   Markdown link (`[notes.txt](/abs/notes.txt)`, `[x](src/a.zig:42)`,

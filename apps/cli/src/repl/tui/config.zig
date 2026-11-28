@@ -5,7 +5,7 @@
 //!   null = 文件不存在/无 theme 字段;/theme 命令调 saveTheme(state_root, variant),原子读改写
 //!   (保留其他字段)。
 //! - `startupAnimation`(bool,缺省开):REPL 启动 banner 前读 loadStartupAnimation,只读不写。
-//! - `mouse`(bool,缺省开):启动时 copy_select 读 loadMouse,false 不开鼠标上报,只读不写。
+//! - `mouse`(bool,缺省关):启动时 copy_select 读 loadMouse,true 才开鼠标上报,只读不写。
 //!
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
