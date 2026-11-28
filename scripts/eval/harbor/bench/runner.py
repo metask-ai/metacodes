@@ -7,9 +7,11 @@ environment. Each launch has its own worker so HTTP restarts do not stop jobs.
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -49,6 +51,181 @@ def atomic_json(path, value):
         tmp.replace(path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def lock_path(records, name):
+    return Path(records) / (name + ".lock")
+
+
+def acquire_worker_lock(records, name):
+    path = lock_path(records, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def release_worker_lock(fd):
+    if fd is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def worker_lock_held(records, name):
+    path = lock_path(records, name)
+    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    return True
+                return None
+            size = os.fstat(fd).st_size
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            return None if size == 0 else False
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if isinstance(exc, BlockingIOError) or exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                return True
+            return None
+        size = os.fstat(fd).st_size
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return None if size == 0 else False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def worker_alive(records, name, record_path=None, stale_after=30, process=None, record=None):
+    if process is not None and process.poll() is None:
+        return True
+    held = worker_lock_held(records, name)
+    if held is not None:
+        return held
+    if isinstance(record, dict) and record.get("stop_pending"):
+        return False
+    path = Path(record_path) if record_path is not None else Path(records) / (name + ".json")
+    try:
+        return time.time() - path.stat().st_mtime <= stale_after
+    except OSError:
+        return False
+
+
+def _posix_pgid_processes(pgid):
+    try:
+        done = subprocess.run(["ps", "-e", "-o", "pgid=,stat=,args="], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    found = []
+    for line in done.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            group = int(parts[0])
+        except ValueError:
+            continue
+        if group == pgid and not parts[1].startswith("Z"):
+            found.append(parts[2])
+    return found
+
+
+def local_child_running(child_pid, name):
+    if type(child_pid) is not int or child_pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            os.kill(child_pid, 0)
+            return True
+        except OSError:
+            return False
+    return any(name in args for args in _posix_pgid_processes(child_pid))
+
+
+def stop_local_child(child_pid, name, timeout=20.0):
+    if not local_child_running(child_pid, name):
+        return True, None
+    if os.name == "nt":
+        try:
+            os.kill(child_pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return True, None
+    try:
+        os.killpg(child_pid, signal.SIGINT)
+    except ProcessLookupError:
+        return True, None
+    except OSError as exc:
+        return False, str(exc)
+    deadline = time.monotonic() + max(0.2, float(timeout))
+    while time.monotonic() < deadline:
+        if not _posix_pgid_processes(child_pid):
+            return True, None
+        time.sleep(0.2)
+    try:
+        os.killpg(child_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True, None
+    except OSError as exc:
+        return False, str(exc)
+    kill_deadline = time.monotonic() + 2.0
+    while time.monotonic() < kill_deadline:
+        if not _posix_pgid_processes(child_pid):
+            return True, None
+        time.sleep(0.1)
+    if _posix_pgid_processes(child_pid):
+        return False, "残留本地进程未能终止"
+    return True, None
 
 
 def settings(path):
@@ -134,15 +311,18 @@ class ExecutorUnreachable(ValueError):
 
 
 class RunManager:
-    # A worker rewrites its receipt every two seconds; one older than this
-    # belongs to a worker that stopped.
     STALE_AFTER = 30
+    CHILD_STOP_TIMEOUT = 20.0
+    REMOTE_CANCEL_TIMEOUT = 35.0
 
     def __init__(self, jobs_dir, config_path):
         self.jobs_dir = Path(jobs_dir).expanduser().resolve()
         self.config_path = Path(config_path).expanduser().resolve()
         self.records = self.jobs_dir / ".bench-runs"
         self.lock = threading.Lock()
+        self.reap_lock = threading.Lock()
+        self.processes = {}
+        self.reaping = {}
         self.account_lock = threading.Lock()
         self.account_cache = None
         self.probe_lock = threading.Lock()
@@ -388,14 +568,141 @@ class RunManager:
             path = write_config(Path(directory) / "provider.json", route["config"])
             return route_problem({"auth_mode": "provider", "model": route["model"], "provider_config": path})
 
+    def _worker_alive(self, name, path, record=None):
+        with self.reap_lock:
+            process = self.processes.get(name)
+        return worker_alive(self.records, name, path, self.STALE_AFTER, process=process, record=record)
+
+    def _is_reaping(self, name):
+        with self.reap_lock:
+            thread = self.reaping.get(name)
+            return thread is not None and thread.is_alive()
+
+    def _append_log(self, name, message):
+        try:
+            with (self.records / (name + ".log")).open("a", encoding="utf-8") as handle:
+                handle.write(message + "\n")
+        except OSError:
+            pass
+
+    def _finalize_interrupted(self, name, path, error):
+        current = data.read_json(path)
+        if not isinstance(current, dict) or current.get("status") not in ACTIVE:
+            return
+        if self._worker_alive(name, path, current):
+            return
+        updated = {**current, "status": "interrupted", "finished_at": current.get("finished_at") or now(), "error": error}
+        updated.pop("child_pid", None)
+        updated.pop("stop_pending", None)
+        try:
+            atomic_json(path, updated)
+        except OSError:
+            pass
+
+    def _mark_stop_pending(self, name, path, error):
+        current = data.read_json(path)
+        if not isinstance(current, dict) or current.get("status") not in ACTIVE:
+            return
+        if self._worker_alive(name, path, current):
+            return
+        updated = {**current, "status": "cancelling", "stop_pending": True, "error": error}
+        updated.pop("finished_at", None)
+        try:
+            atomic_json(path, updated)
+        except OSError:
+            pass
+
+    def _start_reap(self, name, path, record):
+        with self.reap_lock:
+            existing = self.reaping.get(name)
+            if existing is not None and existing.is_alive():
+                return
+            thread = threading.Thread(target=self._reap_worker, args=(name, path, dict(record)),
+                                      name=f"bench-reap-{name}", daemon=True)
+            self.reaping[name] = thread
+            thread.start()
+
+    def _reap_worker(self, name, path, initial):
+        try:
+            try:
+                (self.records / (name + ".cancel")).touch()
+            except OSError:
+                pass
+            spec = data.read_json(self.records / (name + ".spec"))
+            spec = spec if isinstance(spec, dict) else {}
+            entry = spec.get("executor") if isinstance(spec.get("executor"), dict) else {}
+            if entry.get("kind") == "ssh":
+                try:
+                    executor = executors.parse({k: v for k, v in entry.items() if v is not None})
+                except ValueError as exc:
+                    confirmed, reason = False, str(exc)
+                else:
+                    confirmed, reason = executors.cancel_remote_run(
+                        executor, name, initial.get("remote_spec_path"),
+                        log=lambda msg: self._append_log(name, msg),
+                        binary=initial.get("remote_node"),
+                        timeout=self.REMOTE_CANCEL_TIMEOUT,
+                    )
+                if confirmed:
+                    self._finalize_interrupted(name, path, "执行进程已停止更新，已终止残留远程评测进程，请检查运行日志")
+                else:
+                    self._mark_stop_pending(
+                        name, path,
+                        f"执行进程已停止更新，未能连接执行机器确认停止远程评测（{reason}）；恢复连接后可再次点击停止",
+                    )
+                return
+            child_pid = initial.get("child_pid")
+            confirmed, reason = stop_local_child(child_pid, name, timeout=self.CHILD_STOP_TIMEOUT)
+            if confirmed:
+                self._finalize_interrupted(name, path, "执行进程已停止更新，已终止残留评测进程，请检查运行日志")
+            else:
+                self._mark_stop_pending(
+                    name, path,
+                    f"执行进程已停止更新，残留本地进程未能确认终止（{reason}）；可再次点击停止重试",
+                )
+        finally:
+            with self.reap_lock:
+                if self.reaping.get(name) is threading.current_thread():
+                    self.reaping.pop(name, None)
+
+    def _reap_or_interrupt(self, name, path, value):
+        if self._is_reaping(name):
+            return {**value, "status": "cancelling", "error": value.get("error") or "执行进程已停止更新，正在终止残留评测进程"}
+        if value.get("stop_pending"):
+            return {**value, "status": "cancelling"}
+        try:
+            (self.records / (name + ".cancel")).touch()
+        except OSError:
+            pass
+        spec = data.read_json(self.records / (name + ".spec"))
+        spec = spec if isinstance(spec, dict) else {}
+        entry = spec.get("executor") if isinstance(spec.get("executor"), dict) else {}
+        needs_remote = entry.get("kind") == "ssh"
+        needs_local = local_child_running(value.get("child_pid"), name)
+        if needs_remote or needs_local:
+            self._start_reap(name, path, value)
+            return {**value, "status": "cancelling", "error": value.get("error") or "执行进程已停止更新，正在终止残留评测进程"}
+        error = value.get("error") or "执行进程已停止更新，请检查运行日志"
+        interrupted = {**value, "status": "interrupted", "finished_at": value.get("finished_at") or now(), "error": error}
+        interrupted.pop("child_pid", None)
+        interrupted.pop("stop_pending", None)
+        try:
+            atomic_json(path, interrupted)
+        except OSError:
+            pass
+        return interrupted
+
     def runs(self):
         result = []
         for path in self.records.glob("*.json"):
             value = data.read_json(path)
             if not isinstance(value, dict) or not data.NAME.fullmatch(value.get("name", "")):
                 continue
-            if value.get("status") in ACTIVE and time.time() - path.stat().st_mtime > self.STALE_AFTER:
-                value = {**value, "status": "interrupted", "error": "执行进程已停止更新，请检查运行日志"}
+            name = value["name"]
+            if self._is_reaping(name):
+                value = {**value, "status": "cancelling", "error": value.get("error") or "执行进程已停止更新，正在终止残留评测进程"}
+            elif value.get("status") in ACTIVE and not self._worker_alive(name, path, value):
+                value = self._reap_or_interrupt(name, path, value)
             result.append(value)
         return sorted(result, key=lambda r: r.get("created_at", ""), reverse=True)
 
@@ -638,7 +945,18 @@ class RunManager:
                     process = subprocess.Popen([sys.executable, "-m", "scripts.eval.harbor.bench.worker", str(spec_path)],
                                                cwd=str(Path(__file__).resolve().parents[4]), env=runtime_env(),
                                                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-                    threading.Thread(target=process.wait, daemon=True).start()
+                    with self.reap_lock:
+                        self.processes[name] = process
+
+                    def watch(proc=process, run_name=name):
+                        try:
+                            proc.wait()
+                        finally:
+                            with self.reap_lock:
+                                if self.processes.get(run_name) is proc:
+                                    self.processes.pop(run_name, None)
+
+                    threading.Thread(target=watch, daemon=True).start()
             except OSError:
                 atomic_json(self.records / (name + ".json"), {**record, "status": "failed", "error": "无法启动执行进程"})
                 raise ValueError("无法启动执行进程")
@@ -648,6 +966,8 @@ class RunManager:
         record = next((r for r in self.runs() if r["name"] == name), None)
         if record is None or record["status"] not in ACTIVE:
             raise ValueError("运行不存在或已结束")
+        if record["status"] == "cancelling" or record.get("stop_pending"):
+            raise ValueError("运行正在停止，不能调整并发")
         if record.get("runner") == suites.WORKBUDDY:
             raise ValueError("WorkBuddy 评测运行中不能调整并发")
         live_concurrency.write(self.records / (name + ".concurrency"), concurrency)
@@ -661,6 +981,9 @@ class RunManager:
             raise ValueError("运行不存在")
         if record["status"] in ACTIVE:
             (self.records / (name + ".cancel")).touch()
+            if record.get("stop_pending"):
+                self._start_reap(name, self.records / (name + ".json"), record)
+                return {"name": name, "status": "cancelling", "cancel_requested": True}
         return {"name": name, "status": record["status"], "cancel_requested": True}
 
 

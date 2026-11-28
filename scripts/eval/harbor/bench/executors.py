@@ -34,6 +34,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1761,6 +1762,120 @@ class RemoteRun:
                 "retry": "metacodes bench sync --run " + self.spec["name"]}
 
 
+def cancel_remote_run(executor: SshExecutor, name: str, remote_spec_path: Optional[str] = None, *,
+                      log: Callable[[str], None] = lambda _message: None, binary: Optional[str] = None,
+                      popen=subprocess.Popen, timeout: float = 35.0) -> Tuple[bool, Optional[str]]:
+    target = remote_spec_path or (executor.remote("runs", name) + "/spec.json")
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    last_error = None
+    while time.monotonic() < deadline:
+        argv = node_argv(executor, "attach", target, binary=binary)
+        log("$ " + display(argv) + "  （终止残留远程运行）")
+        try:
+            process = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+        except OSError as exc:
+            return False, str(exc)
+        events = []
+        stderr_chunks = []
+
+        def read_stdout():
+            if process.stdout is None:
+                return
+            try:
+                for line in process.stdout:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict):
+                        events.append(event)
+            except OSError:
+                pass
+
+        def read_stderr():
+            if process.stderr is None:
+                return
+            try:
+                for chunk in iter(lambda: process.stderr.read(4096), b""):
+                    stderr_chunks.append(chunk)
+            except OSError:
+                pass
+
+        out_thread = threading.Thread(target=read_stdout, daemon=True)
+        err_thread = threading.Thread(target=read_stderr, daemon=True)
+        out_thread.start()
+        err_thread.start()
+        try:
+            if process.stdin is not None:
+                process.stdin.write(b"cancel\n")
+                process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        handed_off = False
+        ended = False
+        while time.monotonic() < deadline:
+            snapshot = list(events)
+            if any(e.get("event") in ("exit", "error") for e in snapshot):
+                ended = True
+                break
+            if any(e.get("event") == "handoff" for e in snapshot):
+                handed_off = True
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+        if process.poll() is None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except OSError:
+                pass
+            if not ended:
+                try:
+                    if os.name == "nt":
+                        process.terminate()
+                    else:
+                        signal_group(process, signal.SIGTERM)
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        signal_group(process, signal.SIGKILL)
+                    process.wait(timeout=3)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        out_thread.join(timeout=2)
+        err_thread.join(timeout=2)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        snapshot = list(events)
+        if any(e.get("event") in ("exit", "error") for e in snapshot):
+            return True, None
+        if handed_off or any(e.get("event") == "handoff" for e in snapshot):
+            time.sleep(0.2)
+            continue
+        code = process.returncode
+        if code in (0, 3):
+            return True, None
+        if code == 75:
+            time.sleep(0.5)
+            continue
+        stderr_text = b"".join(stderr_chunks).decode(errors="replace").strip()
+        last_error = stderr_text[-300:] if stderr_text else f"SSH 退出码 {code}"
+        break
+    return False, last_error or "连接执行机器超时"
+
+
 RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]*$")
 
 
@@ -1789,7 +1904,7 @@ def _has_archived_mirror(local, store_config, spec):
 
 
 def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float], store_config) -> Dict:
-    from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json
+    from scripts.eval.harbor.bench.runner import ACTIVE, RunManager, atomic_json, worker_alive
     records = Path(jobs_dir) / ".bench-runs"
     record_path, spec_path = records / (name + ".json"), records / (name + ".spec")
     try:
@@ -1799,8 +1914,8 @@ def _sync_run(jobs_dir: Path, name: str, log, timeout: Optional[float], store_co
         raise ValueError("运行不存在：" + name) from None
     if (spec.get("executor") or {}).get("kind") != "ssh":
         raise ValueError(name + " 不是在 SSH 执行机器上运行的，结果已在本机")
-    fresh = time.time() - record_path.stat().st_mtime <= RunManager.STALE_AFTER
-    if record.get("status") in ACTIVE and fresh:
+    if record.get("status") in ACTIVE and (
+            record.get("stop_pending") or worker_alive(records, name, record_path, RunManager.STALE_AFTER)):
         raise ValueError(name + " 仍在运行；它结束时会自己同步结果")
     remote = RemoteRun(spec, log=log)
     local = jobs_dir / name

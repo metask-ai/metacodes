@@ -522,6 +522,11 @@ class ProfileManager:
                         item.update(status="skipped", finished_at=now())
                     elif item["status"] == "running":
                         item["cancel_requested"] = True
+                        if item.get("run"):
+                            try:
+                                self.runs.cancel(item["run"])
+                            except ValueError:
+                                pass
                 self.save(record)
             elif action == "delete":
                 if any(item["status"] not in ITEM_DONE for item in items):
@@ -636,6 +641,9 @@ class ProfileManager:
                         self.runs.cancel(run["name"])
                     except ValueError:
                         pass
+                if run.get("stop_pending") and current.get("error") != run.get("error"):
+                    current["error"] = run.get("error")
+                    self.save(record)
                 return
             current.update(status=run["status"] if run else "interrupted",
                            error=(run or {}).get("error") or (None if run else "运行记录丢失"),
