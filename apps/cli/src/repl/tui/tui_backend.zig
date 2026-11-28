@@ -645,12 +645,14 @@ pub const TuiBackend = struct {
                 const Ctx = struct {
                     threadlocal var tool: []const u8 = "";
                     threadlocal var args: []const u8 = "";
+                    threadlocal var always_comes_back: bool = false;
                     fn run(fd: c_int, th: Theme, a: std.mem.Allocator) perm_dialog.PermissionChoice {
-                        return perm_dialog.promptLoop(a, th, fd, 2, tool, args) orelse .deny_once;
+                        return perm_dialog.promptLoop(a, th, fd, 2, tool, args, always_comes_back) orelse .deny_once;
                     }
                 };
                 Ctx.tool = p.tool;
                 Ctx.args = p.args;
+                Ctx.always_comes_back = if (title_app) |a| alwaysComesBack(a) else false;
                 const choice = self.withTerminalTakeover(perm_dialog.PermissionChoice, &Ctx.run) orelse .deny_once;
                 out.* = .{ .permission = choice };
             },
@@ -661,6 +663,11 @@ pub const TuiBackend = struct {
                 return error.CustomUiUnsupported;
             },
         }
+    }
+
+    fn alwaysComesBack(app: *const app_mod.App) bool {
+        const ctx = &app.permission_ctx;
+        return perm_dialog.alwaysComesBack(ctx.always_allow == .settings_file, ctx.match_ctx.home, ctx.match_ctx.project_root, app.project_dir);
     }
 
     /// trampoline:ToolContext.ui_request_fn 的 *anyopaque state → *TuiBackend。
