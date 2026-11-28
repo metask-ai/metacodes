@@ -85,6 +85,7 @@ pub const TermGate = struct {
 };
 
 pub var test_term_gate: ?*TermGate = null;
+var test_grace_gate: ?*TermGate = null;
 
 fn holdBeforeTermInTests() void {
     if (!@import("builtin").is_test) return;
@@ -328,7 +329,7 @@ pub const JobRegistry = struct {
     fn sweepDue(self: *JobRegistry, steps: *std.ArrayList(ExpiryStep), clock: anytype) void {
         steps.clearRetainingCapacity();
         self.claimExpired(null, clock.nowMs(), steps);
-        self.sendTerm(steps.items, clock);
+        self.sendTermAndSchedule(steps.items, clock);
         self.killDue(clock.nowMs());
     }
 
@@ -941,7 +942,7 @@ pub const JobRegistry = struct {
         }
     }
 
-    fn sendTerm(self: *JobRegistry, steps: []const ExpiryStep, clock: anytype) void {
+    fn sendTermAndSchedule(self: *JobRegistry, steps: []const ExpiryStep, clock: anytype) void {
         for (steps) |step| {
             holdBeforeTermInTests();
             process.terminate(step.proc);
@@ -977,21 +978,6 @@ pub const JobRegistry = struct {
         }
     }
 
-    fn killScheduled(self: *JobRegistry, steps: []ExpiryStep) void {
-        var count: usize = 0;
-        self.lock();
-        for (steps) |step| {
-            const entry = self.getPtrLocked(step.id[0..]) orelse continue;
-            const slot = killAtSlot(entry) orelse continue;
-            if (slot.* == null) continue;
-            slot.* = null;
-            steps[count] = step;
-            count += 1;
-        }
-        self.unlock();
-        self.forceKillAndReap(steps[0..count]);
-    }
-
     fn forceKillAndReap(self: *JobRegistry, steps: []const ExpiryStep) void {
         if (steps.len == 0) return;
         for (steps) |step| process.forceKill(step.proc);
@@ -1003,9 +989,18 @@ pub const JobRegistry = struct {
 
     fn stopWithGrace(self: *JobRegistry, steps: []ExpiryStep) void {
         if (steps.len == 0) return;
-        self.sendTerm(steps, util_time);
+        for (steps) |step| {
+            holdBeforeTermInTests();
+            process.terminate(step.proc);
+        }
+        if (@import("builtin").is_test) {
+            if (test_grace_gate) |gate| {
+                gate.reached.store(true, .release);
+                while (!gate.released.load(.acquire)) util_time.sleepMs(1);
+            }
+        }
         util_time.sleepMs(process.KILL_GRACE_MS);
-        self.killScheduled(steps);
+        self.forceKillAndReap(steps);
     }
 
     fn stopExpired(self: *JobRegistry, owner: SessionId, now_ms: util_time.Millis) void {
@@ -1816,6 +1811,102 @@ test "a claimed expiry cannot be killed or reaped by anyone else before its TERM
 
 fn monitorIndex(r: *JobRegistry, id: []const u8) usize {
     return r.index.get(id[0..12].*).?;
+}
+
+test "synchronous watchdog and monitor stops retain ownership through the grace period" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Mode = enum { watchdog, monitor, flooding };
+    for ([_]Mode{ .watchdog, .monitor, .flooding }) |mode| {
+        var r = try JobRegistry.init(a);
+        defer r.deinit();
+        const owner = @import("metacodes-kernel").session_id.gen();
+        const command = "trap '' TERM; echo ready; while :; do echo spam; sleep 0.01; done";
+        const j = switch (mode) {
+            .watchdog => try r.spawnBackgroundWatched(command, null, owner, 60_000),
+            .monitor => try r.spawnMonitorOwned(command, null, owner, "expiry", 60_000),
+            .flooding => try r.spawnMonitorOwned(command, null, owner, "flood", null),
+        };
+        try waitForOutput(&r, j.idSlice(), "ready\n".len);
+        const expired_at = j.started_ms + 60_000;
+        if (mode == .flooding) {
+            r.lock();
+            defer r.unlock();
+            const state = &r.jobs.items[monitorIndex(&r, j.idSlice())].kind.monitor;
+            state.tokens = 0;
+            state.refilled_ms = std.math.maxInt(i64) / 2;
+            state.over_budget_since_ms = expired_at - monitor_stream.OVER_BUDGET_STOP_MS;
+        }
+        var gate: TermGate = .{};
+        test_grace_gate = &gate;
+        defer test_grace_gate = null;
+        const Taker = struct {
+            registry: *JobRegistry,
+            session: SessionId,
+            job: JobEntry,
+            mode: Mode,
+            now_ms: util_time.Millis,
+            failure: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                self.take() catch |err| {
+                    self.failure = err;
+                };
+            }
+
+            fn take(self: *@This()) !void {
+                if (self.mode == .watchdog) {
+                    const events = try self.registry.takeUnannouncedExitsAt(self.session, std.testing.allocator, self.now_ms);
+                    defer freeJobExitEvents(std.testing.allocator, events);
+                    try std.testing.expectEqual(@as(usize, 1), events.len);
+                    try std.testing.expectEqual(JobStatus.killed, events[0].status);
+                    try std.testing.expectEqual(JobEventKind{ .time_limit = 60_000 }, events[0].kind);
+                } else {
+                    const notices = try self.registry.takeMonitorEvents(self.session, std.testing.allocator, self.now_ms);
+                    defer monitor_stream.freeNotices(std.testing.allocator, notices);
+                    if (self.mode == .monitor) {
+                        try std.testing.expectEqual(@as(usize, 1), notices.len);
+                        try std.testing.expect(notices[0].end.? == .expired);
+                    }
+                }
+                const stopped = self.registry.get(self.job.idSlice()).?;
+                try std.testing.expectEqual(JobStatus.killed, stopped.status);
+                try std.testing.expect(!stopped.stop_in_progress);
+                if (self.mode == .flooding) {
+                    const notices = try self.registry.takeMonitorEvents(self.session, std.testing.allocator, self.now_ms);
+                    defer monitor_stream.freeNotices(std.testing.allocator, notices);
+                    try std.testing.expectEqual(@as(usize, 1), notices.len);
+                    try std.testing.expectEqual(@as(?monitor_stream.End, .too_much_output), notices[0].end);
+                }
+            }
+        };
+        var taker: Taker = .{ .registry = &r, .session = owner, .job = j, .mode = mode, .now_ms = expired_at };
+        const thread = try std.Thread.spawn(.{}, Taker.run, .{&taker});
+        var joined = false;
+        defer if (!joined) {
+            gate.released.store(true, .release);
+            thread.join();
+        };
+        var attempts: usize = 0;
+        while (!gate.reached.load(.acquire) and attempts < 5_000) : (attempts += 1) util_time.sleepMs(1);
+        try std.testing.expect(gate.reached.load(.acquire));
+        const later = expired_at + 10 * @as(util_time.Millis, @intCast(process.KILL_GRACE_MS));
+        r.killDue(later);
+        const held = r.get(j.idSlice()).?;
+        try std.testing.expectEqual(JobStatus.running, held.status);
+        try std.testing.expect(held.stop_in_progress);
+        try std.testing.expectEqual(@as(?util_time.Millis, null), JobRegistry.scheduledKill(&held));
+        {
+            r.lock();
+            defer r.unlock();
+            try std.testing.expectEqual(@as(?u64, null), r.nextExpiryWaitLocked(later));
+        }
+        try std.testing.expectEqual(process.ReapStatus.running, process.reapNonblock(held.proc));
+        gate.released.store(true, .release);
+        thread.join();
+        joined = true;
+        if (taker.failure) |err| return err;
+    }
 }
 
 fn waitForStdout(r: *JobRegistry, id: []const u8) !void {
