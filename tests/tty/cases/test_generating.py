@@ -6,7 +6,7 @@ key_events 用够长 sleep 落在生成窗口内。
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run, wait_for
+from tty_driver import IDLE, READY, run, wait_for
 from asserts import TTYAssert
 from e2e_helpers import run_live_fresh, require_model  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
 
@@ -219,8 +219,8 @@ def test_esc_with_draft_interrupts_then_resends_draft(bin_path):
         simple_text("RESENT_OK"),
     ]) as srv:
         raw = run(bin_path, [
-            "sleep:0.8", "type:first", "key:enter", "sleep:0.8",
-            "type:DRAFTED", "sleep:0.3", "key:esc", "sleep:4.0",
+            READY, "type:first", "key:enter", wait_for("esc to interrupt", 15),
+            "type:DRAFTED", "key:esc", wait_for("RESENT_OK", 15), IDLE,
         ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
 
     assert b"Interrupted" in raw, "带 draft 的 Esc 没有中断当前推理"
@@ -236,8 +236,8 @@ def test_empty_esc_and_ctrl_c_interrupt_generation(bin_path):
     for key in ("esc", "ctrl_c"):
         with SlowMockServer([slow_text_then_end(n_chunks=40, delay=0.3)]) as srv:
             raw = run(bin_path, [
-                "sleep:0.8", "type:interrupt-me", "key:enter", "sleep:0.8",
-                f"key:{key}", "sleep:2.0",
+                READY, "type:interrupt-me", "key:enter", wait_for("esc to interrupt", 15),
+                f"key:{key}", wait_for("Interrupted", 15), IDLE,
             ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
         assert b"Interrupted" in raw, f"空框 {key} 没有中断慢请求"
 
@@ -523,12 +523,16 @@ def test_completion_spinner_never_commits_to_history(bin_path):
     from asserts import split_frames
 
     # 两轮短对话(各 ~1.6s),复刻用户"在么 / 你是谁"多轮场景。离线 mock,确定性。
-    turns = [slow_text_then_end(n_chunks=4, delay=0.4), slow_text_then_end(n_chunks=4, delay=0.4)]
+    turns = [slow_text_then_end(n_chunks=4, delay=0.4),
+             slow_text_then_end(n_chunks=4, delay=0.4).replace(b'"text":"tok', b'"text":"second_tok')]
     with SlowMockServer(turns) as srv:
         raw = run(bin_path,
-                  ["sleep:0.8", "type:在么", "key:enter", "sleep:3.0",
-                   "type:你是谁", "key:enter", "sleep:3.0"],
+                  [READY, "type:在么", "key:enter", wait_for("tok3", 15), IDLE,
+                   "type:你是谁", "key:enter", wait_for("second_tok3", 15), IDLE],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.06, term_size=(24, 80))
+
+    assert len(srv.requests) == 2, "两轮对话必须都提交到 mock server"
+    assert TTYAssert(raw).final.find_last_row("second_tok3") is not None, "第二轮回复没有完成"
 
     # committed scrollback(帧间散文本 = 真正进历史区的字节)。
     prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"",
@@ -574,7 +578,7 @@ def test_logs_never_leak_into_tui_render_stream(bin_path):
     OK_SSE = (
         b'data: {"type":"message_start","message":{"id":"m","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
         b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
-        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"RECOVERED_OK"}}\n\n'
         b'data: {"type":"content_block_stop","index":0}\n\n'
         b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
         b'data: {"type":"message_stop"}\n\n'
@@ -605,11 +609,14 @@ def test_logs_never_leak_into_tui_render_stream(bin_path):
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        raw = run(bin_path, ["sleep:0.8", "type:hi", "key:enter", "sleep:5"],
+        raw = run(bin_path, [READY, "type:hi", "key:enter", wait_for("RECOVERED_OK", 20), IDLE],
                   base_url="http://127.0.0.1:%d/v1/messages" % port,
                   startup_drain=0.8, per_key_drain=0.05, term_size=(24, 80))
     finally:
         srv.shutdown()
+
+    assert state["n"] >= 3, "HTTP 500 重试未到达成功响应"
+    assert TTYAssert(raw).final.find_last_row("RECOVERED_OK") is not None, "重试成功回复没有显示"
 
     det = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
     # 核心:任何日志前缀都不得出现在 TUI 渲染流里(否则注入固定区 → 残影)。
@@ -804,9 +811,11 @@ def test_generation_frames_are_synchronized(bin_path):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_port}/v1/messages"
     try:
-        raw = run(bin_path, ["sleep:0.8", "type:hi", "key:enter", "sleep:2.5"], base_url=url)
+        raw = run(bin_path, [READY, "type:hi", "key:enter", wait_for("world", 15), IDLE], base_url=url)
     finally:
         srv.shutdown()
+
+    assert TTYAssert(raw).final.find_last_row("world") is not None, "慢流回复没有完成"
 
     nb = raw.count(b"\x1b[?2026h")
     ne = raw.count(b"\x1b[?2026l")

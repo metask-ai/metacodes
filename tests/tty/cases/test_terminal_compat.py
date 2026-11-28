@@ -13,7 +13,7 @@ macos-26 runner 上首个输入框实测晚到过 2.2 s(启动后 0.8 + 0.8 s �
 import os
 import sys
 
-from tty_driver import READY, case_tmpdir, run
+from tty_driver import READY, case_tmpdir, run, wait_for
 from asserts import TTYAssert
 from screen import Screen
 
@@ -233,7 +233,7 @@ def test_windows_console_shift_enter_record_is_a_newline(bin_path):
     a.assert_line_contains(a.footer_row(), "shift + ")
 
     enter = _win32_records("13;28;13;1;0;1", "13;28;13;0;0;1")
-    raw = run(bin_path, [READY, "type:aa", enter, "sleep:0.8"])
+    raw = run(bin_path, [READY, "type:aa", enter, wait_for("esc to interrupt", 15)])
     a = TTYAssert(raw)
     a.assert_input_echo("")
     sc = Screen(24, 80)
