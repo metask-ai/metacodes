@@ -328,6 +328,138 @@ class ProfileTest(unittest.TestCase):
         latest, _ = workbench_module.latest_results(record, {'a': view('a', 'pass'), 'b': view('b', 'fail')})
         self.assertEqual(latest[('terminal-bench-2.1', 'm', 'fix-git')][1], 'b')
 
+    def test_authoritative_evaluation_overrides_profile_stats_tasks_and_clears_on_delete(self):
+        first = self.wait_profile(self.client.request('api/profiles/run', self.request())['id'])
+        pid = first['id']
+        run1_tb21 = first['items'][0]['run']
+        run1_tb20 = first['items'][1]['run']
+        sub1 = first['items'][0]['submission']
+
+        extra_trial = self.manager.jobs_dir / run1_tb21 / 'extra-task__fake'
+        _write(extra_trial / 'config.json', {})
+        _write(extra_trial / 'result.json', {
+            'task_name': 'terminal-bench/extra-task', 'started_at': '2026-11-16T08:00:00Z',
+            'finished_at': '2026-11-16T08:01:00Z', 'verifier_result': {'rewards': {'reward': 1.0}}})
+
+        second = self.wait_profile(self.client.request('api/profiles/run', {
+            'profile': pid, 'model': 'tokenjoy/test-model', 'attempts': 1,
+            'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}],
+        })['id'])
+        run2_tb21 = second['items'][2]['run']
+        trial2 = self.manager.jobs_dir / run2_tb21 / 'fix-git__fake' / 'result.json'
+        result2 = json.loads(trial2.read_text(encoding='utf-8'))
+        result2['verifier_result'] = {'rewards': {'reward': 0.0}}
+        trial2.write_text(json.dumps(result2), encoding='utf-8')
+        self.workbench.library.sync(verify=True)
+
+        default_view = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(default_view['authoritative'], {})
+        default_tasks = {(t['suite'], t['task']): t for t in default_view['tasks']}
+        self.assertEqual(default_tasks[('terminal-bench-2.1', 'fix-git')]['job'], run2_tb21)
+        self.assertEqual(default_tasks[('terminal-bench-2.1', 'fix-git')]['first_status'], 'fail')
+        self.assertEqual(default_tasks[('terminal-bench-2.1', 'fix-git')]['history'], [run1_tb21])
+        self.assertEqual(default_tasks[('terminal-bench-2.1', 'extra-task')]['job'], run1_tb21)
+        self.assertEqual(default_view['summary']['counts']['pass'], 2)
+        self.assertEqual(default_view['summary']['counts']['fail'], 1)
+
+        pinned1 = self.client.request('api/profile/authoritative', {
+            'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run1_tb21,
+        })
+        self.assertEqual(pinned1['authoritative'], {'terminal-bench-2.1': {'tokenjoy/test-model': run1_tb21}})
+        self.assertTrue(pinned1['items'][0]['authoritative'])
+        self.assertFalse(pinned1['items'][2]['authoritative'])
+        view1 = self.client.request('api/profile?id=' + pid)
+        tasks1 = {(t['suite'], t['task']): t for t in view1['tasks']}
+        self.assertEqual(tasks1[('terminal-bench-2.1', 'fix-git')]['job'], run1_tb21)
+        self.assertEqual(tasks1[('terminal-bench-2.1', 'fix-git')]['first_status'], 'pass')
+        self.assertTrue(tasks1[('terminal-bench-2.1', 'fix-git')]['authoritative'])
+        self.assertEqual(tasks1[('terminal-bench-2.1', 'fix-git')]['submission_label'], '作业 1')
+        self.assertEqual(tasks1[('terminal-bench-2.1', 'fix-git')]['history'], [run2_tb21])
+        self.assertEqual(view1['summary']['counts']['pass'], 3)
+        self.assertEqual(view1['summary']['counts']['fail'], 0)
+        overview1 = next(p for p in self.client.request('api/jobs')['profiles'] if p['id'] == pid)
+        self.assertEqual((overview1['summary']['counts']['pass'], overview1['summary']['counts']['fail']), (3, 0))
+        job1 = self.client.request('api/job?name=' + run1_tb21)
+        self.assertEqual((job1['authoritative'], job1['submission_label']), (True, '作业 1'))
+
+        self.client.request('api/profile/authoritative', {
+            'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run2_tb21,
+        })
+        view2 = self.client.request('api/profile?id=' + pid)
+        tasks2 = {(t['suite'], t['task']): t for t in view2['tasks']}
+        self.assertEqual(sorted(tasks2), [('terminal-bench-2.0', 'fix-git'), ('terminal-bench-2.1', 'fix-git')])
+        self.assertEqual(tasks2[('terminal-bench-2.1', 'fix-git')]['job'], run2_tb21)
+        self.assertEqual(tasks2[('terminal-bench-2.1', 'fix-git')]['first_status'], 'fail')
+        self.assertEqual(tasks2[('terminal-bench-2.1', 'fix-git')]['history'], [run1_tb21])
+        self.assertEqual(tasks2[('terminal-bench-2.0', 'fix-git')]['job'], run1_tb20)
+        self.assertEqual((view2['summary']['counts']['pass'], view2['summary']['counts']['fail']), (1, 1))
+        overview2 = next(p for p in self.client.request('api/jobs')['profiles'] if p['id'] == pid)
+        self.assertEqual((overview2['summary']['counts']['pass'], overview2['summary']['counts']['fail']), (1, 1))
+
+        cleared = self.client.request('api/profile/authoritative', {
+            'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': None,
+        })
+        self.assertEqual(cleared['authoritative'], {})
+        reverted = self.client.request('api/profile?id=' + pid)
+        self.assertEqual((reverted['summary']['counts']['pass'], reverted['summary']['counts']['fail']), (2, 1))
+
+        self.client.request('api/profile/authoritative', {
+            'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run2_tb21,
+        })
+        self.client.request('api/job/delete', {'name': run2_tb21})
+        after_job_delete = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(after_job_delete['authoritative'], {})
+        stored_record = next(r for r in self.workbench.library.profile_records() if r['id'] == pid)
+        self.assertNotIn('authoritative', stored_record)
+
+        self.client.request('api/profile/authoritative', {
+            'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run1_tb21,
+        })
+        self.client.request('api/profile/submission', {'id': pid, 'submission': sub1, 'action': 'delete'})
+        after_sub_delete = self.client.request('api/profile?id=' + pid)
+        self.assertEqual(after_sub_delete['authoritative'], {})
+
+        with self.assertRaisesRegex(ValueError, '不属于'):
+            self.client.request('api/profile/authoritative', {
+                'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run1_tb20,
+            })
+        with self.assertRaisesRegex(ValueError, '不存在'):
+            self.client.request('api/profile/authoritative', {
+                'id': 'profile-missing', 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run1_tb21,
+            })
+        foreign = {'id': 'profile-elsewhere', 'status': 'finished', 'items': [], 'created_at': '2026-01-01T00:00:00Z'}
+        with patch.object(self.workbench.library, 'profile_records', return_value=[foreign]), \
+                self.assertRaisesRegex(ValueError, '其他 jobs 目录'):
+            self.client.request('api/profile/authoritative', {
+                'id': 'profile-elsewhere', 'suite': 'terminal-bench-2.1', 'model': 'm', 'run': None,
+            })
+
+    def test_authoritative_rejects_running_item_and_hides_pending_tasks_for_pinned_suite(self):
+        self.manager.profiles.stop()
+        self.manager.profiles._thread.join()
+        first = self.client.request('api/profiles/run', self.request(items=[{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git']}]))
+        pid = first['id']
+        self.wait_profile(pid)
+        run1 = self.manager.profiles.get(pid)['items'][0]['run']
+        self.client.request('api/profile/authoritative', {
+            'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run1,
+        })
+        self.client.request('api/profiles/run', {
+            'profile': pid, 'model': 'tokenjoy/test-model', 'attempts': 1,
+            'items': [{'suite': 'terminal-bench-2.1', 'tasks': ['fix-git', 'cancel-async-tasks']}],
+        })
+        view = self.client.request('api/profile?id=' + pid)
+        self.assertEqual([t['task'] for t in view['tasks']], ['fix-git'])
+        with patch.dict(os.environ, {'FAKE_BENCH_RELEASE_FILE': str(self.root / 'hold-auth')}):
+            self.manager.profiles.advance()
+            run2 = self.manager.profiles.get(pid)['items'][1]['run']
+            with self.assertRaisesRegex(ValueError, '结束后再设为权威'):
+                self.client.request('api/profile/authoritative', {
+                    'id': pid, 'suite': 'terminal-bench-2.1', 'model': 'tokenjoy/test-model', 'run': run2,
+                })
+            self.client.request('api/profile/cancel', {'id': pid})
+        self.wait_profile(pid)
+
     def unreachable_launches(self, down):
         """RunManager.launch refusing real launches while `down` is set, as
         an SSH executor that does not answer would."""
