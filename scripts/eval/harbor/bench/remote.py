@@ -68,6 +68,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -86,6 +87,7 @@ from scripts.eval.harbor import live_concurrency
 
 DELTA_CHECK_BYTES = 64 * 1024  # executors.DELTA_CHECK_BYTES
 DETACH_GRACE = 1800
+HEARTBEAT_INTERVAL = 2.0
 SOCKET_ROOT = "/tmp"  # short: AF_UNIX paths are limited to about 100 bytes
 DRIVER_PID = "driver.pid"
 END_EVENT = "end.json"
@@ -753,13 +755,20 @@ def dataset_selection(argv):
     return dataset, [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-i"]
 
 
+def heartbeat_interval():
+    try:
+        interval = float(os.environ.get("METACODES_BENCH_HEARTBEAT_INTERVAL") or HEARTBEAT_INTERVAL)
+    except ValueError:
+        return HEARTBEAT_INTERVAL
+    return interval if math.isfinite(interval) and interval > 0 else HEARTBEAT_INTERVAL
+
+
 def beating(phase, stop, work):
-    """work() with a heartbeat every 2 s: preparation can outlast the
-    worker's 90 s heartbeat window."""
+    interval = heartbeat_interval()
     done = threading.Event()
 
     def beat():
-        while not done.wait(2):
+        while not done.wait(interval):
             emit("heartbeat", phase=phase)
     threading.Thread(target=beat, daemon=True).start()
     try:
@@ -992,6 +1001,7 @@ def follow(harbor, stop, hung_up, run_dir, control, handoff, finishing, worker_r
     if handoff is not None:
         handoff.offer(harbor, control)
     interrupted_at = None
+    interval = heartbeat_interval()
     last = 0.0
     while True:
         ended = harbor.result()
@@ -1005,10 +1015,10 @@ def follow(harbor, stop, hung_up, run_dir, control, handoff, finishing, worker_r
             harbor.signal(signal.SIGINT)
         if interrupted_at and time.monotonic() - interrupted_at > 20:
             harbor.signal(signal.SIGKILL)
-        if time.monotonic() - last > 2:
+        if time.monotonic() - last >= interval:
             emit("heartbeat")
             last = time.monotonic()
-        time.sleep(0.25)
+        time.sleep(min(0.25, interval / 4))
     harbor.ended.set()
     output.join(5)
     finishing()
