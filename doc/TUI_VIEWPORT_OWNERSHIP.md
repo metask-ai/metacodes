@@ -167,14 +167,14 @@ first would have to come with a change to this record.
 
 ### Copy on select
 
-While the TUI reports the mouse (macOS and Linux), `screen_mirror` keeps a
-copy of the main screen: the Renderer's `flush`, the command output and the region
-dialogs feed it the bytes they write, and it applies the subset of VT the
-REPL sends. It writes nothing. A drag asks for the cursor position
-(`ESC[6n`) and sends the copied text as OSC 52, both through
-`emitTerminal`; neither moves the cursor or touches the grid. The mirror
-records its own cursor row when it sees the query, and the answer gives the
-row's place on the screen.
+While the TUI reports the mouse (`"mouse": true` in `config.json`, macOS and
+Linux), `screen_mirror` keeps a copy of the main screen: the Renderer's
+`flush`, the command output and the region dialogs feed it the bytes they
+write, and it applies the subset of VT the REPL sends. It writes nothing. A
+drag asks for the cursor position (`ESC[6n`) and sends the copied text as
+OSC 52, both through `emitTerminal`; neither moves the cursor or touches the
+grid. The mirror records its own cursor row when it sees the query, and the
+answer gives the row's place on the screen.
 
 ### Review checklist
 
