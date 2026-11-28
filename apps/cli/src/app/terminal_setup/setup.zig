@@ -969,7 +969,13 @@ test "SSH terminal signals reach the process consumers and screen never enables 
     const was_mouse = input.mouseSelectionOn();
     defer input.recordMouseSelection(was_mouse);
     input.recordMouseSelection(false);
-    copy.enable(testing.allocator, "", -1);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"mouse\": true}" });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    try testing.expect(copy.turnedOn(testing.allocator, state_root));
+    copy.enable(testing.allocator, state_root, -1);
     try testing.expect(!input.mouseSelectionOn());
     paths.setEnv("TERM", "xterm-256color");
     paths.unsetEnv("TERM_PROGRAM");

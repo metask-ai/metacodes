@@ -206,15 +206,16 @@ changed.
 
 ## Selecting text with the mouse
 
-On macOS and Linux the interactive TUI turns on mouse reporting
-(`ESC [?1002h`, `ESC [?1006h`) for as long as it runs, so that dragging over
-text copies it: when the left button is released, metacodes copies the text
-under the drag through OSC 52 (and `pbcopy` in a local macOS session). It
-stays off on Windows and inside GNU screen, and when `METACODES_NO_MOUSE` is
-set (to any value, even `0`) or `<state root>/config.json` says
-`"mouse": false`: then the wheel scrolls the terminal's scrollback and the
-terminal's own selection works without a key held, but dragging no longer
-copies through metacodes.
+metacodes leaves the mouse to the terminal: the wheel scrolls the terminal's
+scrollback and the terminal's own selection works without a key held. With
+`"mouse": true` in `<state root>/config.json` (read when metacodes starts),
+dragging over text copies it through metacodes instead: on macOS and Linux
+the interactive TUI turns on mouse reporting (`ESC [?1002h`, `ESC [?1006h`)
+while it reads keys, and when the left button is released, metacodes copies
+the text under the drag through OSC 52 (and `pbcopy` in a local macOS
+session). It stays off on Windows and inside GNU screen, and when
+`METACODES_NO_MOUSE` is set (to any value, even `0`), whatever
+`config.json` says.
 
 While it is on, the terminal hands the mouse to metacodes:
 
@@ -278,8 +279,9 @@ does not bring back what was on the screen.
 - Inside screen metacodes requests no keyboard protocol, which screen does not
   forward, unless `TERM` names kitty or Ghostty. Shift+Enter therefore
   submits: end the line with `\` and press Enter.
-- Mouse reporting and drag-to-copy stay off: screen 4 does not forward the
-  SGR mouse mode metacodes uses. Select text with the terminal as usual.
+- Mouse reporting and drag-to-copy stay off, even with `"mouse": true`:
+  screen 4 does not forward the SGR mouse mode metacodes uses. Select text
+  with the terminal as usual.
 - screen 4 does not pass 24-bit colour on, so text drawn in it comes out in
   the default colour; screen 5 has `truecolor on`.
 - Ctrl+A is screen's prefix: press Ctrl+A and then `a` to send Ctrl+A (start of

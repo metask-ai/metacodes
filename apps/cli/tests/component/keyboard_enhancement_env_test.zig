@@ -183,7 +183,7 @@ test "METACODES_NO_KEYBOARD_ENHANCEMENT keeps every keyboard protocol sequence o
     }
 }
 
-test "METACODES_NO_MOUSE and config.json's \"mouse\": false keep mouse reporting off the terminal; without them the TUI turns it on" {
+test "config.json's \"mouse\": true turns mouse reporting on; without it, or with METACODES_NO_MOUSE set, the terminal keeps the mouse" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const copy_select = cc.tui_copy_select;
     const pty = try Pty.open();
@@ -198,12 +198,14 @@ test "METACODES_NO_MOUSE and config.json's \"mouse\": false keep mouse reporting
     const state_root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
 
     const cases = [_]struct { env: ?[*:0]const u8, config: ?[]const u8, on: bool }{
-        .{ .env = null, .config = null, .on = true },
-        .{ .env = null, .config = "{\"mouse\": true}", .on = true },
+        .{ .env = null, .config = null, .on = false },
+        .{ .env = null, .config = "{\"theme\": \"dark\"}", .on = false },
+        .{ .env = null, .config = "{\"mouse\": \"on\"}", .on = false },
         .{ .env = null, .config = "{\"theme\": \"dark\", \"mouse\": false}", .on = false },
-        .{ .env = "1", .config = null, .on = false },
+        .{ .env = null, .config = "{\"mouse\": true}", .on = true },
+        .{ .env = "1", .config = "{\"mouse\": true}", .on = false },
         .{ .env = "0", .config = "{\"mouse\": true}", .on = false },
-        .{ .env = "", .config = null, .on = false },
+        .{ .env = "", .config = "{\"mouse\": true}", .on = false },
     };
     for (cases) |c| {
         errdefer std.debug.print("{s}={?s} config.json={?s}\n", .{ copy_select.no_mouse_env, if (c.env) |v| std.mem.span(v) else null, c.config });
@@ -228,6 +230,10 @@ test "METACODES_NO_MOUSE and config.json's \"mouse\": false keep mouse reporting
         try testing.expectEqual(c.on, input.mouseSelectionOn());
         try testing.expectEqual(c.on, contains(taken, input.mouse_selection_enable));
         try testing.expectEqual(c.on, contains(given_back, input.mouse_selection_disable));
+        for ([_][]const u8{ "\x1b[?1002", "\x1b[?1006" }) |mode| {
+            try testing.expectEqual(c.on, contains(taken, mode));
+            try testing.expectEqual(c.on, contains(given_back, mode));
+        }
         try testing.expect(contains(taken, "\x1b[?2004h"));
     }
 }

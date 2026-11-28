@@ -1407,12 +1407,15 @@ class WorkflowTest(unittest.TestCase):
             fake = Path(tmp) / "zig"
             fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
             fake.chmod(0o755)
-            env = dict(os.environ, PATH=f"{tmp}{os.pathsep}{os.environ['PATH']}",
-                       PACKAGE_TESTS="test:mid test:top", ZIG_BUILD_JOBS="4")
-            proc = subprocess.run([*BASH, step["run"]], env=env, capture_output=True, text=True)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(proc.stdout.splitlines()[:4], ["build", "test:mid", "test:top", "test:integration"])
-            proc_no_int = subprocess.run([*BASH, step["run"]], env=dict(env, INTEGRATION="false"),
+            base_env = dict(os.environ, PATH=f"{tmp}{os.pathsep}{os.environ['PATH']}",
+                            PACKAGE_TESTS="test:mid test:top", ZIG_BUILD_JOBS="4")
+            base_env.pop("INTEGRATION", None)
+            for integration in (None, "true"):
+                env = base_env if integration is None else dict(base_env, INTEGRATION=integration)
+                proc = subprocess.run([*BASH, step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.splitlines()[:4], ["build", "test:mid", "test:top", "test:integration"])
+            proc_no_int = subprocess.run([*BASH, step["run"]], env=dict(base_env, INTEGRATION="false"),
                                          capture_output=True, text=True)
         self.assertEqual(proc_no_int.returncode, 0, proc_no_int.stderr)
         self.assertEqual(proc_no_int.stdout.splitlines()[:3], ["build", "test:mid", "test:top"])
@@ -1469,7 +1472,8 @@ class WorkflowTest(unittest.TestCase):
             output.write_text("", encoding="utf-8")
             env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_LOG=str(log),
                        GITHUB_EVENT_NAME=event, GITHUB_OUTPUT=str(output), GITHUB_REPOSITORY="o/r",
-                       MERGE_GROUP_BASE_SHA="b" * 40 if event == "merge_group" else "")
+                       MERGE_GROUP_BASE_SHA="b" * 40 if event == "merge_group" else "",
+                       PR_LABELS="", FAST_PATH="", RUNNER_TEMP=tmp)
             proc = subprocess.run([*BASH, step["run"]], env=env, capture_output=True, text=True)
             calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
             return proc, calls, output.read_text(encoding="utf-8")

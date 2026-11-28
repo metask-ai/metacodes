@@ -36,6 +36,15 @@
       "main_releases": [
         "0.13.0"
       ]
+    },
+    {
+      "version": "0.17.0",
+      "abi_version": 1,
+      "abi_revision": 29,
+      "input_digest": "8ed7f0a4c34369338678bb24902b604dc57e0afe74d82cd8131304a6b3cb5a23",
+      "main_releases": [
+        "0.14.0"
+      ]
     }
   ]
 }

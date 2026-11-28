@@ -18,16 +18,15 @@ pub const no_mouse_env = "METACODES_NO_MOUSE";
 
 pub fn enable(gpa: std.mem.Allocator, state_root: []const u8, fd: c_int) void {
     const env = TerminalEnv.fromProcess();
-    if (builtin.os.tag == .windows or env.insideGnuScreen() or turnedOff(gpa, state_root)) return;
+    if (builtin.os.tag == .windows or env.insideGnuScreen() or !turnedOn(gpa, state_root)) return;
     input.recordMouseSelection(true);
     mirror.enable(fd);
     if (env.insideTmux()) askTmuxInBackground();
 }
 
-pub fn turnedOff(gpa: std.mem.Allocator, state_root: []const u8) bool {
-    if (std.c.getenv(no_mouse_env) != null) return true;
-    if (state_root.len == 0) return false;
-    return tui_config.loadMouse(gpa, state_root) == false;
+pub fn turnedOn(gpa: std.mem.Allocator, state_root: []const u8) bool {
+    if (std.c.getenv(no_mouse_env) != null or state_root.len == 0) return false;
+    return tui_config.loadMouse(gpa, state_root) orelse false;
 }
 
 pub const Drag = struct {
@@ -231,4 +230,36 @@ test "osc52: the text goes base64 encoded to the clipboard selection" {
     const seq = try osc52(testing.allocator, "hi");
     defer testing.allocator.free(seq);
     try testing.expectEqualStrings("\x1b]52;c;aGk=\x07", seq);
+}
+
+test "turnedOn: only config.json's \"mouse\": true turns drag-to-copy on, and METACODES_NO_MOUSE keeps it off even then" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const paths = @import("metacodes-internal").platform.paths;
+    const previous = if (std.c.getenv(no_mouse_env)) |raw| try testing.allocator.dupeZ(u8, std.mem.span(raw)) else null;
+    defer {
+        if (previous) |value| {
+            paths.setEnv(no_mouse_env, value.ptr);
+            testing.allocator.free(value);
+        } else paths.unsetEnv(no_mouse_env);
+    }
+    paths.unsetEnv(no_mouse_env);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state_root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+
+    try testing.expect(!turnedOn(testing.allocator, state_root));
+    for ([_][]const u8{ "{}", "{\"theme\": \"dark\"}", "{\"mouse\": false}", "{\"mouse\": \"on\"}", "{\"mouse\": 1}", "not json" }) |config| {
+        errdefer std.debug.print("config.json={s}\n", .{config});
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = config });
+        try testing.expect(!turnedOn(testing.allocator, state_root));
+    }
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"theme\": \"dark\", \"mouse\": true}" });
+    try testing.expect(turnedOn(testing.allocator, state_root));
+    try testing.expect(!turnedOn(testing.allocator, ""));
+    for ([_][*:0]const u8{ "1", "0", "" }) |value| {
+        errdefer std.debug.print("{s}={s}\n", .{ no_mouse_env, value });
+        paths.setEnv(no_mouse_env, value);
+        try testing.expect(!turnedOn(testing.allocator, state_root));
+    }
 }

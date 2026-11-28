@@ -13,22 +13,30 @@ def _osc52(text):
     return b"\x1b]52;c;" + base64.b64encode(text.encode()) + b"\x07"
 
 
+def _mouse_on(env):
+    home = case_tmpdir("cc-tty-mouse-home-")
+    os.makedirs(os.path.join(home, ".metacodes"), exist_ok=True)
+    with open(os.path.join(home, ".metacodes", "config.json"), "w") as f:
+        f.write('{"mouse": true}')
+    return {**env, "HOME": home, "METACODES_HOME": None, "METACODES_NO_MOUSE": None}
+
+
 def test_dragging_over_text_copies_it_to_the_clipboard(bin_path):
     if IS_WINDOWS:
         return
     raw = run(bin_path, [
         READY, "type:!echo SELECTME-42", "key:enter", "waitline:⎿  SELECTME-42:30",
         "select:SELECTME-42:20", wait_for("Sent to the terminal's clipboard", 10),
-    ], env=ENV)
+    ], env=_mouse_on(ENV))
     assert MOUSE_ON in raw
     assert _osc52("SELECTME-42") in raw, raw[-2000:]
 
 
-def test_mouse_reporting_is_on_without_any_preview_flag(bin_path):
+def test_the_mouse_setting_turns_mouse_reporting_on_without_any_preview_flag(bin_path):
     if IS_WINDOWS:
         return
     for args in ([], ["--no-preview"]):
-        raw = run(bin_path, [READY, "raw:\\x1b[<0;3;2M", "strictsleep:0.3"], extra_args=args, env=ENV)
+        raw = run(bin_path, [READY, "raw:\\x1b[<0;3;2M", "strictsleep:0.3"], extra_args=args, env=_mouse_on(ENV))
         assert MOUSE_ON in raw, args
         assert CURSOR_QUERY in raw, args
 
@@ -39,7 +47,7 @@ def _fake_tmux(set_clipboard):
     with open(path, "w") as f:
         f.write(f"#!/bin/sh\necho {set_clipboard}\n")
     os.chmod(path, 0o755)
-    return {**ENV, "TMUX": "/tmp/cc-tty-fake-tmux,1,0", "PATH": tools + os.pathsep + os.environ.get("PATH", "")}
+    return _mouse_on({**ENV, "TMUX": "/tmp/cc-tty-fake-tmux,1,0", "PATH": tools + os.pathsep + os.environ.get("PATH", "")})
 
 
 def test_inside_a_tmux_that_drops_osc_52_the_copy_notice_says_how_to_let_it_through(bin_path):
