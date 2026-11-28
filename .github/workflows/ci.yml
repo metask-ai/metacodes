@@ -449,7 +449,7 @@ jobs:
       # sees the bare version and is refused, exactly as it would be on main
       # (doc/CI_DESIGN.md §3; it relies on the queue's ALLGREEN setting).
       - name: Version state gate and release rehearsal
-        if: matrix.checks || (matrix.release && env.FAST_PATH != 'true' && env.RELEASE != 'false')
+        if: matrix.checks || (matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false' && env.RELEASE != 'false')
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_PR_NUMBER: ${{ github.event.pull_request.number }}
