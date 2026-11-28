@@ -36,7 +36,7 @@ from unittest.mock import Mock, call, patch
 
 from scripts.eval.harbor import cli
 from scripts.eval.harbor.command import BUNDLE_EXECUTABLES, check_bundle
-from scripts.eval.harbor.bench import data, executors, remote, setup
+from scripts.eval.harbor.bench import data, executors, remote, setup, worker
 from scripts.eval.harbor.bench import node as node_protocol
 from scripts.eval.harbor.viewer import server
 from scripts.eval.harbor.bench.runner import RunManager, atomic_json
@@ -1465,6 +1465,55 @@ class SshRunTest(SetupFixture):
         end = self.remote_home / ".metacodes-bench/runs" / run["name"] / remote.END_EVENT
         self.assertEqual(json.loads(end.read_text())["code"], 0)
         self.assertTrue((self.remote_home / ".metacodes-bench/jobs" / run["name"] / "fix-git__fake" / "result.json").exists())
+
+    def test_supervise_remote_records_reconnects_even_when_run_ends_before_next_flush(self):
+        """A reconnect followed immediately by remote exit (within the 2s periodic
+        record flush window) must still be recorded in the final run record."""
+        spec_path = self.root / "quick-reconnect.spec"
+        record_path = spec_path.with_suffix(".json")
+        record = {"status": "starting", "concurrency": 1}
+        spec = {"key_env": "METASK_API_KEY", "remote_spec_path": "runs/quick/spec.json",
+                "executor": {"name": "relay-4090"}}
+        source = types.SimpleNamespace(current=lambda: None, status=lambda: {"kind": "key"})
+
+        class QuickReconnectRemote:
+            def __init__(self):
+                self.reconnects = 0
+                self.summary = {"counts": {"pass": 1}}
+                self.concurrency = 1
+                self.heartbeat_timeout = 60
+                self.final_timeout = 5
+                self.last_event = time.monotonic()
+                self._polls = iter([None, 255, 0])
+                self.process = types.SimpleNamespace(poll=self._poll, returncode=0)
+
+            def _poll(self):
+                code = next(self._polls, 0)
+                if code is not None:
+                    self.process.returncode = code
+                return code
+
+            def start(self, *_a, **_kw): pass
+            def start_sync(self): pass
+            def follow_handoff(self, *_a): pass
+            def retry_tunnel(self, *_a): return False
+
+            def reconnect(self, *_a):
+                if self.reconnects == 0:
+                    self.reconnects += 1
+                    return True
+                return False
+
+            def hang_up(self): pass
+            def close(self): pass
+            def exit_code(self): return 0
+            def final_sync(self, *_a): return True
+
+        worker.supervise_remote(QuickReconnectRemote(), spec, {"METASK_API_KEY": "placeholder"},
+                                spec_path, record_path, record, source)
+        self.assertEqual((record["status"], record["exit_code"]), ("finished", 0), record)
+        self.assertEqual(record["reconnects"], 1, record)
+        self.assertEqual(record["worker_summary"], {"counts": {"pass": 1}}, record)
 
     def test_a_session_silent_before_its_first_event_is_ended_and_attached(self):
         manager, client, _ = self.prepare_remote()
